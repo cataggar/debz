@@ -2491,8 +2491,18 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "            NATIVE_STEP_OUTCOME=\"$NATIVE_STEP_OUTCOME\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
-        "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",
+        "\"$zig\" build-exe -O ReleaseSafe -lc --dep private_network \\\n",
+        "  -Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig \\\n",
         "  --zig-lib-dir \"$(dirname -- \"$zig\")/lib\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-launcher.zig", &.{
+        "const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;\n",
+        "    if (network_ready != .SUCCESS) fail(status, 15, network_ready);\n",
+        "        if (failure[0] == 15) return error.ReferenceNetworkSetupFailed;\n",
+    });
+    try nativeMutations(&f, "protected-reference", "src/private_network.zig", &.{
+        "    request.ifru.flags.UP = true;\n",
+        "    if (applied != .SUCCESS) return applied;\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
         "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
@@ -2506,10 +2516,12 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    profiles = prove_profiles(args, scripts)\n",
         "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
         "    \"udev\": (\"proc-pid-only\",),\n",
+        "            if control.returncode != 0 or control.stdout != expected:\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
         "    report(\"proc-pid-only\", ",
+        "    try network_probe.observe(\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/verify-minisign.py", &.{
         "    ed25519_verify(key, blob[10:] + trusted, global_signature)\n",

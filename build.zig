@@ -490,12 +490,23 @@ pub fn build(b: *std.Build) void {
         },
     );
     audit_step.dependOn(&audit_tests.step);
+    const private_network_module = b.createModule(.{
+        .root_source_file = b.path("src/private_network.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_network_probe_module = b.createModule(.{
+        .root_source_file = b.path("src/fixtures/script_network_probe.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
     const reference_launcher_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-launcher.zig"),
         .target = target,
         .optimize = optimize,
     });
     reference_launcher_module.link_libc = true;
+    reference_launcher_module.addImport("private_network", private_network_module);
     const reference_launcher = b.addExecutable(.{
         .name = "debz-reference-launcher",
         .root_module = reference_launcher_module,
@@ -515,6 +526,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     reference_launcher_root_module.link_libc = true;
+    reference_launcher_root_module.addImport("private_network", private_network_module);
     const reference_launcher_root_tests = b.addTest(.{ .root_module = reference_launcher_root_module });
     const run_reference_launcher_root_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });
     run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);
@@ -530,6 +542,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    reference_escape_probe.root_module.addImport("network_probe", reference_network_probe_module);
     audit_step.dependOn(&reference_escape_probe.step);
     const protected_reference = b.addSystemCommand(
         &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },

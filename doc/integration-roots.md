@@ -563,8 +563,10 @@ with `InvalidProfile`. Each refusal must leave the bound package unpacked and
 the probe unrun. On arm64 all three profiles must refuse with `InvalidProfile`
 (arm64 signed profiles remain unproved).
 
-This gate does **not** prove runtime library binding (#263), or resolve the
-shared host-network decision (#278). An arm64 run is not amd64 evidence.
+This gate exercises the authenticated dpkg startup closure and the shared
+private-network contract. It does not authorize generic triggered scripts,
+all helper/runtime code or full-root parity. An arm64 run is not amd64
+evidence, and the AMD-only signed proc grants remain unchanged.
 
 ### Hosted protected reference job
 
@@ -621,16 +623,19 @@ mount remains, and removes the tree with `rm -rf --one-file-system`.
 steps, `sudo -n` use and script tokens, so the job cannot silently skip,
 continue on error or lose its protection.
 
-Not covered: a missing-namespace negative (hosted runners cannot withdraw
-namespace support cleanly). The bundle passes through the runner-owned
+Unsupported namespace errno values have a bounded Zig refusal test. The
+root capability proof also withdraws namespace/loopback-configuration
+authority in a child and requires explicit kernel refusals. These are not
+claims that the hosted kernel itself lacks namespace support.
+The bundle passes through the runner-owned
 checkout, but the protected side binds it to `GITHUB_SHA` and `git fsck`.
 
 PID 1 now refuses supervisor-pipe EOF (including the death-before-`prctl`
 window), not just unexpected bytes, and requires `getppid()` to be 0 because
 its supervisor lies outside the new PID namespace; its installed seccomp policy also refuses
-every Linux `CLONE_NEW*` namespace flag after setup, including `NEWNET`,
-without changing the inherited network namespace. This is independent of
-the native script host's policy (#257) and does not settle #278.
+every Linux `CLONE_NEW*` namespace flag after setup, including `NEWNET`.
+Its initial clone now requires private mount, PID and network namespaces;
+there is no retry without `NEWNET` or host-network fallback.
 The launcher independently bounds probe operations to 45 seconds and mutating
 operations to 110 seconds; an expired deadline kills and reaps namespace PID 1
 before returning a distinct error. The outer Python driver retains its
@@ -638,21 +643,30 @@ before returning a distinct error. The outer Python driver retains its
 actually kills and reaps a hung child, but that unprivileged test is not a
 substitute for a protected pinned-dpkg descendant-teardown observation.
 
-This reference-only capability reduction is deliberately **stricter** than
-the existing native script runner, which currently drops `CAP_SYS_ADMIN`
-but not `CAP_SYS_MODULE` or all high-numbered capabilities. If a signed
+The original reference-only capability reduction preceded native's separate
+#257 hardening. Both now use explicit bounded capability policies, not
+a one-capability reduction. If a signed
 script needs a capability outside the reference allowlist, the reference
 must refuse rather than borrow the native authority. Such a refusal is
 not proof of a package-state mismatch or permission to expand the
-reference allowlist: native hardening and any resulting behavior change
-need a separate decision and equivalent protected script proofs. Native's
-existing capability syscall also uses the padded Zig header; its correction
-needs independent review in the native worktree, not a silent change to this
-reference-only delta. The
-shared host network view described below also remains under review.
+reference allowlist: any additional authority needs a separate decision and
+equivalent protected script proofs. The earlier shared host network view is
+historical, not the current contract.
+
+### Shared native/reference network authority (#396)
+
+Native already requires a private network namespace. Reference now requires
+the same boundary for every verb, including no-act operations, before dpkg
+or a package script starts. Both use `src/private_network.zig` to bring up
+only private loopback and verify its kernel flags before capability
+reduction. Namespace creation failure is `ReferenceNamespaceUnavailable`;
+reference loopback setup failure is `ReferenceNetworkSetupFailed`. Neither
+case can borrow host connectivity. No external interface, default route,
+DNS path, abstract host UNIX socket or inherited socket is authorized.
+Private loopback remains usable; no package-specific network grant is added.
 
 The native exact systemd mode (`src/maintainer_script.zig`) and reference
-mode both clone **mount and PID**, not network, namespaces; mount a fresh
+mode mount a fresh
 `ro,nosuid,nodev,noexec,hidepid=2` procfs; and cover `/proc/sys` with a
 read-only boot-ID-only mask before executing a script. Native udev/sudo and
 the reference use the separate `subset=pid` mode without `/proc/sys`.
@@ -662,36 +676,36 @@ proof that the resulting script environment is safe or identical: native
 executes the signed script as PID 1, while reference executes pinned dpkg
 as PID 1 and the script as its child.
 
-Without a separate network namespace, `/proc/net` resolves to
+The original host-network deferral remains historical evidence: without a
+separate network namespace, `/proc/net` resolves to
 `/proc/self/net` and reports the task's network namespace (see Linux
 [`proc_pid_net(5)`](https://man7.org/linux/man-pages/man5/proc_pid_net.5.html)
 and [`network_namespaces(7)`](https://man7.org/linux/man-pages/man7/network_namespaces.7.html)).
-Masking `/proc/sys` does not hide that network view, and hiding the top-level
-`/proc/net` alone would leave per-PID `/proc/1/net` to assess. Native and
-reference both inherit the host network namespace under the reviewed modes;
-equivalent exposure is **not** evidence of harmless exposure. A proposed
-reference-only refusal for `/proc/net` was removed because it would make
-the reference proc mode narrower than the already approved native mode;
-neither mode now adds a network namespace or a proc-network mask. These
-shared network surfaces need separate native-and-reference hardening review,
-including per-PID views under udev/sudo's PID-only procfs, not a unilateral
-reference change.
-Neither a private PID namespace nor a read-only proc mount isolates network
-syscalls or proves the retained network capabilities harmless.
+Masking `/proc/sys` or only `/proc/net` is not a substitute for `NEWNET`:
+per-PID network views and ordinary sockets still belong to the task's
+network namespace. Existing host sysfs mounts must not be substituted for
+the private view.
 
-A disposable **unprivileged** user+network-namespace probe on this host
-changed the visible `/proc/self/net/dev` interface count from three to one.
-Thus adding `CLONE_NEWNET` to the reference alone cannot be called
-behavior-preserving, even if it avoids host network visibility. Any private
-network view would require an explicit reviewed contract for native and
-reference, equivalent pinned-dpkg/signed-script results, and runner-capability
-proof. Existing host sysfs mounts can also retain an old network view; do
-not substitute a host bind mount or assume hiding `/proc/net` removes every
-network surface. The shared view reflects the approved native profile but
-does not establish full parity or resolve future network hardening. The
-signed-lock bindings of dpkg's in-root dynamic loader and runtime libraries
-remain unverified;
-no privileged reference run is authorized on this delta.
+The protected reference proof creates reachable host TCP and abstract-UNIX
+listeners and deliberately inherits a host socket at FD 200 or higher. The
+same static Zig observer must first reach both listeners in the host
+control, then observe their refusal after pinned dpkg executes the probe.
+It checks descriptor sealing before new sockets can reuse the FD number,
+masked `/proc/net`, actual kernel interface and IPv4/IPv6 route dumps, no
+external interface/default route, and a working private loopback connection.
+The identical observer is used by the native signed systemd/udev tests.
+Reference repeats it in the existing AMD systemd/udev/sudo proc profiles;
+ARM continues to refuse those AMD-only grants. Original signed-script
+Debug/ReleaseSafe replays remain a separate required unchanged-behaviour
+and independent pinned-dpkg comparison gate.
+
+Host-control arguments, status, raw stdout/stderr and every confined
+receipt are retained by the always-export collector. Missing, unreachable
+or ambiguous controls fail before the reference operation; missing observer
+inputs or a successful host probe fail the confined proof. Synthetic
+reference interpreter probes alone are not evidence that the original
+signed postinsts executed. Local unprivileged compilation and parser tests
+are not hosted privileged acceptance or full-root parity.
 
 The **amd64 base-cycle exception (#401)** is a separate `break_base_cycle`
 operation with the `libgcc_cycle` profile, not ordinary configure authority.

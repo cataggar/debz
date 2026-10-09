@@ -2438,23 +2438,7 @@ fn sealInheritedDescriptors() linux.E {
 }
 
 fn setupPrivateLoopback() linux.E {
-    const fd_result = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
-    if (linux.errno(fd_result) != .SUCCESS) return linux.errno(fd_result);
-    const fd: i32 = @intCast(fd_result);
-    defer _ = linux.close(fd);
-    var request: linux.ifreq = .{
-        .ifrn = .{ .name = .{ 'l', 'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
-        .ifru = undefined,
-    };
-    const fetched = linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&request)));
-    if (fetched != .SUCCESS) return fetched;
-    request.ifru.flags.UP = true;
-    const applied = linux.errno(linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&request)));
-    if (applied != .SUCCESS) return applied;
-    const verified = linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&request)));
-    if (verified != .SUCCESS) return verified;
-    if (!request.ifru.flags.UP or !request.ifru.flags.LOOPBACK) return .NODEV;
-    return .SUCCESS;
+    return @import("private_network.zig").setupLoopback();
 }
 
 const HelperExposure = struct { root: i32 = -1, err: linux.E = .SUCCESS };
