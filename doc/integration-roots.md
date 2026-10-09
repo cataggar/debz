@@ -666,7 +666,7 @@ DNS path, abstract host UNIX socket or inherited socket is authorized.
 Private loopback remains usable; no package-specific network grant is added.
 
 The native exact systemd mode (`src/maintainer_script.zig`) and reference
-mode mount a fresh
+systemd profile mount a fresh
 `ro,nosuid,nodev,noexec,hidepid=2` procfs; and cover `/proc/sys` with a
 read-only boot-ID-only mask before executing a script. Native udev/sudo and
 the reference use the separate `subset=pid` mode without `/proc/sys`.
@@ -691,8 +691,13 @@ listeners and deliberately inherits a host socket at FD 200 or higher. The
 same static Zig observer must first reach both listeners in the host
 control, then observe their refusal after pinned dpkg executes the probe.
 It checks descriptor sealing before new sockets can reuse the FD number,
-masked `/proc/net`, actual kernel interface and IPv4/IPv6 route dumps, no
-external interface/default route, and a working private loopback connection.
+actual kernel interface and IPv4/IPv6 route dumps, no external
+interface/default route, and a working private loopback connection.
+The full systemd proc profile exposes `/proc/net` from this private namespace:
+the observer additionally reads bounded interface/route files and requires
+only loopback and no default route, reporting `proc_net=private`. PID-only
+profiles require absent proc network files, reporting `proc_net=absent`.
+Neither observation substitutes for the real kernel/socket checks.
 The identical observer is used by the native signed systemd/udev tests.
 Reference repeats it in the existing AMD systemd/udev/sudo proc profiles;
 ARM continues to refuse those AMD-only grants. Original signed-script
