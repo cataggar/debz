@@ -305,7 +305,10 @@ def prove_runtime(args: argparse.Namespace, identity: str) -> None:
             if mutation in ("altered", "private-altered"):
                 data = bytearray(target.read_bytes())
                 data[0] ^= 1
-                write_beneath(target.parent, target.name, bytes(data), stat.S_IMODE(target.stat().st_mode), replace=True)
+                write_beneath(
+                    args.workspace, target.relative_to(args.workspace).as_posix(),
+                    bytes(data), stat.S_IMODE(target.stat().st_mode), replace=True,
+                )
             status, error = operation(
                 args.workspace, name, args.launcher, args.dpkg, prefix, root,
                 args.architecture, args.archive, args.archive_sha512, args.archive_size, "unpack",

@@ -733,6 +733,72 @@ class ReferenceLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size changed"):
                 ORDER.verify_archive(package)
 
+    def test_runtime_mutation_negatives_reach_checks_using_workspace_rooted_writes(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "debz_reference_protected_fixture",
+            TOOLS / "test_real_snapshot_reference_protected.py",
+        )
+        assert spec and spec.loader
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        original = b"original library bytes"
+        bindings = [
+            {"name": name, "root_path": f"/usr/lib/{name}"}
+            for name in ("loader.so", "libpcre2-8.so.0")
+        ]
+        for binding in bindings:
+            (runtime / binding["name"]).write_bytes(original)
+        (runtime / "binding.json").write_text(json.dumps({
+            "loader": "loader.so", "objects": bindings,
+        }))
+        workspace = self.root / "proof"
+        workspace.mkdir()
+
+        def fresh(template: Path, destination: Path, name: str) -> Path:
+            root = destination / f"{name}-root"
+            (root / "usr/lib").mkdir(parents=True)
+            (root / "var/lib/dpkg").mkdir(parents=True)
+            (root / "var/lib/dpkg/status").write_bytes(b"")
+            (root / "etc").mkdir()
+            for binding in bindings:
+                (root / binding["root_path"].lstrip("/")).write_bytes(original)
+            return root
+
+        def operation(directory: Path, name: str, *arguments, **keywords) -> tuple[int, str]:
+            if name.endswith("unbound-preload"):
+                return 1, "UnboundRuntimePreload"
+            if name.endswith(("missing", "symlink")):
+                return 1, "RuntimeInputRefused"
+            return 1, "RuntimeDigestChanged"
+
+        args = proof.argparse.Namespace(
+            runtime=runtime, workspace=workspace, root_template=self.root,
+            launcher=self.root / "launcher", dpkg=self.root / "dpkg",
+            runtime_tool=self.root / "runtime-tool", architecture="amd64",
+            archive=self.root / "package.deb", archive_sha512="a" * 128,
+            archive_size=42,
+        )
+        with (
+            mock.patch.object(proof, "fresh_root", side_effect=fresh),
+            mock.patch.object(proof, "protected_directory"),
+            mock.patch.object(proof, "operation", side_effect=operation),
+            mock.patch.object(proof, "assert_teardown", return_value={}),
+            mock.patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, b"", b"RuntimeSourceChanged; no dpkg or script executed",
+            )),
+        ):
+            proof.prove_runtime(args, "a" * 64)
+        for binding in bindings:
+            name = binding["name"]
+            self.assertEqual((runtime / name).read_bytes(), original)
+            changed = bytes([original[0] ^ 1]) + original[1:]
+            self.assertEqual((workspace / f"runtime-{name}-altered-root/usr/lib/{name}").read_bytes(), changed)
+            self.assertEqual((workspace / f"runtime-{name}-private-altered-prefix/{name}").read_bytes(), changed)
+        report = json.loads((workspace / "runtime-preflight-proof.json").read_text())
+        self.assertEqual(len(report["cases"]), 11)
+
     def test_configured_closure_cannot_route_unbound_trigger_action(self) -> None:
         package = ORDER.Package("fixture", "1", "amd64", "a" * 128, 42,
                                 self.root / "fixture.deb")
