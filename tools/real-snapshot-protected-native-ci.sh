@@ -173,7 +173,7 @@ try:
     for path in entries:
         destination = target / path.relative_to(source)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW)) as src:
+        with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW)) as src:
             with destination.open("xb") as dst:
                 shutil.copyfileobj(src, dst)
     (target / "artifact-summary.txt").write_text(f"bytes_before_index={total}\n")

@@ -1832,7 +1832,7 @@ jobs:
             >"$GITHUB_WORKSPACE/.tmp/signed-bindings.log" 2>&1 || status=$?
           cat "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
           test "${status:-0}" -eq 0
-          grep -Eq 'run test [0-9]+ pass, 3 skip \([0-9]+ total\)' "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
+          grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\.$' "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
       - name: Copy bounded evidence and remove named protected roots
         if: ${{ always() }}
         run: |
