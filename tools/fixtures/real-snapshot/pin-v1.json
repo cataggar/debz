@@ -620,6 +620,14 @@
         {
           "form": "fixture",
           "path": "src/fixtures/ubuntu-resolute-less.postinst"
+        },
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
         }
       ],
       "digest": "sha256:a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4",
@@ -3296,6 +3304,58 @@
       },
       "review": "#393",
       "size": 583,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:dc92b0cc1982509409f1dfbf175e79f6b28940fcc0547ee1db7ab093b7a77738",
+      "id": "file:less/usr/bin/less@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "less",
+      "path": "usr/bin/less",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8"
+        },
+        "version": "668-1build1"
+      },
+      "review": "#393",
+      "size": 282008,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:1980f0221b6fedc7144ea0ec931128abea638665b7b7c2ab13387de83c908da3",
+      "id": "file:less/usr/share/man/man1/less.1.gz@arm64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "less",
+      "path": "usr/share/man/man1/less.1.gz",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8"
+        },
+        "version": "668-1build1"
+      },
+      "review": "#393",
+      "size": 28936,
       "version_bound": false
     }
   ],

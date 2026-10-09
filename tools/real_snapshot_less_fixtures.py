@@ -143,20 +143,28 @@ def copy_exclusive(root: Path, relative: str, source: Path, mode: int) -> None:
     create_exclusive(root, relative, contents, mode)
 
 
-def mutate_negative_roots(roots: list[Path]) -> None:
+def mutate_negative_roots(roots: list[Path], *, kind: str = "preinst") -> None:
     if len(roots) != 5:
         raise ValueError("five distinct negative roots are required")
+    if kind not in ("preinst", "postinst"):
+        raise ValueError("unsupported signed less script mutation")
     for root in roots:
         metadata = protected(root, directory=True)
         if stat.S_IMODE(metadata.st_mode) != 0o700:
             raise ValueError("fixture root must be protected mode 0700")
     bad_script, bad_mode, bad_tool, bad_alias, bad_prestate = roots
-    with regular_descriptor(bad_script, "var/lib/dpkg/info/less.preinst") as descriptor:
+    relative = f"var/lib/dpkg/info/less.{kind}"
+    with regular_descriptor(bad_script, relative) as descriptor:
         contents = os.read(descriptor, 1024)
-        if len(contents) != 292 or b"exit 0" not in contents:
-            raise ValueError("unexpected signed-less preinst fixture")
-        replace_contents(descriptor, contents.replace(b"exit 0", b"exit 1"))
-    with regular_descriptor(bad_mode, "var/lib/dpkg/info/less.preinst") as descriptor:
+        if len(contents) != (292 if kind == "preinst" else 374):
+            raise ValueError("unexpected signed-less script fixture")
+        if kind == "preinst":
+            if b"exit 0" not in contents:
+                raise ValueError("unexpected signed-less preinst fixture")
+            replace_contents(descriptor, contents.replace(b"exit 0", b"exit 1"))
+        else:
+            replace_contents(descriptor, contents + b"\nunreviewed callback\n")
+    with regular_descriptor(bad_mode, relative) as descriptor:
         os.fchmod(descriptor, 0o644)
     overwrite_regular(bad_tool, "usr/bin/update-alternatives", b"foreign alternatives tool\n")
     with parent_descriptor(bad_alias, "usr/bin/sh") as (parent, name):

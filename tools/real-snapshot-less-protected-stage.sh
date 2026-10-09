@@ -61,4 +61,4 @@ timeout --signal=TERM --kill-after=30s 15m \
   >"$workspace/evidence/less-replay.txt" 2>"$workspace/evidence/less-replay.stderr"
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 8 * 1024 * 1024 * 1024 ))
-echo "signed arm64 less source and eight replay roots staged; required receipt verification remains"
+echo "signed arm64 less source and fifteen replay roots staged; required receipt verification remains"

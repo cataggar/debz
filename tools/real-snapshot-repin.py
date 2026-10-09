@@ -1913,6 +1913,31 @@ def record_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def retained_source_member(
+    manifest: dict, evidence: bytes, package: str, architecture: str, prefix: str, path: str,
+) -> tuple[dict, bytes, int]:
+    try:
+        failures = check_prestate_evidence(manifest, evidence)
+    except (zipfile.BadZipFile, KeyError, ValueError, TypeError, OSError, EOFError) as error:
+        fail(f"binding source evidence refused: {error}")
+    if failures:
+        fail("binding source evidence refused: " + "; ".join(failures))
+    with zipfile.ZipFile(io.BytesIO(evidence)) as archive:
+        index = json.loads(archive.read("evidence.json"))
+        sources = [source for source in index["sources"]
+                   if source["architecture"] == architecture and source["package"] == package]
+        if len(sources) != 1:
+            fail("binding has no unique independently retained source archive; run a new probe")
+        source = sources[0]
+        report = json.loads(archive.read("report.json"))
+        lock = json.loads(archive.read(source["lock_file"]))
+        entry = authenticated_source_package(report, lock, package, architecture)
+        data = archive.read(source["archive_file"])
+        verify_source_archive(data, entry)
+        member, mode = tar_member(data, prefix, path)
+    return entry, member, mode
+
+
 def bind_architecture(
     manifest: dict,
     identity_id: str,
@@ -1933,25 +1958,9 @@ def bind_architecture(
     now = int(time.time()) if now is None else now
     if manifest["snapshot"]["status"] != "probed" or now >= manifest["snapshot"]["admission_deadline"]:
         fail("architecture binding requires a currently admissible recorded snapshot")
-    try:
-        failures = check_prestate_evidence(manifest, evidence)
-    except (zipfile.BadZipFile, KeyError, ValueError, TypeError, OSError, EOFError) as error:
-        fail(f"architecture binding source evidence refused: {error}")
-    if failures:
-        fail("architecture binding source evidence refused: " + "; ".join(failures))
-    with zipfile.ZipFile(io.BytesIO(evidence)) as archive:
-        index = json.loads(archive.read("evidence.json"))
-        sources = [source for source in index["sources"]
-                   if source["architecture"] == architecture and source["package"] == identity["package"]]
-        if len(sources) != 1:
-            fail("architecture binding has no unique independently retained source archive; run a new probe")
-        source = sources[0]
-        report = json.loads(archive.read("report.json"))
-        lock = json.loads(archive.read(source["lock_file"]))
-        entry = authenticated_source_package(report, lock, identity["package"], architecture)
-        data = archive.read(source["archive_file"])
-        verify_source_archive(data, entry)
-        member, mode = tar_member(data, "control.tar", identity["path"])
+    entry, member, mode = retained_source_member(
+        manifest, evidence, identity["package"], architecture, "control.tar", identity["path"],
+    )
     if (tagged("sha256", member) != identity["digest"] or len(member) != identity["size"]
             or f"0{mode:03o}" != identity["mode"] or not isinstance(identity["provenance"], dict)
             or entry["version"] != identity["provenance"]["version"]):
@@ -1966,6 +1975,66 @@ def bind_architecture(
     if failures:
         fail("architecture binding recorded source refused: " + "; ".join(failures))
     return updated
+
+
+def bind_member(
+    manifest: dict, archive_id: str, path: str, consumers: list[str], review: str,
+    evidence: bytes, now: int | None = None,
+) -> dict:
+    validate_manifest(manifest)
+    archives = [item for item in manifest["identities"] if item["id"] == archive_id]
+    if len(archives) != 1 or archives[0]["kind"] != "archive" or len(archives[0]["architectures"]) != 1:
+        fail("member binding requires an existing single-architecture archive identity")
+    archive = archives[0]
+    if not isinstance(archive["provenance"], dict):
+        fail("member binding requires recorded archive provenance")
+    architecture = archive["architectures"][0]
+    validate_relative_path(path, "member binding path")
+    if not consumers or len(set(consumers)) != len(consumers) or any(
+            consumer not in DEBZ_SNAPSHOT_CONSTANT_SOURCES for consumer in consumers):
+        fail("member binding requires distinct snapshot admission source consumers")
+    if not REVIEW_REFERENCE.fullmatch(review):
+        fail("member binding requires a PR or issue review reference")
+    now = int(time.time()) if now is None else now
+    if manifest["snapshot"]["status"] != "probed" or now >= manifest["snapshot"]["admission_deadline"]:
+        fail("member binding requires a currently admissible recorded snapshot")
+    identity_id = f"file:{archive['package']}/{path}@{architecture}"
+    if any(item["id"] == identity_id for item in manifest["identities"]):
+        fail("member binding identity already exists")
+    entry, member, mode = retained_source_member(
+        manifest, evidence, archive["package"], architecture, "data.tar", path,
+    )
+    if (archive["digest"] != source_archive_digest(entry) or archive["size"] != entry["declared_size"]
+            or archive["provenance"]["version"] != entry["version"]):
+        fail("member binding source disagrees with the reviewed archive identity")
+    updated = copy.deepcopy(manifest)
+    updated["identities"].append({
+        "id": identity_id, "kind": "tool_file", "package": archive["package"], "path": path,
+        "architectures": [architecture], "digest": tagged("sha256", member), "size": len(member),
+        "mode": f"0{mode:03o}", "version_bound": False, "review": review,
+        "provenance": {"version": entry["version"], "archives": {architecture: source_archive_digest(entry)}},
+        "consumers": [{"path": consumer, "form": "hex"} for consumer in consumers],
+    })
+    validate_manifest(updated)
+    if updated["identities"][-1] not in source_evidence_identities(updated):
+        fail("member binding requires an archive already retained by the offline source gates")
+    failures = check_prestate_evidence(updated, evidence)
+    if failures:
+        fail("member binding recorded source refused: " + "; ".join(failures))
+    return updated
+
+
+def bind_member_command(args: argparse.Namespace) -> int:
+    manifest = validate_manifest(load_json(args.manifest))
+    root = args.root.resolve()
+    if "prestate_evidence" not in manifest:
+        fail("member binding requires independently retained source evidence")
+    evidence = read_source_file(root / manifest["prestate_evidence"], root, MAXIMUM_EVIDENCE_BYTES,
+                                "member binding source evidence")
+    updated = bind_member(manifest, args.archive_identity, args.member, args.consumer, args.reviewed, evidence)
+    write_json(args.manifest, updated)
+    print(f"recorded original {args.member} from {args.archive_identity}; no live probe or execution proof claimed")
+    return 0
 
 
 def bind_architecture_command(args: argparse.Namespace) -> int:
@@ -1992,6 +2061,13 @@ def source_evidence_identities(manifest: dict) -> list[dict]:
     identities.extend(
         identity for identity in manifest["identities"]
         if identity["kind"] == "script" and len(identity["architectures"]) > 1
+    )
+    retained = {(identity["package"], arch) for identity in identities for arch in identity["architectures"]}
+    retained_ids = {identity["id"] for identity in identities}
+    identities.extend(
+        identity for identity in manifest["identities"]
+        if identity["kind"] == "tool_file" and identity["id"] not in retained_ids
+        and all((identity["package"], arch) in retained for arch in identity["architectures"])
     )
     return identities
 
@@ -2760,6 +2836,14 @@ def main(argv: list[str] | None = None) -> int:
     architecture_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)
     architecture_parser.add_argument("--root", type=Path, default=ROOT)
 
+    member_parser = commands.add_parser("bind-member", help="derive a member identity from a retained reviewed archive")
+    member_parser.add_argument("--archive-identity", required=True)
+    member_parser.add_argument("--member", required=True)
+    member_parser.add_argument("--consumer", action="append", choices=DEBZ_SNAPSHOT_CONSTANT_SOURCES, required=True)
+    member_parser.add_argument("--reviewed", required=True, metavar="REF")
+    member_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)
+    member_parser.add_argument("--root", type=Path, default=ROOT)
+
     check_parser = commands.add_parser("check", help="offline: verify in-tree pins against the manifest")
     check_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)
     check_parser.add_argument("--root", type=Path, default=ROOT)
@@ -2775,6 +2859,8 @@ def main(argv: list[str] | None = None) -> int:
             return record_command(args)
         if args.command == "bind-architecture":
             return bind_architecture_command(args)
+        if args.command == "bind-member":
+            return bind_member_command(args)
         return check_command(args)
     except RepinError as error:
         print(f"real-snapshot-repin: {error}", file=sys.stderr)

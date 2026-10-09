@@ -1686,9 +1686,11 @@ def audit_production_sources() -> None:
         "if ((!amd64 and !arm64) or",
         "const snapshot_less_arm64_artifacts = [_]struct {",
         "const snapshot_less_arm64_controls = [_]SignedDebconfControlFile{",
+        "const snapshot_less_arm64_postinst_controls = [_]SignedDebconfControlFile{",
+        "if ((less_inert or snapshot_postinst) and std.mem.eql(u8, architecture, \"arm64\")) {",
         'if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))',
-        "try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture);",
-        "try bindSnapshotLessArm64ImmutableInputs(&script);",
+        "try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture, kind);",
+        "try bindSnapshotLessArm64ImmutableInputs(&script, kind);",
         'stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)',
         '"etc/ld.so.preload",\n    "etc/ld.so.cache",',
         "var contents = try proc.observeAlloc(allocator, 0, 0);",
@@ -1696,7 +1698,7 @@ def audit_production_sources() -> None:
         "try attempt.requireRecovery(allocator, .script);",
     ):
         if required not in unpack:
-            fail(f"reviewed exact arm64 less inert boundary changed: {required}")
+            fail(f"reviewed exact arm64 less callback boundary changed: {required}")
     less_reference = (ROOT / "tools/real-snapshot-less-reference.sh").read_text(errors="strict")
     for required in (
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT="$source_root"',
@@ -2806,7 +2808,10 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'content = os.read(descriptor, 2048)',
         'if (len(content) != 583 or hashlib.sha256(content).hexdigest() !=',
         'raise ValueError("signed less ownership path set changed")',
-        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", script, 0o755)',
+        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", preinst, 0o755)',
+        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755)',
+        'regular_descriptor(root, "var/lib/dpkg/info/less.postinst")',
+        'raise ValueError("signed less postinst changed")',
         'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
     ),
     "tools/real-snapshot-less-reference.sh": (
@@ -2816,6 +2821,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         '\ncheck_source_inputs\n',
         'mutate_negative_roots([Path(root) for root in sys.argv[1:]])',
         'stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))',
+        'stage_dpkg_reference(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))',
     ),
     "tools/real_snapshot_less_fixtures.py": (
         'parent_fd = open_beneath(root_fd, parent, directory=True)',
@@ -3044,7 +3050,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             failures.append(f"protected Python alternatives must preserve complete inventories in both modes: {token}")
     for path, count in (
         ("tools/real-snapshot-less-protected-stage.sh", 1),
-        ("tools/real-snapshot-less-reference.sh", 2),
+        ("tools/real-snapshot-less-reference.sh", 3),
     ):
         commands = re.findall(
             r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
@@ -3062,13 +3068,18 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     arm_body = arm_ci.partition(arm_start)[2].partition('\n# The protected proof on the staged new empty workspace')[0]
     for token in (
         '$checkout/.real-snapshot/less-arm64',
-        'step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
+        'step arm64-less-stage 0 "fifteen replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
         'bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"',
         'step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m',
         '"$zig" build test-real-snapshot-arm64-less-protected',
         '"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate"',
         '"$less_workspace/evidence/less-source-proof.txt"',
         '"$less_workspace/evidence/less-replay-proof.txt"',
+        'step arm64-less-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-arm64-less-postinst-protected',
+        '"-Darm64-less-postinst-bad-prestate=$less_workspace/script-after-postinst-bad-prestate"',
+        '"$less_workspace/evidence/less-postinst-proof.txt"',
+        'grep -Fx "signed arm64 less native postinst and independent pinned dpkg agree without skips"',
         'grep -F " $less_workspace" /proc/self/mountinfo',
         'rm -rf --one-file-system -- "$less_workspace"',
     ):
@@ -3082,12 +3093,16 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         'run_arm64_less_tests.has_side_effects = true;',
         '"Required protected ARM less proof coordinate") orelse ""',
         'setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT", value)',
+        'b.step("test-real-snapshot-arm64-less-postinst-protected",',
+        'run_arm64_less_postinst_tests.has_side_effects = true;',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_POSTINST_{s}',
     ):
         if token not in arm_build:
             failures.append(f"protected arm64 less build lost {token}")
     for name, calls in (
         ("source is validated before fixture mutation", (
-            'try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");',
+            'try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64", .preinst);',
+            'try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64", .postinst);',
             'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_PROOF',
         )),
         ("inert input and replay roots are exact", (
@@ -3096,12 +3111,33 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             'try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Inputs(',
             'DEBZ_REQUIRE_SIGNED_ARM64_LESS_REPLAY_PROOF',
         )),
+        ("postinst runs natively and matches pinned dpkg", (
+            'maintainer_script.SystemLauncher',
+            'maintainer_script.run(testing.allocator,',
+            'try testing.expect(report.succeeded());',
+            '.policy = lifecycleInvocationPolicy(false, false, false)',
+            'try verifySnapshotLessArm64Inputs(testing.allocator, native.root, &artifacts, "arm64", .postinst);',
+            'native_alternatives.validateScriptInputs(',
+            'native_alternatives.validateScriptTransition(',
+            'try testing.expectEqualDeep(actual.record, expected.record);',
+            'try testing.expectEqualStrings("/usr/bin/less", actual.selected);',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_POSTINST_BAD_PRESTATE_ROOT',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_POSTINST_PROOF',
+        )),
     ):
         text = texts.get("src/native_unpack.zig", "")
         body = text.partition(f'test "native_unpack.test.protected signed arm64 less {name}" {{')[2].partition('\n}\n')[0]
         for token in (*calls, '.exclusive = true', 'try proof.writeStreamingAll('):
             if token not in body:
                 failures.append(f"protected arm64 less test body lost {token}")
+    less_reference = texts.get("tools/real-snapshot-less-reference.sh", "")
+    for token in (
+        'mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")',
+        '--force-depends --no-triggers --configure less',
+        "'668-1build1 arm64 install ok installed'",
+    ):
+        if token not in less_reference:
+            failures.append(f"protected arm64 less independent configure lost {token}")
     python_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
     python_start = 'if [[ $architecture == amd64 ]]; then\n  python3_workspace='
     python_end = '\n# The protected proof on the staged new empty workspace'

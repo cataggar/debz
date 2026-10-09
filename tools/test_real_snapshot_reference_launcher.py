@@ -76,6 +76,8 @@ class ReferenceLauncherTests(unittest.TestCase):
         listing.write_bytes(content)
         preinst, _ = REPIN.tar_member(deb, "control.tar", "preinst")
         (info / "less.preinst").write_bytes(preinst)
+        postinst, _ = REPIN.tar_member(deb, "control.tar", "postinst")
+        (info / "less.postinst").write_bytes(postinst)
         before = listing.stat()
         LESS_STAGE.seal(self.root)
         after = listing.stat()

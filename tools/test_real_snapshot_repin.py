@@ -1147,6 +1147,64 @@ class ArchitectureBindingTests(unittest.TestCase):
             self.bind(evidence=output.getvalue())
 
 
+class MemberBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        self.manifest["identities"] = [item for item in self.manifest["identities"]
+                                      if not item["id"].startswith("file:less/")]
+        self.evidence = (ROOT / self.manifest["prestate_evidence"]).read_bytes()
+        self.now = self.manifest["snapshot"]["admission_deadline"] - 1
+
+    def bind(self, **overrides) -> dict:
+        arguments = {
+            "manifest": self.manifest, "archive_id": "archive:less@arm64", "path": "usr/bin/less",
+            "consumers": ["src/native_unpack.zig"], "review": "#393",
+            "evidence": self.evidence, "now": self.now,
+        }
+        arguments.update(overrides)
+        return repin.bind_member(**arguments)
+
+    def test_member_coordinates_are_derived_from_original_retained_archive(self) -> None:
+        original = copy.deepcopy(self.manifest)
+        for path in ("usr/bin/less", "usr/share/man/man1/less.1.gz"):
+            with self.subTest(path=path), patch.object(repin, "fetch", side_effect=AssertionError("offline")):
+                updated = self.bind(path=path)
+            item = updated["identities"][-1]
+            with zipfile.ZipFile(io.BytesIO(self.evidence)) as archive:
+                source = next(source for source in json.loads(archive.read("evidence.json"))["sources"]
+                              if source["architecture"] == "arm64" and source["package"] == "less")
+                member, mode = repin.tar_member(archive.read(source["archive_file"]), "data.tar", path)
+            self.assertEqual((item["digest"], item["size"], item["mode"]), (sha256(member), len(member), f"0{mode:03o}"))
+            self.assertEqual(repin.check_prestate_evidence(updated, self.evidence), [])
+            item["digest"] = sha256(b"unreviewed")
+            self.assertTrue(any("member bytes disagree" in failure
+                                for failure in repin.check_prestate_evidence(updated, self.evidence)))
+        self.assertEqual(self.manifest, original)
+
+    def test_missing_review_invalid_member_consumer_or_expired_snapshot_refuses(self) -> None:
+        for overrides in (
+            {"archive_id": "script:less/postinst"}, {"path": "../less"}, {"path": "usr/bin/missing"},
+            {"consumers": []}, {"consumers": ["src/native_unpack.zig"] * 2},
+            {"consumers": ["unregistered.zig"]}, {"review": "unreviewed"}, {"now": self.now + 1},
+            {"evidence": b"not a source ZIP"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(repin.RepinError):
+                self.bind(**overrides)
+        with patch.object(repin.time, "time", return_value=self.now + 1), self.assertRaisesRegex(
+                repin.RepinError, "currently admissible"):
+            self.bind(now=None)
+
+    def test_archive_identity_and_repeated_member_binding_cannot_be_borrowed(self) -> None:
+        updated = self.bind()
+        with self.assertRaisesRegex(repin.RepinError, "already exists"):
+            self.bind(manifest=updated)
+        for field, value in (("digest", sha512(b"wrong")), ("size", 1)):
+            changed = copy.deepcopy(self.manifest)
+            next(item for item in changed["identities"] if item["id"] == "archive:less@arm64")[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(repin.RepinError, "reviewed archive identity"):
+                self.bind(manifest=changed)
+
+
 class SourceEvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         (ROOT / ".tmp").mkdir(exist_ok=True)

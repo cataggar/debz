@@ -211,6 +211,23 @@ This records source identity only. It does not admit execution or prove the
 new architecture's helper, loader, alias, prestate or namespace environment;
 those remain independent native guards and protected replay requirements.
 
+### `bind-member`
+
+```sh
+python3 tools/real-snapshot-repin.py bind-member \
+    --archive-identity archive:less@arm64 --member usr/bin/less \
+    --consumer src/native_unpack.zig --reviewed '#393'
+```
+
+This derives a new architecture-specific member identity from an already
+reviewed archive retained by the offline source gates. The currently admissible
+snapshot, original signed index/Release, lock, archive digest/size/version and
+regular member are revalidated before recording its digest, size and mode.
+Repeat identities, missing sources and unsupported consumers refuse without
+rewriting the manifest. Offline checks and future exports also rederive tool
+members whose package/architecture sources are already retained. This neither
+updates freshness nor substitutes for protected execution evidence.
+
 ### `record`
 
 ```sh
