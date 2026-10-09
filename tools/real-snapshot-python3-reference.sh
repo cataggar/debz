@@ -161,14 +161,14 @@ grep -Fx "signed Python source guard executed before fixture mutation" "$source_
 
 alternatives_fingerprint() {
   local root=$1
-  [[ $(find "$root/var/lib/dpkg/alternatives" -mindepth 1 -maxdepth 1 -type f | wc -l) == 14 ]]
-  [[ $(find "$root/etc/alternatives" -mindepth 1 -maxdepth 1 -type l | wc -l) == 76 ]]
   (
-    cd "$root"
+    cd "$root" || exit 1
+    first=$(find var/lib/dpkg/alternatives -mindepth 1 -maxdepth 1 -type f -print -quit) || exit 1
+    [[ -n $first ]] || { echo "Python source has no alternatives records" >&2; exit 1; }
     find var/lib/dpkg/alternatives -mindepth 1 -maxdepth 1 -type f -print0 |
-      sort -z | xargs -0 sha256sum
-    find etc/alternatives -mindepth 1 -maxdepth 1 -type l -printf '%P %l\n' | sort
-    readlink usr/bin/python3
+      sort -z | xargs -0 sha256sum || exit 1
+    find etc/alternatives -mindepth 1 -maxdepth 1 -type l -printf '%P %l\n' | sort || exit 1
+    readlink usr/bin/python3 || exit 1
   ) | sha256sum | cut -d' ' -f1
 }
 before=$(alternatives_fingerprint "$source_root")

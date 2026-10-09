@@ -3834,73 +3834,82 @@ test "native_alternatives.test.signed python3 install preinst has no alternative
 
 test "native_alternatives.test.protected signed python3 preinst preserves all records and selectors" {
     const testing = std.testing;
-    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
-    const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse
-        return error.TestUnexpectedResult;
-    var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
-    defer before_root.close();
-    var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
-    defer after_root.close();
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") == null) return;
     var script = try discoverScriptAuthority(
         testing.allocator,
         @embedFile("fixtures/ubuntu-resolute-python3.preinst"),
         .{},
     );
     defer script.deinit();
-    var listed = try listGroups(testing.allocator, before_root.root, .{});
-    defer listed.deinit();
-    try testing.expectEqual(@as(usize, 14), listed.names.len);
-    const groups = try testing.allocator.alloc(GroupAuthority, listed.names.len);
-    defer testing.allocator.free(groups);
-    for (listed.names, groups) |name, *allowed|
-        allowed.* = .{ .name = name, .mutable = false };
-    const authority: Authority = .{ .groups = groups };
-    var before = try capture(testing.allocator, before_root.root, authority);
-    defer before.deinit();
-    try testing.expect(before.group("python3") == null);
-    var inputs = try captureScriptInputs(testing.allocator, before_root.root, script, before, .{});
-    defer inputs.deinit();
-    try validateScriptInputs(testing.allocator, before_root.root, script, before, inputs, .{});
-    var same = try capture(testing.allocator, before_root.root, authority);
-    defer same.deinit();
-    try validateScriptTransition(testing.allocator, before, same, script, authority);
-    var after = try capture(testing.allocator, after_root.root, authority);
-    defer after.deinit();
-    try testing.expect(after.group("python3") == null);
-    for (listed.names) |name| {
-        const path = try std.fmt.allocPrint(
-            testing.allocator,
-            "{s}/{s}",
-            .{ database_directory, name },
-        );
-        defer testing.allocator.free(path);
-        const old_record = try before_root.root.readFileAlloc(
-            testing.allocator,
-            try root_fs.Path.init(path),
-            1024 * 1024,
-        );
-        defer testing.allocator.free(old_record);
-        const new_record = try after_root.root.readFileAlloc(
-            testing.allocator,
-            try root_fs.Path.init(path),
-            1024 * 1024,
-        );
-        defer testing.allocator.free(new_record);
-        try testing.expectEqualSlices(u8, old_record, new_record);
-        try testing.expectEqualStrings(
-            before.group(name).?.selected,
-            after.group(name).?.selected,
+    for ([_][2][:0]const u8{
+        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER" },
+        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },
+    }) |coordinate| {
+        const before_path = std.c.getenv(coordinate[0]) orelse return error.TestUnexpectedResult;
+        const after_path = std.c.getenv(coordinate[1]) orelse return error.TestUnexpectedResult;
+        var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+        defer before_root.close();
+        var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
+        defer after_root.close();
+        var listed = try listGroups(testing.allocator, before_root.root, .{});
+        defer listed.deinit();
+        try testing.expect(listed.names.len != 0);
+        var listed_after = try listGroups(testing.allocator, after_root.root, .{});
+        defer listed_after.deinit();
+        try testing.expectEqualDeep(listed.names, listed_after.names);
+        const groups = try testing.allocator.alloc(GroupAuthority, listed.names.len);
+        defer testing.allocator.free(groups);
+        for (listed.names, groups) |name, *allowed|
+            allowed.* = .{ .name = name, .mutable = false };
+        const authority: Authority = .{ .groups = groups };
+        var before = try capture(testing.allocator, before_root.root, authority);
+        defer before.deinit();
+        try testing.expect(before.group("python3") == null);
+        var inputs = try captureScriptInputs(testing.allocator, before_root.root, script, before, .{});
+        defer inputs.deinit();
+        try validateScriptInputs(testing.allocator, before_root.root, script, before, inputs, .{});
+        var same = try capture(testing.allocator, before_root.root, authority);
+        defer same.deinit();
+        try validateScriptTransition(testing.allocator, before, same, script, authority);
+        var after = try capture(testing.allocator, after_root.root, authority);
+        defer after.deinit();
+        try testing.expect(after.group("python3") == null);
+        try validateScriptTransition(testing.allocator, before, after, script, authority);
+        for (listed.names) |name| {
+            const path = try std.fmt.allocPrint(
+                testing.allocator,
+                "{s}/{s}",
+                .{ database_directory, name },
+            );
+            defer testing.allocator.free(path);
+            const old_record = try before_root.root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(path),
+                1024 * 1024,
+            );
+            defer testing.allocator.free(old_record);
+            const new_record = try after_root.root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(path),
+                1024 * 1024,
+            );
+            defer testing.allocator.free(new_record);
+            try testing.expectEqualSlices(u8, old_record, new_record);
+            try testing.expectEqualStrings(
+                before.group(name).?.selected,
+                after.group(name).?.selected,
+            );
+        }
+        const forged_groups = try testing.allocator.dupe(GroupState, before.groups);
+        defer testing.allocator.free(forged_groups);
+        forged_groups[0].digest[0] ^= 1;
+        var forged_after = before;
+        forged_after.groups = forged_groups;
+        try testing.expectError(
+            error.AlternativesStateChanged,
+            validateScriptTransition(testing.allocator, before, forged_after, script, authority),
         );
     }
-    const forged_groups = try testing.allocator.dupe(GroupState, before.groups);
-    defer testing.allocator.free(forged_groups);
-    forged_groups[0].digest[0] ^= 1;
-    var forged_after = before;
-    forged_after.groups = forged_groups;
-    try testing.expectError(
-        error.AlternativesStateChanged,
-        validateScriptTransition(testing.allocator, before, forged_after, script, authority),
-    );
     if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")) |path| {
         var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{ .exclusive = true });
         defer proof.close(testing.io);

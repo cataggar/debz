@@ -39,12 +39,12 @@ python3 -B -I tools/real_snapshot_less_stage.py prepare "$source" "$lock" "$cach
 # unchanged signed inert less preinst runs; no configure/trigger authority.
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
-  chroot "$source" /bin/sh -c '
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$source" /bin/sh -c '
     set -eu
     test "$$" -eq 1
     exec setpriv --bounding-set=-sys_admin --no-new-privs \
-      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
-      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
       /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
       --force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb
   '

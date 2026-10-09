@@ -3021,6 +3021,33 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
 def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     """The protected reference job stages only reviewed, root-owned inputs and cannot skip."""
     failures: list[str] = []
+    python_alternatives = texts.get("src/native_alternatives.zig", "").partition(
+        'test "native_alternatives.test.protected signed python3 preinst preserves all records and selectors" {'
+    )[2].partition('\ntest "')[0]
+    for token in (
+        '"DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644"',
+        "try testing.expect(listed.names.len != 0);",
+        "try testing.expectEqualDeep(listed.names, listed_after.names);",
+        "try validateScriptTransition(testing.allocator, before, after, script, authority);",
+        "try testing.expectEqualSlices(u8, old_record, new_record);",
+    ):
+        if token not in python_alternatives:
+            failures.append(f"protected Python alternatives must preserve complete inventories in both modes: {token}")
+    for path, count in (
+        ("tools/real-snapshot-less-protected-stage.sh", 1),
+        ("tools/real-snapshot-less-reference.sh", 2),
+    ):
+        commands = re.findall(
+            r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
+            texts.get(path, ""), re.DOTALL,
+        )
+        if len(commands) != count or any(
+                "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C" not in command or
+                command.find("/usr/bin/env -i") > command.find("chroot ") or
+                "env -i" in command.partition("chroot ")[2] or
+                "--bounding-set=-sys_admin --no-new-privs" not in command
+                for command in commands):
+            failures.append(f"protected less environment must be sanitized before chroot without guest env: {path}")
     arm_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
     arm_start = 'elif [[ $architecture == arm64 ]]; then\n  less_workspace='
     arm_body = arm_ci.partition(arm_start)[2].partition('\n# The protected proof on the staged new empty workspace')[0]

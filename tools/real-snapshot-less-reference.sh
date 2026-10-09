@@ -151,12 +151,12 @@ check_activated_roots
 before=$(alternatives_fingerprint "$source_root")
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
-  chroot "$script_root" /bin/sh -c '
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$script_root" /bin/sh -c '
     set -eu
     test "$$" -eq 1
     exec setpriv --bounding-set=-sys_admin --no-new-privs \
-      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
-      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
       /bin/sh /var/lib/debz-lifecycle-scripts/less.preinst install
   '
 python3 - "$dpkg_root" "$pinned" "$archive" <<'PY'
@@ -168,17 +168,15 @@ stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))
 PY
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
-  chroot "$dpkg_root" /bin/sh -c '
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$dpkg_root" /bin/sh -c '
     set -eu
     test "$$" -eq 1
     exec setpriv --bounding-set=-sys_admin --no-new-privs /bin/sh -ec '\''
-      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
-        DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
-        /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
+      /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
         --force-depends --no-triggers --purge less
-      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
-        DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
-        /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
+      /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
         --no-triggers --unpack /var/lib/dpkg/less-probe.deb
     '\'' sh
   '

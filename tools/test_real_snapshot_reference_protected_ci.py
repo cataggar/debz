@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -320,6 +321,95 @@ class ExtractedReferenceReceiptTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_less_orchestration_cleans_environment_before_entering_minimal_guest(self) -> None:
+        for filename, count in (("real-snapshot-less-protected-stage.sh", 1),
+                                ("real-snapshot-less-reference.sh", 2)):
+            source = (TOOLS / filename).read_text()
+            commands = re.findall(
+                r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
+                source, re.DOTALL,
+            )
+            self.assertEqual(len(commands), count)
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                log = root / "calls"
+                chroot = root / "mock-chroot"
+                chroot.write_text(
+                    "#!/bin/bash\nset -euo pipefail\n"
+                    '[[ ! -v UNTRUSTED_TEST_ENV && $HOME == / && $LC_ALL == C ]]\n'
+                    '[[ $PATH == /usr/sbin:/usr/bin:/sbin:/bin && $DPKG_COLORS == never ]]\n'
+                    '[[ $DEBIAN_FRONTEND == noninteractive && $4 != *"env -i"* ]]\n'
+                    '[[ $4 == *"--bounding-set=-sys_admin --no-new-privs"* ]]\n'
+                    f'printf "%s\\n" "$1" >>{shlex.quote(str(log))}\n'
+                )
+                chroot.chmod(0o755)
+                setup = """
+source=/unit-source
+script_root=/unit-script
+dpkg_root=/unit-dpkg
+timeout() { while [[ $1 != unshare ]]; do shift; done; "$@"; }
+unshare() { while [[ $1 != -- ]]; do shift; done; shift; "$@"; }
+"""
+                for command in commands:
+                    with self.subTest(filename=filename, command=command.splitlines()[-2]):
+                        command = command.replace("chroot ", shlex.quote(str(chroot)) + " ")
+                        result = subprocess.run(
+                            ["bash", "-euo", "pipefail", "-c", setup + command],
+                            env=dict(os.environ, UNTRUSTED_TEST_ENV="must-not-enter-guest"),
+                            capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(log.is_file(), "guest entry must receive the sanitized environment")
+                self.assertEqual(len(log.read_text().splitlines()), count)
+
+    def test_python_alternatives_fingerprint_covers_inventory_and_fails_closed_in_substitution(self) -> None:
+        source = (TOOLS / "real-snapshot-python3-reference.sh").read_text()
+        function = "alternatives_fingerprint() {" + source.split(
+            "alternatives_fingerprint() {", 1
+        )[1].split("\nbefore=$(alternatives_fingerprint", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = root / "var/lib/dpkg/alternatives"
+            selectors = root / "etc/alternatives"
+            records.mkdir(parents=True)
+            selectors.mkdir(parents=True)
+            (root / "usr/bin").mkdir(parents=True)
+            (root / "usr/bin/python3").symlink_to("python3.14")
+            (records / "editor").write_bytes(b"unchanged record\n")
+            (selectors / "editor").symlink_to("/usr/bin/editor")
+            def fingerprint() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c",
+                     function + '\nvalue=$(alternatives_fingerprint "$1")\nprintf "%s\\n" "$value"\n',
+                     "python-alternatives-fingerprint-test", str(root)],
+                    capture_output=True, text=True,
+                )
+            original = fingerprint()
+            self.assertEqual(original.returncode, 0, original.stderr)
+            (records / "pager").write_bytes(b"additional record\n")
+            changed = fingerprint()
+            self.assertEqual(changed.returncode, 0, changed.stderr)
+            self.assertNotEqual(original.stdout, changed.stdout)
+            (records / "pager").unlink()
+            (selectors / "editor").unlink()
+            (selectors / "editor").symlink_to("/usr/bin/other-editor")
+            self.assertNotEqual(original.stdout, fingerprint().stdout)
+            for mutation in ("missing-records", "missing-selectors", "missing-python-link"):
+                with self.subTest(mutation=mutation):
+                    if mutation == "missing-records":
+                        records.rename(records.with_name("saved-records"))
+                    elif mutation == "missing-selectors":
+                        selectors.rename(selectors.with_name("saved-selectors"))
+                    else:
+                        (root / "usr/bin/python3").unlink()
+                    result = fingerprint()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(result.stdout, "")
+                    if mutation == "missing-records":
+                        records.with_name("saved-records").rename(records)
+                    elif mutation == "missing-selectors":
+                        selectors.with_name("saved-selectors").rename(selectors)
+
     def test_selected_prestate_origins_require_all_fresh_authenticated_witnesses(self) -> None:
         source = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
         predicate = re.search(r"jq -e --arg release .*? '\n(.*?)\n' \"\$lock\"",
@@ -615,6 +705,16 @@ timeout() {
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, token in (
+            ("src/native_alternatives.zig",
+             '        try testing.expectEqualDeep(listed.names, listed_after.names);\n'),
+            ("src/native_alternatives.zig",
+             '        try validateScriptTransition(testing.allocator, before, after, script, authority);\n'),
+            ("src/native_alternatives.zig",
+             '        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },\n'),
+            ("tools/real-snapshot-less-protected-stage.sh",
+             '    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \\\n'),
+            ("tools/real-snapshot-less-reference.sh",
+             '    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \\\n'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
              'require_protected_file "$snapshot/evidence/refresh.json"\n'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
