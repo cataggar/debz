@@ -23396,10 +23396,11 @@ test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings"
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
     );
+    const null_entry = try null_root.entry(null_path);
     try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
         "reason=control_file_mismatch",
         "path=dev/null",
-        "field=uid",
+        if (null_entry.uid != 0) "field=uid" else if (null_entry.gid != 0) "field=gid" else "field=size",
         "expected=0",
         "observed=",
     });

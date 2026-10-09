@@ -3028,8 +3028,16 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         '"DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644"',
         "try testing.expect(listed.names.len != 0);",
         "try testing.expectEqualDeep(listed.names, listed_after.names);",
-        "try validateScriptTransition(testing.allocator, before, after, script, authority);",
+        "try validateScriptTransition(testing.allocator, before, same, script, authority);",
+        "try validateScriptTransition(testing.allocator, after, after_same, script, authority);",
+        "try testing.expectEqualDeep(old_group.record, new_group.record);",
+        "try testing.expectEqualDeep(old_group.links, new_group.links);",
+        "try testing.expectEqualDeep(old_group.missing_master_targets, new_group.missing_master_targets);",
+        "try testing.expectEqual(old_group.facts.len, new_group.facts.len);",
+        "try testing.expect(testClonedEntryFactEqual(left, right));",
         "try testing.expectEqualSlices(u8, old_record, new_record);",
+        "errdefer |err| std.debug.print(",
+        "protected Python alternatives: coordinate={s} phase={s} group={s} error={s}",
     ):
         if token not in python_alternatives:
             failures.append(f"protected Python alternatives must preserve complete inventories in both modes: {token}")
