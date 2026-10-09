@@ -5614,7 +5614,12 @@ const SignedNetworkProof = struct {
     }
 
     fn expectReceipt(report: *const Report, domain: []const u8) !void {
-        const receipt = "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n";
+        const receipt = if (std.mem.eql(u8, domain, "systemd"))
+            "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
+        else if (std.mem.eql(u8, domain, "udev"))
+            "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
+        else
+            return error.InvalidNetworkProofDomain;
         try testing.expect(std.mem.indexOf(u8, report.stdout, receipt) != null);
         const directory = std.c.getenv("DEBZ_SIGNED_NETWORK_PROOF_DIR") orelse
             return error.SignedNetworkProofDirectoryRequired;

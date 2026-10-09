@@ -3560,7 +3560,11 @@ SIGNED_PROC_CI_STEPS = {
         '            sudo -n cat "$PROTECTED/checkout/.tmp/signed-network-$target.proof" >"$proof"',
         '            grep -Fxq "domain=$target" "$proof"',
         "            grep -Fxq 'DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open' \"$proof\"",
-        "            grep -Fxq 'DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok' \"$proof\"",
+        '            case "$target" in',
+        "              systemd) proc_net=private ;;",
+        "              udev) proc_net=absent ;;",
+        "              *) exit 1 ;;",
+        '            grep -Fxq "DEBZ_SIGNED_NETWORK_PROOF proc_net=$proc_net interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok" "$proof"',
     ),
     "Compare native replays with pinned dpkg proofs": (
         "        working-directory: ${{ env.PROTECTED }}/checkout",

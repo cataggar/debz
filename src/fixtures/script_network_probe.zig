@@ -245,6 +245,49 @@ fn present(path: [*:0]const u8) !bool {
     }
 }
 
+fn readProcNetwork(path: [*:0]const u8, buffer: []u8) ![]const u8 {
+    const fd: i32 = @intCast(try checked(linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0)));
+    defer _ = linux.close(fd);
+    var length: usize = 0;
+    while (length < buffer.len) {
+        const size = try checked(linux.read(fd, buffer[length..].ptr, buffer.len - length));
+        if (size == 0) return buffer[0..length];
+        length += size;
+    }
+    return error.NetworkObservationTooLarge;
+}
+
+fn privateProcNetwork(devices: []const u8, routes: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, devices, '\n');
+    if (!std.mem.startsWith(u8, lines.next() orelse return error.MalformedNetworkObservation, "Inter-") or
+        !std.mem.startsWith(u8, std.mem.trim(u8, lines.next() orelse return error.MalformedNetworkObservation, " \t"), "face"))
+        return error.MalformedNetworkObservation;
+    var interfaces: usize = 0;
+    while (lines.next()) |line| {
+        const row = std.mem.trim(u8, line, " \t\r");
+        if (row.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, row, ':') orelse return error.MalformedNetworkObservation;
+        if (!std.mem.eql(u8, std.mem.trim(u8, row[0..colon], " \t"), "lo"))
+            return error.ProcNetworkBoundaryFailed;
+        interfaces += 1;
+    }
+    if (interfaces != 1) return error.ProcNetworkBoundaryFailed;
+    lines = std.mem.splitScalar(u8, routes, '\n');
+    if (!std.mem.startsWith(u8, lines.next() orelse return error.MalformedNetworkObservation, "Iface\tDestination\tGateway"))
+        return error.MalformedNetworkObservation;
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const interface = fields.next() orelse continue;
+        if (!std.mem.eql(u8, interface, "lo")) return error.ProcNetworkBoundaryFailed;
+        var values: [10][]const u8 = undefined;
+        for (&values) |*value| value.* = fields.next() orelse return error.MalformedNetworkObservation;
+        if (fields.next() != null) return error.MalformedNetworkObservation;
+        const destination = try std.fmt.parseInt(u32, values[0], 16);
+        const mask = try std.fmt.parseInt(u32, values[6], 16);
+        if (destination == 0 and mask == 0) return error.ProcNetworkBoundaryFailed;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.next();
@@ -262,15 +305,25 @@ pub fn main(init: std.process.Init) !void {
     const inherited_result = linux.errno(linux.fcntl(inherited, linux.F.GETFD, 0));
     if (inherited_result != (if (host) linux.E.SUCCESS else linux.E.BADF))
         return error.InheritedDescriptorBoundaryFailed;
-    if (try present("/proc/net") != host) return error.ProcNetworkBoundaryFailed;
+    const systemd = std.mem.eql(u8, mode, "systemd");
+    if (try present("/proc/net") != (host or systemd)) return error.ProcNetworkBoundaryFailed;
     if (!host) {
-        if (try present("/proc/net/dev") or try present("/proc/net/route"))
-            return error.ProcNetworkBoundaryFailed;
-        if (std.mem.eql(u8, mode, "systemd")) {
+        if (systemd) {
+            // The existing full proc profile exposes this private network namespace.
+            var devices: [16384]u8 = undefined;
+            var routes: [16384]u8 = undefined;
+            try privateProcNetwork(
+                try readProcNetwork("/proc/net/dev", &devices),
+                try readProcNetwork("/proc/net/route", &routes),
+            );
             if (!try present("/proc/sys/kernel/random/boot_id") or
                 try present("/proc/sys/kernel/random/uuid"))
                 return error.SignedProcBoundaryFailed;
-        } else if (try present("/proc/sys")) return error.SignedProcBoundaryFailed;
+        } else {
+            if (try present("/proc/net/dev") or try present("/proc/net/route"))
+                return error.ProcNetworkBoundaryFailed;
+            if (try present("/proc/sys")) return error.SignedProcBoundaryFailed;
+        }
     }
     var topology: Topology = .{};
     try dump(&topology, Link, 18, 16);
@@ -289,6 +342,8 @@ pub fn main(init: std.process.Init) !void {
     try privateLoopback();
     const receipt = if (host)
         "DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
+    else if (systemd)
+        "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
     else
         "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n";
     if (try checked(linux.write(1, receipt.ptr, receipt.len)) != receipt.len)
@@ -324,4 +379,23 @@ test "network probe rejects malformed or missing interface identity" {
     try std.testing.expectError(error.MalformedNetworkObservation, topology.link(std.mem.asBytes(&info)));
     bytes[bytes.len - 2] = 'x';
     try std.testing.expectError(error.MalformedNetworkObservation, topology.link(&bytes));
+}
+
+test "systemd proc network view must show only one private loopback interface" {
+    const header = "Inter-| Receive | Transmit\n face |bytes packets\n";
+    const routes = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+    try privateProcNetwork(header ++ " lo: 0\n", routes);
+    try std.testing.expectError(error.ProcNetworkBoundaryFailed, privateProcNetwork(header, routes));
+    try std.testing.expectError(error.ProcNetworkBoundaryFailed, privateProcNetwork(header ++ " lo: 0\n eth0: 0\n", routes));
+    try std.testing.expectError(error.ProcNetworkBoundaryFailed, privateProcNetwork(header ++ " lo: 0\n lo: 0\n", routes));
+    try std.testing.expectError(error.MalformedNetworkObservation, privateProcNetwork("lo: 0\n", routes));
+}
+
+test "systemd proc routes must not contain external interfaces or a default route" {
+    const devices = "Inter-| Receive | Transmit\n face |bytes packets\n lo: 0\n";
+    const header = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+    try privateProcNetwork(devices, header ++ "lo 0000007F 00000000 0001 0 0 0 000000FF 0 0 0\n");
+    try std.testing.expectError(error.ProcNetworkBoundaryFailed, privateProcNetwork(devices, header ++ "lo 00000000 00000000 0001 0 0 0 00000000 0 0 0\n"));
+    try std.testing.expectError(error.ProcNetworkBoundaryFailed, privateProcNetwork(devices, header ++ "eth0 0000007F 00000000 0001 0 0 0 000000FF 0 0 0\n"));
+    try std.testing.expectError(error.MalformedNetworkObservation, privateProcNetwork(devices, header ++ "lo 0000007F\n"));
 }
