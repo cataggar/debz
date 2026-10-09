@@ -713,12 +713,18 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         .{ .before = "grep -Fxq 'All 4 tests passed.'", .after = "grep -Fq 'passed'" },
         .{ .before = "            'udev postinst uses only PID proc and applies static permissions' \\\n", .after = "" },
         .{ .before = "grep -Fq \"maintainer_script.test.signed $name...OK\"", .after = "true" },
+        .{ .before = "grep -Fxq \"domain=$target\" \"$proof\"", .after = "true" },
+        .{ .before = "grep -Fxq 'DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open' \"$proof\"", .after = "true" },
+        .{ .before = "systemd) proc_net=private ;;", .after = "systemd) proc_net=absent ;;" },
+        .{ .before = "udev) proc_net=absent ;;", .after = "udev) proc_net=private ;;" },
+        .{ .before = "grep -Fxq \"DEBZ_SIGNED_NETWORK_PROOF proc_net=$proc_net interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\" \"$proof\"", .after = "true" },
         .{ .before = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n", .after = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n        if: false\n" },
         .{ .before = "        timeout-minutes: 25\n", .after = "        timeout-minutes: 25\n        continue-on-error: true\n" },
         .{ .before = "python3 tools/real-snapshot-signed-proc-compare.py \"$target\"", .after = "python3 tools/real-snapshot-signed-proc-compare.py --report-only \"$target\"" },
         .{ .before = "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py\n", .after = "" },
         .{ .before = "      - name: Execute signed binding refusal fixtures\n", .after = "      - name: Skip signed binding refusal fixtures\n" },
-        .{ .before = "grep -Eq 'run test [0-9]+ pass, 3 skip", .after = "grep -Eq 'run test [0-9]+ pass, [0-9]+ skip" },
+        .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; [0-9]+ skipped; 0 failed" },
+        .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; [0-9]+ failed" },
         .{ .before = "        if: ${{ always() }}\n        run: |", .after = "        run: |" },
         .{ .before = "sudo -n rm -rf --one-file-system -- \"$PROTECTED\"", .after = "true" },
     }) |mutation| {
@@ -905,7 +911,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 47), members);
+    try testing.expectEqual(@as(usize, 48), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2488,8 +2494,18 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "            NATIVE_STEP_OUTCOME=\"$NATIVE_STEP_OUTCOME\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
-        "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",
+        "\"$zig\" build-exe -O ReleaseSafe -lc --dep private_network \\\n",
+        "  -Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig \\\n",
         "  --zig-lib-dir \"$(dirname -- \"$zig\")/lib\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-launcher.zig", &.{
+        "const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;\n",
+        "    if (network_ready != .SUCCESS) fail(status, 15, network_ready);\n",
+        "        if (failure[0] == 15) return error.ReferenceNetworkSetupFailed;\n",
+    });
+    try nativeMutations(&f, "protected-reference", "src/private_network.zig", &.{
+        "    request.ifru.flags.UP = true;\n",
+        "    if (applied != .SUCCESS) return applied;\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
         "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
@@ -2503,10 +2519,12 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    profiles = prove_profiles(args, scripts)\n",
         "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
         "    \"udev\": (\"proc-pid-only\",),\n",
+        "            if control.returncode != 0 or control.stdout != expected:\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
         "    report(\"proc-pid-only\", ",
+        "    try network_probe.observe(\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/verify-minisign.py", &.{
         "    ed25519_verify(key, blob[10:] + trusted, global_signature)\n",

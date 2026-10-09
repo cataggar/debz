@@ -1,5 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
+const private_network = @import("private_network");
+const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;
 const runtime = @import("real-snapshot-reference-runtime.zig");
 
 const OpenHow = extern struct { flags: u64, mode: u64 = 0, resolve: u64 };
@@ -1292,6 +1294,8 @@ fn childMain(input: Child) noreturn {
     if (!supervisorPipeAlive(child.control_pipe[0])) fail(status, 2, .CHILD);
     _ = linux.close(child.control_pipe[0]);
     must(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0), status, 3);
+    const network_ready = private_network.setupLoopback();
+    if (network_ready != .SUCCESS) fail(status, 15, network_ready);
     child.runtime.verify(child.options.root) catch |err| {
         std.log.err("reference runtime before-chroot refusal: {s}", .{@errorName(err)});
         fail(status, 12, .STALE);
@@ -1560,11 +1564,16 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         .status_pipe = fds,
         .control_pipe = control,
     };
-    const cloned = linux.clone2(
-        linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+    const clone_result = linux.clone2(
+        reference_namespaces | @intFromEnum(linux.SIG.CHLD),
         0,
     );
-    _ = try checked(cloned);
+    const cloned = referenceNamespaceResult(clone_result) catch |err| {
+        std.log.err("required private reference namespaces unavailable: {s}", .{
+            @tagName(linux.errno(clone_result)),
+        });
+        return err;
+    };
     if (cloned == 0) childMain(child);
     const pid: i32 = @intCast(cloned);
     _ = linux.close(fds[1]);
@@ -1580,10 +1589,23 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         std.log.err("reference namespace setup failed at stage {d}, errno {d}", .{
             failure[0], std.mem.readInt(u32, failure[1..5], .little),
         });
+        if (failure[0] == 15) return error.ReferenceNetworkSetupFailed;
         return error.ReferenceSetupFailed;
     }
     if (!linux.W.IFEXITED(status)) return error.ReferenceProcessSignaled;
     return linux.W.EXITSTATUS(status);
+}
+
+fn referenceNamespaceResult(result: usize) !usize {
+    if (linux.errno(result) != .SUCCESS) return error.ReferenceNamespaceUnavailable;
+    return result;
+}
+
+test "reference namespace refusal never falls back to host networking" {
+    for ([_]linux.E{ .PERM, .NOSYS, .INVAL, .OPNOTSUPP }) |err| {
+        const result: usize = @bitCast(-@as(isize, @intFromEnum(err)));
+        try std.testing.expectError(error.ReferenceNamespaceUnavailable, referenceNamespaceResult(result));
+    }
 }
 
 fn cycleStatusFixture(allocator: std.mem.Allocator) ![]u8 {
@@ -1929,6 +1951,9 @@ pub fn capabilityTransitionProbe() !void {
         if (linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 1, linux.CAP.CHOWN, 0, 0) != 0)
             linux.exit(10);
         if (linux.errno(linux.syscall0(.init_module)) != .PERM) linux.exit(11);
+        const refused_namespace = linux.clone2(reference_namespaces | @intFromEnum(linux.SIG.CHLD), 0);
+        if (linux.errno(refused_namespace) != .PERM) linux.exit(15);
+        if (private_network.setupLoopback() != .PERM) linux.exit(16);
         linux.exit(0);
     }
     var status: u32 = 0;

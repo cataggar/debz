@@ -96,6 +96,7 @@ require_protected_file "$script_path"
 require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
+require_protected_file "$repository_root/src/private_network.zig"
 require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
 # The staged toolchain lives outside the fixed PATH above, so the caller names
 # it and it is verified like every other root-trusted input: it compiles the
@@ -259,7 +260,8 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nc
   "$(sha256sum "$pinned" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)" \
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
 launcher=$tools/reference-launcher
-"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+"$zig" build-exe -O ReleaseSafe -lc --dep private_network \
+  -Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig \
   --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$tools/zig-cache" \
   --global-cache-dir "$tools/zig-global-cache" \
