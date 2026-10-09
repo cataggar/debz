@@ -3,15 +3,17 @@ set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+unset ZIG_LIB_DIR
 export PYTHONNOUSERSITE=1
 
 [[ $# == 5 ]] || {
   echo "usage: $0 REFERENCE_DPKG LOCK CACHE ARCHITECTURE WORKSPACE" >&2
   exit 2
 }
-reference_dpkg=$(realpath "$1")
-lock=$(realpath "$2")
-cache=$(realpath "$3")
+reference_dpkg=$1
+lock=$2
+cache=$3
+zig=${DEBZ_ZIG:-$(command -v zig || true)}
 architecture=$4
 workspace=$(realpath -m "$5")
 repository_root=$(pwd -P)
@@ -20,7 +22,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   echo "run the protected reference script from its checkout root" >&2
   exit 2
 }
-python3 -I - "$repository_root" "$workspace" "$reference_dpkg" "$lock" "$cache" <<'PY'
+python3 -I - "$repository_root" "$workspace" "$reference_dpkg" "$lock" "$cache" "$zig" <<'PY'
 import os
 import stat
 import sys
@@ -52,7 +54,7 @@ def protected(path, directory=False):
     finally:
         os.close(fd)
 
-repository, workspace, dpkg, lock, cache = map(Path, sys.argv[1:])
+repository, workspace, dpkg, lock, cache = map(Path, sys.argv[1:6])
 for path in (repository, repository / ".real-snapshot", workspace, cache):
     result = protected(path, directory=True)
     if path in (repository / ".real-snapshot", workspace) and result.st_mode & 0o7777 != 0o700:
@@ -67,6 +69,12 @@ for path in (repository / "tools/real-snapshot-reference.sh",
     protected(path)
 protected(workspace / "evidence", directory=True)
 protected(cache / "packages-v2/objects", directory=True)
+protected(repository / "tools/real_snapshot_reference_paths.py")
+sys.path.insert(0, str(repository / "tools"))
+from real_snapshot_reference_paths import toolchain
+if not sys.argv[6]:
+    raise ValueError("an explicit absolute protected DEBZ_ZIG compiler is required")
+toolchain(Path(sys.argv[6]))
 PY
 case "$workspace" in
   "$repository_root"/.real-snapshot/*) ;;
@@ -126,6 +134,8 @@ while IFS=$'\t' read -r name version package_arch digest size; do
   [[ "$digest" =~ ^[a-f0-9]{128}$ && "$size" =~ ^[0-9]+$ ]]
   archive=$cache/packages-v2/objects/sha512-$digest
   [[ -f "$archive" && ! -L "$archive" ]]
+  [[ $(stat -c '%u:%g' "$archive") == 0:0 ]]
+  (( ($(stat -c '0%a' "$archive") & 022) == 0 ))
   [[ $(stat -c '%s' "$archive") == "$size" ]]
   printf '%s  %s\n' "$digest" "$archive" | sha512sum --check --status
   case "$name" in
@@ -173,7 +183,8 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nbootstrap_archives=%
   "$(sha256sum "$lock" | cut -d' ' -f1)" "${#bootstrap[@]}" \
   >"$evidence/reference-identity.txt"
 launcher="$workspace/reference-launcher"
-zig build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/reference-zig-cache" \
   --global-cache-dir "$workspace/reference-zig-global-cache" \
   -femit-bin="$launcher"

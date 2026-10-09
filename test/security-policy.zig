@@ -659,6 +659,78 @@ test "security: required CI modes, architecture and aggregate failure propagatio
     }
 }
 
+test "security: hosted amd64 signed proc replay refuses skips, weakened staging and hidden failures" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const valid = try f.check("ci-signed-proc", workflow);
+    defer valid.deinit();
+    try valid.ok();
+    const signed = try job(workflow, "signed-proc-protected-replay", "\n  build-and-test:\n");
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "    timeout-minutes: 35", .after = "    timeout-minutes: 90" },
+        .{ .before = "    runs-on: ubuntu-24.04", .after = "    runs-on: ubuntu-24.04-arm" },
+        .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [Debug]" },
+        .{ .before = "      PROTECTED: /srv/debz-protected/signed-proc", .after = "      PROTECTED: /home/runner/signed-proc" },
+        .{ .before = "      UBUNTU_ARCHIVE_KEYRING_SHA256: 80a36b0a", .after = "      UBUNTU_ARCHIVE_KEYRING_SHA256: 00a36b0a" },
+        .{ .before = "            DEBZ_REAL_SNAPSHOT_KEYRING=\"$PROTECTED/keyrings/ubuntu-archive-keyring.gpg\" \\\n", .after = "" },
+        .{ .before = "    strategy:\n", .after = "    if: false\n    strategy:\n" },
+        .{ .before = "    strategy:\n", .after = "    continue-on-error: true\n    strategy:\n" },
+        .{ .before = "          test \"$RUNNER_ARCH\" = X64\n", .after = "" },
+        .{ .before = "grep -Fq 'prestate path is writable by an unprivileged user'", .after = "true" },
+        .{ .before = "grep -Fq 'fixture path is writable by an unprivileged user'", .after = "true" },
+        .{ .before = "grep -Fq 'three distinct absolute disposable root paths'", .after = "true" },
+        .{ .before = "--no-same-owner", .after = "--same-owner" },
+        .{ .before = "          test ! -s .tmp/protected-writable.txt\n", .after = "" },
+        .{ .before = "for path in / /srv /srv/debz-protected \"$PROTECTED\"; do", .after = "for path in \"$PROTECTED\"; do" },
+        .{ .before = "            tools/real-snapshot-signed-proc-prestates.sh \\", .after = "            true \\" },
+        .{ .before = "          sudo -n test -s \"$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json\"\n", .after = "" },
+        .{ .before = "          sudo -n test -s \"$PWD/.real-snapshot/ws/prestate-build/evidence/openssl-cycle-after.json\"\n", .after = "" },
+        .{ .before = "                snapshot/evidence/refresh.json snapshot/evidence/refresh.stderr \\\n", .after = "" },
+        .{ .before = "                snapshot/evidence/plan.json snapshot/evidence/plan.stderr \\\n", .after = "" },
+        .{ .before = "                snapshot/evidence/download.json snapshot/evidence/download.stderr \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/base-cycle-before.json \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/base-cycle-after.json \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/openssl-cycle-after.json \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/openssl-cycle-refusals.json \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/reference-no-progress.json \\\n", .after = "" },
+        .{ .before = "                prestate-build/evidence/base-cycle-proof/comparison.json \\\n", .after = "" },
+        .{ .before = "                native/systemd/var/log/dpkg.log native/udev/var/log/dpkg.log \\\n", .after = "" },
+        .{ .before = "                native/sudo/var/log/dpkg.log \\\n", .after = "" },
+        .{ .before = "                native/systemd/var/lib/dpkg/status native/udev/var/lib/dpkg/status \\\n", .after = "" },
+        .{ .before = "                native/sudo/var/lib/dpkg/status \\\n", .after = "" },
+        .{ .before = "                native/systemd/var/lib/dpkg/status-old native/udev/var/lib/dpkg/status-old \\\n", .after = "" },
+        .{ .before = "                native/sudo/var/lib/dpkg/status-old \\\n", .after = "" },
+        .{ .before = "                proofs/systemd/var/lib/dpkg/status proofs/udev/var/lib/dpkg/status \\\n", .after = "" },
+        .{ .before = "                proofs/sudo/var/lib/dpkg/status \\\n", .after = "" },
+        .{ .before = "                proofs/systemd/var/lib/dpkg/status-old proofs/udev/var/lib/dpkg/status-old \\\n", .after = "" },
+        .{ .before = "                proofs/sudo/var/lib/dpkg/status-old \\\n", .after = "" },
+        .{ .before = "                native/udev/etc/group proofs/udev/etc/group \\\n", .after = "" },
+        .{ .before = "cp -a -- \"$ws/prestates/$target\" \"$ws/proof-sources/$target\"", .after = "ln -s -- \"$ws/native/$target\" \"$ws/proof-sources/$target\"" },
+        .{ .before = "              ln -sfn -- sudo.ws \"$ws/native/sudo/usr/bin/sudoedit\"\n", .after = "" },
+        .{ .before = "-Dsigned-udev-proc-root=\"$ws/native/udev\"", .after = "-Dsigned-udev-proc-root=\"$ws/native/systemd\"" },
+        .{ .before = "          test \"${status:-0}\" -eq 0\n", .after = "" },
+        .{ .before = "grep -Fxq 'All 4 tests passed.'", .after = "grep -Fq 'passed'" },
+        .{ .before = "            'udev postinst uses only PID proc and applies static permissions' \\\n", .after = "" },
+        .{ .before = "grep -Fq \"maintainer_script.test.signed $name...OK\"", .after = "true" },
+        .{ .before = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n", .after = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n        if: false\n" },
+        .{ .before = "        timeout-minutes: 25\n", .after = "        timeout-minutes: 25\n        continue-on-error: true\n" },
+        .{ .before = "python3 tools/real-snapshot-signed-proc-compare.py \"$target\"", .after = "python3 tools/real-snapshot-signed-proc-compare.py --report-only \"$target\"" },
+        .{ .before = "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py\n", .after = "" },
+        .{ .before = "      - name: Execute signed binding refusal fixtures\n", .after = "      - name: Skip signed binding refusal fixtures\n" },
+        .{ .before = "grep -Eq 'run test [0-9]+ pass, 3 skip", .after = "grep -Eq 'run test [0-9]+ pass, [0-9]+ skip" },
+        .{ .before = "        if: ${{ always() }}\n        run: |", .after = "        run: |" },
+        .{ .before = "sudo -n rm -rf --one-file-system -- \"$PROTECTED\"", .after = "true" },
+    }) |mutation| {
+        const changed_job = try f.replace(signed, mutation.before, mutation.after);
+        const changed = try f.replace(workflow, signed, changed_job);
+        const rejected = try f.check("ci-signed-proc", changed);
+        defer rejected.deinit();
+        if (rejected.code == 0) std.debug.print("signed proc CI mutation missed: {s}\n", .{mutation.before});
+        try rejected.failsWith("ci.yml: signed proc replay");
+    }
+}
+
 test "security: every split build workload job, mode and step fails closed under mutation" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -2304,6 +2376,19 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
 test "security: protected reference CI stays opt-in, root-staged, bounded and unskippable" {
     var f = try Fixture.init();
     defer f.deinit();
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
+        "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-protected-stage.sh", &.{
+        "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
+        "python3 -B -I tools/real_snapshot_less_stage.py prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\" \\\n",
+        "  bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
+        "    for package in SOURCE_ARTIFACTS:\n        archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
+        "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
+    });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
         "      run_protected_reference:\n",
         "  schedule:\n    - cron: \"23 3 * * 1\"\n",
@@ -2329,6 +2414,86 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "step negative-swapped-keyring refused '\"summary\":\"WrongSigningKey\"' swapped_keyring_stage\n",
         "    echo \"negative-$name launched before refusing\" >&2\n",
         "step proof 0 \"executed without skips\" timeout --signal=TERM --kill-after=60s 45m \\\n",
+        "  mode=native-staging\n",
+        "print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))\n",
+        "module.verify_extracted_bindings(prefix, architecture)\n",
+        "    bash tools/real-snapshot-python3-protected-stage.sh \"$zig\" \"$checkout/zig-out/bin/debz\" \\\n",
+        "  [[ ${#python3_arguments[@]} == 20 ]]\n",
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-python3-protected \"${python3_arguments[@]}\" \\\n",
+        "    \"$python3_workspace/evidence/inputs-proof.txt\"\n",
+        "    \"$python3_workspace/evidence/alternatives-proof.txt\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-protected-stage.sh", &.{
+        "toolchain(Path(sys.argv[3]))\n",
+        "fixture empty \"$before\"\n",
+        "fixture mode \"$before_0644\" 0644\n",
+        "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
+        "bash tools/real-snapshot-signed-proc-prestates.sh --python3 \"$pinned\" \"$workspace\"\n",
+        "    bash tools/real-snapshot-python3-reference.sh \"$pinned\" \"$input\" \"$lock\" \"$archive\" \\\n",
+        "  \"-Dpython3-reference-root-py3compile=$after-py3compile-before\" \\\n",
+        "  \"-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
+        "module.receipt_from_extracted_archive(\n",
+        "  --architecture \"$architecture\" --verify-only \"$dpkg_prefix/usr/bin/dpkg\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_python_fixtures.py", &.{
+        "    create_exclusive(shadow, \"usr/sbin/update-alternatives\", b\"shadow\\n\", 0o644)\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-reference.sh", &.{
+        "fixture preflight \"$source_root\"\n",
+        "fixture dpkg \"$dpkg_root\" \"$pinned\" \"$archive\"\n",
+        "fixture strict \"$py3compile_bad_hash\" \"$py3compile_bad_mode\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-reference.sh", &.{
+        "require_protected_file \"$source_root/dev/null\"\n",
+        "[[ $(stat -c '%u:%g:%a:%s:%h' \"$py3compile_before/dev/null\") == 0:0:644:20:1 ]]\n",
+        "[[ $(stat -c '%u:%g:%a:%s:%h' \"$py3compile_after/dev/null\") == 0:0:644:96:1 ]]\n",
+    });
+    try nativeMutations(&f, "protected-reference", "build.zig", &.{
+        "    run_python3_reference_tests.has_side_effects = true;\n",
+        "    run_python3_alternatives_tests.has_side_effects = true;\n",
+        "    python3_reference_step.dependOn(&run_python3_alternatives_tests.step);\n",
+        "            value.*,\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", "src/native_alternatives.zig", "test \"native_alternatives.test.protected signed python3 preinst preserves all records and selectors\"", "\ntest \"native_alternatives.test.snapshot less", &.{
+        "        try testing.expectEqualSlices(u8, old_record, new_record);\n",
+        "        try proof.writeStreamingAll(testing.io, \"signed Python alternatives records and selectors executed without skips\\n\");\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-protected-native-ci.sh", &.{
+        "  export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}\n",
+        "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
+        "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
+        "            if total > 512 * 1024 * 1024:\n",
+        "                 \"tools/real_snapshot_outcome.py\",\n",
+        "python3 -I tools/real_snapshot_outcome.py \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
+        "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
+        "    --check-keyring \"$keyring\" >/dev/null\n",
+        "python3 -I - \"$repository_root/tools\" \"$repository_root\" \"$debz\" <<'PY'\n",
+        "  printf '%s\\n' \"$wrapper_status\" >\"$evidence/native-wrapper-exit-status.txt\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":null}\\n' \"$name\" >\"$evidence/native-stage-v1.json\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":%s}\\n' \"$name\" \"$status\" >\"$evidence/native-stage-v1.json\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_outcome.py", &.{
+        "        marker = json.loads(read_root_file(evidence, \"native-stage-v1.json\", 4096))\n",
+        "        result = json.loads(read_root_file(evidence, f\"{stage}.json\", 128 * 1024 * 1024))\n",
+        "            if wrapper_status != 0 or not expected_refusal:\n",
+        "        if command_status is None:\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  ubuntu-real-snapshot:", "  protected-reference:", &.{
+        "        id: native\n",
+        "          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        "            NATIVE_STEP_OUTCOME=\"$NATIVE_STEP_OUTCOME\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
+        "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",
+        "  --zig-lib-dir \"$(dirname -- \"$zig\")/lib\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
+        "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
+        "                if not target.is_relative_to(library):\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
@@ -2359,9 +2524,9 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n", "          env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n") },
         .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n", "          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n") },
         .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          if-no-files-found: error\n          retention-days: 14\n      - name: Kill protected", "          if-no-files-found: warn\n          retention-days: 14\n      - name: Kill protected") },
-        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    timeout-minutes: 90\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: amd64\n            runner: ubuntu-24.04\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE", "    timeout-minutes: 90\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: amd64\n            runner: ubuntu-24.04\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE", "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE") },
         .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "trap collect EXIT\n", "trap collect EXIT\nexit 0\n") },
-        .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "  -Doptimize=ReleaseSafe -j4 --summary all\n", "  -Doptimize=ReleaseSafe -j4 --summary all || true\n") },
+        .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "  -Doptimize=ReleaseSafe -j2 --summary all\n", "  -Doptimize=ReleaseSafe -j2 --summary all || true\n") },
         .{ .path = "tools/test_real_snapshot_reference_protected.py", .text = try f.replace(harness, "    profiles = prove_profiles(args, scripts)\n", "    profiles = \"skipped\"\n    unittest.SkipTest\n") },
     }) |mutation| {
         const refused = try nativeCheck(&f, "protected-reference", mutation.path, mutation.text);

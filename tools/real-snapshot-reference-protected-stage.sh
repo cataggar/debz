@@ -9,6 +9,11 @@
 set -euo pipefail
 umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
+purpose=proof
+if [[ ${1:-} == --arm64-less-source ]]; then
+  purpose=arm64-less
+  shift
+fi
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
 # The launcher binds amd64 proc-profile postinsts by exact version, size and
@@ -20,7 +25,7 @@ readonly snapshot_suite=resolute
 readonly snapshot_witness_suites=(resolute-updates resolute-security)
 readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
 readonly frozen_release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
-readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
+readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}
 # The distribution dpkg's locked dependency closure supplies every runtime
 # library and tar the pinned Debian dpkg and its helpers load in the root.
 readonly closure_root=dpkg
@@ -76,7 +81,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 }
 for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-escape-probe.zig \
-  tools/prepare-native-dpkg.py; do
+  tools/prepare-native-dpkg.py tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
 done
 require_protected_path "$repository_root/.real-snapshot"
@@ -84,11 +89,18 @@ require_protected_path "$repository_root/.real-snapshot"
   echo "the staging directory must be root-owned and mode 0700" >&2
   exit 2
 }
-zig=$(realpath -- "$1")
+zig=$1
 debz=$(realpath -- "$2")
 workspace=$(realpath -m -- "$3")
 require_protected_file "$zig"
 require_protected_path "$(dirname -- "$zig")/lib"
+python3 -I - "$repository_root/tools" "$zig" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import toolchain
+print(toolchain(Path(sys.argv[2])))
+PY
 require_protected_file "$debz"
 require_protected_file "$keyring"
 [[ -x "$zig" && -x "$debz" ]]
@@ -106,8 +118,13 @@ case "$(uname -m)" in
   aarch64) architecture=arm64 loader=usr/lib/ld-linux-aarch64.so.1 ;;
   *) echo "unsupported native reference architecture" >&2; exit 2 ;;
 esac
+closure_args=("$closure_root")
+if [[ $purpose == arm64-less ]]; then
+  [[ $architecture == arm64 ]]
+fi
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+unset ZIG_LIB_DIR
 export PYTHONNOUSERSITE=1 LC_ALL=C SOURCE_DATE_EPOCH=0
 
 install -d -o root -g root -m 0700 "$workspace"
@@ -172,9 +189,18 @@ authenticated_lock() {
   ' "$1" >/dev/null
 }
 debz_step refresh refresh "$snapshot/root" --assume-yes
-debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "$closure_root"
-debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "$closure_root"
+debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "${closure_args[@]}"
+debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "${closure_args[@]}"
 authenticated_lock "$lock"
+if [[ $purpose == arm64-less ]]; then
+  # Each CLI request accepts one root. Keep its authenticated lock intact.
+  for package in less dash util-linux; do
+    package_lock=$evidence/$package.lock.json
+    debz_step "$package-plan" plan "$snapshot/root" --transaction-backend native --lock-output "$package_lock" "$package"
+    debz_step "$package-download" download "$snapshot/root" --transaction-backend native --lock-input "$package_lock" "$package"
+    authenticated_lock "$package_lock"
+  done
+fi
 
 template=$workspace/template
 install -d -o root -g root -m 0700 "$template"
@@ -250,7 +276,7 @@ PY
 install -d -o root -g root -m 0755 "$dpkg_prefix"
 dpkg-deb --extract "$workspace/build/dpkg.deb" "$dpkg_prefix"
 python3 -I - "$repository_root/tools/prepare-native-dpkg.py" "$architecture" \
-  "$dpkg_prefix/usr/bin/dpkg" <<'PY'
+  "$dpkg_prefix/usr/bin/dpkg" "$workspace/build/dpkg.deb" <<'PY'
 import importlib.util
 import pathlib
 import sys
@@ -259,7 +285,11 @@ spec = importlib.util.spec_from_file_location("prepare_native_dpkg", sys.argv[1]
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.verify_file(pathlib.Path(sys.argv[3]), module.PINS[sys.argv[2]]["executable"])
+module.receipt_from_extracted_archive(
+    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])
 PY
+python3 -B "$repository_root/tools/prepare-native-dpkg.py" \
+  --architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"
 for helper in dpkg-deb dpkg-split; do
   install -o root -g root -m 0755 "$dpkg_prefix/usr/bin/$helper" "$template/usr/bin/$helper"
 done
@@ -267,6 +297,10 @@ chmod 0700 "$template"
 if [[ -n $(find "$template" \( ! -user 0 -o ! -group 0 \) -print -quit) ]]; then
   echo "the template must contain only root-owned entries" >&2
   exit 1
+fi
+if [[ $purpose == arm64-less ]]; then
+  echo "fresh authenticated arm64 less runtime template staged; no replay claimed"
+  exit 0
 fi
 
 # The launcher binds its proc profiles to the signed amd64 systemd, udev and
@@ -302,10 +336,12 @@ fi
 launcher=$workspace/launcher
 probe=$workspace/escape-probe
 "$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$launcher"
 "$zig" build-exe tools/real-snapshot-reference-escape-probe.zig -O ReleaseSafe -fstrip \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$probe"

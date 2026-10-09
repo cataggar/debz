@@ -1,0 +1,30 @@
+{
+  "schema": "io.github.cataggar.debz.base-cycle-controls.v1",
+  "source": "Hard-graph fields projected directly from the four rehashed signed archive ./control members; status values are unit-test input, not root registration.",
+  "packages": [
+    {
+      "archive_sha512": "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696",
+      "archive_size": 2104056,
+      "control": "Package: libc6\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\nBreaks: base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)\nReplaces: libc6-amd64\nMulti-Arch: same\n",
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2",
+      "archive_size": 80312,
+      "control": "Package: libgcc-s1\nVersion: 16-20260322-1ubuntu1\nArchitecture: amd64\nProtected: yes\nDepends: gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)\nReplaces: libgcc1 (<< 1:10)\nProvides: libgcc1 (= 1:16-20260322-1ubuntu1)\nMulti-Arch: same\n",
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c",
+      "archive_size": 38296,
+      "control": "Package: gcc-16-base\nVersion: 16-20260322-1ubuntu1\nArchitecture: amd64\nBreaks: gnat (<< 7)\nMulti-Arch: same\n",
+      "status": "install ok installed"
+    },
+    {
+      "archive_sha512": "c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692",
+      "archive_size": 1362202,
+      "control": "Package: libc-gconv-modules-extra\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\nBreaks: libc6 (<< 2.42-1)\nReplaces: libc6 (<< 2.42-1)\nMulti-Arch: same\n",
+      "status": "install ok installed"
+    }
+  ]
+}

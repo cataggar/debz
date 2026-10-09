@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -167,12 +168,32 @@ def write_receipt(
     prefix: Path,
 ) -> None:
     path = prefix / RECEIPT
-    path.write_text(canonical_json(receipt_document(
-        architecture,
-        archive_url,
-        archive,
-        prefix,
-    )))
+    with path.open("x", encoding="utf-8") as output:
+        output.write(canonical_json(receipt_document(
+            architecture,
+            archive_url,
+            archive,
+            prefix,
+        )))
+
+
+def receipt_from_extracted_archive(architecture: str, archive: Path, prefix: Path) -> None:
+    if archive.resolve(strict=True) != archive or prefix.resolve(strict=True) != prefix:
+        raise RuntimeError("reference receipt inputs must not traverse symlinks")
+    for path in (archive, *(prefix / "usr/bin" / name for name in
+                            ("dpkg", "dpkg-query", "update-alternatives"))):
+        metadata = path.lstat()
+        if (path.resolve(strict=True) != path or not stat.S_ISREG(metadata.st_mode) or
+                metadata.st_uid != os.geteuid() or metadata.st_gid != os.getegid() or
+                metadata.st_nlink != 1 or metadata.st_mode & 0o022):
+            raise RuntimeError("reference receipt requires owned protected regular inputs")
+    verify_file(archive, PINS[architecture]["archive"])
+    verify_archive_metadata(archive, architecture)
+    verify_extracted_bindings(prefix, architecture)
+    content = archive.read_bytes()
+    archive_url = f"{BASE_URL}/dpkg_{VERSION}_{architecture}.deb"
+    write_receipt(architecture, archive_url, content, prefix)
+    verify_receipt(prefix / RECEIPT, architecture)
 
 
 def verify_receipt(path: Path, architecture: str) -> dict[str, object]:

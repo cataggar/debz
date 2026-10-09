@@ -1391,26 +1391,27 @@ class VendorStateCaptureTests(unittest.TestCase):
         )
         self.assertEqual(schema["$id"], vendor_state_capture.SCHEMA)
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        job = workflow[workflow.index("  ubuntu-real-snapshot:") :]
-        capture = job.index("python3 tools/capture-vendor-state.py")
-        manifest_chown = job.index('sudo chown "$USER:$USER" "$manifest"')
-        cleanup = job.index(
-            'sudo rm -rf "$work/root" "$work/cache" || cleanup_status=$?'
-        )
-        ownership = job.index(
-            'sudo chown -R "$USER:$USER" .real-snapshot || ownership_status=$?'
-        )
+        job = workflow[workflow.index("  ubuntu-real-snapshot:") : workflow.index("  protected-reference:")]
+        collector = (ROOT / "tools/real-snapshot-protected-native-ci.sh").read_text()
+        capture = job.index("      - name: Collect bounded protected native diagnostics")
+        export = job.index("      - name: Copy bounded native evidence")
+        cleanup = job.index("      - name: Kill native descendants and remove only the named tree")
         upload = job.index("      - name: Upload real acceptance evidence")
-        self.assertIn("      - name: Collect diagnostics and clean staged payloads\n"
+        self.assertIn("      - name: Collect bounded protected native diagnostics\n"
                       "        if: always()", job)
-        self.assertLess(capture, cleanup)
-        self.assertLess(capture, manifest_chown)
-        self.assertLess(manifest_chown, cleanup)
-        self.assertLess(cleanup, ownership)
+        self.assertLess(capture, export)
+        self.assertLess(export, cleanup)
         self.assertLess(cleanup, upload)
-        self.assertIn('if [ "$capture_status" -ne 0 ]; then', job)
-        self.assertIn('if [ "$cleanup_status" -ne 0 ]; then', job)
-        self.assertIn('exit "$ownership_status"', job)
+        self.assertIn('python3 tools/capture-vendor-state.py', collector)
+        self.assertIn('capture_status == 0 && differential_status == 0', collector)
+        self.assertIn('NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}', job)
+        self.assertIn('NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME"', job)
+        self.assertIn('tools/real_snapshot_outcome.py "$evidence"', collector)
+        self.assertIn('outcome_status == 0', collector)
+        self.assertNotIn('"$evidence/refresh.json"', collector)
+        self.assertIn('cleanup_status=%s', job)
+        self.assertNotIn('chown', job)
+        self.assertNotIn('chown', collector)
         self.assertIn(
             "      - name: Upload real acceptance evidence\n"
             "        if: always()",
@@ -1420,7 +1421,7 @@ class VendorStateCaptureTests(unittest.TestCase):
             "path: .real-snapshot/${{ matrix.architecture }}/evidence/", job
         )
         self.assertIn(
-            'sudo tee "$work/evidence/disk-usage-final.txt" >/dev/null', job
+            'du -sh "$work" >"$evidence/disk-usage-final.txt"', collector
         )
         build = (ROOT / "build.zig").read_text()
         self.assertIn('"vendor-state-inventory-v1.json",', build)

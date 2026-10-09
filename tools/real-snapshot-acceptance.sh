@@ -4,7 +4,7 @@ umask 077
 
 readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
 readonly pinned_suite=resolute
-readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
+readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}
 readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
 readonly max_cache_bytes=$((2 * 1024 * 1024 * 1024))
@@ -54,6 +54,8 @@ validate() {
     x86_64:amd64|aarch64:arm64) ;;
     *) echo "native runner architecture does not match $architecture" >&2; return 2 ;;
   esac
+  bash "$(dirname -- "${BASH_SOURCE[0]}")/real-snapshot-reference-protected-ci.sh" \
+    --check-keyring "$keyring" >/dev/null
 }
 
 seconds_value() {
@@ -622,6 +624,19 @@ install_ceiling_seconds=$(install_bound \
 readonly install_progress_limit_seconds install_ceiling_seconds
 [[ -x "$debz" ]]
 case "$workspace" in "$repository_root"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
+python3 -I - "$repository_root/tools" "$repository_root" "$debz" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import protected
+repository, debz = map(Path, sys.argv[2:])
+protected(repository, directory=True)
+protected(repository / ".real-snapshot", directory=True)
+for path in (debz, Path(sys.argv[1]) / "real-snapshot-acceptance.sh",
+             Path(sys.argv[1]) / "real-snapshot-reference-protected-ci.sh",
+             Path(sys.argv[1]) / "real_snapshot_reference_paths.py"):
+    protected(path)
+PY
 [[ ! -e "$5" && ! -L "$5" && ! -e "$workspace" && ! -L "$workspace" ]] || {
   echo "snapshot workspace must be new: $workspace" >&2
   exit 2
@@ -640,6 +655,8 @@ mkdir -p "$root" "$cache" "$state" "$evidence" "$source_dir" "$config_dir"
 printf 'install_root_exists=true\ndpkg_database_present=false\nhelper_placeholder_present=false\npackage_state_present=false\n' \
   >"$evidence/fresh-root-before.txt"
 capture_root_layout() {
+  local wrapper_status=$?
+  printf '%s\n' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"
   {
     for path in bin sbin lib lib64 bin/sh usr/bin/sh usr/bin/dpkg usr/bin/dpkg-deb \
       usr/bin/dpkg-trigger; do
@@ -824,6 +841,7 @@ run_candidate() {
   local audit_status=0
   local command
   shift 2
+  printf '{"stage":"%s","command_exit_status":null}\n' "$name" >"$evidence/native-stage-v1.json"
   if [[ "$duration" == progress ]]; then
     # The watchdog stops the install at its ceiling; timeout's own limit is a backstop.
     command=(timeout --signal=TERM --kill-after=30s "$((install_ceiling_seconds + 30))s")
@@ -844,6 +862,7 @@ run_candidate() {
   else
     "${command[@]}" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
   fi
+  printf '{"stage":"%s","command_exit_status":%s}\n' "$name" "$status" >"$evidence/native-stage-v1.json"
   if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
     [[ -s "$evidence/$name.execve" ]] || {
       echo "candidate execution trace missing for $name" >&2

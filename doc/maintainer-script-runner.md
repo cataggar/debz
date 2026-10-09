@@ -627,9 +627,67 @@ be investigated and decided **for both** engines in #278. Do not infer host
 network isolation from this gate, silently adjust one signed proc view, or
 authorize any new network connectivity on this evidence.
 
+## Exact arm64 less preinst inert alternatives branch (#393)
+
+The first arm64 alternatives refusal in native run `37537004982` is the
+signed `less:arm64` `668-1build1` new-package preinst with exactly
+`["install"]`, not the last traced libreadline diversion. The retained
+bootstrap insertion order, preserved by database publication, has a
+59-package configured prefix before the `ncurses-bin` Pre-Depends barrier.
+Then ncurses-bin has no scripts, libreadline's preinst is observed, and
+libncurses has no scripts before less. The compiler emits less's preinst
+before its unpack. Its installed and staged 292-byte scripts match the
+authenticated archive and existing signed fixture exactly.
+
+Only that inert arm64 callback is admitted. The original amd64 behavior
+is unchanged; arm64 less postinst, upgrade/abort arguments, other versions,
+foreign architectures and unknown scripts still refuse. The install branch
+performs no alternatives operation: every observed group remains immutable,
+including an existing pager. No proc or debconf authority is added.
+
+Arm64 admission additionally requires exact authenticated archive identities
+for less `668-1build1`, dash `0.5.12-12ubuntu3`, dpkg `1.23.7ubuntu1` and
+libc6 `2.43-2ubuntu2.4`. Installed/staged preinst bytes, the signed-derived
+583-byte ownership list, 133,864-byte dash, 68,032-byte snapshot alternatives
+tool, 201,872-byte loader and 1,788,240-byte libc are bound by content,
+size, mode, root ownership and single-link metadata. Files remain frozen
+through the alternatives boundary. The exact merged-/usr, shell and loader
+aliases are checked before and after execution, as are the root-owned
+mode-0700 root, empty mode-0755 proc directory, and absent loader
+cache/preload/hwcaps and alternatives shadow paths. An unexplained change
+after launch requires durable recovery, never repair or conversion to success.
+
+These identities were independently extracted/derived from the original
+authenticated arm64 lock/CAS and cross-checked against checksum-verified
+retained root inventory. The identical preinst digest is not a transfer of
+amd64 runtime behavior; the arm64 tools, archives and loader/libc are
+independently bound in the repin manifest.
+
+The protected positive replay remains **blocked pending privileged arm64
+execution**. General CI and an unactivated optional test are not proof.
+`tools/real-snapshot-less-reference.sh` accepts seven explicit arguments:
+the verified pinned arm64 dpkg, protected prestate root, signed lock,
+signed less archive, two new disposable root paths, and protected Zig.
+Before copying roots or constructing any negative fixtures, it activates a
+separate source-only Zig check with
+`DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT`. This calls the production
+input verifier, including regular alternatives-tool and absent cache
+requirements. All fixture writes then use descriptor-rooted no-follow
+parent traversal. Existing files are opened without truncation and their
+regular/single-link metadata is checked before `ftruncate` or `fchmod`;
+the cache and staged dpkg/archive files use exclusive no-follow creation.
+Source aliases therefore cannot redirect a privileged mutation to a host
+file, even if a malformed clone is presented. Unprivileged safety tests
+do not substitute for protected positive replay.
+It supplies all eight protected test coordinates and actually invokes the
+activated ReleaseSafe Zig test, before execution and again after unmodified
+script/pinned-dpkg replay and strict negative fixtures. It must be invoked
+explicitly from a root-owned protected checkout; no workflow dispatch or
+automatic CI proof is implied. Full #393/#262 closure remains separate.
+
 ## Exact signed python3 preinst inert alternatives call
 
-The separate new-package `python3:amd64` `3.14.7-3`
+The separate new-package `python3:amd64` `3.14.3-0ubuntu2`
 `preinst ["install"]` (signed SHA-256
 `115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`)
 does not receive proc, mount, or general shell authority. The exact
@@ -638,8 +696,8 @@ and python3-minimal archives, their dpkg ownership lists, the
 `/usr/bin/python3 -> python3.14` link, signed `dash` and GNU `rm` bytes,
 their aliases, the snapshot-pinned alternatives tool, and the root-owned
 mode-0700 fixture root. `/proc` must be empty, `/usr/sbin` tool shadows
-and the HTML cleanup target absent, and `/dev/null` must be a root-owned,
-mode-0600 or mode-0644, empty regular file. Both modes were separately
+and the HTML cleanup target absent. The original `/dev/null` input is a
+root-owned, mode-0600 or mode-0644, empty regular file. Both modes were separately
 proved against pinned dpkg 1.22.22 and the signed script in protected
 disposable roots; 0640 and 0666 refuse. Other tool, root, alias,
 script, argument, package, or architecture identities refuse before launch.
@@ -657,6 +715,108 @@ A different exit or redirected witness cannot be converted into success;
 post-launch proof failure requires durable recovery. The managed checkpoint
 includes that one changed file. This does not admit `--auto` with an
 absolute name elsewhere or the signed script's upgrade branch.
+
+### Exact amd64 Python minimal callback input
+
+The input verifier also recognizes one **amd64-only** observed-before
+transition: a root-owned, single-link, regular mode-0644 `/dev/null`
+containing exactly the 20 bytes `/usr/bin/py3compile\n`, SHA-256
+`e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e`.
+The exact authenticated Python archives above remain required. In addition,
+the installed 117-byte `python3-minimal.postinst` and 13,312-byte
+`usr/bin/py3compile` must match their signed archive members, including
+mode-0755, root ownership and single-link metadata. Their script/tool
+identities and the separate behavioral prestate are registered with amd64
+archive/version provenance in the real-snapshot pin manifest.
+
+This transition is grounded in native run `37537004982`: its checksum-verified
+vendor inventory records regular-file kind, mode 0644, root ownership,
+size 20 and that digest, and its callback
+trace records `python3-minimal.postinst configure`, `which py3compile`, then
+`py3compile` immediately before Python preinst refuses the 20-byte input.
+The signed minimal postinst contains `which py3compile >/dev/null 2>&1`;
+the literal line independently hashes to the inventory witness. The original
+root bytes and an open/write trace were not retained, so this is not a claim
+of exclusive writer attribution or independent protected replay.
+
+No production repair, pre-truncation, arbitrary nonempty input, arm64
+behavioral authority, or output relaxation is introduced. Wrong content,
+size, mode, owner, link/type, architecture or stale source controls refuse.
+The unchanged signed Python preinst performs its own redirection and must
+still leave the exact 96-byte output witness above.
+
+`tools/real-snapshot-python3-reference.sh` retains its original empty-input
+proof and additionally prepares separate protected roots by running the
+unmodified signed minimal postinst, then compares the Python preinst outcome
+with pinned dpkg and prepares wrong-content/mode/source negatives. Its new
+`DEBZ_REQUIRE_SIGNED_PYTHON3_*PY3COMPILE*` and minimal-source coordinates
+are mandatory when the existing protected Zig root test is enabled.
+This extended positive replay remains a privileged/hosted acceptance gate;
+an unprivileged test pass does not prove it. Full #393/#262 closure and
+character-device `/dev/null` parity remain separate.
+
+The amd64 `protected-reference` lane now activates that gate. It stages an
+independent `.real-snapshot/python3-amd64` workspace using the same protected
+checkout, package-derived keyring, absolute compiler and pinned dpkg. The
+existing authenticated-closure/prestate producer captures the Python root
+before configure; it does not change reference configure semantics or claim
+full reference completion. New disposable copies supply the original empty
+0600/0644 sinks. The signed helper derives the separate 20-byte input by running
+the original minimal callback and proves the unchanged 96-byte output against
+both the script and pinned dpkg.
+
+Shared protected staging generates the existing pinned dpkg identity receipt
+from the authenticated archive only after checking its metadata and all three
+extracted tool bindings; both architectures retain the unchanged mandatory
+`--verify-only` receipt check. Before cloning or mutating Python fixtures, the
+helper rejects setup-parent aliases and executes the actual signed source
+verifier through `test-real-snapshot-python3-source-protected`, checking its
+exclusive receipt. Fixture copies, truncations, chmods, alias replacements
+and captures use the shared descriptor-rooted no-follow primitives. Existing
+file mutations require owned single-link regular descriptors before truncation;
+staging and shadow negatives require exclusive fresh leaves. This changes no
+signed callback, root authority or native `/dev/null` guard.
+
+All six positive before/after roots and twelve negative roots are mandatory
+coordinates for `zig build test-real-snapshot-python3-protected`. The target
+forces its environment even when options are missing, so the optional unit
+tests cannot return early and masquerade as activation. Both actual Zig test
+bodies must write new exclusive proof receipts after their assertions; the
+protected caller verifies those receipts, not test/skip counts. Staging/replay
+and Zig verification are separately bounded to 40 and 10 minutes. Missing
+source prerequisites, cycle/profile refusals or wrong root/control bytes fail
+the lane. The regular-file fixture conversion never resets a native root.
+
+This wiring is local implementation, not evidence of a passing hosted replay.
+The protected job remains skipped on ordinary PR runs and requires the parent's
+explicit dispatch after local review/capacity release. The Python 20-byte
+activation remains amd64-only; ARM Python is not admitted.
+
+The companion arm64 `protected-reference` branch now activates the reviewed
+`tools/real-snapshot-less-reference.sh` safety correction. Its independent
+`.real-snapshot/less-arm64` workspace reuses the existing protected runtime
+stager and reviewed keyring/compiler, not a mutated proof root. An opt-in
+source-only staging mode adds the signed less/dash/util-linux closure without
+changing the default proof or any reference configure semantics. The exact
+production less/dash/dpkg/libc6 archives are checked before source mutation
+or callback execution. Pinned dpkg genuinely unpacks the exact signed less
+archive; status/control bytes are not fabricated. Descriptor-rooted no-follow,
+exclusive setup supplies the signed runtime and staged control; the observed
+ownership list is normalized only if its exact existing path-set digest matches.
+
+The helper retains its production source guard before clones/negatives and
+uses only the reviewed no-follow fixture writes. The caller then explicitly
+runs `test-real-snapshot-arm64-less-protected -Doptimize=ReleaseSafe -j2` with
+all eight root coordinates: source, script/dpkg after-roots and five bad
+script/mode/tool/alias/prestate roots. Both actual source and replay verifier
+bodies must write exclusive receipts after their assertions. Missing options
+override ambient inputs with empty values and fail instead of returning early.
+Source/replay and required verification are bounded to 30/10 minutes; bounded
+failure evidence and named-workspace/mount checks remain in the protected lane.
+
+This is activation wiring, not a claim of positive hosted execution, native
+installation, wider alternatives/proc authority or full reference completion.
+The parent owns the explicit dispatch and retained evidence review.
 
 ### Resolute arm64 Python input-binding prerequisite (#393)
 

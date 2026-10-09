@@ -5471,6 +5471,41 @@ fn signedProcFixture(value: ?[*:0]const u8, required: bool) ![]const u8 {
     return error.SkipZigTest;
 }
 
+fn signedProcGroupId(groups: []const u8, name: []const u8) !u32 {
+    var result: ?u32 = null;
+    var lines = std.mem.splitScalar(u8, groups, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ':');
+        if (!std.mem.eql(u8, fields.next().?, name)) continue;
+        if (result != null) return error.InvalidSignedProcGroup;
+        _ = fields.next() orelse return error.InvalidSignedProcGroup;
+        const gid = fields.next() orelse return error.InvalidSignedProcGroup;
+        _ = fields.next() orelse return error.InvalidSignedProcGroup;
+        if (fields.next() != null or gid.len == 0) return error.InvalidSignedProcGroup;
+        for (gid) |digit| if (digit < '0' or digit > '9') return error.InvalidSignedProcGroup;
+        result = std.fmt.parseInt(u32, gid, 10) catch return error.InvalidSignedProcGroup;
+    }
+    return result orelse error.MissingSignedProcGroup;
+}
+
+test "maintainer_script.test.signed udev permissions bind the named group instead of bootstrap allocation" {
+    const groups = "root:x:0:\ninput:x:996:\nkvm:x:993:\nrender:x:992:\n";
+    try testing.expectEqual(@as(u32, 993), try signedProcGroupId(groups, "kvm"));
+    try testing.expect((try signedProcGroupId(groups, "kvm")) != try signedProcGroupId(groups, "render"));
+    try testing.expectEqual(@as(u32, 992), try signedProcGroupId("kvm:x:992:\n", "kvm"));
+    for ([_][]const u8{
+        "kvm:x:993:\nkvm:x:992:\n",
+        "kvm:x:993\n",
+        "kvm:x::\n",
+        "kvm:x:+993:\n",
+        "kvm:x:4294967296:\n",
+        "kvm:x:993::\n",
+    }) |invalid| {
+        try testing.expectError(error.InvalidSignedProcGroup, signedProcGroupId(invalid, "kvm"));
+    }
+    try testing.expectError(error.MissingSignedProcGroup, signedProcGroupId("render:x:992:\n", "kvm"));
+}
+
 test "maintainer_script.test.required signed proc fixture never silently skips" {
     try testing.expectError(error.SkipZigTest, signedProcFixture(null, false));
     try testing.expectError(error.SignedProcRootRequired, signedProcFixture(null, true));
@@ -5553,8 +5588,10 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
         try root_fs.Path.init("proc/sys"),
     )) == null);
     const kvm = try root.root.entry(try root_fs.Path.init("dev/kvm"));
+    const groups = try root.root.readFileAlloc(testing.allocator, try root_fs.Path.init("etc/group"), 64 * 1024);
+    defer testing.allocator.free(groups);
     try testing.expectEqual(@as(u16, 0o660), kvm.mode);
-    try testing.expectEqual(@as(u32, 992), kvm.gid);
+    try testing.expectEqual(try signedProcGroupId(groups, "kvm"), kvm.gid);
     const fuse = try root.root.entry(try root_fs.Path.init("dev/fuse"));
     try testing.expectEqual(@as(u16, 0o666), fuse.mode);
     try testing.expectEqual(@as(u32, 0), fuse.uid);

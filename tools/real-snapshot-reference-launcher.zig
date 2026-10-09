@@ -69,8 +69,8 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
     null,
 };
 
-const Profile = enum { none, systemd, udev, sudo };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure };
+const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -86,6 +86,83 @@ const dpkg_digests = [_][]const u8{
     "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
     "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
 };
+const CycleBinding = struct {
+    name: []const u8,
+    version: []const u8,
+    depends: []const u8,
+    archive_size: usize,
+    archive_sha512: []const u8,
+};
+const base_cycle = [_]CycleBinding{
+    .{ .name = "libc6", .version = "2.43-2ubuntu2.4", .depends = "libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)", .archive_size = 2104056, .archive_sha512 = "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696" },
+    .{ .name = "libgcc-s1", .version = "16-20260322-1ubuntu1", .depends = "gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)", .archive_size = 80312, .archive_sha512 = "a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2" },
+    .{ .name = "gcc-16-base", .version = "16-20260322-1ubuntu1", .depends = "", .archive_size = 38296, .archive_sha512 = "0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c" },
+    .{ .name = "libc-gconv-modules-extra", .version = "2.43-2ubuntu2.4", .depends = "", .archive_size = 1362202, .archive_sha512 = "c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692" },
+};
+const openssl_cycle = [_]CycleBinding{
+    .{ .name = "libssl3t64", .version = "3.5.5-1ubuntu3.6", .depends = "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy", .archive_size = 2364586, .archive_sha512 = "10df2f82619faff2ed4b890812313c35cd58abbfce858caf3403e1b654fac857bd7bc28e7a528a79a18ebfbfbdca5cffb3c2dd5b340c729fb7eb2470b76d528d" },
+    .{ .name = "openssl-provider-legacy", .version = "3.5.5-1ubuntu3.6", .depends = "libc6 (>= 2.14), libssl3t64 (>= 3.0.3)", .archive_size = 39690, .archive_sha512 = "cbb4f55a609576d99a1b52952a674e78b2cbb7026e54c765cfd964812b65bdcdea4f5ea67961159b737fcba3093b3b15de8b7a6aff3bbf08a85805a09290c470" },
+    base_cycle[0],
+    .{ .name = "libzstd1", .version = "1.5.7+dfsg-3", .depends = "libc6 (>= 2.34)", .archive_size = 308174, .archive_sha512 = "284a44950a9caae10a6b7a06baead5db2d6dd2989fc01107c78c76ef5468cb489fc1a8e92d6cb84d44b5a371f8b1156bd2f5c232e79f1631dcf000a601e52183" },
+    .{ .name = "zlib1g", .version = "1:1.3.dfsg+really1.3.1-1ubuntu3.1", .depends = "libc6 (>= 2.14)", .archive_size = 61612, .archive_sha512 = "a0ad94daadd3099ee40766a62a42d3fa7f431c6d805e9108d1dde07d64bfe3e7da66a41a2294598917e5ef5435df7a239d011711dd6d18037bc9b61b530ed3d4" },
+};
+const CycleKind = enum { base, openssl };
+const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
+const cycle_graph_keys = [_][]const u8{
+    "Depends",    "Pre-Depends", "Breaks",    "Conflicts",        "Provides",         "Replaces",
+    "Multi-Arch", "Protected",   "Essential", "Triggers-Pending", "Triggers-Awaited", "Config-Version",
+};
+
+fn cycleGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return base_cycle[index].depends;
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => libc6_breaks,
+        2 => "gnat (<< 7)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libc6-amd64",
+        1 => "libgcc1 (<< 1:10)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return if (index == 1) "libgcc1 (= 1:16-20260322-1ubuntu1)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return "same";
+    if (std.ascii.eqlIgnoreCase(key, "Protected")) return if (index == 1) "yes" else "";
+    return "";
+}
+
+fn opensslGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return openssl_cycle[index].depends;
+    if (index == 2) return cycleGraphField(0, key);
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => "libssl3 (<< 3.5.5-1ubuntu3.6), openssh-client (<< 1:9.4p1), openssh-server (<< 1:9.4p1), python3-m2crypto (<< 0.38.0-4)",
+        1 => "libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)",
+        4 => "libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2023.20230311.66589-8)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libssl3",
+        1 => "libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return switch (index) {
+        0 => "libssl3 (= 3.5.5-1ubuntu3.6)",
+        4 => "libz1",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Conflicts")) return if (index == 4) "zlib1 (<= 1:1.0.4-7)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index == 1) "foreign" else "same";
+    return "";
+}
+
+fn scriptBinding(profile: Profile) ?ScriptBinding {
+    return switch (profile) {
+        .systemd, .udev, .sudo => script_bindings[@intFromEnum(profile) - 1],
+        .none, .libgcc_cycle, .openssl_cycle => null,
+    };
+}
 
 const Pinned = struct { fd: i32, metadata: linux.Statx };
 const Options = struct {
@@ -98,6 +175,8 @@ const Options = struct {
     archive: ?[:0]const u8 = null,
     archive_sha512: ?[]const u8 = null,
     archive_size: ?usize = null,
+    cycle_archives: ?[base_cycle.len][:0]const u8 = null,
+    openssl_archives: ?[openssl_cycle.len][:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -122,9 +201,26 @@ pub fn main(init: std.process.Init) !void {
     const profile = std.meta.stringToEnum(Profile, profile_name) orelse return error.InvalidArguments;
     const verb = std.meta.stringToEnum(Verb, verb_name) orelse return error.InvalidArguments;
     const selector = args.next();
-    const archive = args.next();
-    const digest = args.next();
-    const size_text = args.next();
+    var cycle_archives: ?[base_cycle.len][:0]const u8 = null;
+    var openssl_archives: ?[openssl_cycle.len][:0]const u8 = null;
+    if (verb == .break_base_cycle) {
+        var paths: [base_cycle.len][:0]const u8 = undefined;
+        for (&paths) |*path| {
+            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+        }
+        cycle_archives = paths;
+    }
+    if (verb == .configure_openssl_cycle) {
+        var paths: [openssl_cycle.len][:0]const u8 = undefined;
+        for (&paths) |*path| {
+            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+        }
+        openssl_archives = paths;
+    }
+    const normal = cycle_archives == null and openssl_archives == null;
+    const archive = if (normal) args.next() else null;
+    const digest = if (normal) args.next() else null;
+    const size_text = if (normal) args.next() else null;
     if (args.next() != null) return error.InvalidArguments;
     const options: Options = .{
         .root = try init.arena.allocator().dupeZ(u8, root),
@@ -136,6 +232,8 @@ pub fn main(init: std.process.Init) !void {
         .archive = if (archive) |value| try init.arena.allocator().dupeZ(u8, value) else null,
         .archive_sha512 = digest,
         .archive_size = if (size_text) |value| try std.fmt.parseInt(usize, value, 10) else null,
+        .cycle_archives = cycle_archives,
+        .openssl_archives = openssl_archives,
     };
     try validateOptions(options);
     const status = try run(init.arena.allocator(), options);
@@ -163,21 +261,42 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .probe_configure;
+    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
         (unpacking or configuring) != (options.selector != null))
         return error.InvalidArguments;
+    if ((options.verb == .break_base_cycle) != (options.cycle_archives != null))
+        return error.InvalidArguments;
+    if ((options.verb == .configure_openssl_cycle) != (options.openssl_archives != null))
+        return error.InvalidArguments;
+    if (options.openssl_archives) |paths| {
+        for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
+        if (options.profile != .openssl_cycle or architecture_index != 0 or
+            !std.mem.eql(u8, options.selector.?, "libssl3t64:amd64"))
+            return error.InvalidCycleProfile;
+    } else if (options.profile == .openssl_cycle) {
+        return error.InvalidCycleProfile;
+    }
+    if (options.cycle_archives) |paths| {
+        for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
+        if (options.profile != .libgcc_cycle or architecture_index != 0 or
+            !std.mem.eql(u8, options.selector.?, "libgcc-s1:amd64"))
+            return error.InvalidCycleProfile;
+    } else if (options.profile == .libgcc_cycle) {
+        return error.InvalidCycleProfile;
+    }
     if (options.selector) |selector| {
         if (selector.len == 0 or selector.len > 120 or
             std.mem.indexOfAny(u8, selector, "/ \t\n\x00") != null or selector[0] == '-')
             return error.InvalidArguments;
     }
-    if (options.profile != .none) {
-        if (options.verb != .configure or architecture_index != 0)
+    if (options.verb == .continue_prestate and options.profile != .systemd and options.profile != .udev)
+        return error.InvalidProfile;
+    if (scriptBinding(options.profile)) |binding| {
+        if ((options.verb != .configure and options.verb != .continue_prestate) or architecture_index != 0)
             return error.InvalidProfile;
-        const binding = script_bindings[@intFromEnum(options.profile) - 1];
         const selector_name = options.selector.?;
         if (selector_name.len != binding.name.len + ":amd64".len or
             !std.mem.startsWith(u8, selector_name, binding.name) or
@@ -328,6 +447,18 @@ fn openVerified(
 }
 
 fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
+    return bindingStatusMatchesFor(status, binding, .configure);
+}
+
+fn bindingStatusMatchesFor(status: []const u8, binding: ScriptBinding, verb: Verb) bool {
+    const expected_state: []const u8 = switch (verb) {
+        .configure => "install ok unpacked",
+        .continue_prestate => if (std.mem.eql(u8, binding.name, "systemd") or std.mem.eql(u8, binding.name, "udev"))
+            "install ok half-configured"
+        else
+            return false,
+        else => return false,
+    };
     var matched = false;
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
@@ -345,9 +476,11 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
                 continue;
             }
             identity_field = false;
-            const separator = std.mem.indexOf(u8, line, ": ") orelse return false;
+            const separator = std.mem.indexOfScalar(u8, line, ':') orelse return false;
             const key = line[0..separator];
-            const value = line[separator + 2 ..];
+            const rest = line[separator + 1 ..];
+            if (rest.len > 0 and rest[0] != ' ') return false;
+            const value = if (rest.len == 0) rest else rest[1..];
             if (std.ascii.eqlIgnoreCase(key, "Package")) {
                 if (name != null) return false;
                 name = value;
@@ -370,15 +503,14 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
             if (matched or architecture == null or version == null or state == null or
                 !std.mem.eql(u8, architecture.?, "amd64") or
                 !std.mem.eql(u8, version.?, binding.version) or
-                !std.mem.eql(u8, state.?, "install ok unpacked")) return false;
+                !std.mem.eql(u8, state.?, expected_state)) return false;
             matched = true;
         }
     }
     return matched;
 }
 
-fn verifyInstalledBinding(binding: ScriptBinding) !void {
-    const path: [:0]const u8 = "/var/lib/dpkg/status";
+fn readInstalledFile(path: [:0]const u8, maximum: usize) ![]u8 {
     try protectedAncestors(path);
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true };
     const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve_no_symlinks };
@@ -393,20 +525,29 @@ fn verifyInstalledBinding(binding: ScriptBinding) !void {
     const before = try metadata(fd);
     if (before.uid != 0 or before.gid != 0 or
         (before.mode & 0o170000) != 0o100000 or (before.mode & 0o022) != 0 or
-        before.nlink != 1 or before.size > 4 * 1024 * 1024)
+        before.nlink != 1 or before.size > maximum)
         return error.InvalidInstalledBinding;
     const size: usize = @intCast(before.size);
-    const bytes = try std.heap.page_allocator.alloc(u8, size + 1);
-    defer std.heap.page_allocator.free(bytes);
+    const bytes = try std.heap.page_allocator.alloc(u8, size);
+    errdefer std.heap.page_allocator.free(bytes);
     var count: usize = 0;
     while (count < bytes.len) {
         const got = try checked(linux.read(fd, bytes[count..].ptr, bytes.len - count));
         if (got == 0) break;
         count += got;
     }
-    if (count != size or !same(before, try metadata(fd)) or
-        !bindingStatusMatches(bytes[0..count], binding))
-        return error.InvalidInstalledBinding;
+    if (count != size or !same(before, try metadata(fd))) return error.InvalidInstalledBinding;
+    return bytes[0..count];
+}
+
+fn readInstalledStatus() ![]u8 {
+    return readInstalledFile("/var/lib/dpkg/status", 4 * 1024 * 1024);
+}
+
+fn verifyInstalledBinding(binding: ScriptBinding, verb: Verb) !void {
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    if (!bindingStatusMatchesFor(bytes, binding, verb)) return error.InvalidInstalledBinding;
     const script_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.postinst",
@@ -424,6 +565,128 @@ fn verifyInstalledBinding(binding: ScriptBinding) !void {
     _ = linux.close(script.fd);
 }
 
+fn cycleStatusMatches(status: []const u8) bool {
+    return cycleStatusMatchesFor(status, .base);
+}
+
+fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
+    const bindings = if (kind == .base) base_cycle else openssl_cycle;
+    const graphField = if (kind == .base) cycleGraphField else opensslGraphField;
+    var matched = [_]bool{false} ** bindings.len;
+    var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+    while (paragraphs.next()) |paragraph| {
+        if (paragraph.len == 0) continue;
+        var fields: [128]struct { key: []const u8, value: []const u8 } = undefined;
+        var count: usize = 0;
+        var lines = std.mem.splitScalar(u8, paragraph, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == ' ' or line[0] == '\t') {
+                if (count == 0) return false;
+                const key = fields[count - 1].key;
+                for ([_][]const u8{ "Package", "Architecture", "Version", "Status" } ++ cycle_graph_keys) |identity| {
+                    if (std.ascii.eqlIgnoreCase(key, identity)) return false;
+                }
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+            const rest = line[colon + 1 ..];
+            if (rest.len != 0 and rest[0] != ' ') return false;
+            if (count == fields.len) return false;
+            const key = line[0..colon];
+            for (fields[0..count]) |field| {
+                if (std.ascii.eqlIgnoreCase(field.key, key)) return false;
+            }
+            fields[count] = .{ .key = key, .value = if (rest.len == 0) rest else rest[1..] };
+            count += 1;
+        }
+        var name: []const u8 = "";
+        for (fields[0..count]) |field| {
+            if (std.ascii.eqlIgnoreCase(field.key, "Package")) name = field.value;
+        }
+        for (bindings, 0..) |binding, index| {
+            if (!std.mem.eql(u8, name, binding.name)) continue;
+            if (matched[index]) return false;
+            matched[index] = true;
+            var architecture: []const u8 = "";
+            var version: []const u8 = "";
+            var state: []const u8 = "";
+            var depends: []const u8 = "";
+            var graph_seen = [_]bool{false} ** cycle_graph_keys.len;
+            for (fields[0..count]) |field| {
+                if (std.ascii.eqlIgnoreCase(field.key, "Architecture")) architecture = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Version")) version = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Status")) state = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Depends")) depends = field.value;
+                for (cycle_graph_keys, 0..) |key, graph_index| {
+                    if (!std.ascii.eqlIgnoreCase(field.key, key)) continue;
+                    graph_seen[graph_index] = true;
+                    if (!std.mem.eql(u8, field.value, graphField(index, key))) return false;
+                }
+            }
+            for (cycle_graph_keys, graph_seen) |key, seen| {
+                if (!seen and graphField(index, key).len != 0) return false;
+            }
+            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, binding.version) or
+                !std.mem.eql(u8, depends, binding.depends) or !std.mem.eql(u8, state, if (index < 2)
+                "install ok unpacked"
+            else
+                "install ok installed")) return false;
+        }
+    }
+    return std.mem.allEqual(bool, &matched, true);
+}
+
+fn verifyCycle(comptime kind: CycleKind) !void {
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    if (!cycleStatusMatchesFor(bytes, kind)) return error.CycleStateOrGraphChanged;
+    protectedAncestors("/var/lib/dpkg/updates/.cycle-check") catch return error.CycleStateChanged;
+    emptyDirectory("/var/lib/dpkg/updates") catch return error.CycleStateChanged;
+    const unincorp_path: [:0]const u8 = "/var/lib/dpkg/triggers/Unincorp";
+    try protectedAncestors(unincorp_path);
+    const unincorp = linux.open(unincorp_path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(unincorp) == .SUCCESS) {
+        _ = linux.close(@intCast(unincorp));
+        const pending = readInstalledFile(unincorp_path, 0) catch return error.CycleCallbackChanged;
+        std.heap.page_allocator.free(pending);
+    } else if (linux.errno(unincorp) != .NOENT) return error.CycleCallbackChanged;
+    const activation_name = if (kind == .base) "libgcc-s1" else "libssl3t64";
+    const triggers = readInstalledFile("/var/lib/dpkg/info/" ++ activation_name ++ ":amd64.triggers", 1024) catch return error.CycleCallbackChanged;
+    defer std.heap.page_allocator.free(triggers);
+    if (!std.mem.eql(u8, triggers, "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"))
+        return error.CycleCallbackChanged;
+    const unqualified = linux.open("/var/lib/dpkg/info/" ++ activation_name ++ ".triggers", .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(unqualified) == .SUCCESS) {
+        _ = linux.close(@intCast(unqualified));
+        return error.CycleCallbackChanged;
+    }
+    if (linux.errno(unqualified) != .NOENT) return error.CycleCallbackChanged;
+    if (kind == .openssl) {
+        try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy.triggers");
+        try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy:amd64.triggers");
+    }
+    const names = if (kind == .base)
+        .{ "libgcc-s1", "libgcc-s1:amd64" }
+    else
+        .{ "libssl3t64", "libssl3t64:amd64", "openssl-provider-legacy", "openssl-provider-legacy:amd64" };
+    inline for (names) |name| {
+        inline for (.{ "preinst", "postinst", "prerm", "postrm", "config" }) |script| {
+            const path = "/var/lib/dpkg/info/" ++ name ++ "." ++ script;
+            try verifyCycleAbsent(path);
+        }
+    }
+}
+
+fn verifyCycleAbsent(path: [:0]const u8) !void {
+    try protectedAncestors(path);
+    const present = linux.open(path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(present) == .SUCCESS) {
+        _ = linux.close(@intCast(present));
+        return error.CycleCallbackChanged;
+    }
+    if (linux.errno(present) != .NOENT) return error.CycleCallbackChanged;
+}
 fn protectedRoot(root: [:0]const u8) !Pinned {
     try protectedAncestors(root);
     const pinned = try openPinned(root, true);
@@ -541,7 +804,7 @@ fn mountArchive(child: Child) linux.E {
 }
 
 fn mountProc(child: Child) linux.E {
-    if (child.options.profile == .none) return .SUCCESS;
+    if (child.options.profile == .none or child.options.profile == .libgcc_cycle or child.options.profile == .openssl_cycle) return .SUCCESS;
     const proc = openPinned("/proc", true) catch return .STALE;
     defer _ = linux.close(proc.fd);
     if (!same(proc.metadata, child.proc_mountpoint.metadata)) return .STALE;
@@ -878,10 +1141,20 @@ fn childMain(input: Child) noreturn {
     must(linux.chroot("."), status, 4);
     must(linux.chdir("/"), status, 4);
     _ = linux.close(root.fd);
-    if (child.options.profile != .none) {
-        verifyInstalledBinding(script_bindings[@intFromEnum(child.options.profile) - 1]) catch
+    if (scriptBinding(child.options.profile)) |binding| {
+        verifyInstalledBinding(binding, child.options.verb) catch
             fail(status, 10, .STALE);
     }
+    if (child.options.verb == .break_base_cycle)
+        verifyCycle(.base) catch |err| {
+            std.log.err("reference cycle operation refused: {s}", .{@errorName(err)});
+            fail(status, 11, .STALE);
+        };
+    if (child.options.verb == .configure_openssl_cycle)
+        verifyCycle(.openssl) catch |err| {
+            std.log.err("reference OpenSSL operation refused: {s}", .{@errorName(err)});
+            fail(status, 11, .STALE);
+        };
     const archive_setup = mountArchive(child);
     if (archive_setup != .SUCCESS) fail(status, 5, archive_setup);
     const proc_setup = mountProc(child);
@@ -899,7 +1172,9 @@ fn childMain(input: Child) noreturn {
         .probe_unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--unpack", archive_target, null },
         .unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--unpack", archive_target, null },
         .probe_configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--configure", selector, null },
-        .configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
+        .configure, .continue_prestate => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
+        .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
+        .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
     };
     must(linux.syscall5(
         .execveat,
@@ -988,6 +1263,30 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     defer {
         if (archive) |value| _ = linux.close(value.fd);
     }
+    if (options.cycle_archives) |paths| {
+        for (paths, base_cycle) |path, binding| {
+            const source = openVerified(
+                path,
+                std.crypto.hash.sha2.Sha512,
+                binding.archive_sha512,
+                binding.archive_size,
+                binding.archive_size,
+            ) catch return error.CycleIdentityChanged;
+            _ = linux.close(source.fd);
+        }
+    }
+    if (options.openssl_archives) |paths| {
+        for (paths, openssl_cycle) |path, binding| {
+            const source = openVerified(
+                path,
+                std.crypto.hash.sha2.Sha512,
+                binding.archive_sha512,
+                binding.archive_size,
+                binding.archive_size,
+            ) catch return error.CycleIdentityChanged;
+            _ = linux.close(source.fd);
+        }
+    }
     const root_proc = try std.fmt.allocPrintSentinel(allocator, "{s}/proc", .{options.root}, 0);
     const proc = try openPinned(root_proc, true);
     defer _ = linux.close(proc.fd);
@@ -1003,8 +1302,7 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
         target.metadata.mode != 0o100600 or target.metadata.size != 0 or
         target.metadata.nlink != 1 or target.metadata.dev_major != root.metadata.dev_major or
         target.metadata.dev_minor != root.metadata.dev_minor) return error.InvalidArchiveMountpoint;
-    if (options.profile != .none) {
-        const binding = script_bindings[@intFromEnum(options.profile) - 1];
+    if (scriptBinding(options.profile)) |binding| {
         const script_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/var/lib/dpkg/info/{s}.postinst",
@@ -1071,8 +1369,207 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     return linux.W.EXITSTATUS(status);
 }
 
+fn cycleStatusFixture(allocator: std.mem.Allocator) ![]u8 {
+    return cycleStatusFixtureFor(allocator, .base);
+}
+
+fn cycleStatusFixtureFor(allocator: std.mem.Allocator, comptime kind: CycleKind) ![]u8 {
+    const source = if (kind == .base)
+        @embedFile("fixtures/real-snapshot/base-cycle-controls-v1.json")
+    else
+        @embedFile("fixtures/real-snapshot/openssl-cycle-controls-v1.json");
+    const fixture = try std.json.parseFromSlice(struct {
+        packages: []const struct { control: []const u8, status: []const u8 },
+    }, allocator, source, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (fixture.value.packages) |package| {
+        try output.appendSlice(allocator, package.control);
+        const state = try std.fmt.allocPrint(allocator, "Status: {s}\n", .{package.status});
+        defer allocator.free(state);
+        try output.appendSlice(allocator, state);
+        try output.appendSlice(allocator, "Conffiles:\n /etc/fixture abcdef\n\n");
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+test "reference OpenSSL pair refuses changed signed graph, pending triggers and outside state" {
+    const allocator = std.testing.allocator;
+    const status = try cycleStatusFixtureFor(allocator, .openssl);
+    defer allocator.free(status);
+    try std.testing.expect(cycleStatusMatchesFor(status, .openssl));
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "Depends: libc6 (>= 2.14), libssl3t64", .after = "Depends: libc6 (>= 2.14), other" },
+        .{ .before = "Package: libssl3t64", .after = "Package: libssl3t64\nPre-Depends: openssl-provider-legacy" },
+        .{ .before = "Status: install ok installed", .after = "Status: install ok unpacked" },
+        .{ .before = "Status: install ok unpacked", .after = "Status: install ok triggers-pending" },
+        .{ .before = "Multi-Arch: foreign", .after = "Multi-Arch: same" },
+        .{ .before = "Multi-Arch: foreign", .after = "Triggers-Pending: ldconfig\nMulti-Arch: foreign" },
+        .{ .before = "Provides: libz1", .after = "Provides: other" },
+        .{ .before = "Architecture: amd64", .after = "Architecture: arm64" },
+        .{ .before = "Version: 3.5.5-1ubuntu3.6", .after = "Version: 3.5.5-1ubuntu3.7" },
+        .{ .before = "Package: libssl3t64", .after = "Package: libssl3t64\npackage: libssl3t64" },
+    }) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, allocator, status, mutation.before, mutation.after);
+        defer allocator.free(changed);
+        try std.testing.expect(!cycleStatusMatchesFor(changed, .openssl));
+    }
+    const missing = std.mem.indexOf(u8, status, "Package: zlib1g").?;
+    try std.testing.expect(!cycleStatusMatchesFor(status[0..missing], .openssl));
+}
+
+test "reference OpenSSL operation cannot become a generic batch or proc profile" {
+    const options: Options = .{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .architecture = "amd64",
+        .profile = .openssl_cycle,
+        .verb = .configure_openssl_cycle,
+        .selector = "libssl3t64:amd64",
+        .openssl_archives = .{ "/protected/ssl", "/protected/provider", "/protected/libc", "/protected/zstd", "/protected/zlib" },
+    };
+    try validateOptions(options);
+    var changed = options;
+    changed.verb = .configure;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.profile = .none;
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.profile = .systemd;
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.architecture = "arm64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.selector = "openssl-provider-legacy:amd64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.openssl_archives = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.cycle_archives = .{ "/protected/libc", "/protected/libgcc", "/protected/gcc", "/protected/gconv" };
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+}
+
+test "reference cycle authority refuses changed graph, pre-depends, triggers and outside state" {
+    const allocator = std.testing.allocator;
+    const status = try cycleStatusFixture(allocator);
+    defer allocator.free(status);
+    try std.testing.expect(cycleStatusMatches(status));
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "Depends: libgcc-s1,", .after = "Depends: unknown-package," },
+        .{ .before = "Depends: gcc-16-base", .after = "Pre-Depends: libc6\nDepends: gcc-16-base" },
+        .{ .before = "Status: install ok installed", .after = "Status: install ok unpacked" },
+        .{ .before = "Status: install ok unpacked", .after = "Status: install ok triggers-pending" },
+        .{ .before = "Protected: yes", .after = "Protected: no" },
+        .{ .before = "Protected: yes", .after = "Triggers-Pending: ldconfig\nProtected: yes" },
+        .{ .before = "Protected: yes", .after = "Config-Version: previous\nProtected: yes" },
+        .{ .before = "Architecture: amd64", .after = "Architecture: arm64" },
+        .{ .before = "Multi-Arch: same", .after = "Multi-Arch: foreign" },
+        .{ .before = "Multi-Arch: same\n", .after = "" },
+        .{ .before = "Version: 16-20260322-1ubuntu1", .after = "Version: 16-20260322-1ubuntu2" },
+        .{ .before = "Package: libgcc-s1", .after = "Package: libgcc-s1\npackage: libgcc-s1" },
+        .{ .before = "Depends: gcc-16-base", .after = "Depends: gcc-16-base\n continued" },
+    }) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, allocator, status, mutation.before, mutation.after);
+        defer allocator.free(changed);
+        try std.testing.expect(!cycleStatusMatches(changed));
+    }
+    const missing = std.mem.indexOf(u8, status, "Package: gcc-16-base").?;
+    try std.testing.expect(!cycleStatusMatches(status[0..missing]));
+}
+
+test "reference cycle operation is not generic configure or a proc profile" {
+    const options: Options = .{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .architecture = "amd64",
+        .profile = .libgcc_cycle,
+        .verb = .break_base_cycle,
+        .selector = "libgcc-s1:amd64",
+        .cycle_archives = .{ "/protected/libc6", "/protected/libgcc", "/protected/gcc-base", "/protected/gconv" },
+    };
+    try validateOptions(options);
+    try std.testing.expect(scriptBinding(options.profile) == null);
+    var changed = options;
+    changed.verb = .configure;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.profile = .none;
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.architecture = "arm64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.selector = "libc6:amd64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.cycle_archives = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.archive = "/protected/extra";
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+}
+
 test "reference capability transition fails closed without root authority" {
     try unprivilegedTransitionProbe();
+}
+
+test "prestate continuation accepts only exact systemd and udev half-configured bindings" {
+    for ([_]Profile{ .systemd, .udev }) |profile| {
+        const binding = scriptBinding(profile).?;
+        const selector = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}:amd64", .{binding.name}, 0);
+        defer std.testing.allocator.free(selector);
+        const options: Options = .{
+            .root = "/root/proof/root",
+            .dpkg = "/root/proof/dpkg",
+            .architecture = "amd64",
+            .profile = profile,
+            .verb = .continue_prestate,
+            .selector = selector,
+        };
+        try validateOptions(options);
+        for ([_][]const u8{ "half-configured", "unpacked", "installed", "triggers-pending" }) |state| {
+            const bytes = try std.fmt.allocPrint(std.testing.allocator, "Package: {s}\nVersion: {s}\nArchitecture: amd64\nStatus: install ok {s}\n\n", .{ binding.name, binding.version, state });
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqual(std.mem.eql(u8, state, "half-configured"), bindingStatusMatchesFor(bytes, binding, .continue_prestate));
+            try std.testing.expectEqual(std.mem.eql(u8, state, "unpacked"), bindingStatusMatchesFor(bytes, binding, .configure));
+        }
+        for ([_][3][]const u8{
+            .{ "wrong", binding.version, "amd64" },
+            .{ binding.name, "wrong", "amd64" },
+            .{ binding.name, binding.version, "arm64" },
+        }) |identity| {
+            const bytes = try std.fmt.allocPrint(std.testing.allocator, "Package: {s}\nVersion: {s}\nArchitecture: {s}\nStatus: install ok half-configured\n\n", .{ identity[0], identity[1], identity[2] });
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expect(!bindingStatusMatchesFor(bytes, binding, .continue_prestate));
+        }
+        var changed = options;
+        changed.architecture = "arm64";
+        try std.testing.expectError(error.InvalidProfile, validateOptions(changed));
+        changed = options;
+        changed.selector = "sudo:amd64";
+        try std.testing.expectError(error.InvalidProfile, validateOptions(changed));
+    }
+    const sudo: Options = .{
+        .root = "/root/proof/root",
+        .dpkg = "/root/proof/dpkg",
+        .architecture = "amd64",
+        .profile = .sudo,
+        .verb = .continue_prestate,
+        .selector = "sudo:amd64",
+    };
+    try std.testing.expectError(error.InvalidProfile, validateOptions(sudo));
+    try std.testing.expect(!bindingStatusMatchesFor(
+        "Package: sudo\nVersion: 1.9.17p2-1ubuntu3.1\nArchitecture: amd64\nStatus: install ok half-configured\n\n",
+        scriptBinding(.sudo).?,
+        .continue_prestate,
+    ));
+    var none = sudo;
+    none.profile = .none;
+    try std.testing.expectError(error.InvalidProfile, validateOptions(none));
 }
 
 test "reference launcher rejects wider profiles and unsafe operation shapes" {
@@ -1419,6 +1916,12 @@ test "reference proc profile is bound to the installed dpkg status version" {
         "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
         "Status: install ok unpacked\n\n";
     try std.testing.expect(bindingStatusMatches(valid, binding));
+    try std.testing.expect(bindingStatusMatches(valid ++
+        "Package: conffile-owner\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\nConffiles:\n /etc/fixture abcdef\n\n", binding));
+    try std.testing.expect(!bindingStatusMatches(valid ++
+        "Package: conffile-owner\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\nConffiles:missing-space\n\n", binding));
     try std.testing.expect(!bindingStatusMatches(
         "Package: systemd\nVersion: 259.5-0ubuntu3.5\nArchitecture: amd64\n" ++
             "Status: install ok unpacked\n\n",

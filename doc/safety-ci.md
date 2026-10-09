@@ -83,12 +83,27 @@ The published four-job recovery graph uses 14 verified Zig installations;
 this prepared three-job graph requires exactly 13 in both security and
 release workflow policy audits.
 
-Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
-commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned
-minisign key and GitHub attestations, and checks `zig version` before use. The
+Ordinary CI and release builds obtain Zig 0.16.0 from `cataggar/zig` through the
+commit-pinned `ghr` v0.8.1 install action, verify the release with its pinned
+minisign key and GitHub attestations, and check `zig version` before use. The
 action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
+
+The dispatch-only native snapshot job instead shares the small protected
+proof's root-owned bootstrap: the same size/SHA-256/minisign-pinned Zig and
+verified library tree, package-derived Ubuntu keyring and pinned dpkg. It
+stages a new `native-ci-RUN-ATTEMPT-ARCH` tree on each architecture; the small
+proof retains a distinct `ci-RUN-ATTEMPT-ARCH` tree. No proof workspace is
+reused. The native wrapper requires protected reviewed keyring bytes, without
+an ambient image fallback; the full reference wrapper invokes the explicit
+absolute protected `DEBZ_ZIG` with its protected `lib`, without extending its
+fixed PATH. The 20 ordinary ghr-install jobs include the separate signed proc
+replay, but not the protected native snapshot job; both protected consumers are
+checked separately. Bounded diagnostics/export and named descendant cleanup
+run on failure, without returning ownership of protected inputs to the runner.
+Successful setup or small-proof results do not claim full wrapper/parity
+completion; hosted native success must reach the reference step.
 
 The CI workflow has a top-level concurrency group keyed by the workflow name,
 event name, and either the pull request number, the pushed ref, or the unique
@@ -154,7 +169,7 @@ proof. The bounded replacement refuses shared/unprotected checkouts,
 unknown or multi-package/pending script operations, and unsupported arm64
 script profiles. Hosted checkout staging, mode-0700 root-owned workspace
 and cleanup, small protected namespace tests, arm64 signed profiles and
-more than the current 90-minute job budget require separate review before
+the protected full-reference execution require separate review before
 re-enabling the full opt-in reference run. No retained failed root may be
 reused as a fresh proof.
 The opt-in `test-real-snapshot-reference-protected` Zig build target requires
@@ -170,7 +185,22 @@ runners only on the weekly schedule or a `workflow_dispatch` with
 from a root-owned bare repository into a new mode-0700 tree under
 `/srv/debz-protected`. It verifies the pinned Zig with minisign, tightens and
 records the `zig-pkg` modes, and runs seven fail-closed negatives before the
-proof. Bounded evidence is always uploaded, and the tree is always removed.
+proof. Its amd64 leg additionally stages a separate signed Python pre-configure
+source and runs the empty0600/0644 and strict20/96 replay, then requires exclusive
+receipts from both activated Zig root validators and the actual pre-mutation
+Python source verifier. Shared staging produces and verifies the pinned archive's complete
+dpkg tool receipt on both architectures; Python setup/mutation/capture writes
+reuse the reviewed descriptor-rooted no-follow fixture primitives.
+The 140-minute job budget
+includes bounded Python staging/replay (40) and Zig verification (10). Its
+arm64 leg separately stages a fresh signed less source using the reviewed
+no-follow helper, then requires both actual source/replay verifier receipts
+with all eight root coordinates (30-minute staging/replay, 10-minute required
+Zig verification). The AMD Python 20/96 gate remains AMD-only; neither branch
+changes reference configure semantics or broadens proc/alternatives authority.
+These are dispatch gates, not proof inferred from skipped ordinary PR jobs;
+genuinely protected positive replay still requires retained hosted evidence.
+Bounded evidence is always uploaded, and the tree is always removed.
 `tools/security-audit.py` and `test/security-policy.zig` keep the job opt-in,
 `sudo -n`-only and unskippable; see "Hosted protected reference job" in
 [integration roots](integration-roots.md).
