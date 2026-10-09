@@ -71,6 +71,12 @@ class CycleRefusal(RuntimeError):
 
 
 @dataclass(frozen=True)
+class Launcher:
+    path: Path
+    runtime: Path
+
+
+@dataclass(frozen=True)
 class Package:
     name: str
     version: str
@@ -145,7 +151,7 @@ def verify_archive(package: Package) -> None:
 
 
 def dpkg_command(
-    launcher: Path, dpkg: Path, root: Path, architecture: str, profile: str,
+    launcher: Launcher, dpkg: Path, root: Path, architecture: str, profile: str,
     verb: str, package: Package | None = None, cycle: tuple[Package, ...] = (),
 ) -> list[str]:
     if verb == "configure_openssl_cycle":
@@ -155,8 +161,8 @@ def dpkg_command(
                    (name, version, "amd64", size, digest)
                    for p, (name, version, size, digest, _) in zip(cycle, OPENSSL_CYCLE))):
             raise CycleRefusal("CycleIdentityChanged: unauthorized OpenSSL cycle operation")
-        return [str(launcher), str(root), str(dpkg), architecture, profile, verb,
-                package.selector, *(str(p.archive) for p in cycle)]
+        return [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, str(launcher.runtime), *(str(p.archive) for p in cycle)]
     if verb == "break_base_cycle":
         if (architecture != "amd64" or profile != BASE_CYCLE_PROFILE
             or len(cycle) != len(BASE_CYCLE) or package != cycle[1]
@@ -164,8 +170,8 @@ def dpkg_command(
                    (name, version, "amd64", size, digest)
                    for p, (name, version, size, digest, _) in zip(cycle, BASE_CYCLE))):
             raise CycleRefusal("CycleIdentityChanged: unauthorized cycle operation")
-        return [str(launcher), str(root), str(dpkg), architecture, profile, verb,
-                package.selector, *(str(p.archive) for p in cycle)]
+        return [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, str(launcher.runtime), *(str(p.archive) for p in cycle)]
     if cycle:
         raise CycleRefusal("CycleIdentityChanged: archives on a normal operation")
     if verb not in ("probe_unpack", "unpack", "probe_configure", "configure", "continue_prestate"):
@@ -182,8 +188,8 @@ def dpkg_command(
             raise ValueError(f"unauthorized reference script profile: {profile}")
     elif verb == "configure" and package.name in PROFILE_VERSIONS:
         raise ValueError(f"missing exact configure profile: {package.selector}")
-    command = [str(launcher), str(root), str(dpkg), architecture, profile, verb]
-    command.append(package.selector)
+    command = [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+               package.selector, str(launcher.runtime)]
     if verb in ("unpack", "probe_unpack"):
         command.extend((str(package.archive), package.digest, str(package.size)))
     return command
@@ -412,7 +418,7 @@ def verify_base_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
 
 
 def break_base_cycle(
-    launcher: Path, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
     packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
 ) -> Package:
     cycle = base_cycle_packages(packages, architecture)
@@ -521,7 +527,7 @@ def verify_openssl_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
 
 
 def configure_openssl_cycle(
-    launcher: Path, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
     packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
 ) -> tuple[Package, ...]:
     cycle = openssl_cycle_packages(packages, architecture)
@@ -598,7 +604,7 @@ def record_pending_result(proof: Path, command: list[str], result: subprocess.Co
 
 
 def prove_base_cycle(
-    launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path, setpriv: Path,
+    launcher: Launcher, dpkg: Path, root: Path, cache: Path, evidence: Path, setpriv: Path,
 ) -> None:
     """A four-package pending oracle, never a pending operation on the full closure."""
     if os.uname().machine != "x86_64" or database_packages(root):
@@ -764,7 +770,7 @@ def package_status(root: Path, selector: str, environment: dict[str, str]) -> st
 
 
 def interrupt_postinst(
-    launcher: Path,
+    launcher: Launcher,
     dpkg: Path,
     root: Path,
     architecture: str,
@@ -831,7 +837,7 @@ def interrupt_postinst(
 
 
 def capture_prestate(
-    launcher: Path,
+    launcher: Launcher,
     dpkg: Path,
     root: Path,
     architecture: str,
@@ -874,7 +880,7 @@ def capture_prestate(
 
 
 def install(
-    launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path,
+    launcher: Launcher, dpkg: Path, root: Path, cache: Path, evidence: Path,
     architecture: str, prestates: tuple[Prestate, ...] = (),
 ) -> None:
     packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
@@ -1062,6 +1068,7 @@ def main() -> None:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--prove-base-cycle", type=Path, metavar="SIGNED_SETPRIV")
     parser.add_argument("--launcher", type=Path)
+    parser.add_argument("--runtime", type=Path)
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument(
@@ -1075,20 +1082,21 @@ def main() -> None:
     if args.report_only:
         report(args.root, args.cache, args.evidence)
         return
-    if args.dpkg is None or args.launcher is None or not args.dpkg.is_absolute():
-        raise ValueError("reference launcher and pinned dpkg are required")
+    if args.dpkg is None or args.launcher is None or args.runtime is None or not args.dpkg.is_absolute():
+        raise ValueError("reference launcher, authenticated runtime and pinned dpkg are required")
     protected(args.launcher)
     protected(args.dpkg)
+    protected(args.runtime, directory=True)
     protected(args.cache, directory=True)
     protected(args.evidence, directory=True)
     if args.prove_base_cycle is not None:
         if args.architecture != "amd64" or args.prestate:
             raise CycleRefusal("CycleProofPrestate: requires amd64 and no capture targets")
-        prove_base_cycle(args.launcher, args.dpkg, args.root, args.cache, args.evidence,
+        prove_base_cycle(Launcher(args.launcher, args.runtime), args.dpkg, args.root, args.cache, args.evidence,
                          args.prove_base_cycle)
         return
     install(
-        args.launcher, args.dpkg, args.root, args.cache, args.evidence,
+        Launcher(args.launcher, args.runtime), args.dpkg, args.root, args.cache, args.evidence,
         args.architecture, tuple(args.prestate),
     )
 

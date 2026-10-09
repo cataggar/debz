@@ -2069,7 +2069,8 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_debian_closure_inventory_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
+        "run_debian_closure_inventory_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
     "workload_production": ("test-workload-production", (
@@ -2771,7 +2772,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     '    echo "negative-$name launched before refusing" >&2',
     'step proof 0 "executed without skips" timeout --signal=TERM --kill-after=60s 45m \\',
     '"${zenv[@]}" "$zig" build test-real-snapshot-reference-protected "${proof_arguments[@]}" \\',
-    "[[ ${#proof_arguments[@]} == 13 ]]",
+    "[[ ${#proof_arguments[@]} == 15 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/prepare-native-dpkg.py": (

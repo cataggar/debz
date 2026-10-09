@@ -95,6 +95,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 require_protected_file "$script_path"
 require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
+require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
 require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
 # The staged toolchain lives outside the fixed PATH above, so the caller names
 # it and it is verified like every other root-trusted input: it compiles the
@@ -265,6 +266,13 @@ launcher=$tools/reference-launcher
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
 require_protected_file "$launcher"
+"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+  --cache-dir "$tools/zig-cache" --global-cache-dir "$tools/zig-global-cache" \
+  --prefix "$tools/runtime-tool"
+runtime=$tools/reference-runtime
+"$tools/runtime-tool/bin/debz-reference-runtime" record \
+  amd64 "$lock" "$cache" "$pinned" "$runtime"
+cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
 
 # This oracle has only the four reviewed packages registered. Its one possible
 # libc6 callback is denied before exec; --pending is never used on the closure.
@@ -283,7 +291,7 @@ env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 5m \
   python3 tools/real-snapshot-reference-order.py \
-    --launcher "$launcher" --architecture amd64 \
+    --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prove-base-cycle "$tools/setpriv"
 [[ -s "$evidence/base-cycle-proof/comparison.json" ]]
@@ -293,7 +301,7 @@ if [[ $purpose == python3 ]]; then
     unshare --mount --propagation private -- \
     timeout --signal=TERM --kill-after=30s 20m \
     python3 -B tools/real-snapshot-reference-order.py \
-      --launcher "$launcher" --architecture amd64 \
+      --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
       --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
       --prestate "python3:amd64=unpacked:$prestates/python3"
   [[ $(cat "$prestates/prestates.tsv") == \
@@ -307,7 +315,7 @@ env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 20m \
   python3 tools/real-snapshot-reference-order.py \
-    --launcher "$launcher" --architecture amd64 \
+    --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prestate "systemd:amd64=half-configured:$prestates/systemd" \
     --prestate "udev:amd64=half-configured:$prestates/udev" \

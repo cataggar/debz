@@ -49,6 +49,7 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="debz-reference-negative-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.launcher = ORDER.Launcher(self.root / "launcher", self.root / "runtime")
 
     def retained_list(self, name: str, architecture: str) -> tuple[bytes, bytes]:
         manifest = json.loads((TOOLS / "fixtures/real-snapshot/pin-v1.json").read_text())
@@ -541,6 +542,8 @@ class ReferenceLauncherTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(TOOLS / "test_real_snapshot_reference_protected.py"),
              "--launcher", str(self.root / "launcher"),
+             "--runtime", str(self.root / "runtime"),
+             "--runtime-tool", str(self.root / "runtime-tool"),
              "--dpkg", str(self.root / "dpkg"),
              "--root-template", str(self.root / "root"),
              "--workspace", str(self.root / "workspace"),
@@ -658,11 +661,12 @@ class ReferenceLauncherTests(unittest.TestCase):
             "demo", "1", "amd64", "a" * 128, 42, self.root / "package.deb",
         )
         command = ORDER.dpkg_command(
-            self.root / "launcher", self.root / "dpkg", self.root / "root",
+            self.launcher, self.root / "dpkg", self.root / "root",
             "amd64", "none", "unpack", package,
         )
         self.assertEqual(command[3:7], ["amd64", "none", "unpack", "demo:amd64"])
-        self.assertEqual(command[7:], [str(package.archive), package.digest, "42"])
+        self.assertEqual(command[7], str(self.launcher.runtime))
+        self.assertEqual(command[8:], [str(package.archive), package.digest, "42"])
         self.assertNotIn("--pending", command)
 
     def test_trigger_verbs_refuse_without_a_triggered_script_profile(self) -> None:
@@ -673,7 +677,7 @@ class ReferenceLauncherTests(unittest.TestCase):
 
         def command(profile: str, verb: str, selected: ORDER.Package = package) -> list[str]:
             return ORDER.dpkg_command(
-                self.root / "launcher", self.root / "dpkg", self.root / "root",
+                self.launcher, self.root / "dpkg", self.root / "root",
                 "amd64", profile, verb, selected,
             )
 
@@ -687,7 +691,7 @@ class ReferenceLauncherTests(unittest.TestCase):
             command("sudo", "triggers_pending")
         with self.assertRaisesRegex(ValueError, "requires one signed package"):
             ORDER.dpkg_command(
-                self.root / "launcher", self.root / "dpkg", self.root / "root",
+                self.launcher, self.root / "dpkg", self.root / "root",
                 "amd64", "none", "configure",
             )
         with self.assertRaisesRegex(ValueError, "missing exact configure profile"):
@@ -708,7 +712,7 @@ class ReferenceLauncherTests(unittest.TestCase):
             command("sudo", "probe_configure")
         with self.assertRaisesRegex(ValueError, "unauthorized reference script profile"):
             ORDER.dpkg_command(
-                self.root / "launcher", self.root / "dpkg", self.root / "root",
+                self.launcher, self.root / "dpkg", self.root / "root",
                 "arm64", "sudo", "configure", package,
             )
 
@@ -729,6 +733,72 @@ class ReferenceLauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "size changed"):
                 ORDER.verify_archive(package)
 
+    def test_runtime_mutation_negatives_reach_checks_using_workspace_rooted_writes(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "debz_reference_protected_fixture",
+            TOOLS / "test_real_snapshot_reference_protected.py",
+        )
+        assert spec and spec.loader
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        original = b"original library bytes"
+        bindings = [
+            {"name": name, "root_path": f"/usr/lib/{name}"}
+            for name in ("loader.so", "libpcre2-8.so.0")
+        ]
+        for binding in bindings:
+            (runtime / binding["name"]).write_bytes(original)
+        (runtime / "binding.json").write_text(json.dumps({
+            "loader": "loader.so", "objects": bindings,
+        }))
+        workspace = self.root / "proof"
+        workspace.mkdir()
+
+        def fresh(template: Path, destination: Path, name: str) -> Path:
+            root = destination / f"{name}-root"
+            (root / "usr/lib").mkdir(parents=True)
+            (root / "var/lib/dpkg").mkdir(parents=True)
+            (root / "var/lib/dpkg/status").write_bytes(b"")
+            (root / "etc").mkdir()
+            for binding in bindings:
+                (root / binding["root_path"].lstrip("/")).write_bytes(original)
+            return root
+
+        def operation(directory: Path, name: str, *arguments, **keywords) -> tuple[int, str]:
+            if name.endswith("unbound-preload"):
+                return 1, "UnboundRuntimePreload"
+            if name.endswith(("missing", "symlink")):
+                return 1, "RuntimeInputRefused"
+            return 1, "RuntimeDigestChanged"
+
+        args = proof.argparse.Namespace(
+            runtime=runtime, workspace=workspace, root_template=self.root,
+            launcher=self.root / "launcher", dpkg=self.root / "dpkg",
+            runtime_tool=self.root / "runtime-tool", architecture="amd64",
+            archive=self.root / "package.deb", archive_sha512="a" * 128,
+            archive_size=42,
+        )
+        with (
+            mock.patch.object(proof, "fresh_root", side_effect=fresh),
+            mock.patch.object(proof, "protected_directory"),
+            mock.patch.object(proof, "operation", side_effect=operation),
+            mock.patch.object(proof, "assert_teardown", return_value={}),
+            mock.patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, b"", b"RuntimeSourceChanged; no dpkg or script executed",
+            )),
+        ):
+            proof.prove_runtime(args, "a" * 64)
+        for binding in bindings:
+            name = binding["name"]
+            self.assertEqual((runtime / name).read_bytes(), original)
+            changed = bytes([original[0] ^ 1]) + original[1:]
+            self.assertEqual((workspace / f"runtime-{name}-altered-root/usr/lib/{name}").read_bytes(), changed)
+            self.assertEqual((workspace / f"runtime-{name}-private-altered-prefix/{name}").read_bytes(), changed)
+        report = json.loads((workspace / "runtime-preflight-proof.json").read_text())
+        self.assertEqual(len(report["cases"]), 11)
+
     def test_configured_closure_cannot_route_unbound_trigger_action(self) -> None:
         package = ORDER.Package("fixture", "1", "amd64", "a" * 128, 42,
                                 self.root / "fixture.deb")
@@ -743,7 +813,7 @@ class ReferenceLauncherTests(unittest.TestCase):
             mock.patch.object(ORDER, "apply") as applied,
         ):
             with self.assertRaisesRegex(RuntimeError, "no exact triggered postinst identity"):
-                ORDER.install(self.root / "launcher", self.root / "dpkg",
+                ORDER.install(self.launcher, self.root / "dpkg",
                               self.root, self.root / "cache", evidence, "amd64")
         self.assertEqual([args.args[0][5] for args in applied.call_args_list],
                          ["unpack", "configure"])
@@ -891,7 +961,8 @@ class ReferenceLauncherTests(unittest.TestCase):
             mock.patch.object(ORDER.subprocess, "check_output", return_value=control.getvalue()),
             mock.patch.object(ORDER.subprocess, "run", side_effect=run),
         ):
-            ORDER.prove_base_cycle(tools / "launcher", dpkg, image, tools, evidence, setpriv)
+            ORDER.prove_base_cycle(ORDER.Launcher(tools / "launcher", tools / "runtime"),
+                                   dpkg, image, tools, evidence, setpriv)
         return evidence / "base-cycle-proof"
 
     def test_pending_oracle_stages_helper_runtime_without_registering_or_widening_candidate(self) -> None:
@@ -959,12 +1030,12 @@ class ReferenceLauncherTests(unittest.TestCase):
 
     def test_cycle_operation_requires_exact_four_archives_and_dedicated_profile(self) -> None:
         cycle, _, _ = self.cycle_fixture()
-        command = ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg",
+        command = ORDER.dpkg_command(self.launcher, self.root / "dpkg",
                                      self.root, "amd64", ORDER.BASE_CYCLE_PROFILE,
                                      "break_base_cycle", cycle[1], cycle)
         self.assertEqual(command[3:7],
                          ["amd64", "libgcc_cycle", "break_base_cycle", "libgcc-s1:amd64"])
-        self.assertEqual(command[7:], [str(p.archive) for p in cycle])
+        self.assertEqual(command[8:], [str(p.archive) for p in cycle])
         for architecture, profile, selected, archives in (
             ("arm64", "libgcc_cycle", cycle[1], cycle),
             ("amd64", "none", cycle[1], cycle),
@@ -973,7 +1044,7 @@ class ReferenceLauncherTests(unittest.TestCase):
         ):
             with self.subTest(architecture=architecture, profile=profile, selected=selected.name):
                 with self.assertRaises(ORDER.CycleRefusal):
-                    ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg",
+                    ORDER.dpkg_command(self.launcher, self.root / "dpkg",
                                        self.root, architecture, profile, "break_base_cycle",
                                        selected, archives)
         with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleIdentityChanged"):
@@ -1002,7 +1073,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                 record[field] = changed
                 with self.subTest(name=name, field=field):
                     with self.assertRaisesRegex(ORDER.CycleRefusal, reason):
-                        ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+                        ORDER.break_base_cycle(self.launcher, self.root / "dpkg",
                                                self.root, self.root, "amd64", list(cycle),
                                                {}, self.root / "out", self.root / "err")
                 record.clear()
@@ -1037,7 +1108,7 @@ class ReferenceLauncherTests(unittest.TestCase):
         with (mock.patch.object(ORDER, "verify_base_cycle", return_value=before),
               mock.patch.object(ORDER, "database_fields", return_value=after),
               mock.patch.object(ORDER, "apply") as applied):
-            selected = ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+            selected = ORDER.break_base_cycle(self.launcher, self.root / "dpkg",
                                               self.root, self.root, "amd64", list(cycle),
                                               {}, self.root / "out", self.root / "err")
             self.assertEqual(selected, cycle[1])
@@ -1046,7 +1117,7 @@ class ReferenceLauncherTests(unittest.TestCase):
             self.assertEqual(evidence["callbacks"], [])
             after[("libc6", "amd64")]["status"] = "install ok installed"
             with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
-                ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+                ORDER.break_base_cycle(self.launcher, self.root / "dpkg",
                                        self.root, self.root, "amd64", list(cycle),
                                        {}, self.root / "out", self.root / "err")
 
@@ -1060,14 +1131,14 @@ class ReferenceLauncherTests(unittest.TestCase):
               mock.patch.object(ORDER, "apply"),
               mock.patch.object(ORDER, "break_base_cycle", return_value=cycle[1]) as breaker):
             with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
-                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                ORDER.install(self.launcher, self.root / "dpkg", self.root,
                               self.root / "cache", self.root, "amd64")
         breaker.assert_called_once()
 
     def test_openssl_operation_refuses_different_selectors_archives_and_profiles(self) -> None:
         cycle, _, _ = self.cycle_fixture(openssl=True)
         command = ORDER.dpkg_command(
-            self.root / "launcher", self.root / "dpkg", self.root, "amd64",
+            self.launcher, self.root / "dpkg", self.root, "amd64",
             "openssl_cycle", "configure_openssl_cycle", cycle[0], cycle,
         )
         self.assertEqual(command[3:7],
@@ -1083,7 +1154,7 @@ class ReferenceLauncherTests(unittest.TestCase):
             with self.subTest(architecture=architecture, profile=profile, selected=selected.name):
                 with self.assertRaises(ORDER.CycleRefusal):
                     ORDER.dpkg_command(
-                        self.root / "launcher", self.root / "dpkg", self.root, architecture,
+                        self.launcher, self.root / "dpkg", self.root, architecture,
                         profile, "configure_openssl_cycle", selected, archives,
                     )
         changed = ORDER.Package(cycle[0].name, cycle[0].version, "amd64",
@@ -1119,7 +1190,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                 with self.subTest(name=name, field=field):
                     with self.assertRaisesRegex(ORDER.CycleRefusal, reason):
                         ORDER.configure_openssl_cycle(
-                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            self.launcher, self.root / "dpkg", self.root, self.root,
                             "amd64", list(cycle), {}, self.root / "out", self.root / "err",
                         )
                 record.clear()
@@ -1169,7 +1240,7 @@ class ReferenceLauncherTests(unittest.TestCase):
               mock.patch.object(ORDER, "trigger_database", return_value={}),
               mock.patch.object(ORDER, "apply") as applied):
             self.assertEqual(ORDER.configure_openssl_cycle(
-                self.root / "launcher", self.root / "dpkg", self.root, self.root, "amd64",
+                self.launcher, self.root / "dpkg", self.root, self.root, "amd64",
                 list(cycle), {}, self.root / "out", self.root / "err",
             ), cycle[:2])
             evidence = json.loads((self.root / "openssl-cycle-after.json").read_text())
@@ -1181,14 +1252,14 @@ class ReferenceLauncherTests(unittest.TestCase):
                 with self.subTest(name=name):
                     with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
                         ORDER.configure_openssl_cycle(
-                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            self.launcher, self.root / "dpkg", self.root, self.root,
                             "amd64", list(cycle), {}, self.root / "out", self.root / "err",
                         )
                 after[(name, "amd64")] = saved
             with mock.patch.object(ORDER, "trigger_database", return_value={"ldconfig": {}}):
                 with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
                     ORDER.configure_openssl_cycle(
-                        self.root / "launcher", self.root / "dpkg", self.root, self.root, "amd64",
+                        self.launcher, self.root / "dpkg", self.root, self.root, "amd64",
                         list(cycle), {}, self.root / "out", self.root / "err",
                     )
             applied.reset_mock()
@@ -1203,7 +1274,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                                        response if command[6] == selected.selector else probe(command)):
                     with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProbeChanged"):
                         ORDER.configure_openssl_cycle(
-                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            self.launcher, self.root / "dpkg", self.root, self.root,
                             "amd64", list(cycle), {}, self.root / "out", self.root / "err",
                         )
             applied.assert_not_called()
@@ -1252,11 +1323,11 @@ class ReferenceLauncherTests(unittest.TestCase):
                       mock.patch.object(ORDER, "capture_prestate", side_effect=capture),
                       mock.patch.object(ORDER, "apply", side_effect=apply)):
                     if captured_state == "half-configured":
-                        ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                        ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                       self.root, self.root, "amd64", targets)
                     else:
                         with self.assertRaisesRegex(ValueError, "captured prestate state/version changed"):
-                            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                            ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                           self.root, self.root, "amd64", targets)
                 if captured_state == "half-configured":
                     self.assertEqual(continuations, ["systemd:amd64", "udev:amd64"])
@@ -1339,11 +1410,11 @@ class ReferenceLauncherTests(unittest.TestCase):
                     targets = (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),) \
                         if capture_requested else ()
                     if capture_requested:
-                        ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                        ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                       self.root, self.root, "amd64", targets)
                     else:
                         with self.assertRaisesRegex(RuntimeError, "reference trigger closure refused"):
-                            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                            ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                           self.root, self.root, "amd64", targets)
                 self.assertEqual(configured, ["sudo-rs"] if capture_requested else ["sudo", "sudo-rs"])
                 self.assertEqual(captured.call_count, int(capture_requested))
@@ -1359,7 +1430,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                   mock.patch.object(ORDER, "packages_from_manifest", return_value=packages),
                   mock.patch.object(ORDER, "apply") as applied,
                   self.assertRaisesRegex(ValueError, "exact reviewed sudo-rs companion")):
-                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                ORDER.install(self.launcher, self.root / "dpkg", self.root,
                               self.root, self.root, "amd64",
                               (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),))
             applied.assert_not_called()
@@ -1387,7 +1458,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                   mock.patch.object(ORDER, "apply", side_effect=apply),
                   mock.patch.object(ORDER, "capture_prestate") as captured,
                   self.assertRaisesRegex(ValueError, "companion state/version changed")):
-                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                ORDER.install(self.launcher, self.root / "dpkg", self.root,
                               self.root, self.root, "amd64",
                               (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),))
             captured.assert_not_called()
@@ -1404,7 +1475,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                 package = ORDER.Package(name, version, architecture, "a" * 128, 42,
                                         self.root / f"{name}.deb")
                 with self.assertRaisesRegex(ValueError, "unauthorized"):
-                    ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg", self.root,
+                    ORDER.dpkg_command(self.launcher, self.root / "dpkg", self.root,
                                        architecture, profile, "continue_prestate", package)
 
     def test_openssl_cycle_resumes_single_package_capture_and_never_repeats_authority(self) -> None:
@@ -1440,7 +1511,7 @@ class ReferenceLauncherTests(unittest.TestCase):
               mock.patch.object(ORDER, "configure_openssl_cycle", side_effect=ssl_break) as ssl,
               mock.patch.object(ORDER, "apply") as applied,
               mock.patch.object(ORDER, "capture_prestate") as capture):
-            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root, self.root,
+            ORDER.install(self.launcher, self.root / "dpkg", self.root, self.root,
                           self.root, "amd64", (ORDER.Prestate(
                               target.selector, "half-configured", self.root / "saved"),))
             base.assert_called_once()
@@ -1455,7 +1526,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                                    (0, b"") if command[5] == "probe_unpack"
                                    else (1, b"dependency problems")):
                 with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
-                    ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                    ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                   self.root, self.root, "amd64")
             base.assert_called_once()
             ssl.assert_called_once()
@@ -1493,7 +1564,7 @@ class ReferenceLauncherTests(unittest.TestCase):
               mock.patch.object(ORDER, "break_base_cycle", side_effect=breaker) as break_cycle,
               mock.patch.object(ORDER, "apply") as applied,
               mock.patch.object(ORDER, "capture_prestate") as captured):
-            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+            ORDER.install(self.launcher, self.root / "dpkg", self.root,
                           self.root / "cache", self.root, "amd64",
                           (ORDER.Prestate(target.selector, "half-configured", self.root / "saved"),))
         break_cycle.assert_called_once()

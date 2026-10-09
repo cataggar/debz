@@ -4,8 +4,8 @@
 # dpkg 1.22.22, a script-free template whose loader, libraries and tar come
 # from an authenticated snapshot closure, a script-free proof archive, a
 # static escape-probe archive, on amd64 the signed systemd/udev/sudo postinsts
-# the launcher's proc profiles bind, and a new empty proof workspace. It does
-# not run the proof and never proves runtime binding (#263).
+# the launcher's proc profiles bind, and a new empty proof workspace. Staging
+# alone is not a runtime-binding or namespace-execution proof.
 set -euo pipefail
 umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
@@ -80,7 +80,8 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   exit 2
 }
 for input in tools/real-snapshot-reference-protected-stage.sh \
-  tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-escape-probe.zig \
+  tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
+  tools/real-snapshot-reference-escape-probe.zig \
   tools/prepare-native-dpkg.py tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
 done
@@ -346,6 +347,14 @@ probe=$workspace/escape-probe
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$probe"
 chmod 0500 "$launcher" "$probe"
+"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+  --cache-dir "$workspace/build/zig-cache" \
+  --global-cache-dir "$workspace/build/zig-global-cache" \
+  --prefix "$workspace/build/runtime-tool"
+runtime=$workspace/reference-runtime
+"$workspace/build/runtime-tool/bin/debz-reference-runtime" record \
+  "$architecture" "$lock" "$snapshot/cache" "$dpkg_prefix/usr/bin/dpkg" "$runtime"
+cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
 if readelf -l "$probe" | grep -q 'program interpreter'; then
   echo "the escape probe must be static" >&2
   exit 1
@@ -381,6 +390,8 @@ install -d -o root -g root -m 0700 "$workspace/proof"
 {
   printf -- '-Dreference-protected-launcher=%s\n' "$launcher"
   printf -- '-Dreference-protected-dpkg=%s\n' "$dpkg_prefix/usr/bin/dpkg"
+  printf -- '-Dreference-protected-runtime=%s\n' "$runtime"
+  printf -- '-Dreference-protected-runtime-tool=%s\n' "$workspace/build/runtime-tool/bin/debz-reference-runtime"
   printf -- '-Dreference-protected-root-template=%s\n' "$template"
   printf -- '-Dreference-protected-workspace=%s\n' "$workspace/proof"
   printf -- '-Dreference-protected-archive=%s\n' "$proof_archive"
