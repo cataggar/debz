@@ -1292,6 +1292,10 @@ pub fn build(b: *std.Build) void {
         trigger_zig.addArg("--byte-order-only");
         trigger_oracle_zig.addArg("--byte-order-only");
     }
+    if (b.option(bool, "native-trigger-multi-handler-only", "Select deferred explicit and awaited file multi-handler cases") orelse false) {
+        trigger_zig.addArg("--multi-handler-only");
+        trigger_oracle_zig.addArg("--multi-handler-only");
+    }
     const settlement_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
