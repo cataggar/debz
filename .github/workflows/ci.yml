@@ -1857,6 +1857,17 @@ jobs:
                 prestate-build/evidence/base-cycle-proof/pending-status.json \
                 prestate-build/evidence/base-cycle-proof/callback-refusal.log \
                 compare/systemd.json compare/udev.json compare/sudo.json \
+                native/systemd/var/log/dpkg.log native/udev/var/log/dpkg.log \
+                native/sudo/var/log/dpkg.log \
+                native/systemd/var/lib/dpkg/status native/udev/var/lib/dpkg/status \
+                native/sudo/var/lib/dpkg/status \
+                native/systemd/var/lib/dpkg/status-old native/udev/var/lib/dpkg/status-old \
+                native/sudo/var/lib/dpkg/status-old \
+                proofs/systemd/var/lib/dpkg/status proofs/udev/var/lib/dpkg/status \
+                proofs/sudo/var/lib/dpkg/status \
+                proofs/systemd/var/lib/dpkg/status-old proofs/udev/var/lib/dpkg/status-old \
+                proofs/sudo/var/lib/dpkg/status-old \
+                native/udev/etc/group proofs/udev/etc/group \
                 proofs/systemd/var/log/dpkg.log proofs/udev/var/log/dpkg.log \
                 proofs/sudo/var/log/dpkg.log proofs/sudo/var/log/alternatives.log \
                 native/sudo/var/log/alternatives.log; do

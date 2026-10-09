@@ -807,6 +807,15 @@ do not satisfy those gates.
 The restored `signed-proc-protected-replay` job runs both Debug and ReleaseSafe,
 with the historical protected staging, non-skipped signed systemd/udev/sudo
 proofs and native replays, comparison, refusal mutations and bounded evidence.
+The signed udev static-node rule names the `kvm` group; the replay checks
+`dev/kvm` against that unique named entry in the disposable root's `etc/group`,
+not a bootstrap-specific allocated GID. Modes and the PID-only proc contract
+remain unchanged. Comparison uses the current authenticated snapshot dpkg and
+setpriv byte identities. The pinned proof may append only the exact target's
+configure sequence and version to the byte-identical inherited dpkg log;
+changed, truncated or reordered history remains a refusal. Raw native/proof
+`status`/`status-old`, udev group databases and both dpkg log histories are retained as
+bounded diagnostic evidence, not rewritten or substituted for proof.
 Before the full prestate install, a fresh **four-package** fixture reproduces
 both single-configure refusals and compares this callback-free transition with
 protected real pinned `dpkg --no-triggers --configure --pending`. Its only
