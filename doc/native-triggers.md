@@ -178,6 +178,47 @@ expectation, including exact pending names and awaiting edges. Missing,
 extra, or reordered edges and unrelated package identity/version/selection
 changes remain mismatches; derived mode is not permission to accept any
 pending state.
+Before publishing derived status, native execution checks each selection it
+would publish against that bound closure. A maintainer-script selection change
+requires recovery without rewriting status or status-old; trigger publication
+does not silently restore the authorized selection and conceal the drift.
+An unchanged authorized hold is retained.
+
+The input base digest must match the caller's exact closure before
+authorization canonicalizes package order. The returned authority rebinds
+that already-validated closure to its canonical order, so adding a source
+before an installed handler in the name order cannot invalidate deferred
+derivation or its persisted recovery authority. A wrong input digest still
+refuses; no handler, activation, or package transition is newly authorized.
+
+`zig build test-native-triggers-zig test-native-triggers-zig-oracle
+-Dnative-trigger-multi-handler-only=true -Dnative-reference-dpkg=/absolute/pinned/dpkg
+-Doptimize=Debug -j2` selects two natively installed handlers: explicit
+no-await interest and awaited file interest. The original source name and a
+source that sorts before both handlers run with recovery on/off. Case 1
+remains in the existing full suite, outside this focused selector. The fixture
+requires exact pinned-dpkg `--no-triggers` status bytes and pending/awaited
+edges, eventual native `process_triggers` settlement, exact per-handler
+callback argv, and an unchanged zero-action upgrade including database and
+provenance bytes/mtimes. It also interrupts after deferred status publication:
+clean recovery must not replay scripts or rewrite status, and pending-field
+drift must retain recovery evidence with `managed_state_changed`.
+The native selector also requires a scripted unrelated selection change to
+retain the changed status, report `recovery_required/final_closure_mismatch`
+with its exact program binding, and block subsequent mutation.
+Repeat with `-Doptimize=ReleaseSafe`.
+
+This fixture does **not** establish dpkg's cross-handler `--pending` scheduling
+order. The reference settlement explicitly selects both handlers with
+`--no-triggers --triggers-only zero-trigger-handler zero-file-handler`;
+dpkg processes that selected list in reverse, matching the native fixture's
+file-then-explicit callback order. Traces are compared without reordering or
+normalization. Generic pending-handler scheduling remains a separate
+compatibility question; hosted isolated-runtime acceptance remains required.
+Unprivileged authorization and unpack tests also require the same canonical
+base and exact derived edges before and after serialization, and reject a
+wrong input digest, changed closure, unknown activation or unbound handler.
+Those tests do not execute the genuine callbacks or replace protected CI.
 
 ## Private activation helper
 

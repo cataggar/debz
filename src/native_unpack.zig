@@ -18041,8 +18041,16 @@ fn lifecyclePublishDerivedFinalState(
             .outcome = .refused,
             .detail = "derived_trigger_package_missing",
         };
+        if (record.status.want != lifecycleFinalPackageWant(package)) {
+            try attempt.requireRecovery(allocator, .verification);
+            return .{
+                .outcome = .recovery_required,
+                .detail = "final_closure_mismatch",
+            };
+        }
         try updates.append(allocator, .{
             .package = record.identity(),
+            .want = record.status.want,
             .current = switch (package.state) {
                 .installed => .installed,
                 .triggers_pending => .triggers_pending,
@@ -18631,7 +18639,11 @@ fn lifecycleRunTriggerWork(
                 policy,
                 activation_log.items,
             );
-            if (lifecycleMaterializationFailure(derived)) |failure| return failure;
+            if (lifecycleMaterializationFailure(derived)) |failure| return .{
+                .outcome = failure.outcome,
+                .detail = failure.detail,
+                .program_sha256 = program.digest_sha256,
+            };
             if (execution.recovery) |runtime|
                 runtime.crash.hit(.after_deferred_trigger_status_publication);
         }
@@ -27141,11 +27153,13 @@ fn lifecycleFinalPackageMatches(
             record.triggers_awaited,
         ))
         return false;
-    return if (expected.dpkg_selection_hold)
-        record.status.want == .hold
-    else switch (expected.state) {
-        .installed, .triggers_pending, .triggers_awaited => record.status.want == .install,
-        .config_files => record.status.want == .deinstall,
+    return record.status.want == lifecycleFinalPackageWant(expected);
+}
+
+fn lifecycleFinalPackageWant(expected: native_authorization.FinalPackage) package_database.Want {
+    return if (expected.dpkg_selection_hold) .hold else switch (expected.state) {
+        .installed, .triggers_pending, .triggers_awaited => .install,
+        .config_files => .deinstall,
     };
 }
 
@@ -35839,6 +35853,286 @@ test "native_unpack.test.failed script incorporation cannot schedule an unpacked
     ));
 }
 
+test "native_unpack.test.deferred two-handler derivation binds a canonical source-before-handler closure" {
+    const source_name = "zero-file-activator";
+    const final_state = [_]native_authorization.FinalPackage{
+        .{ .name = "zero-trigger-handler", .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false },
+        .{ .name = "zero-file-handler", .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false },
+        .{ .name = source_name, .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false },
+    };
+    const handlers = [_]native_authorization.TriggerHandler{
+        .{
+            .package = "zero-trigger-handler",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .postinst_sha256 = @as([32]u8, @splat(0x11)),
+            .declarations_sha256 = @splat(0x12),
+        },
+        .{
+            .package = "zero-file-handler",
+            .version = "1",
+            .architecture = "amd64",
+            .source = .installed_package,
+            .postinst_sha256 = @as([32]u8, @splat(0x21)),
+            .declarations_sha256 = @splat(0x22),
+        },
+    };
+    var owned = try native_authorization.create(testing.allocator, .{
+        .backend = .native,
+        .target_architecture = "amd64",
+        .install_root = "/srv/root",
+        .request_sha256 = @splat(1),
+        .solver_policy_sha256 = @splat(2),
+        .executor_policy_sha256 = @splat(3),
+        .plan_sha256 = @splat(4),
+        .exact_lock = .{ .schema = exact_lock_v2.schema_id, .version = exact_lock_v2.schema_version, .digest_sha256 = @splat(5) },
+        .policy = .{ .conffile = .keep_existing },
+        .actions = &.{.{
+            .sequence = 0,
+            .kind = .install,
+            .package = source_name,
+            .version = "1",
+            .architecture = "amd64",
+            .prior_version = null,
+            .artifact = .{
+                .sha256 = @splat(0x31),
+                .size = 1,
+                .origin = .{ .authenticated_repository = .{
+                    .repository_id = @splat('a'),
+                    .repository_snapshot_sha256 = @splat(0x32),
+                } },
+            },
+        }},
+        .final_state = &final_state,
+        .trigger_authority = .{
+            .mode = .transaction,
+            .defer_triggers = true,
+            .initial_state_sha256 = @splat(0x33),
+            .handlers = &handlers,
+            .callers = &.{},
+            .allowed_triggers = &.{ "debz-zero-trigger", "/usr/share/debz-zero-files" },
+            .maximum_invocations = 2,
+            .final_mode = .derive_from_activations,
+            .base_final_state_sha256 = native_authorization.finalStateDigest(&final_state),
+            .maximum_activations = 2,
+        },
+    });
+    defer owned.deinit();
+    const bytes = try owned.authorization.canonicalJson(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var decoded = try native_authorization.decode(testing.allocator, bytes, native_authorization.maximum_document_bytes);
+    defer decoded.deinit();
+    const named_listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "debz-zero-trigger",
+        .package = .{ .name = "zero-trigger-handler", .architecture = "" },
+        .await_mode = .noawait,
+    }};
+    const file_listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "/usr/share/debz-zero-files",
+        .package = .{ .name = "zero-file-handler", .architecture = "" },
+        .await_mode = .awaited,
+    }};
+    const events = [_]RuntimeTriggerEvent{
+        .{
+            .origin = .automatic,
+            .source = .{ .name = source_name, .architecture = "amd64" },
+            .trigger = "/usr/share/debz-zero-files",
+            .activation_awaits = true,
+            .listeners = &file_listeners,
+        },
+        .{
+            .origin = .automatic,
+            .source = .{ .name = source_name, .architecture = "amd64" },
+            .trigger = "debz-zero-trigger",
+            .activation_awaits = false,
+            .listeners = &named_listeners,
+        },
+    };
+    const initial_model: package_database.Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .packages = &.{},
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]native_authorization.Authorization{ owned.authorization, decoded.authorization }) |authorization| {
+        const derived = try deriveDeferredFinalState(arena.allocator(), authorization, initial_model, &events);
+        try testing.expectEqualStrings(source_name, derived[0].name);
+        try testing.expectEqual(native_authorization.FinalState.triggers_awaited, derived[0].state);
+        try testing.expectEqual(@as(usize, 0), derived[0].triggers_pending.len);
+        try testing.expectEqual(@as(usize, 1), derived[0].triggers_awaited.len);
+        try testing.expectEqualStrings("zero-file-handler", derived[0].triggers_awaited[0]);
+        for (derived[1..], [_][]const u8{ "/usr/share/debz-zero-files", "debz-zero-trigger" }) |handler, trigger| {
+            try testing.expectEqual(native_authorization.FinalState.triggers_pending, handler.state);
+            try testing.expectEqual(@as(usize, 0), handler.triggers_awaited.len);
+            try testing.expectEqual(@as(usize, 1), handler.triggers_pending.len);
+            try testing.expectEqualStrings(trigger, handler.triggers_pending[0]);
+        }
+    }
+}
+
+test "native_unpack.test.deferred publication preserves bound selections and refuses script drift" {
+    for ([_]enum { installed, hold_added, hold_removed, held }{ .installed, .hold_added, .hold_removed, .held }) |selected| {
+        const held = selected == .held or selected == .hold_removed;
+        const drift = selected == .hold_added or selected == .hold_removed;
+        const status = try std.fmt.allocPrint(testing.allocator, "Package: debz-trigger-receiver\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n\n" ++
+            "Package: debz-trigger-unrelated\nStatus: {s} ok installed\nVersion: 1\nArchitecture: amd64\n\n" ++
+            "Package: debz-trigger-source\nStatus: install ok installed\nVersion: 1\nArchitecture: amd64\n\n", .{if (held) "hold" else "install"});
+        defer testing.allocator.free(status);
+        var fixture: Fixture = undefined;
+        try fixture.init(status, &.{
+            .{ .name = "debz-trigger-receiver.list", .bytes = "/.\n" },
+            .{ .name = "debz-trigger-unrelated.list", .bytes = "/.\n" },
+            .{ .name = "debz-trigger-source.list", .bytes = "/.\n" },
+        });
+        defer fixture.deinit();
+        const root = fixture.root();
+        var database = try fixture.database();
+        defer database.deinit();
+        var root_buffer: [4096]u8 = undefined;
+        const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+        const final_state = [_]native_authorization.FinalPackage{
+            .{ .name = "debz-trigger-receiver", .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false },
+            .{ .name = "debz-trigger-unrelated", .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = held },
+            .{ .name = "debz-trigger-source", .version = "1", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false },
+        };
+        var owned = try native_authorization.create(testing.allocator, .{
+            .backend = .native,
+            .target_architecture = "amd64",
+            .install_root = install_root,
+            .request_sha256 = @splat(0),
+            .solver_policy_sha256 = @splat(0),
+            .executor_policy_sha256 = @splat(0),
+            .plan_sha256 = @splat(0),
+            .exact_lock = .{ .schema = exact_lock_v2.schema_id, .version = exact_lock_v2.schema_version, .digest_sha256 = @splat(0) },
+            .policy = .{ .conffile = .keep_existing },
+            .actions = &.{.{
+                .sequence = 0,
+                .kind = .install,
+                .package = "debz-trigger-source",
+                .version = "1",
+                .architecture = "amd64",
+                .prior_version = null,
+                .artifact = .{
+                    .sha256 = @splat(0x31),
+                    .size = 1,
+                    .origin = .{ .authenticated_repository = .{
+                        .repository_id = @splat('a'),
+                        .repository_snapshot_sha256 = @splat(0x32),
+                    } },
+                },
+            }},
+            .final_state = &final_state,
+            .trigger_authority = .{
+                .mode = .transaction,
+                .defer_triggers = true,
+                .initial_state_sha256 = @splat(0x33),
+                .handlers = &.{},
+                .callers = &.{},
+                .allowed_triggers = &.{},
+                .maximum_invocations = 1,
+                .final_mode = .derive_from_activations,
+                .base_final_state_sha256 = native_authorization.finalStateDigest(&final_state),
+                .maximum_activations = 1,
+            },
+        });
+        defer owned.deinit();
+        const authority_bytes = try owned.authorization.canonicalJson(testing.allocator);
+        defer testing.allocator.free(authority_bytes);
+        var decoded = try native_authorization.decode(testing.allocator, authority_bytes, native_authorization.maximum_document_bytes);
+        defer decoded.deinit();
+        const authorization = &decoded.authorization;
+        try testing.expectEqualStrings("debz-trigger-source", authorization.final_state[1].name);
+        var program = testProgram(database.generation.sha256, database.model.packages.len, &.{}, &.{});
+        program.authorization_sha256 = hex(32, authorization.digest_sha256);
+        program.final_state_sha256 = hex(32, authorization.final_state_sha256);
+        program.trigger_authority = .{
+            .mode = .transaction,
+            .defer_triggers = true,
+            .initial_state_sha256 = hex(32, authorization.trigger_authority.?.initial_state_sha256),
+            .handlers = &.{},
+            .callers = &.{},
+            .allowed_triggers = &.{},
+            .maximum_invocations = 1,
+            .final_mode = .derive_from_activations,
+            .base_final_state_sha256 = hex(32, authorization.final_state_sha256),
+            .maximum_activations = 1,
+        };
+        _ = bindFixtureProgramRoot(&program, install_root);
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
+        var attempt = try coordinator.acquire(testing.allocator, .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .install },
+            .request_sha256 = @splat(0),
+            .policy_sha256 = @splat(0),
+            .evidence = try native_operation.evidence(program),
+            .target_architecture = "amd64",
+        });
+        defer attempt.release();
+        try attempt.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+        try attempt.markMutationStarted(testing.allocator, .script);
+        if (drift) {
+            const changed = try std.mem.replaceOwned(u8, testing.allocator, status, if (held) "Status: hold ok installed" else "Package: debz-trigger-unrelated\nStatus: install ok installed", if (held) "Status: install ok installed" else "Package: debz-trigger-unrelated\nStatus: hold ok installed");
+            defer testing.allocator.free(changed);
+            try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), changed, .{ .overwrite = .replace });
+        }
+        var before = try captureDatabaseSnapshot(testing.allocator, root, .{});
+        defer before.deinit();
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var execution: ExecutionState = .{};
+        var activation_log: std.ArrayList(RuntimeTriggerEvent) = .empty;
+        defer activation_log.deinit(arena.allocator());
+        const result = try lifecycleRunTriggerWork(
+            &execution,
+            testing.allocator,
+            arena.allocator(),
+            &activation_log,
+            root,
+            install_root,
+            &program,
+            authorization,
+            database.model,
+            locks.interface(),
+            &attempt,
+            .install,
+            .keep_existing,
+            0,
+            false,
+            false,
+        );
+        var after = try captureDatabaseSnapshot(testing.allocator, root, .{});
+        defer after.deinit();
+        errdefer std.debug.print("deferred selection {t}: {t}/{s}\nbefore:\n{s}after:\n{s}", .{
+            selected, result.outcome, result.detail, before.snapshot.status.bytes, after.snapshot.status.bytes,
+        });
+        if (drift) {
+            try testing.expectEqual(LifecycleOutcome.recovery_required, result.outcome);
+            try testing.expectEqualStrings("final_closure_mismatch", result.detail);
+            try testing.expectEqualSlices(u8, before.snapshot.status.bytes, after.snapshot.status.bytes);
+            try testing.expectEqualDeep(
+                try package_database.generation(testing.allocator, before.snapshot),
+                try package_database.generation(testing.allocator, after.snapshot),
+            );
+            try testing.expect(after.snapshot.status_old == null);
+            try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) == null);
+            try testing.expectEqual(root_operation.State.recovery_required, attempt.record().state);
+            try testing.expect(attempt.record().mutation_started);
+            try testing.expectEqual(program.digest_sha256, hex(32, attempt.record().program_sha256.?));
+            try testing.expectEqual(program.digest_sha256, result.program_sha256.?);
+        } else {
+            try testing.expectEqual(LifecycleOutcome.applied, result.outcome);
+            try testing.expect(try verifyLifecycleFinalClosure(testing.allocator, root, "amd64", authorization.final_state));
+        }
+        const authority_after = try authorization.canonicalJson(testing.allocator);
+        defer testing.allocator.free(authority_after);
+        try testing.expectEqualSlices(u8, authority_bytes, authority_after);
+    }
+}
+
 test "native_unpack.test.derived trigger closure rejects missing reordered and unrelated changes" {
     const final_state = [_]native_authorization.FinalPackage{
         .{
@@ -35981,6 +36275,24 @@ test "native_unpack.test.derived trigger closure rejects missing reordered and u
     );
     var derived_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer derived_arena.deinit();
+    tampered = authorization;
+    tampered.trigger_authority.?.allowed_triggers = &.{"debz-a"};
+    try testing.expectError(error.InvalidTriggerActivation, deriveDeferredFinalState(
+        derived_arena.allocator(),
+        tampered,
+        initial_model,
+        &events,
+    ));
+    var unknown_listeners = listeners;
+    unknown_listeners[0].package.name = "unbound-handler";
+    var unknown_handler_events = events;
+    unknown_handler_events[0].listeners = &unknown_listeners;
+    try testing.expectError(error.InvalidTriggerActivation, deriveDeferredFinalState(
+        derived_arena.allocator(),
+        authorization,
+        initial_model,
+        &unknown_handler_events,
+    ));
     const expected = try deriveDeferredFinalState(
         derived_arena.allocator(),
         authorization,
