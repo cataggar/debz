@@ -1456,16 +1456,19 @@ fn lowerAlphaNumeric(byte: u8) bool {
 /// `/dev/null`, captures bounded output, and terminates the whole script
 /// process group with SIGTERM/SIGKILL escalation and an exact reap.
 pub const SystemLauncher = struct {
+    boundary_probe: BoundaryProbe = empty_boundary_probe,
+
     pub fn interface(self: *SystemLauncher) Launcher {
         return .{ .context = self, .launchFn = launchInterface };
     }
 
     fn launchInterface(
-        _: *anyopaque,
+        context: *anyopaque,
         allocator: std.mem.Allocator,
         invocation: Invocation,
     ) anyerror!Execution {
-        return launch(allocator, invocation);
+        const self: *SystemLauncher = @ptrCast(@alignCast(context));
+        return launchConfigured(allocator, invocation, false, self.boundary_probe);
     }
 
     /// Exercises the complete helper/root setup without entering a script.
@@ -1486,7 +1489,7 @@ pub const SystemLauncher = struct {
             .limits = .{ .timeout_ms = 5_000 },
             .cancellation = cancellation,
             .helper_mount = mount,
-        }, true);
+        }, true, empty_boundary_probe);
     }
 };
 
@@ -1497,14 +1500,20 @@ const proc_mount_flags = linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV | li
 const proc_mask_flags = linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC;
 const close_range_cloexec = 4;
 
-fn launch(allocator: std.mem.Allocator, invocation: Invocation) !Execution {
-    return launchConfigured(allocator, invocation, false);
-}
+const TestBoundaryProbe = struct {
+    executable: i32,
+    argv: [*:null]const ?[*:0]const u8,
+    stdout_fd: ?i32 = null,
+};
+// The observer crosses exec in the restricted child before the unchanged signed script.
+const BoundaryProbe = if (builtin.is_test) ?TestBoundaryProbe else void;
+const empty_boundary_probe: BoundaryProbe = if (builtin.is_test) null else {};
 
 fn launchConfigured(
     allocator: std.mem.Allocator,
     invocation: Invocation,
     setup_only: bool,
+    boundary_probe: BoundaryProbe,
 ) !Execution {
     if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
@@ -1623,6 +1632,7 @@ fn launchConfigured(
         .helper_source = strings.helper_source,
         .helper_target = strings.helper_target,
         .setup_only = setup_only,
+        .boundary_probe = boundary_probe,
         .control_read = control_pipe[0],
         .control_write = control_pipe[1],
         .proc = if (invocation.snapshot_proc) |proc| switch (proc) {
@@ -1835,6 +1845,7 @@ const ChildDescriptor = struct {
     helper_source: ?[:0]const u8 = null,
     helper_target: ?[:0]const u8 = null,
     setup_only: bool = false,
+    boundary_probe: BoundaryProbe = empty_boundary_probe,
     control_read: i32 = -1,
     control_write: i32 = -1,
     proc: ?ProcDescriptor = null,
@@ -1984,6 +1995,12 @@ fn childMain(child: ChildDescriptor) noreturn {
     if (sealed != .SUCCESS)
         childFail(streams.status, .standard_streams, sealed);
     if (child.setup_only) linux.exit(0);
+    if (builtin.is_test) {
+        if (child.boundary_probe) |probe| {
+            if (executeBoundaryProbe(probe, child.envp) != .SUCCESS)
+                childFail(streams.status, .network_setup, .IO);
+        }
+    }
 
     // dpkg forces umask 022 process-wide (`lib/dpkg/program.c`
     // `dpkg_program_init`), so maintainer scripts never inherit the caller's
@@ -1991,6 +2008,36 @@ fn childMain(child: ChildDescriptor) noreturn {
     _ = linux.syscall1(.umask, script_umask);
     const executed = linux.errno(linux.execve(child.program.ptr, child.argv, child.envp));
     childFail(streams.status, .execute, executed);
+}
+
+fn executeBoundaryProbe(probe: TestBoundaryProbe, environment: [*:null]const ?[*:0]const u8) linux.E {
+    const forked = linux.fork();
+    const result = linux.errno(forked);
+    if (result != .SUCCESS) return result;
+    if (forked == 0) {
+        if (probe.stdout_fd) |fd| {
+            if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit(125);
+        }
+        _ = linux.syscall5(
+            .execveat,
+            @bitCast(@as(isize, probe.executable)),
+            @intFromPtr(@as([*:0]const u8, "")),
+            @intFromPtr(probe.argv),
+            @intFromPtr(environment),
+            linux.AT.EMPTY_PATH,
+        );
+        linux.exit(125);
+    }
+    var status: u32 = 0;
+    while (true) {
+        const waited = linux.waitpid(@intCast(forked), &status, 0);
+        switch (linux.errno(waited)) {
+            .INTR => continue,
+            .SUCCESS => break,
+            else => |err| return err,
+        }
+    }
+    return if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) .SUCCESS else .IO;
 }
 
 fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
@@ -5471,6 +5518,140 @@ fn signedProcFixture(value: ?[*:0]const u8, required: bool) ![]const u8 {
     return error.SkipZigTest;
 }
 
+const SignedNetworkProof = struct {
+    allocator: std.mem.Allocator,
+    executable: i32,
+    listener: i32,
+    unix_listener: i32,
+    inherited: i32,
+    port: [:0]u8,
+    name: [:0]u8,
+    descriptor: [:0]u8,
+    argv: [6]?[*:0]const u8,
+
+    fn init(allocator: std.mem.Allocator, mode: [*:0]const u8) !*SignedNetworkProof {
+        const path = std.c.getenv("DEBZ_SCRIPT_NETWORK_PROBE") orelse
+            return error.SignedNetworkProbeRequired;
+        const opened = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+        if (linux.errno(opened) != .SUCCESS) return error.SignedNetworkProbeRequired;
+        const executable: i32 = @intCast(opened);
+        errdefer _ = linux.close(executable);
+        var observed: linux.Statx = undefined;
+        if (helperStat(executable, &observed) != .SUCCESS or
+            observed.mode & 0o170000 != 0o100000 or observed.mode & 0o022 != 0 or
+            observed.nlink != 1)
+            return error.UnprotectedSignedNetworkProbe;
+        const listener = try openLoopbackListener();
+        errdefer _ = linux.close(listener.fd);
+        const name = try std.fmt.allocPrintSentinel(
+            allocator,
+            "debz365-{d}-{d}",
+            .{ linux.getpid(), monotonicMs() },
+            0,
+        );
+        errdefer allocator.free(name);
+        const unix_listener = try openAbstractUnixListener(name);
+        errdefer _ = linux.close(unix_listener);
+        var pipes: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipes, .{})) != .SUCCESS)
+            return error.TestSocketUnavailable;
+        defer closePipe(&pipes);
+        const duplicate = linux.fcntl(pipes[1], linux.F.DUPFD, 200);
+        if (linux.errno(duplicate) != .SUCCESS) return error.TestSocketUnavailable;
+        const inherited: i32 = @intCast(duplicate);
+        errdefer _ = linux.close(inherited);
+        const port = try std.fmt.allocPrintSentinel(allocator, "{d}", .{listener.port}, 0);
+        errdefer allocator.free(port);
+        const descriptor = try std.fmt.allocPrintSentinel(allocator, "{d}", .{inherited}, 0);
+        errdefer allocator.free(descriptor);
+        const self = try allocator.create(SignedNetworkProof);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .executable = executable,
+            .listener = listener.fd,
+            .unix_listener = unix_listener,
+            .inherited = inherited,
+            .port = port,
+            .name = name,
+            .descriptor = descriptor,
+            .argv = .{ "debz-signed-network-probe", mode, port, name, descriptor, null },
+        };
+        var host = self.argv;
+        host[1] = "host";
+        var output: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true })) != .SUCCESS)
+            return error.TestSocketUnavailable;
+        defer closePipe(&output);
+        if (executeBoundaryProbe(.{
+            .executable = executable,
+            .argv = @ptrCast(&host),
+            .stdout_fd = output[1],
+        }, &.{null}) != .SUCCESS)
+            return error.SignedNetworkHostControlFailed;
+        const expected = "DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n";
+        var receipt: [128]u8 = undefined;
+        if (linux.read(output[0], &receipt, receipt.len) != expected.len or
+            !std.mem.eql(u8, receipt[0..expected.len], expected))
+            return error.SignedNetworkHostControlFailed;
+        return self;
+    }
+
+    fn boundary(self: *const SignedNetworkProof) TestBoundaryProbe {
+        return .{ .executable = self.executable, .argv = @ptrCast(&self.argv) };
+    }
+
+    fn deinit(self: *SignedNetworkProof) void {
+        _ = linux.close(self.executable);
+        _ = linux.close(self.listener);
+        _ = linux.close(self.unix_listener);
+        _ = linux.close(self.inherited);
+        self.allocator.free(self.port);
+        self.allocator.free(self.name);
+        self.allocator.free(self.descriptor);
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
+    fn expectReceipt(report: *const Report, domain: []const u8) !void {
+        const receipt = if (std.mem.eql(u8, domain, "systemd"))
+            "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
+        else if (std.mem.eql(u8, domain, "udev"))
+            "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
+        else
+            return error.InvalidNetworkProofDomain;
+        try testing.expect(std.mem.indexOf(u8, report.stdout, receipt) != null);
+        const directory = std.c.getenv("DEBZ_SIGNED_NETWORK_PROOF_DIR") orelse
+            return error.SignedNetworkProofDirectoryRequired;
+        const path = try std.fmt.allocPrintSentinel(
+            testing.allocator,
+            "{s}/signed-network-{s}.proof",
+            .{ std.mem.span(directory), domain },
+            0,
+        );
+        defer testing.allocator.free(path);
+        const opened = linux.open(path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0o600);
+        if (linux.errno(opened) != .SUCCESS) return error.SignedNetworkProofPublicationFailed;
+        const fd: i32 = @intCast(opened);
+        defer _ = linux.close(fd);
+        const evidence = try std.fmt.allocPrint(
+            testing.allocator,
+            "domain={s}\nDEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n{s}",
+            .{ domain, receipt },
+        );
+        defer testing.allocator.free(evidence);
+        if (linux.write(fd, evidence.ptr, evidence.len) != evidence.len or
+            linux.errno(linux.fsync(fd)) != .SUCCESS)
+            return error.SignedNetworkProofPublicationFailed;
+    }
+};
+
 fn signedProcGroupId(groups: []const u8, name: []const u8) !u32 {
     var result: ?u32 = null;
     var lines = std.mem.splitScalar(u8, groups, '\n');
@@ -5512,6 +5693,21 @@ test "maintainer_script.test.required signed proc fixture never silently skips" 
     try testing.expectEqualStrings("/protected/prestate", try signedProcFixture("/protected/prestate", true));
 }
 
+test "maintainer_script.test.signed network observer verifies real reachable host controls" {
+    if (builtin.os.tag != .linux) return;
+    _ = try signedProcFixture(
+        std.c.getenv("DEBZ_SCRIPT_NETWORK_PROBE"),
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_PROC_ROOTS") != null,
+    );
+    const network = try SignedNetworkProof.init(testing.allocator, "systemd");
+    defer network.deinit();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(
+        network.inherited,
+        linux.F.GETFD,
+        0,
+    )));
+}
+
 test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
     if (builtin.os.tag != .linux) return;
     const root_path = try signedProcFixture(
@@ -5522,7 +5718,9 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
     defer root.close();
     var proc = try SnapshotSystemdProc.init(testing.allocator, root.root);
     defer proc.deinit();
-    var launcher: SystemLauncher = .{};
+    const network = try SignedNetworkProof.init(testing.allocator, "systemd");
+    defer network.deinit();
+    var launcher: SystemLauncher = .{ .boundary_probe = network.boundary() };
     var report = try run(testing.allocator, .{
         .root = root_path,
         .identity = .{
@@ -5545,6 +5743,7 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
         });
     try testing.expect(report.succeeded());
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try SignedNetworkProof.expectReceipt(&report, "systemd");
     try testing.expect((try root.root.entryIfExists(
         try root_fs.Path.init("proc/sys"),
     )) == null);
@@ -5561,7 +5760,9 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
     defer root.close();
     var proc = try SnapshotUdevProc.init(testing.allocator, root.root);
     defer proc.deinit();
-    var launcher: SystemLauncher = .{};
+    const network = try SignedNetworkProof.init(testing.allocator, "udev");
+    defer network.deinit();
+    var launcher: SystemLauncher = .{ .boundary_probe = network.boundary() };
     var report = try run(testing.allocator, .{
         .root = root_path,
         .identity = .{
@@ -5584,6 +5785,7 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
         });
     try testing.expect(report.succeeded());
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try SignedNetworkProof.expectReceipt(&report, "udev");
     try testing.expect((try root.root.entryIfExists(
         try root_fs.Path.init("proc/sys"),
     )) == null);

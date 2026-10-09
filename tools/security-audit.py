@@ -2070,6 +2070,7 @@ WORKLOAD_PARTITIONS = {
         "run_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
+        "run_script_network_probe_tests",
         "run_debian_closure_inventory_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
@@ -3555,6 +3556,15 @@ SIGNED_PROC_CI_STEPS = {
         "            'udev postinst uses only PID proc and applies static permissions' \\",
         "            'sudo postinst repairs only pinned alternatives with PID-only proc'; do",
         '            grep -Fq "maintainer_script.test.signed $name...OK" "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"',
+        '          for target in systemd udev; do',
+        '            sudo -n cat "$PROTECTED/checkout/.tmp/signed-network-$target.proof" >"$proof"',
+        '            grep -Fxq "domain=$target" "$proof"',
+        "            grep -Fxq 'DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open' \"$proof\"",
+        '            case "$target" in',
+        "              systemd) proc_net=private ;;",
+        "              udev) proc_net=absent ;;",
+        "              *) exit 1 ;;",
+        '            grep -Fxq "DEBZ_SIGNED_NETWORK_PROOF proc_net=$proc_net interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok" "$proof"',
     ),
     "Compare native replays with pinned dpkg proofs": (
         "        working-directory: ${{ env.PROTECTED }}/checkout",
@@ -3569,7 +3579,7 @@ SIGNED_PROC_CI_STEPS = {
         "            DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \\",
         '            sh "$PWD/.real-snapshot/ws/bindings.env" "$OPTIMIZE" \\',
         '          test "${status:-0}" -eq 0',
-        "          grep -Eq 'run test [0-9]+ pass, 3 skip \\([0-9]+ total\\)' "
+        "          grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\\.$' "
         '"$GITHUB_WORKSPACE/.tmp/signed-bindings.log"',
     ),
     "Copy bounded evidence and remove named protected roots": (

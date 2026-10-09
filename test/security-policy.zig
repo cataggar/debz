@@ -713,12 +713,18 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         .{ .before = "grep -Fxq 'All 4 tests passed.'", .after = "grep -Fq 'passed'" },
         .{ .before = "            'udev postinst uses only PID proc and applies static permissions' \\\n", .after = "" },
         .{ .before = "grep -Fq \"maintainer_script.test.signed $name...OK\"", .after = "true" },
+        .{ .before = "grep -Fxq \"domain=$target\" \"$proof\"", .after = "true" },
+        .{ .before = "grep -Fxq 'DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open' \"$proof\"", .after = "true" },
+        .{ .before = "systemd) proc_net=private ;;", .after = "systemd) proc_net=absent ;;" },
+        .{ .before = "udev) proc_net=absent ;;", .after = "udev) proc_net=private ;;" },
+        .{ .before = "grep -Fxq \"DEBZ_SIGNED_NETWORK_PROOF proc_net=$proc_net interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\" \"$proof\"", .after = "true" },
         .{ .before = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n", .after = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n        if: false\n" },
         .{ .before = "        timeout-minutes: 25\n", .after = "        timeout-minutes: 25\n        continue-on-error: true\n" },
         .{ .before = "python3 tools/real-snapshot-signed-proc-compare.py \"$target\"", .after = "python3 tools/real-snapshot-signed-proc-compare.py --report-only \"$target\"" },
         .{ .before = "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py\n", .after = "" },
         .{ .before = "      - name: Execute signed binding refusal fixtures\n", .after = "      - name: Skip signed binding refusal fixtures\n" },
-        .{ .before = "grep -Eq 'run test [0-9]+ pass, 3 skip", .after = "grep -Eq 'run test [0-9]+ pass, [0-9]+ skip" },
+        .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; [0-9]+ skipped; 0 failed" },
+        .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; [0-9]+ failed" },
         .{ .before = "        if: ${{ always() }}\n        run: |", .after = "        run: |" },
         .{ .before = "sudo -n rm -rf --one-file-system -- \"$PROTECTED\"", .after = "true" },
     }) |mutation| {
@@ -905,7 +911,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 47), members);
+    try testing.expectEqual(@as(usize, 48), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
