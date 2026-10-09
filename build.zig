@@ -253,6 +253,37 @@ pub fn build(b: *std.Build) void {
     );
     workload_core.dependOn(&run_real_snapshot_comparator_tests.step);
 
+    const reference_runtime_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_runtime_module.addImport("debz", debz);
+    const reference_runtime = b.addExecutable(.{
+        .name = "debz-reference-runtime",
+        .root_module = reference_runtime_module,
+    });
+    const install_reference_runtime = b.addInstallArtifact(reference_runtime, .{});
+    const reference_runtime_step = b.step(
+        "build-reference-runtime",
+        "Build the authenticated original-archive reference runtime recorder",
+    );
+    reference_runtime_step.dependOn(&install_reference_runtime.step);
+    const reference_runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/real-snapshot-reference-runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_reference_runtime_tests = b.addRunArtifact(reference_runtime_tests);
+    const reference_runtime_test_step = b.step(
+        "test-real-snapshot-reference-runtime",
+        "Test bounded ELF enumeration and closed reference runtime bindings",
+    );
+    reference_runtime_test_step.dependOn(&run_reference_runtime_tests.step);
+    workload_core.dependOn(&run_reference_runtime_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
@@ -465,10 +496,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     reference_launcher_module.link_libc = true;
+    const reference_launcher = b.addExecutable(.{
+        .name = "debz-reference-launcher",
+        .root_module = reference_launcher_module,
+    });
     const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
     const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
-    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and unprivileged capability refusal")
-        .dependOn(&run_reference_launcher_tests.step);
+    const reference_launcher_step = b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and unprivileged capability refusal");
+    reference_launcher_step.dependOn(&run_reference_launcher_tests.step);
+    reference_launcher_step.dependOn(&reference_launcher.step);
     audit_step.dependOn(&run_reference_launcher_tests.step);
     // The capability transition must be proven with the real root authority the
     // protected launcher uses. It stays outside security-audit, which must run
@@ -503,6 +539,10 @@ pub fn build(b: *std.Build) void {
         b.option([]const u8, "reference-protected-launcher", "Root-owned protected ReleaseSafe launcher") orelse "",
         "--dpkg",
         b.option([]const u8, "reference-protected-dpkg", "Root-owned native hash-pinned dpkg 1.22.22") orelse "",
+        "--runtime",
+        b.option([]const u8, "reference-protected-runtime", "Original signed-archive-derived protected reference runtime") orelse "",
+        "--runtime-tool",
+        b.option([]const u8, "reference-protected-runtime-tool", "Protected runtime recorder and post-binding drift proof") orelse "",
         "--root-template",
         b.option([]const u8, "reference-protected-root-template", "New protected script-free reference root template") orelse "",
         "--workspace",

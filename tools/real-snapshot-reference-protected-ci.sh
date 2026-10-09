@@ -587,7 +587,7 @@ step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring
   "$zig" "$checkout/zig-out/bin/debz" ".real-snapshot/$architecture"
 arguments=$workspace/reference-protected.args
 mapfile -t proof_arguments <"$arguments"
-[[ ${#proof_arguments[@]} == 13 ]]
+[[ ${#proof_arguments[@]} == 15 ]]
 step tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 
 # Preflight negatives: each must refuse before any reference launch and leave

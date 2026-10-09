@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const runtime = @import("real-snapshot-reference-runtime.zig");
 
 const OpenHow = extern struct { flags: u64, mode: u64 = 0, resolve: u64 };
 const resolve_no_symlinks: u64 = 0x02 | 0x04;
@@ -168,6 +169,7 @@ const Pinned = struct { fd: i32, metadata: linux.Statx };
 const Options = struct {
     root: [:0]const u8,
     dpkg: [:0]const u8,
+    runtime: [:0]const u8,
     architecture: []const u8,
     profile: Profile,
     verb: Verb,
@@ -201,6 +203,7 @@ pub fn main(init: std.process.Init) !void {
     const profile = std.meta.stringToEnum(Profile, profile_name) orelse return error.InvalidArguments;
     const verb = std.meta.stringToEnum(Verb, verb_name) orelse return error.InvalidArguments;
     const selector = args.next();
+    const runtime_path = args.next() orelse return error.InvalidArguments;
     var cycle_archives: ?[base_cycle.len][:0]const u8 = null;
     var openssl_archives: ?[openssl_cycle.len][:0]const u8 = null;
     if (verb == .break_base_cycle) {
@@ -225,6 +228,7 @@ pub fn main(init: std.process.Init) !void {
     const options: Options = .{
         .root = try init.arena.allocator().dupeZ(u8, root),
         .dpkg = try init.arena.allocator().dupeZ(u8, dpkg),
+        .runtime = try init.arena.allocator().dupeZ(u8, runtime_path),
         .architecture = architecture,
         .profile = profile,
         .verb = verb,
@@ -251,7 +255,7 @@ fn validAbsolute(path: []const u8) bool {
 }
 
 fn validateOptions(options: Options) !void {
-    if (!validAbsolute(options.root) or !validAbsolute(options.dpkg) or
+    if (!validAbsolute(options.root) or !validAbsolute(options.dpkg) or !validAbsolute(options.runtime) or
         (options.archive != null and !validAbsolute(options.archive.?)))
         return error.InvalidArguments;
     const architecture_index: usize = if (std.mem.eql(u8, options.architecture, "amd64"))
@@ -752,17 +756,177 @@ fn readBootId() ![37]u8 {
     return bytes[0..37].*;
 }
 
+const RuntimeMountpoints = struct {
+    directory_path: [:0]const u8,
+    preload_path: [:0]const u8,
+    directory: Pinned,
+    preload: Pinned,
+    root_parent: Pinned,
+    etc_parent: Pinned,
+    remove_preload: bool,
+
+    fn create(allocator: std.mem.Allocator, root_path: [:0]const u8) !RuntimeMountpoints {
+        const root = try protectedRoot(root_path);
+        errdefer _ = linux.close(root.fd);
+        errdefer restoreMtime(root.fd, root.metadata.mtime) catch |err| {
+            std.log.err("reference root timestamp cleanup failed: {s}", .{@errorName(err)});
+        };
+        const directory_path = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ root_path, runtime.mountpoint }, 0);
+        _ = try checked(linux.mkdirat(root.fd, ".debz-reference-runtime", 0o700));
+        errdefer {
+            const result = linux.errno(linux.unlinkat(linux.AT.FDCWD, directory_path, linux.AT.REMOVEDIR));
+            if (result != .SUCCESS) std.log.err("reference runtime directory cleanup failed: {s}", .{@tagName(result)});
+        }
+        const directory = try openPinned(directory_path, true);
+        errdefer _ = linux.close(directory.fd);
+        if (directory.metadata.mode != 0o40700 or directory.metadata.uid != 0 or directory.metadata.gid != 0)
+            return error.InvalidRuntimeMountpoint;
+        const etc_path = try std.fmt.allocPrintSentinel(allocator, "{s}/etc", .{root_path}, 0);
+        const etc = try openPinned(etc_path, true);
+        errdefer _ = linux.close(etc.fd);
+        errdefer restoreMtime(etc.fd, etc.metadata.mtime) catch |err| {
+            std.log.err("reference etc timestamp cleanup failed: {s}", .{@errorName(err)});
+        };
+        if (etc.metadata.uid != 0 or etc.metadata.gid != 0 or etc.metadata.mode & 0o022 != 0)
+            return error.InvalidRuntimeMountpoint;
+        const preload_path = try std.fmt.allocPrintSentinel(allocator, "{s}/etc/ld.so.preload", .{root_path}, 0);
+        const created = linux.openat(etc.fd, "ld.so.preload", .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0o600);
+        const remove_preload = switch (linux.errno(created)) {
+            .SUCCESS => blk: {
+                _ = linux.close(@intCast(created));
+                break :blk true;
+            },
+            .EXIST => false,
+            else => return error.InvalidRuntimeMountpoint,
+        };
+        errdefer {
+            if (remove_preload) {
+                const result = linux.errno(linux.unlinkat(linux.AT.FDCWD, preload_path, 0));
+                if (result != .SUCCESS) std.log.err("reference preload mountpoint cleanup failed: {s}", .{@tagName(result)});
+            }
+        }
+        const preload = try openPinned(preload_path, false);
+        errdefer _ = linux.close(preload.fd);
+        if (preload.metadata.uid != 0 or preload.metadata.gid != 0 or preload.metadata.nlink != 1 or
+            preload.metadata.mode & 0o022 != 0 or preload.metadata.size != 0)
+            return error.UnboundRuntimePreload;
+        try restoreMtime(root.fd, root.metadata.mtime);
+        try restoreMtime(etc.fd, etc.metadata.mtime);
+        return .{
+            .directory_path = directory_path,
+            .preload_path = preload_path,
+            .directory = directory,
+            .preload = preload,
+            .remove_preload = remove_preload,
+            .root_parent = root,
+            .etc_parent = etc,
+        };
+    }
+
+    fn close(self: RuntimeMountpoints) void {
+        _ = linux.close(self.directory.fd);
+        _ = linux.close(self.preload.fd);
+        _ = linux.close(self.root_parent.fd);
+        _ = linux.close(self.etc_parent.fd);
+    }
+
+    fn cleanup(self: RuntimeMountpoints) !void {
+        const root_info = try metadata(self.root_parent.fd);
+        const etc_info = try metadata(self.etc_parent.fd);
+        const directory = try openPinned(self.directory_path, true);
+        defer _ = linux.close(directory.fd);
+        if (!same(directory.metadata, self.directory.metadata)) return error.RuntimeMountpointChanged;
+        try emptyDirectory(self.directory_path);
+        const preload = try openPinned(self.preload_path, false);
+        defer _ = linux.close(preload.fd);
+        if (!same(preload.metadata, self.preload.metadata)) return error.RuntimeMountpointChanged;
+        if (self.remove_preload) _ = try checked(linux.unlinkat(linux.AT.FDCWD, self.preload_path, 0));
+        _ = try checked(linux.unlinkat(linux.AT.FDCWD, self.directory_path, linux.AT.REMOVEDIR));
+        try restoreMtime(self.root_parent.fd, root_info.mtime);
+        try restoreMtime(self.etc_parent.fd, etc_info.mtime);
+    }
+};
+
+fn restoreMtime(fd: i32, mtime: @FieldType(linux.Statx, "mtime")) !void {
+    // Preserve package-induced changes, not temporary mountpoint mutations.
+    const directory: i32 = @intCast(try checked(linux.openat(fd, ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0)));
+    defer _ = linux.close(directory);
+    const times = [2]linux.timespec{
+        .{ .sec = 0, .nsec = 1073741822 },
+        .{ .sec = mtime.sec, .nsec = mtime.nsec },
+    };
+    _ = try checked(linux.syscall4(.utimensat, @bitCast(@as(isize, directory)), 0, @intFromPtr(&times), 0));
+}
+
 const Child = struct {
     options: Options,
     root: Pinned,
     proc_mountpoint: Pinned,
     archive_mountpoint: Pinned,
     dpkg: Pinned,
+    runtime: *const runtime.Bound,
+    runtime_mountpoints: RuntimeMountpoints,
     archive: ?Pinned,
     boot_id: ?[37]u8,
     status_pipe: [2]i32,
     control_pipe: [2]i32,
 };
+
+fn stageRuntime(child: Child, allocator: std.mem.Allocator) !Pinned {
+    const target = try openPinned(runtime.mountpoint, true);
+    defer _ = linux.close(target.fd);
+    if (!same(target.metadata, child.runtime_mountpoints.directory.metadata))
+        return error.RuntimeMountpointChanged;
+    try emptyDirectory(runtime.mountpoint);
+    _ = try checked(linux.mount(
+        "tmpfs",
+        runtime.mountpoint,
+        "tmpfs",
+        linux.MS.NOSUID | linux.MS.NODEV,
+        @intFromPtr(@as([*:0]const u8, "mode=0700,size=256m")),
+    ));
+    const directory = try runtime.openProtected(allocator, runtime.mountpoint, true);
+    defer _ = linux.close(directory.fd);
+    try runtime.populate(allocator, directory.fd, child.runtime.objects.items);
+    const preload_source = try openPinned("/.debz-reference-runtime/preload", false);
+    defer _ = linux.close(preload_source.fd);
+    const preload_target = try openPinned("/etc/ld.so.preload", false);
+    defer _ = linux.close(preload_target.fd);
+    if (!same(preload_target.metadata, child.runtime_mountpoints.preload.metadata))
+        return error.RuntimeMountpointChanged;
+    const preload_tree: i32 = @intCast(try checked(cloneMountDescriptor(preload_source.fd)));
+    defer _ = linux.close(preload_tree);
+    const read_only: MountAttribute = .{ .attr_set = 1 | 2 | 4 };
+    _ = try checked(setMountAttributes(preload_tree, &read_only));
+    _ = try checked(linux.move_mount(preload_tree, "", preload_target.fd, "", .{
+        .F_SYMLINKS = false,
+        .F_AUTOMOUNTS = false,
+        .F_EMPTY_PATH = true,
+        .T_SYMLINKS = false,
+        .T_AUTOMOUNTS = false,
+        .T_EMPTY_PATH = true,
+        .SET_GROUP = false,
+    }));
+    _ = try checked(setMountAttributes(directory.fd, &read_only));
+    const loader_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ runtime.mountpoint, child.runtime.manifest().loader },
+        0,
+    );
+    return openPinned(loader_path, false);
+}
 
 fn fail(status: i32, stage: u8, err: linux.E) noreturn {
     var bytes: [5]u8 = .{ stage, 0, 0, 0, 0 };
@@ -1128,6 +1292,10 @@ fn childMain(input: Child) noreturn {
     if (!supervisorPipeAlive(child.control_pipe[0])) fail(status, 2, .CHILD);
     _ = linux.close(child.control_pipe[0]);
     must(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0), status, 3);
+    child.runtime.verify(child.options.root) catch |err| {
+        std.log.err("reference runtime before-chroot refusal: {s}", .{@errorName(err)});
+        fail(status, 12, .STALE);
+    };
     if (child.options.archive) |path| {
         const reopened = openPinned(path, false) catch fail(status, 3, .STALE);
         if (!same(reopened.metadata, child.archive.?.metadata))
@@ -1141,6 +1309,15 @@ fn childMain(input: Child) noreturn {
     must(linux.chroot("."), status, 4);
     must(linux.chdir("/"), status, 4);
     _ = linux.close(root.fd);
+    child.runtime.verify("") catch |err| {
+        std.log.err("reference runtime before-exec refusal: {s}", .{@errorName(err)});
+        fail(status, 12, .STALE);
+    };
+    const allocator = std.heap.page_allocator;
+    const loader = stageRuntime(child, allocator) catch |err| {
+        std.log.err("reference runtime staging refused: {s}", .{@errorName(err)});
+        fail(status, 13, .STALE);
+    };
     if (scriptBinding(child.options.profile)) |binding| {
         verifyInstalledBinding(binding, child.options.verb) catch
             fail(status, 10, .STALE);
@@ -1176,11 +1353,31 @@ fn childMain(input: Child) noreturn {
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
         .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
     };
+    const loader_name = std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ runtime.mountpoint, child.runtime.manifest().loader },
+        0,
+    ) catch fail(status, 14, .NOMEM);
+    var arguments: [32]?[*:0]const u8 = @splat(null);
+    const loader_arguments = [_][*:0]const u8{
+        loader_name,                     "--inhibit-cache",  "--glibc-hwcaps-mask", "",
+        "--library-path",                runtime.mountpoint, "--argv0",             "dpkg",
+        "/.debz-reference-runtime/dpkg",
+    };
+    for (loader_arguments, 0..) |argument, index| arguments[index] = argument;
+    var count: usize = loader_arguments.len;
+    var index: usize = 1;
+    while (extra[index]) |argument| : (index += 1) {
+        if (count + 1 >= arguments.len) fail(status, 14, .@"2BIG");
+        arguments[count] = argument;
+        count += 1;
+    }
     must(linux.syscall5(
         .execveat,
-        @bitCast(@as(isize, child.dpkg.fd)),
+        @bitCast(@as(isize, loader.fd)),
         @intFromPtr(@as([*:0]const u8, "")),
-        @intFromPtr(extra),
+        @intFromPtr(&arguments),
         @intFromPtr(environment),
         linux.AT.EMPTY_PATH,
     ), status, 9);
@@ -1234,6 +1431,24 @@ fn awaitNamespace(pid: i32, timeout_ms: u64) !u32 {
 }
 
 fn run(allocator: std.mem.Allocator, options: Options) !u8 {
+    const checked_root = try protectedRoot(options.root);
+    _ = linux.close(checked_root.fd);
+    const expected = dpkg_digests[
+        if (std.mem.eql(u8, options.architecture, "amd64")) @as(usize, 0) else @as(usize, 1)
+    ];
+    var bound = try runtime.Bound.init(allocator, options.runtime, options.root, options.architecture, expected);
+    defer bound.deinit();
+    const mountpoints = try RuntimeMountpoints.create(allocator, options.root);
+    defer mountpoints.close();
+    const result = runBound(allocator, options, &bound, mountpoints) catch |err| {
+        try mountpoints.cleanup();
+        return err;
+    };
+    try mountpoints.cleanup();
+    return result;
+}
+
+fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtime.Bound, mountpoints: RuntimeMountpoints) !u8 {
     const root = try protectedRoot(options.root);
     defer _ = linux.close(root.fd);
     const expected_dpkg = dpkg_digests[
@@ -1338,6 +1553,8 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
         .proc_mountpoint = proc,
         .archive_mountpoint = target,
         .dpkg = dpkg,
+        .runtime = bound,
+        .runtime_mountpoints = mountpoints,
         .archive = archive,
         .boot_id = boot_id,
         .status_pipe = fds,
@@ -1423,6 +1640,7 @@ test "reference OpenSSL operation cannot become a generic batch or proc profile"
     const options: Options = .{
         .root = "/protected/root",
         .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
         .architecture = "amd64",
         .profile = .openssl_cycle,
         .verb = .configure_openssl_cycle,
@@ -1485,6 +1703,7 @@ test "reference cycle operation is not generic configure or a proc profile" {
     const options: Options = .{
         .root = "/protected/root",
         .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
         .architecture = "amd64",
         .profile = .libgcc_cycle,
         .verb = .break_base_cycle,
@@ -1525,6 +1744,7 @@ test "prestate continuation accepts only exact systemd and udev half-configured 
         const options: Options = .{
             .root = "/root/proof/root",
             .dpkg = "/root/proof/dpkg",
+            .runtime = "/root/proof/runtime",
             .architecture = "amd64",
             .profile = profile,
             .verb = .continue_prestate,
@@ -1556,6 +1776,7 @@ test "prestate continuation accepts only exact systemd and udev half-configured 
     const sudo: Options = .{
         .root = "/root/proof/root",
         .dpkg = "/root/proof/dpkg",
+        .runtime = "/root/proof/runtime",
         .architecture = "amd64",
         .profile = .sudo,
         .verb = .continue_prestate,
@@ -1576,6 +1797,7 @@ test "reference launcher rejects wider profiles and unsafe operation shapes" {
     const base: Options = .{
         .root = "/root/proof/root",
         .dpkg = "/root/proof/dpkg",
+        .runtime = "/root/proof/runtime",
         .architecture = "amd64",
         .profile = .none,
         .verb = .configure,

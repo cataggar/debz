@@ -61,6 +61,7 @@ for path in (repository, repository / ".real-snapshot", workspace, cache):
         raise ValueError(f"reference directory must be root-only 0700: {path}")
 for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real-snapshot-reference-launcher.zig",
+             repository / "tools/real-snapshot-reference-runtime.zig",
              repository / "tools/real-snapshot-reference-order.py",
              repository / "tools/real_snapshot_reference_paths.py",
              repository / "tools/prepare-native-dpkg.py",
@@ -189,9 +190,17 @@ launcher="$workspace/reference-launcher"
   --global-cache-dir "$workspace/reference-zig-global-cache" \
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
+"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+  --cache-dir "$workspace/reference-zig-cache" \
+  --global-cache-dir "$workspace/reference-zig-global-cache" \
+  --prefix "$workspace/runtime-tool"
+runtime="$workspace/reference-runtime"
+"$workspace/runtime-tool/bin/debz-reference-runtime" record \
+  "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
+cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
 timeout --signal=TERM --kill-after=30s 40m \
   python3 tools/real-snapshot-reference-order.py \
-    --launcher "$launcher" --architecture "$architecture" \
+    --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
     --cache "$cache" --evidence "$evidence"
 python3 tools/real-snapshot-reference-order.py \

@@ -69,6 +69,8 @@ def assert_teardown(root: Path) -> dict[str, object]:
     if (not stat.S_ISREG(archive.st_mode) or archive.st_size != 0 or
             archive.st_nlink != 1 or proc_entries):
         raise AssertionError(f"reference archive or proc mountpoint changed under {root}")
+    if os.path.lexists(root / ".debz-reference-runtime"):
+        raise AssertionError(f"temporary reference runtime survived under {root}")
     return {
         "polls": attempt + 1, "processes_scanned": scanned, "surviving_processes": [],
         "mountinfo_entries": mounts, "mounts_under_root": [],
@@ -153,7 +155,7 @@ def probe_results(output: str) -> dict[str, str]:
 
 
 def operation(
-    workspace: Path, name: str, launcher: Path, dpkg: Path, root: Path,
+    workspace: Path, name: str, launcher: Path, dpkg: Path, runtime: Path, root: Path,
     architecture: str, archive: Path | None, digest: str | None, size: int | None, verb: str,
     *, readable_output: bool = False, inherited_fd: int | None = None,
     package: str = "debz-reference-proof", profile: str = "none",
@@ -164,7 +166,7 @@ def operation(
     stdout_mode = "a+b" if readable_output else "ab"
     command = [
         str(launcher), str(root), str(dpkg), architecture, profile, verb,
-        selector or f"{package}:{architecture}",
+        selector or f"{package}:{architecture}", str(runtime),
     ]
     if archive is not None:
         command.extend((str(archive), str(digest), str(size)))
@@ -277,6 +279,73 @@ def require_unchanged_profile(root: Path, profile: str, name: str) -> None:
         raise AssertionError(f"{name}: the probe ran despite the refusal")
 
 
+def prove_runtime(args: argparse.Namespace, identity: str) -> None:
+    record = json.loads(read_root_file(args.runtime, "binding.json", 128 * 1024))
+    selected = [
+        next(item for item in record["objects"] if item["name"] == name)
+        for name in (record["loader"], "libpcre2-8.so.0")
+    ]
+    results = {}
+    for binding in selected:
+        for mutation in ("missing", "altered", "symlink", "private-altered"):
+            name = f"runtime-{binding['name']}-{mutation}"
+            root = fresh_root(args.root_template, args.workspace, name)
+            prefix = args.runtime
+            target = root / binding["root_path"].lstrip("/")
+            if mutation == "missing":
+                target.unlink()
+            elif mutation == "symlink":
+                target.unlink()
+                target.symlink_to(args.runtime / binding["name"])
+            elif mutation == "private-altered":
+                prefix = args.workspace / f"{name}-prefix"
+                shutil.copytree(args.runtime, prefix)
+                protected_directory(prefix)
+                target = prefix / binding["name"]
+            if mutation in ("altered", "private-altered"):
+                data = bytearray(target.read_bytes())
+                data[0] ^= 1
+                write_beneath(target.parent, target.name, bytes(data), stat.S_IMODE(target.stat().st_mode), replace=True)
+            status, error = operation(
+                args.workspace, name, args.launcher, args.dpkg, prefix, root,
+                args.architecture, args.archive, args.archive_sha512, args.archive_size, "unpack",
+            )
+            expected = "RuntimeInputRefused" if mutation in ("missing", "symlink") else "RuntimeDigestChanged"
+            require(status, error, expected, name)
+            if (read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024) or
+                    os.path.lexists(root / "usr/share/debz-reference-proof/marker")):
+                raise AssertionError(f"{name}: dpkg started despite runtime refusal")
+            results[name] = {"refusal": expected, "dpkg_started": False}
+        name = f"runtime-{binding['name']}-postbinding"
+        root = fresh_root(args.root_template, args.workspace, name)
+        result = subprocess.run(
+            [str(args.runtime_tool), "prove-postbinding", args.architecture,
+             str(args.runtime), str(root), identity, binding["name"]],
+            env=ORDER.oracle_environment(), capture_output=True, timeout=45, check=False,
+        )
+        if result.returncode != 0 or b"RuntimeSourceChanged; no dpkg or script executed" not in result.stderr:
+            raise AssertionError(f"{name}: post-binding drift proof failed: {result.stderr!r}")
+        if read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024):
+            raise AssertionError(f"{name}: post-binding proof mutated the package database")
+        results[name] = {"refusal": "RuntimeSourceChanged", "dpkg_started": False,
+                         "teardown": assert_teardown(root)}
+    name = "runtime-unbound-preload"
+    root = fresh_root(args.root_template, args.workspace, name)
+    write_beneath(root, "etc/ld.so.preload", b"/unbound-library.so\n", 0o644)
+    status, error = operation(
+        args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
+        args.architecture, args.archive, args.archive_sha512, args.archive_size, "unpack",
+    )
+    require(status, error, "UnboundRuntimePreload", name)
+    if read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024):
+        raise AssertionError(f"{name}: dpkg started with an unbound preload")
+    results[name] = {"refusal": "UnboundRuntimePreload", "dpkg_started": False}
+    (args.workspace / "runtime-preflight-proof.json").write_text(json.dumps({
+        "architecture": args.architecture, "original_archive_bindings": record,
+        "cases": results,
+    }, indent=2) + "\n")
+
+
 def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     probe = args.escape_probe.read_bytes()
     if args.architecture != "amd64":
@@ -284,7 +353,7 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
             name = f"profile-{profile}-{args.architecture}"
             root = fresh_root(args.root_template, args.workspace, name)
             status, error = operation(
-                args.workspace, name, args.launcher, args.dpkg, root,
+                args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
                 args.architecture, None, None, None, "configure",
                 profile=profile, selector=f"{profile}:{args.architecture}",
             )
@@ -297,7 +366,7 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
         parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             status, error = operation(
-                args.workspace, name, args.launcher, args.dpkg, root,
+                args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
                 args.architecture, None, None, None, "configure",
                 inherited_fd=parent_fd, profile=profile, selector=f"{profile}:amd64",
             )
@@ -331,7 +400,7 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
         bound = "systemd"
         root = profile_root(args.root_template, args.workspace, name, bound, script, probe, version=version)
         status, error = operation(
-            args.workspace, name, args.launcher, args.dpkg, root, args.architecture,
+            args.workspace, name, args.launcher, args.dpkg, args.runtime, root, args.architecture,
             None, None, None, "configure", profile=profile, selector=selector,
         )
         require(status, error, expected, name)
@@ -344,6 +413,8 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launcher", type=Path, required=True)
+    parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--runtime-tool", type=Path, required=True)
     parser.add_argument("--dpkg", type=Path, required=True)
     parser.add_argument("--root-template", type=Path, required=True)
     parser.add_argument("--workspace", type=Path, required=True)
@@ -362,13 +433,14 @@ def main() -> None:
     # Launcher output streams must not be group/other writable whatever the caller's umask.
     os.umask(0o077)
     if not all(path.is_absolute() for path in (
-        args.launcher, args.dpkg, args.root_template, args.workspace, args.archive,
+        args.launcher, args.dpkg, args.runtime, args.runtime_tool, args.root_template, args.workspace, args.archive,
         args.escape_probe, args.escape_archive, args.profile_scripts,
     )):
         raise ValueError("protected proof inputs must be absolute paths")
     protected(Path(__file__).resolve())
-    for path in (args.launcher, args.dpkg, args.archive, args.escape_probe, args.escape_archive):
+    for path in (args.launcher, args.dpkg, args.runtime_tool, args.archive, args.escape_probe, args.escape_archive):
         protected(path)
+    protected_directory(args.runtime)
     protected_directory(args.root_template)
     protected_directory(args.workspace, empty=True)
     # Bind the claimed architecture to its pinned dpkg before any per-architecture input.
@@ -403,12 +475,14 @@ def main() -> None:
                 archive_hash.update(block)
         if archive_hash.hexdigest() != digest:
             raise ValueError("authenticated archive SHA512 differs")
+    prove_runtime(args, identity)
     for name, verb in (("probe", "probe_unpack"), ("unpack", "unpack")):
         root = fresh_root(args.root_template, args.workspace, name)
+        before_timestamps = {str(path): path.stat().st_mtime_ns for path in (root, root / "etc")}
         parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             status, error = operation(
-                args.workspace, name, args.launcher, args.dpkg, root,
+                args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
                 args.architecture, args.archive, args.archive_sha512,
                 args.archive_size, verb, inherited_fd=parent_fd,
             )
@@ -416,6 +490,9 @@ def main() -> None:
             os.close(parent_fd)
         if status != 0:
             raise AssertionError(f"{name}: pinned dpkg refused {status}: {error}")
+        if name == "probe" and any(Path(path).stat().st_mtime_ns != timestamp
+                                   for path, timestamp in before_timestamps.items()):
+            raise AssertionError("read-only probe changed directory timestamps through temporary runtime mounts")
         if name == "unpack" and not ORDER.database_packages(root):
             raise AssertionError("pinned dpkg reported success without an installed database entry")
 
@@ -427,7 +504,7 @@ def main() -> None:
     ):
         root = fresh_root(args.root_template, args.workspace, name)
         status, error = operation(
-            args.workspace, name, args.launcher, args.dpkg, root,
+            args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
             args.architecture, args.archive, digest, size, "unpack",
         )
         require(status, error, expected, name)
@@ -436,7 +513,7 @@ def main() -> None:
 
     root = fresh_root(args.root_template, args.workspace, "bad-output")
     status, error = operation(
-        args.workspace, "bad-output", args.launcher, args.dpkg, root,
+        args.workspace, "bad-output", args.launcher, args.dpkg, args.runtime, root,
         args.architecture, args.archive, args.archive_sha512,
         args.archive_size, "unpack", readable_output=True,
     )
@@ -446,7 +523,7 @@ def main() -> None:
     link = args.workspace / "symlink-to-root"
     link.symlink_to(root)
     status, error = operation(
-        args.workspace, "symlink", args.launcher, args.dpkg, link,
+        args.workspace, "symlink", args.launcher, args.dpkg, args.runtime, link,
         args.architecture, args.archive, args.archive_sha512, args.archive_size, "unpack",
     )
     require(status, error, "ReferenceSetupFailed", "symlink")
@@ -455,7 +532,7 @@ def main() -> None:
     archive_link = args.workspace / "symlink-to-archive"
     archive_link.symlink_to(args.archive)
     status, error = operation(
-        args.workspace, "symlink-archive", args.launcher, args.dpkg, root,
+        args.workspace, "symlink-archive", args.launcher, args.dpkg, args.runtime, root,
         args.architecture, archive_link, args.archive_sha512,
         args.archive_size, "unpack",
     )
@@ -467,7 +544,7 @@ def main() -> None:
     parent.chmod(0o777)
     try:
         status, error = operation(
-            args.workspace, "writable", args.launcher, args.dpkg, root,
+            args.workspace, "writable", args.launcher, args.dpkg, args.runtime, root,
             args.architecture, args.archive, args.archive_sha512,
             args.archive_size, "unpack",
         )
@@ -497,7 +574,7 @@ def main() -> None:
     parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         status, error = operation(
-            args.workspace, "escape", args.launcher, args.dpkg, root,
+            args.workspace, "escape", args.launcher, args.dpkg, args.runtime, root,
             args.architecture, args.escape_archive, args.escape_archive_sha512,
             args.escape_archive_size, "unpack", inherited_fd=parent_fd,
             package="debz-reference-escape-probe",
@@ -518,7 +595,8 @@ def main() -> None:
         raise AssertionError("escape: pinned dpkg did not record the probe package")
     profiles = prove_profiles(args, scripts)
     print(
-        "protected pinned-dpkg probe/unpack, six refusals, unconfined escape control and "
+        "protected pinned-dpkg runtime: ten loader/recursive-library and one preload preflight refusals; "
+        "probe/unpack, six refusals, unconfined escape control and "
         f"{len(ESCAPE_CHECKS)} confined escape checks, read-only archive mount and "
         f"descendant teardown, {profiles}: executed without skips"
     )
