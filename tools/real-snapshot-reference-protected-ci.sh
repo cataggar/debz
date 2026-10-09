@@ -686,7 +686,7 @@ PY
   rm -rf --one-file-system -- "$python3_workspace"
 elif [[ $architecture == arm64 ]]; then
   less_workspace=$checkout/.real-snapshot/less-arm64
-  step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
+  step arm64-less-stage 0 "fifteen replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
     "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
     bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"
   step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
@@ -704,6 +704,19 @@ elif [[ $architecture == arm64 ]]; then
     -Doptimize=ReleaseSafe -j2 --summary all
   grep -Fx "signed arm64 less source guard executed without skips" "$less_workspace/evidence/less-source-proof.txt"
   grep -Fx "signed arm64 less eight replay roots executed without skips" "$less_workspace/evidence/less-replay-proof.txt"
+  step arm64-less-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-arm64-less-postinst-protected \
+    "-Darm64-less-postinst-root=$less_workspace/source" \
+    "-Darm64-less-postinst-native-root=$less_workspace/script-after-postinst" \
+    "-Darm64-less-postinst-dpkg-root=$less_workspace/dpkg-after-postinst" \
+    "-Darm64-less-postinst-bad-script=$less_workspace/script-after-postinst-bad-script" \
+    "-Darm64-less-postinst-bad-mode=$less_workspace/script-after-postinst-bad-mode" \
+    "-Darm64-less-postinst-bad-tool=$less_workspace/script-after-postinst-bad-tool" \
+    "-Darm64-less-postinst-bad-alias=$less_workspace/script-after-postinst-bad-alias" \
+    "-Darm64-less-postinst-bad-prestate=$less_workspace/script-after-postinst-bad-prestate" \
+    "-Darm64-less-postinst-proof=$less_workspace/evidence/less-postinst-proof.txt" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed arm64 less native postinst and independent pinned dpkg agree without skips" "$less_workspace/evidence/less-postinst-proof.txt"
   find "$less_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
     -exec install -m 0644 -t "$evidence" {} +
   if grep -F " $less_workspace" /proc/self/mountinfo; then

@@ -11,11 +11,13 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
@@ -352,7 +354,7 @@ class ProtectedCiScriptTests(unittest.TestCase):
 
     def test_less_orchestration_cleans_environment_before_entering_minimal_guest(self) -> None:
         for filename, count in (("real-snapshot-less-protected-stage.sh", 1),
-                                ("real-snapshot-less-reference.sh", 2)):
+                                ("real-snapshot-less-reference.sh", 3)):
             source = (TOOLS / filename).read_text()
             commands = re.findall(
                 r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
@@ -376,6 +378,7 @@ class ProtectedCiScriptTests(unittest.TestCase):
 source=/unit-source
 script_root=/unit-script
 dpkg_root=/unit-dpkg
+post_dpkg=/unit-postinst-dpkg
 timeout() { while [[ $1 != unshare ]]; do shift; done; "$@"; }
 unshare() { while [[ $1 != -- ]]; do shift; done; shift; "$@"; }
 """
@@ -798,7 +801,7 @@ timeout() {
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, token in (
-            ("src/native_unpack.zig", '    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");\n'),
+            ("src/native_unpack.zig", '    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64", .preinst);\n'),
             ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
             ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
             ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
@@ -808,6 +811,29 @@ timeout() {
                 self.assertIn(token, texts[path])
                 changed = dict(texts)
                 changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def test_arm_less_postinst_receipt_requires_actual_callback_inputs_transition_and_oracle(self) -> None:
+        audit = load("debz_arm_less_postinst_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        path = "src/native_unpack.zig"
+        source = texts[path]
+        start = source.index('test "native_unpack.test.protected signed arm64 less postinst runs natively and matches pinned dpkg"')
+        end = source.index("\nfn prepareAlternativesScriptBoundary(", start)
+        body = source[start:end]
+        for token in (
+            "maintainer_script.run(testing.allocator,",
+            ".policy = lifecycleInvocationPolicy(false, false, false)",
+            "try testing.expect(report.succeeded());",
+            'try verifySnapshotLessArm64Inputs(testing.allocator, native.root, &artifacts, "arm64", .postinst);',
+            "native_alternatives.validateScriptTransition(",
+            "try testing.expectEqualDeep(actual.record, expected.record);",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, body)
+                changed = dict(texts)
+                changed[path] = source.replace(body, body.replace(token, "", 1), 1)
                 self.assertTrue(audit.protected_reference_ci_failures(changed))
 
     def test_arm_less_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
@@ -1056,6 +1082,59 @@ class ProtectedInputTests(unittest.TestCase):
             library.symlink_to(self.root / "real-lib", target_is_directory=True)
             with self.assertRaises(OSError):
                 toolchain(compiler)
+
+
+class SignedLessStagingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-less-seal-", dir=TOOLS.parent / ".zig-cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.info = self.root / "var/lib/dpkg/info"
+        self.info.mkdir(parents=True)
+        self.lifecycle = self.root / "var/lib/debz-lifecycle-scripts"
+        self.lifecycle.mkdir()
+        repin = load("debz_less_original_members", "real-snapshot-repin.py")
+        manifest = repin.load_json(TOOLS.parent / repin.DEFAULT_MANIFEST)
+        with zipfile.ZipFile(TOOLS.parent / manifest["prestate_evidence"]) as archive:
+            index = json.loads(archive.read("evidence.json"))
+            source = next(item for item in index["sources"]
+                          if item["architecture"] == "arm64" and item["package"] == "less")
+            original = archive.read(source["archive_file"])
+        (self.info / "less.list").write_bytes(repin.dpkg_ownership_list(original))
+        for kind in ("preinst", "postinst"):
+            script, mode = repin.tar_member(original, "control.tar", kind)
+            path = self.info / f"less.{kind}"
+            path.write_bytes(script)
+            path.chmod(mode)
+        self.stage = load("debz_less_seal", "real_snapshot_less_stage.py")
+
+    def test_seal_retains_original_controls_and_stages_both_callbacks_exclusively(self) -> None:
+        def unchanged_metadata(path: Path) -> tuple:
+            metadata = path.stat()
+            return path.read_bytes(), metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid, metadata.st_nlink
+
+        before = {path.name: unchanged_metadata(path) for path in self.info.iterdir()}
+        self.stage.seal(self.root)
+        for kind in ("preinst", "postinst"):
+            path = self.lifecycle / f"less.{kind}"
+            self.assertEqual(path.read_bytes(), before[path.name][0])
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+        for path in self.info.iterdir():
+            self.assertEqual(unchanged_metadata(path), before[path.name])
+        with self.assertRaises(FileExistsError):
+            self.stage.seal(self.root)
+
+    def test_changed_or_symlinked_postinst_cannot_publish_callback_copies(self) -> None:
+        path = self.info / "less.postinst"
+        path.write_bytes(path.read_bytes() + b"unreviewed")
+        with self.assertRaisesRegex(ValueError, "signed less postinst changed"):
+            self.stage.seal(self.root)
+        self.assertEqual(list(self.lifecycle.iterdir()), [])
+        path.unlink()
+        path.symlink_to(self.info / "less.preinst")
+        with self.assertRaises(OSError):
+            self.stage.seal(self.root)
+        self.assertEqual(list(self.lifecycle.iterdir()), [])
 
 
 class NativeOutcomeTests(unittest.TestCase):

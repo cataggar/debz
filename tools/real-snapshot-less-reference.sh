@@ -42,7 +42,7 @@ checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-less-reference.sh" ]]
 for file in tools/real-snapshot-less-reference.sh tools/prepare-native-dpkg.py \
   tools/real_snapshot_less_fixtures.py tools/real_snapshot_reference_paths.py \
-  src/fixtures/ubuntu-resolute-less.preinst; do require_protected_file "$checkout/$file"; done
+  src/fixtures/ubuntu-resolute-less.preinst src/fixtures/ubuntu-resolute-less.postinst; do require_protected_file "$checkout/$file"; done
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
 pinned=$(realpath -- "$1")
@@ -186,4 +186,48 @@ timeout --signal=TERM --kill-after=5s 120s \
 [[ $(dpkg-query --admindir="$dpkg_root/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' less) == '668-1build1 arm64 install ok unpacked' ]]
 check_activated_roots
+post_native="${script_root}-postinst"
+post_dpkg="${dpkg_root}-postinst"
+post_bad_script="${post_native}-bad-script"
+post_bad_mode="${post_native}-bad-mode"
+post_bad_tool="${post_native}-bad-tool"
+post_bad_alias="${post_native}-bad-alias"
+post_bad_prestate="${post_native}-bad-prestate"
+for path in "$post_native" "$post_dpkg" "$post_bad_script" "$post_bad_mode" \
+  "$post_bad_tool" "$post_bad_alias" "$post_bad_prestate"; do
+  require_protected_path "$(dirname -- "$path")"
+  [[ ! -e "$path" && ! -L "$path" ]]
+  cp -a --reflink=auto -- "$source_root" "$path"
+  require_protected_path "$path"
+done
+python3 - "$post_bad_script" "$post_bad_mode" "$post_bad_tool" "$post_bad_alias" "$post_bad_prestate" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "tools")
+from real_snapshot_less_fixtures import mutate_negative_roots
+mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")
+PY
+python3 - "$post_dpkg" "$pinned" "$archive" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "tools")
+from real_snapshot_less_fixtures import stage_dpkg_reference
+stage_dpkg_reference(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+PY
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$post_dpkg" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
+        --force-depends --no-triggers --configure less
+  '
+[[ $(dpkg-query --admindir="$post_dpkg/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' less) == '668-1build1 arm64 install ok installed' ]]
+[[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' less) == '668-1build1 arm64 install ok unpacked' ]]
 printf 'signed_arm64_less_preinst=install\nscript_exit=0\npinned_dpkg_unpack_exit=0\nalternatives_fingerprint=%s\nactivated_zig_gate=passed\n' "$before"
+printf 'signed_arm64_less_postinst=configure\npinned_dpkg_configure_exit=0\nnative_postinst_proof=required\n'

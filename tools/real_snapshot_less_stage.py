@@ -180,11 +180,17 @@ def seal(root: Path) -> None:
             "0206e202ee08fa90d694df6ee0a0f438258ce7f442ff3bc8db4ead65514c62ae"):
         raise ValueError("signed less ownership path set changed")
     with regular_descriptor(root, "var/lib/dpkg/info/less.preinst") as descriptor:
-        script = os.read(descriptor, 1024)
-    if (len(script) != 292 or hashlib.sha256(script).hexdigest() !=
+        preinst = os.read(descriptor, 1024)
+    if (len(preinst) != 292 or hashlib.sha256(preinst).hexdigest() !=
             "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94"):
         raise ValueError("signed less preinst changed")
-    create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", script, 0o755)
+    with regular_descriptor(root, "var/lib/dpkg/info/less.postinst") as descriptor:
+        script = os.read(descriptor, 1024)
+    if (len(script) != 374 or hashlib.sha256(script).hexdigest() !=
+            "a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4"):
+        raise ValueError("signed less postinst changed")
+    create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", preinst, 0o755)
+    create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755)
 
 
 if __name__ == "__main__":

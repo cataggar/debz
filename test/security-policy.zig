@@ -2385,6 +2385,12 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
         "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-postinst-protected \\\n",
+        "    \"-Darm64-less-postinst-bad-prestate=$less_workspace/script-after-postinst-bad-prestate\" \\\n",
+        "  grep -Fx \"signed arm64 less native postinst and independent pinned dpkg agree without skips\" \"$less_workspace/evidence/less-postinst-proof.txt\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
+        "        --force-depends --no-triggers --configure less\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-protected-stage.sh", &.{
         "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",

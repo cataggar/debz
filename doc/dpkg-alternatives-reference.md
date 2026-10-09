@@ -300,6 +300,23 @@ outcome and the expected `pager` record and links at step 888, then refused
 an unrelated `bash.postinst` `update-alternatives --install ... || true`
 script at step 976 before launch.
 
+The byte-identical signed ARM less postinst has a separate native guard for
+fresh `less:arm64` 668-1build1 `postinst/new_package` with exactly
+`["configure", ""]` and a script action. Its source is not borrowed from amd64:
+the retained original ARM archive binds the controls, `/usr/bin/less` and its
+manpage; the independent dash, update-alternatives, loader and libc sources,
+aliases and unchanged ownership list are checked before and after execution.
+Loader cache/preload/hwcaps, shadow tools and nonempty proc remain forbidden.
+
+The mandatory hosted ARM protected target retains the eight preinst roots and
+adds native/pinned-dpkg configure roots plus five postinst refusal roots.
+It invokes the actual production `maintainer_script.run`/`SystemLauncher` with
+the original script and lifecycle policy, checks immutable inputs and the
+reachable transition, and compares the full alternatives inventory with a
+separate pinned-dpkg configure. Missing coordinates or proof receipts fail;
+local unit compilation is not protected acceptance. This bounded callback does
+not establish subsequent ARM callbacks, full-root parity or Python-free cutover.
+
 The same signed amd64 snapshot's `bash` 5.3-3ubuntu1 archive (SHA-512
 `05fc4be7d1457e8e853a04c259d73c2c16de18154275612051f0d8efd6d4ec74c23f85b80c6a60c11e217aa4756a6a27650dd03502733b53141ac69c0732d3b4`)
 ships a 492-byte `postinst` (SHA-256
