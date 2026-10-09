@@ -400,17 +400,19 @@ timeout() {
                     self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
                                         for failure in audit.protected_reference_ci_failures(changed)))
         path = "tools/real-snapshot-signed-proc-bindings.sh"
-        output = '  >"$source_root/var/lib/dpkg/info/sudo.list"\n'
+        output = "sed 's#^/$#/.#' \\\n" + '  >"$source_root/var/lib/dpkg/info/sudo.list"\n'
         for mutation in (
-            '  LC_ALL=C sort >"$source_root/var/lib/dpkg/info/sudo.list"\n',
-            '  >"$source_root/var/lib/dpkg/info/sudo.list.sorted"\n',
+            "sed 's#^/$#/.#' |\n" + '  LC_ALL=C sort >"$source_root/var/lib/dpkg/info/sudo.list"\n',
+            "sed 's#^/$#/.#' \\\n" + '  >"$source_root/var/lib/dpkg/info/sudo.list.sorted"\n',
         ):
             with self.subTest(path=path, mutation=mutation):
-                    changed = dict(texts)
-                    self.assertIn(output, changed[path])
-                    changed[path] = changed[path].replace(output, mutation, 1)
-                    self.assertIn("signed sudo binding list must retain authenticated archive member order",
-                                  audit.protected_reference_ci_failures(changed))
+                changed = dict(texts)
+                self.assertIn(output, changed[path])
+                changed[path] = changed[path].replace(output, mutation, 1)
+                subprocess.run(["bash", "-n"], input=changed[path], text=True,
+                               check=True, capture_output=True)
+                self.assertIn("signed sudo binding list must retain authenticated archive member order",
+                              audit.protected_reference_ci_failures(changed))
         path = "tools/real-snapshot-signed-proc-prestates.sh"
         read = 'require_protected_file "$list"\n'
         for mutation in ('LC_ALL=C sort -- "$list" >"$list.sorted"\n',
