@@ -867,6 +867,87 @@ class SignedBindingSummaryTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
 
 
+class NativeEvidenceExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-native-export-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "evidence"
+        self.target = self.root / "upload"
+        self.source.mkdir()
+        self.target.mkdir()
+        wrapper = (TOOLS / "real-snapshot-protected-native-ci.sh").read_text()
+        self.exporter = wrapper.split(
+            'python3 -I - "$evidence" "$upload" <<\'PY\'\n', 1
+        )[1].split("\nPY\n", 1)[0]
+
+    def export(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-I", "-", str(self.source), str(self.target)],
+            input=self.exporter, capture_output=True, text=True, timeout=30,
+        )
+
+    def verify_index(self) -> None:
+        rows = (self.target / "SHA256SUMS").read_text().splitlines()
+        self.assertTrue(rows)
+        for row in rows:
+            digest, relative = row.split("  ", 1)
+            self.assertEqual(
+                hashlib.sha256((self.target / relative).read_bytes()).hexdigest(),
+                digest,
+            )
+
+    def test_native_export_retains_raw_failure_bytes_and_nested_staging(self) -> None:
+        files = {
+            "create.json": b'{"exit_status":8,"changed":true}\n',
+            "create.stderr": b"original native refusal\x00\xff\n",
+            "staging/compiler.txt": b"original compiler provenance\n",
+        }
+        for relative, payload in files.items():
+            path = self.source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for relative, payload in files.items():
+            self.assertEqual((self.target / relative).read_bytes(), payload)
+        self.assertEqual(
+            (self.target / "artifact-summary.txt").read_text(),
+            f"bytes_before_index={sum(map(len, files.values()))}\n",
+        )
+        self.assertFalse((self.target / "export-failure.txt").exists())
+        self.verify_index()
+
+    def test_native_export_refuses_symlinked_files_and_directories(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret").write_bytes(b"must not be exported\n")
+        for destination in (outside / "secret", outside):
+            with self.subTest(destination=destination):
+                link = self.source / "untrusted"
+                link.symlink_to(destination)
+                result = self.export()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsafe or oversized evidence member", result.stderr)
+                self.assertIn(
+                    "unsafe or oversized evidence member",
+                    (self.target / "export-failure.txt").read_text(),
+                )
+                self.assertFalse((self.target / "untrusted").exists())
+                self.verify_index()
+                link.unlink()
+
+    def test_native_export_refuses_oversized_input_and_indexes_failure(self) -> None:
+        with (self.source / "oversized").open("wb") as payload:
+            payload.truncate(128 * 1024 * 1024 + 1)
+        result = self.export()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe or oversized evidence member", result.stderr)
+        self.assertFalse((self.target / "oversized").exists())
+        self.assertTrue((self.target / "export-failure.txt").is_file())
+        self.verify_index()
+
+
 class ProtectedInputTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")
