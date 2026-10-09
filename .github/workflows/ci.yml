@@ -1833,6 +1833,9 @@ jobs:
               ws=$1 out=$2
               for file in bindings.env prestates.env prestates/prestates.tsv \
                 snapshot/evidence/ubuntu-minimal.lock.json \
+                snapshot/evidence/refresh.json snapshot/evidence/refresh.stderr \
+                snapshot/evidence/plan.json snapshot/evidence/plan.stderr \
+                snapshot/evidence/download.json snapshot/evidence/download.stderr \
                 prestate-build/evidence/reference-archives.tsv \
                 prestate-build/evidence/reference-identity.txt \
                 prestate-build/evidence/stopped-installed.txt \

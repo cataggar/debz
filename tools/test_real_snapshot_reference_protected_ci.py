@@ -319,6 +319,47 @@ class ExtractedReferenceReceiptTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_binding_step_failure_reports_stage_preserves_exit_and_raw_evidence(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-bindings.sh").read_text()
+        loop = "for step in refresh plan download; do" + source.split(
+            "for step in refresh plan download; do", 1
+        )[1].split("\ndone\n", 1)[0] + "\ndone\n"
+        setup = """
+snapshot=$1
+fail_step=$2
+lock=$snapshot/evidence/ubuntu-minimal.lock.json
+debz=unused-test-binary
+common=()
+timeout() {
+  printf '%s\\n' "$5" >>"$snapshot/calls"
+  printf '{"stage":"%s"}\\n' "$5"
+  printf 'raw diagnostic for %s\\n' "$5" >&2
+  [[ "$5" != "$fail_step" ]] || return 6
+}
+"""
+        for failed in ("refresh", "plan", "download", ""):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "evidence").mkdir()
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", setup + loop,
+                     "signed-binding-diagnostic-test", str(root), failed],
+                    capture_output=True, text=True,
+                )
+                steps = ["refresh", "plan", "download"]
+                attempted = steps[:steps.index(failed) + 1] if failed else steps
+                self.assertEqual(result.returncode, 6 if failed else 0, result.stderr)
+                self.assertEqual((root / "calls").read_text().splitlines(), attempted)
+                for step in attempted:
+                    self.assertEqual((root / f"evidence/{step}.json").read_text(),
+                                     f'{{"stage":"{step}"}}\n')
+                    self.assertEqual((root / f"evidence/{step}.stderr").read_text(),
+                                     f"raw diagnostic for {step}\n")
+                if failed:
+                    self.assertIn(f"signed proc bindings {failed} failed with exit 6", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+
     def test_list_preparation_cannot_normalize_or_rewrite_authenticated_original_bytes(self) -> None:
         audit = load("debz_original_fixture_list_guards", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}

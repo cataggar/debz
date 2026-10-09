@@ -137,7 +137,11 @@ for step in refresh plan download; do
     download) arguments+=(--transaction-backend native --lock-input "$lock" ubuntu-minimal) ;;
   esac
   timeout --signal=TERM --kill-after=30s 30m "$debz" "$step" "${arguments[@]}" \
-    >"$snapshot/evidence/$step.json" 2>"$snapshot/evidence/$step.stderr"
+    >"$snapshot/evidence/$step.json" 2>"$snapshot/evidence/$step.stderr" || {
+      status=$?
+      echo "signed proc bindings $step failed with exit $status; see snapshot/evidence/$step.json and $step.stderr" >&2
+      exit "$status"
+    }
 done
 jq -e '
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
