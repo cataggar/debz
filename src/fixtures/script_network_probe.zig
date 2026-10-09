@@ -288,24 +288,18 @@ fn privateProcNetwork(devices: []const u8, routes: []const u8) !void {
     }
 }
 
-pub fn main(init: std.process.Init) !void {
-    var args = init.minimal.args.iterate();
-    _ = args.next();
-    const mode = args.next() orelse return error.InvalidNetworkProbeArguments;
-    const port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidNetworkProbeArguments, 10);
-    const unix_name = args.next() orelse return error.InvalidNetworkProbeArguments;
-    const inherited = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNetworkProbeArguments, 10);
-    if (port == 0 or inherited < 200 or args.next() != null)
+pub const Mode = enum { host, reference, systemd, udev, sudo };
+
+pub fn observe(mode: Mode, port: u16, unix_name: []const u8, inherited: i32) !void {
+    if (port == 0 or inherited < 200)
         return error.InvalidNetworkProbeArguments;
-    const host = std.mem.eql(u8, mode, "host");
-    if (!host and !std.mem.eql(u8, mode, "systemd") and !std.mem.eql(u8, mode, "udev"))
-        return error.InvalidNetworkProbeArguments;
+    const host = mode == .host;
 
     // Observe the inherited descriptor before new sockets could reuse its number.
     const inherited_result = linux.errno(linux.fcntl(inherited, linux.F.GETFD, 0));
     if (inherited_result != (if (host) linux.E.SUCCESS else linux.E.BADF))
         return error.InheritedDescriptorBoundaryFailed;
-    const systemd = std.mem.eql(u8, mode, "systemd");
+    const systemd = mode == .systemd;
     if (try present("/proc/net") != (host or systemd)) return error.ProcNetworkBoundaryFailed;
     if (!host) {
         if (systemd) {
@@ -342,12 +336,28 @@ pub fn main(init: std.process.Init) !void {
     try privateLoopback();
     const receipt = if (host)
         "DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
+    else if (mode == .reference or mode == .sudo)
+        "DEBZ_REFERENCE_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
     else if (systemd)
         "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
     else
         "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n";
     if (try checked(linux.write(1, receipt.ptr, receipt.len)) != receipt.len)
         return error.NetworkReceiptFailed;
+}
+
+pub fn main(init: std.process.Init) !void {
+    var args = init.minimal.args.iterate();
+    _ = args.next();
+    const mode = std.meta.stringToEnum(Mode, args.next() orelse
+        return error.InvalidNetworkProbeArguments) orelse
+        return error.InvalidNetworkProbeArguments;
+    if (mode == .reference or mode == .sudo) return error.InvalidNetworkProbeArguments;
+    const port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidNetworkProbeArguments, 10);
+    const unix_name = args.next() orelse return error.InvalidNetworkProbeArguments;
+    const inherited = try std.fmt.parseInt(i32, args.next() orelse return error.InvalidNetworkProbeArguments, 10);
+    if (args.next() != null) return error.InvalidNetworkProbeArguments;
+    try observe(mode, port, unix_name, inherited);
 }
 
 test "network probe observes routes instead of inferring isolation from hidden proc" {

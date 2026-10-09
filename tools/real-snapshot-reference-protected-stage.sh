@@ -82,6 +82,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
   tools/real-snapshot-reference-escape-probe.zig \
+  src/private_network.zig src/fixtures/script_network_probe.zig \
   tools/prepare-native-dpkg.py tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
 done
@@ -336,12 +337,14 @@ fi
 
 launcher=$workspace/launcher
 probe=$workspace/escape-probe
-"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+"$zig" build-exe -O ReleaseSafe -lc --dep private_network \
+  -Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig \
   --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$launcher"
-"$zig" build-exe tools/real-snapshot-reference-escape-probe.zig -O ReleaseSafe -fstrip \
+"$zig" build-exe -O ReleaseSafe -fstrip --dep network_probe \
+  -Mroot=tools/real-snapshot-reference-escape-probe.zig -Mnetwork_probe=src/fixtures/script_network_probe.zig \
   --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
