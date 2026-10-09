@@ -128,7 +128,7 @@ jobs:
 
   setup-action-container:
     name: Setup action in bare Ubuntu container
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container: ubuntu:24.04
     timeout-minutes: 10
     steps:
@@ -660,7 +660,7 @@ jobs:
   download-action-container:
     name: Download action in bare Ubuntu container
     needs: download-action-container-fixture
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container: ubuntu:24.04
     timeout-minutes: 15
     steps:
