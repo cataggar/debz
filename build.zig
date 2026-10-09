@@ -2133,17 +2133,41 @@ pub fn build(b: *std.Build) void {
     b.step("test-transaction-executor", "Run dpkg transaction executor tests")
         .dependOn(&run_transaction_tests.step);
 
+    const script_network_probe_module = b.createModule(.{
+        .root_source_file = b.path("src/fixtures/script_network_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const script_network_probe = b.addExecutable(.{
+        .name = "debz-script-network-probe",
+        .root_module = script_network_probe_module,
+    });
+    const script_network_probe_tests = b.addTest(.{ .root_module = script_network_probe_module });
+    const run_script_network_probe_tests = b.addRunArtifact(script_network_probe_tests);
+    workload_core.dependOn(&run_script_network_probe_tests.step);
+    b.step("test-script-network-probe", "Test bounded signed-script network observations")
+        .dependOn(&run_script_network_probe_tests.step);
+
     const maintainer_script_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"maintainer_script.test."},
     });
-    const run_maintainer_script_tests = b.addRunArtifact(maintainer_script_tests);
+    const run_maintainer_script_tests = b.addSystemCommand(&.{"env"});
+    run_maintainer_script_tests.addPrefixedFileArg(
+        "DEBZ_SCRIPT_NETWORK_PROBE=",
+        script_network_probe.getEmittedBin(),
+    );
+    run_maintainer_script_tests.addArtifactArg(maintainer_script_tests);
     b.step("test-maintainer-script", "Run audited maintainer-script runner tests")
         .dependOn(&run_maintainer_script_tests.step);
     const native_helper_namespace_tests = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env", "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
     });
+    native_helper_namespace_tests.addPrefixedFileArg(
+        "DEBZ_SCRIPT_NETWORK_PROBE=",
+        script_network_probe.getEmittedBin(),
+    );
     native_helper_namespace_tests.addArtifactArg(maintainer_script_tests);
     b.step("test-native-helper-namespace", "Require private helper mounts without changing package-owned files")
         .dependOn(&native_helper_namespace_tests.step);
@@ -2191,7 +2215,12 @@ pub fn build(b: *std.Build) void {
                 b.fmt("DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT={s}", .{roots[0]}),
                 b.fmt("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT={s}", .{roots[1]}),
                 b.fmt("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT={s}", .{roots[2]}),
+                b.fmt("DEBZ_SIGNED_NETWORK_PROOF_DIR={s}", .{b.pathFromRoot(".tmp")}),
             });
+            signed_proc_run.addPrefixedFileArg(
+                "DEBZ_SCRIPT_NETWORK_PROBE=",
+                script_network_probe.getEmittedBin(),
+            );
             signed_proc_run.addArtifactArg(signed_proc_tests);
             signed_proc_step.dependOn(&signed_proc_run.step);
         }
