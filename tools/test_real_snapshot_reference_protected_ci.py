@@ -6,8 +6,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,6 +33,9 @@ def load(name: str, path: str):
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
 HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
+DPKG = load("debz_reference_receipt", "prepare-native-dpkg.py")
+from real_snapshot_reference_paths import toolchain, verify_keyring
+from real_snapshot_outcome import collect_outcome
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 # The published signature of the pinned x86_64 Zig 0.16.0 archive.
@@ -243,7 +249,576 @@ class ProfileStagingTests(unittest.TestCase):
         self.assertEqual(set(HARNESS.PROFILE_VIEW_CHECKS), set(HARNESS.ORDER.PROFILE_VERSIONS))
 
 
+class ExtractedReferenceReceiptTests(unittest.TestCase):
+    def test_archive_receipt_producer_and_verify_only_both_architectures(self) -> None:
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                package, prefix, archive = base / "package", base / "prefix", base / "dpkg.deb"
+                (package / "DEBIAN").mkdir(parents=True)
+                (package / "DEBIAN/control").write_text(
+                    f"Package: dpkg\nVersion: {DPKG.VERSION}\nArchitecture: {architecture}\n"
+                    "Maintainer: Fixture <fixture@example.invalid>\nDescription: Receipt fixture\n"
+                )
+                (package / "usr/bin").mkdir(parents=True)
+                pins = {}
+                for name, key in (("dpkg", "executable"), ("dpkg-query", "dpkg_query"),
+                                  ("update-alternatives", "update_alternatives")):
+                    executable = package / "usr/bin" / name
+                    executable.write_text(f"#!/bin/sh\necho 'Debian dpkg version {DPKG.VERSION}'\n")
+                    executable.chmod(0o755)
+                    pins[key] = hashlib.sha256(executable.read_bytes()).hexdigest()
+                subprocess.run(["dpkg-deb", "--build", str(package), str(archive)],
+                               stdout=subprocess.DEVNULL, check=True)
+                subprocess.run(["dpkg-deb", "--extract", str(archive), str(prefix)], check=True)
+                pins["archive"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                receipt = prefix / DPKG.RECEIPT
+                with mock.patch.dict(DPKG.PINS, {architecture: pins}):
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    DPKG.verify_receipt(receipt, architecture)
+                    with mock.patch.object(sys, "argv", [
+                        "prepare-native-dpkg.py", "--architecture", architecture,
+                        "--verify-only", str(prefix / "usr/bin/dpkg"),
+                    ]):
+                        self.assertEqual(DPKG.main(), 0)
+                    with self.assertRaises(FileExistsError):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    receipt.unlink()
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    receipt.write_text("{}\n")
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+                    receipt.unlink()
+                    query = prefix / "usr/bin/dpkg-query"
+                    query.chmod(0o777)
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    query.chmod(0o755)
+                    os.link(query, prefix / "hardlink")
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "hardlink").unlink()
+                    (prefix / "usr/bin").rename(prefix / "usr/aliased-bin")
+                    (prefix / "usr/bin").symlink_to("aliased-bin")
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "usr/bin").unlink()
+                    (prefix / "usr/aliased-bin").rename(prefix / "usr/bin")
+                    for name in ("dpkg-query", "update-alternatives"):
+                        tool = prefix / "usr/bin" / name
+                        original = tool.read_bytes()
+                        tool.write_bytes(b"corrupted binding")
+                        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                            DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                        self.assertFalse(receipt.exists())
+                        tool.write_bytes(original)
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "usr/bin/dpkg-query").write_bytes(b"corrupted after receipt")
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+
+
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_less_orchestration_cleans_environment_before_entering_minimal_guest(self) -> None:
+        for filename, count in (("real-snapshot-less-protected-stage.sh", 1),
+                                ("real-snapshot-less-reference.sh", 2)):
+            source = (TOOLS / filename).read_text()
+            commands = re.findall(
+                r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
+                source, re.DOTALL,
+            )
+            self.assertEqual(len(commands), count)
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                log = root / "calls"
+                chroot = root / "mock-chroot"
+                chroot.write_text(
+                    "#!/bin/bash\nset -euo pipefail\n"
+                    '[[ ! -v UNTRUSTED_TEST_ENV && $HOME == / && $LC_ALL == C ]]\n'
+                    '[[ $PATH == /usr/sbin:/usr/bin:/sbin:/bin && $DPKG_COLORS == never ]]\n'
+                    '[[ $DEBIAN_FRONTEND == noninteractive && $4 != *"env -i"* ]]\n'
+                    '[[ $4 == *"--bounding-set=-sys_admin --no-new-privs"* ]]\n'
+                    f'printf "%s\\n" "$1" >>{shlex.quote(str(log))}\n'
+                )
+                chroot.chmod(0o755)
+                setup = """
+source=/unit-source
+script_root=/unit-script
+dpkg_root=/unit-dpkg
+timeout() { while [[ $1 != unshare ]]; do shift; done; "$@"; }
+unshare() { while [[ $1 != -- ]]; do shift; done; shift; "$@"; }
+"""
+                for command in commands:
+                    with self.subTest(filename=filename, command=command.splitlines()[-2]):
+                        command = command.replace("chroot ", shlex.quote(str(chroot)) + " ")
+                        result = subprocess.run(
+                            ["bash", "-euo", "pipefail", "-c", setup + command],
+                            env=dict(os.environ, UNTRUSTED_TEST_ENV="must-not-enter-guest"),
+                            capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(log.is_file(), "guest entry must receive the sanitized environment")
+                self.assertEqual(len(log.read_text().splitlines()), count)
+
+    def test_python_alternatives_fingerprint_covers_inventory_and_fails_closed_in_substitution(self) -> None:
+        source = (TOOLS / "real-snapshot-python3-reference.sh").read_text()
+        function = "alternatives_fingerprint() {" + source.split(
+            "alternatives_fingerprint() {", 1
+        )[1].split("\nbefore=$(alternatives_fingerprint", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = root / "var/lib/dpkg/alternatives"
+            selectors = root / "etc/alternatives"
+            records.mkdir(parents=True)
+            selectors.mkdir(parents=True)
+            (root / "usr/bin").mkdir(parents=True)
+            (root / "usr/bin/python3").symlink_to("python3.14")
+            (records / "editor").write_bytes(b"unchanged record\n")
+            (selectors / "editor").symlink_to("/usr/bin/editor")
+            def fingerprint() -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c",
+                     function + '\nvalue=$(alternatives_fingerprint "$1")\nprintf "%s\\n" "$value"\n',
+                     "python-alternatives-fingerprint-test", str(root)],
+                    capture_output=True, text=True,
+                )
+            original = fingerprint()
+            self.assertEqual(original.returncode, 0, original.stderr)
+            (records / "pager").write_bytes(b"additional record\n")
+            changed = fingerprint()
+            self.assertEqual(changed.returncode, 0, changed.stderr)
+            self.assertNotEqual(original.stdout, changed.stdout)
+            (records / "pager").unlink()
+            (selectors / "editor").unlink()
+            (selectors / "editor").symlink_to("/usr/bin/other-editor")
+            self.assertNotEqual(original.stdout, fingerprint().stdout)
+            for mutation in ("missing-records", "missing-selectors", "missing-python-link"):
+                with self.subTest(mutation=mutation):
+                    if mutation == "missing-records":
+                        records.rename(records.with_name("saved-records"))
+                    elif mutation == "missing-selectors":
+                        selectors.rename(selectors.with_name("saved-selectors"))
+                    else:
+                        (root / "usr/bin/python3").unlink()
+                    result = fingerprint()
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(result.stdout, "")
+                    if mutation == "missing-records":
+                        records.with_name("saved-records").rename(records)
+                    elif mutation == "missing-selectors":
+                        selectors.with_name("saved-selectors").rename(selectors)
+
+    def test_selected_prestate_origins_require_all_fresh_authenticated_witnesses(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
+        predicate = re.search(r"jq -e --arg release .*? '\n(.*?)\n' \"\$lock\"",
+                              source, re.DOTALL).group(1)
+        pins = {name: re.search(rf"^readonly {name}=([a-f0-9]+)$", source, re.MULTILINE).group(1)
+                for name in ("release_sha256", "updates_release_sha256",
+                             "security_release_sha256", "release_signer")}
+        repositories = [
+            {"id": character * 64, "snapshot_sha256": str(index) * 64,
+             "release_sha256": pins[name], "index_identity": {"primary": "sha256"},
+             "signer_fingerprints": [pins["release_signer"]]}
+            for index, (character, name) in enumerate((
+                ("a", "release_sha256"), ("b", "updates_release_sha256"),
+                ("c", "security_release_sha256")), 1)
+        ]
+        sources = [
+            {"package": entry["id"], "repository": {
+                "release_digest": "sha256:" + entry["release_sha256"],
+                "snapshot_digest": "sha256:" + entry["snapshot_sha256"],
+                "signer_fingerprints": entry["signer_fingerprints"], "frozen": None}}
+            for entry in repositories
+        ]
+        sources[0]["repository"]["frozen"] = {
+            "release_digest": "sha256:" + pins["release_sha256"],
+            "witnesses": [
+                {"repository_id": item["package"],
+                 "snapshot_digest": item["repository"]["snapshot_digest"],
+                 "primary_fingerprint": pins["release_signer"]}
+                for item in sources[1:]
+            ],
+        }
+        versions = json.loads((TOOLS / "fixtures/real-snapshot/pin-v1.json").read_text())[
+            "snapshot"]["closures"]["amd64"]["packages"]
+        lock = {
+            "schema": "https://debz.dev/schema/exact-closure-lock-v3", "version": 3,
+            "target_architecture": "amd64", "repositories": repositories,
+            "packages": [
+                {"name": name, "version": versions[name], "architecture": "amd64",
+                 "archive_identity": {"primary": "sha512", "digests": [
+                     {"algorithm": "sha512", "digest": hashlib.sha512(name.encode()).hexdigest()}]}}
+                for name in ("systemd", "udev", "sudo", "sudo-rs", "util-linux", "libcap-ng0")
+            ],
+        }
+        report = {"schema": "io.github.cataggar.debz.command.v1", "api_version": 1,
+                  "operation": "refresh", "exit_status": 0, "items": sources}
+        arguments = []
+        for flag, name in (("release", "release_sha256"), ("updates", "updates_release_sha256"),
+                           ("security", "security_release_sha256"), ("signer", "release_signer")):
+            arguments.extend(("--arg", flag, pins[name]))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def check(candidate: dict, admission: dict) -> subprocess.CompletedProcess:
+                (root / "lock.json").write_text(json.dumps(candidate))
+                (root / "refresh.json").write_text(json.dumps(admission))
+                return subprocess.run(
+                    ["jq", "-e", *arguments, "--slurpfile", "refreshed",
+                     str(root / "refresh.json"), predicate, str(root / "lock.json")],
+                    capture_output=True, text=True,
+                )
+            for count in (2, 3):
+                with self.subTest(selected=count):
+                    candidate = dict(lock, repositories=repositories[:count])
+                    result = check(candidate, report)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for mutation in ("missing-witness", "unknown-signer", "changed-witness",
+                             "changed-id", "changed-snapshot", "unknown-release",
+                             "duplicate-origin", "missing-base", "extra-source", "failed-refresh"):
+                with self.subTest(mutation=mutation):
+                    candidate = json.loads(json.dumps(dict(lock, repositories=repositories[:2])))
+                    admission = json.loads(json.dumps(report))
+                    if mutation == "missing-witness":
+                        admission["items"].pop()
+                    elif mutation == "unknown-signer":
+                        admission["items"][2]["repository"]["signer_fingerprints"] = ["0" * 40]
+                    elif mutation == "changed-witness":
+                        admission["items"][0]["repository"]["frozen"]["witnesses"][0][
+                            "snapshot_digest"] = "sha256:" + "0" * 64
+                    elif mutation == "changed-id":
+                        candidate["repositories"][0]["id"] = "0" * 64
+                    elif mutation == "changed-snapshot":
+                        candidate["repositories"][0]["snapshot_sha256"] = "0" * 64
+                    elif mutation == "unknown-release":
+                        candidate["repositories"][0]["release_sha256"] = "0" * 64
+                    elif mutation == "duplicate-origin":
+                        candidate["repositories"][1] = candidate["repositories"][0]
+                    elif mutation == "missing-base":
+                        candidate["repositories"] = repositories[1:]
+                    elif mutation == "extra-source":
+                        admission["items"].append(admission["items"][0])
+                    else:
+                        admission["exit_status"] = 4
+                    result = check(candidate, admission)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_protected_staging_plan_and_download_use_separate_single_root_locks(self) -> None:
+        source = (TOOLS / "real-snapshot-reference-protected-stage.sh").read_text()
+        selection = 'closure_args=("$closure_root")' + source.split(
+            'closure_args=("$closure_root")', 1
+        )[1].split("\nexport PATH=", 1)[0]
+        calls = "debz_step plan plan " + source.split(
+            "debz_step plan plan ", 1
+        )[1].split("\ntemplate=", 1)[0]
+        setup = """
+closure_root=dpkg
+purpose=$1
+architecture=$2
+snapshot=/protected-test/snapshot
+lock=/protected-test/runtime.lock.json
+evidence=/protected-test/evidence
+authenticated_lock() { :; }
+debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
+"""
+        for purpose, architecture in (("proof", "amd64"), ("proof", "arm64"),
+                                       ("arm64-less", "arm64")):
+            with self.subTest(purpose=purpose, architecture=architecture):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", setup + selection + "\n" + calls,
+                     "protected-staging-roots-test", purpose, architecture],
+                    check=True, capture_output=True, text=True,
+                )
+                rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
+                goals = ("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else ("dpkg",)
+                self.assertEqual(len(rows), 2 * len(goals))
+                for index, package in enumerate(goals):
+                    for offset, command in enumerate(("plan", "download")):
+                        row = rows[2 * index + offset]
+                        name = command if package == "dpkg" else f"{package}-{command}"
+                        self.assertEqual(row[:2], [name, command])
+                        self.assertEqual(row[7:], [package])
+                        expected_lock = ("/protected-test/runtime.lock.json" if package == "dpkg"
+                                         else f"/protected-test/evidence/{package}.lock.json")
+                        self.assertEqual(row[6], expected_lock)
+
+    def test_less_reference_pins_use_separate_locks_and_retain_combined_lock_support(self) -> None:
+        stage = load("debz_less_source_lock_pins", "real_snapshot_less_stage.py")
+        source = (TOOLS / "real-snapshot-less-reference.sh").read_text()
+        checks = "require_lock_artifact() {" + source.split(
+            "require_lock_artifact() {", 1
+        )[1].split("\n[[ $(stat -c '%s'", 1)[0]
+        records = {
+            name: {"name": name, "version": version, "architecture": "arm64",
+                   "declared_size": size, "origin": {"type": "authenticated_repository"},
+                   "archive_identity": {"primary": "sha512", "digests": [
+                       {"algorithm": "sha512", "digest": digest}]}}
+            for name, (version, size, digest) in stage.SOURCE_ARTIFACTS.items()
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for separate in (False, True):
+                with self.subTest(separate=separate):
+                    runtime = [records[name] for name in ("dpkg", "libc6")] if separate else list(records.values())
+                    (root / "runtime.json").write_text(json.dumps({"packages": runtime}))
+                    (root / "less.json").write_text(json.dumps({"packages": [records["less"]]}))
+                    (root / "dash.json").write_text(json.dumps({"packages": [records["dash"]]}))
+                    setup = """
+lock=$1/runtime.json
+less_lock=$lock
+dash_lock=$lock
+if [[ $2 == separate ]]; then
+  less_lock=$1/less.json
+  dash_lock=$1/dash.json
+fi
+"""
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", setup + checks,
+                         "less-reference-source-locks-test", str(root),
+                         "separate" if separate else "combined"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    wrong = dict(records["dash"], declared_size=records["dash"]["declared_size"] + 1)
+                    if separate:
+                        (root / "dash.json").write_text(json.dumps({"packages": [wrong]}))
+                    else:
+                        (root / "runtime.json").write_text(json.dumps({
+                            "packages": [wrong if entry["name"] == "dash" else entry for entry in runtime]}))
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", setup + checks,
+                         "less-reference-source-locks-test", str(root),
+                         "separate" if separate else "combined"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_binding_step_failure_reports_stage_preserves_exit_and_raw_evidence(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-bindings.sh").read_text()
+        loop = "for step in refresh plan download; do" + source.split(
+            "for step in refresh plan download; do", 1
+        )[1].split("\ndone\n", 1)[0] + "\ndone\n"
+        setup = """
+snapshot=$1
+fail_step=$2
+lock=$snapshot/evidence/ubuntu-minimal.lock.json
+debz=unused-test-binary
+common=()
+timeout() {
+  printf '%s\\n' "$5" >>"$snapshot/calls"
+  printf '{"stage":"%s"}\\n' "$5"
+  printf 'raw diagnostic for %s\\n' "$5" >&2
+  [[ "$5" != "$fail_step" ]] || return 6
+}
+"""
+        for failed in ("refresh", "plan", "download", ""):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "evidence").mkdir()
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", setup + loop,
+                     "signed-binding-diagnostic-test", str(root), failed],
+                    capture_output=True, text=True,
+                )
+                steps = ["refresh", "plan", "download"]
+                attempted = steps[:steps.index(failed) + 1] if failed else steps
+                self.assertEqual(result.returncode, 6 if failed else 0, result.stderr)
+                self.assertEqual((root / "calls").read_text().splitlines(), attempted)
+                for step in attempted:
+                    self.assertEqual((root / f"evidence/{step}.json").read_text(),
+                                     f'{{"stage":"{step}"}}\n')
+                    self.assertEqual((root / f"evidence/{step}.stderr").read_text(),
+                                     f"raw diagnostic for {step}\n")
+                if failed:
+                    self.assertIn(f"signed proc bindings {failed} failed with exit 6", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+
+    def test_signed_sudo_binding_list_preserves_original_archive_member_order(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-bindings.sh").read_text()
+        prefix = "awk -F'\\t' '$1 == \"sudo\""
+        command = prefix + source.split(prefix, 1)[1].split("\nchmod 0644", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "var/lib/dpkg/info").mkdir(parents=True)
+            (root / "members.tsv").write_text(
+                "sudo\t\nsudo\tusr\nother\tunrelated\nsudo\tusr/bin/z\nsudo\tusr/bin/a\n"
+            )
+            subprocess.run(
+                ["bash", "-euo", "pipefail", "-c",
+                 'source_root=$1\nlisting=$1/members.tsv\n' + command,
+                 "signed-sudo-binding-list-test", str(root)],
+                check=True, capture_output=True, text=True,
+            )
+            self.assertEqual((root / "var/lib/dpkg/info/sudo.list").read_bytes(),
+                             b"/.\n/usr\n/usr/bin/z\n/usr/bin/a\n")
+
+    def test_list_preparation_cannot_normalize_or_rewrite_authenticated_original_bytes(self) -> None:
+        audit = load("debz_original_fixture_list_guards", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, read, listing in (
+            ("tools/real_snapshot_less_stage.py", "        content = os.read(descriptor, 2048)\n",
+             "var/lib/dpkg/info/less.list"),
+            ("tools/real_snapshot_python_fixtures.py", "        content = read_regular(root, relative, 2048)\n",
+             "var/lib/dpkg/info/python3.list"),
+        ):
+            for mutation in (
+                '        content = b"".join(sorted(content.splitlines(keepends=True)))\n',
+                f'        overwrite_regular(root, "{listing}", content)\n',
+            ):
+                with self.subTest(path=path, mutation=mutation):
+                    self.assertIn(read, texts[path])
+                    changed = dict(texts)
+                    changed[path] = changed[path].replace(read, read + mutation, 1)
+                    self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
+                                        for failure in audit.protected_reference_ci_failures(changed)))
+        path = "tools/real-snapshot-signed-proc-bindings.sh"
+        output = "sed 's#^/$#/.#' \\\n" + '  >"$source_root/var/lib/dpkg/info/sudo.list"\n'
+        for mutation in (
+            "sed 's#^/$#/.#' |\n" + '  LC_ALL=C sort >"$source_root/var/lib/dpkg/info/sudo.list"\n',
+            "sed 's#^/$#/.#' \\\n" + '  >"$source_root/var/lib/dpkg/info/sudo.list.sorted"\n',
+        ):
+            with self.subTest(path=path, mutation=mutation):
+                changed = dict(texts)
+                self.assertIn(output, changed[path])
+                changed[path] = changed[path].replace(output, mutation, 1)
+                subprocess.run(["bash", "-n"], input=changed[path], text=True,
+                               check=True, capture_output=True)
+                self.assertIn("signed sudo binding list must retain authenticated archive member order",
+                              audit.protected_reference_ci_failures(changed))
+        path = "tools/real-snapshot-signed-proc-prestates.sh"
+        read = 'require_protected_file "$list"\n'
+        for mutation in ('LC_ALL=C sort -- "$list" >"$list.sorted"\n',
+                         'mv -- "$list.sorted" "$list"\n',
+                         'printf changed >"$list"\n'):
+            with self.subTest(path=path, mutation=mutation):
+                changed = dict(texts)
+                self.assertIn(read, changed[path])
+                changed[path] = changed[path].replace(read, read + mutation, 1)
+                self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
+                                    for failure in audit.protected_reference_ci_failures(changed)))
+
+    def test_receipt_and_python_premutation_guards_cannot_be_removed(self) -> None:
+        audit = load("debz_receipt_python_guards", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("src/native_alternatives.zig",
+             '        try testing.expectEqualDeep(listed.names, listed_after.names);\n'),
+            ("src/native_alternatives.zig",
+             '        try validateScriptTransition(testing.allocator, before, same, script, authority);\n'),
+            ("src/native_alternatives.zig",
+             '        try validateScriptTransition(testing.allocator, after, after_same, script, authority);\n'),
+            ("src/native_alternatives.zig",
+             '            try testing.expectEqualDeep(old_group.record, new_group.record);\n'),
+            ("src/native_alternatives.zig",
+             '            try testing.expectEqualDeep(old_group.links, new_group.links);\n'),
+            ("src/native_alternatives.zig",
+             '                try testing.expect(testClonedEntryFactEqual(left, right));\n'),
+            ("src/native_alternatives.zig",
+             '        errdefer |err| std.debug.print(\n'),
+            ("src/native_alternatives.zig",
+             '        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },\n'),
+            ("tools/real-snapshot-less-protected-stage.sh",
+             '    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \\\n'),
+            ("tools/real-snapshot-less-reference.sh",
+             '    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \\\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             'require_protected_file "$snapshot/evidence/refresh.json"\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  --slurpfile refreshed "$snapshot/evidence/refresh.json"'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  ([$frozen.witnesses[].repository_id] | sort) =='),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '      .repository.snapshot_digest == ("sha256:" + $repository.snapshot_sha256)'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '      .repository.release_digest == ("sha256:" + $repository.release_sha256)'),
+            ("tools/real-snapshot-reference-protected-stage.sh",
+             '  for package in less dash util-linux; do'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '[[ $actual_record == "$expected_record" ]] || {\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"\n'),
+            ("tools/prepare-native-dpkg.py", "    verify_extracted_bindings(prefix, architecture)\n"),
+            ("tools/prepare-native-dpkg.py", "    verify_archive_metadata(archive, architecture)\n"),
+            ("tools/real-snapshot-reference-protected-stage.sh", "module.receipt_from_extracted_archive(\n"),
+            ("tools/real-snapshot-python3-reference.sh", 'fixture preflight "$source_root"\n'),
+            ("tools/real_snapshot_python_fixtures.py",
+             '    create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)\n'),
+            ("src/native_unpack.zig",
+             "    try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);\n"),
+        ):
+            with self.subTest(path=path, token=token):
+                changed = dict(texts)
+                self.assertIn(token, changed[path])
+                changed[path] = changed[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+        changed = dict(texts)
+        path = "tools/real-snapshot-python3-reference.sh"
+        token = 'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"\n'
+        changed[path] = changed[path].replace(token, "", 1) + "\n" + token
+        self.assertIn("protected Python source guard must execute before copies/mutations",
+                      audit.protected_reference_ci_failures(changed))
+
+    def test_arm_less_receipts_require_real_source_and_replay_assertions(self) -> None:
+        audit = load("debz_arm_less_activation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("src/native_unpack.zig", '    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");\n'),
+            ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
+            ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
+            ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
+            ("tools/real_snapshot_less_stage.py", '    for package in SOURCE_ARTIFACTS:\n        archive(locks["dpkg" if package == "libc6" else package], cache, package)\n'),
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, texts[path])
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def test_arm_less_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
+        script = TOOLS / "real-snapshot-less-protected-stage.sh"
+        for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz",
+                               str(TOOLS.parent / ".real-snapshot/less-arm64"))):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("replay roots staged", result.stdout)
+
+    def test_python_input_receipt_requires_actual_strict_root_assertions(self) -> None:
+        audit = load("debz_python_activation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        path = "src/native_unpack.zig"
+        # This source exceeds the generic mutation CLI's 1 MiB input cap.
+        # Exercise the same real policy directly; do not widen that cap.
+        for token in (
+            "    try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);\n",
+            "    try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);\n",
+            '        try proof.writeStreamingAll(testing.io, "signed Python empty0600/0644 '
+            'and amd64 20/96 input/output guards executed without skips\\n");\n',
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, texts[path])
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(any("protected Python test body lost" in failure for failure in
+                                    audit.protected_reference_ci_failures(changed)))
+
+    def test_python_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
+        script = TOOLS / "real-snapshot-python3-protected-stage.sh"
+        for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz", "/usr/bin/dpkg",
+                               str(TOOLS.parent / ".real-snapshot/python3-amd64"))):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("coordinates staged", result.stdout)
+
     def test_refuses_outside_its_root_owned_tree(self) -> None:
         script = TOOLS / "real-snapshot-reference-protected-ci.sh"
         for arguments in ((), ("/srv/debz-protected/ci-1-1-amd64", "arm64", "0" * 40),
@@ -252,6 +827,229 @@ class ProtectedCiScriptTests(unittest.TestCase):
                                     text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertNotIn("protected reference CI: commit=", result.stdout)
+
+    def test_acceptance_has_no_ambient_keyring_fallback(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("DEBZ_REAL_SNAPSHOT_KEYRING", None)
+        architecture = "arm64" if os.uname().machine == "aarch64" else "amd64"
+        result = subprocess.run(
+            ["bash", str(TOOLS / "real-snapshot-acceptance.sh"), "--validate",
+             "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z", "resolute", architecture],
+            env=environment, capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("explicit regular Ubuntu archive keyring", result.stderr)
+
+
+class ProtectedInputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.real_fstat = os.fstat
+
+    def root_owned_fstat(self, fd: int) -> os.stat_result:
+        values = list(self.real_fstat(fd))
+        values[4:6] = [0, 0]
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if not path.is_relative_to(self.root):
+            values[0] &= ~0o022
+        return os.stat_result(values)
+
+    def test_keyring_refuses_unprotected_writable_symlinked_and_wrong_bytes(self) -> None:
+        keyring = self.root / "keyring"
+        payload = b"reviewed fixture bytes"
+        keyring.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            verify_keyring(keyring, len(payload), digest)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(verify_keyring(keyring, len(payload), digest), digest)
+            for size, expected in ((len(payload) + 1, digest), (len(payload), "0" * 64)):
+                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "pin mismatch"):
+                    verify_keyring(keyring, size, expected)
+            keyring.write_bytes(payload[:-1] + b"?")
+            with self.assertRaisesRegex(ValueError, "pin mismatch"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.write_bytes(payload)
+            keyring.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.chmod(0o644)
+            link = self.root / "linked"
+            link.symlink_to(keyring)
+            with self.assertRaises(OSError):
+                verify_keyring(link, len(payload), digest)
+            directory_link = self.root / "linked-dir"
+            directory_link.symlink_to(self.root, target_is_directory=True)
+            with self.assertRaises(OSError):
+                verify_keyring(directory_link / "keyring", len(payload), digest)
+            self.root.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+
+    def test_compiler_binds_protected_library_ancestry_without_resolving_input_links(self) -> None:
+        compiler = self.root / "zig"
+        compiler.write_text("#!/bin/sh\nexit 0\n")
+        compiler.chmod(0o755)
+        library = self.root / "lib"
+        library.mkdir()
+        source = library / "std.zig"
+        source.write_text("fixture")
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            toolchain(compiler)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(toolchain(compiler), library)
+            compiler.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            compiler.chmod(0o755)
+            source.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            source.chmod(0o644)
+            (library / "escape").symlink_to(compiler)
+            with self.assertRaisesRegex(ValueError, "symlink escapes"):
+                toolchain(compiler)
+            (library / "escape").unlink()
+            linked = self.root / "linked-zig"
+            linked.symlink_to(compiler)
+            with self.assertRaises(OSError):
+                toolchain(linked)
+            library.rename(self.root / "real-lib")
+            library.symlink_to(self.root / "real-lib", target_is_directory=True)
+            with self.assertRaises(OSError):
+                toolchain(compiler)
+
+
+class NativeOutcomeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cache = TOOLS.parent / ".zig-cache"
+        cache.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="debz-native-outcome-", dir=cache)
+        self.addCleanup(temporary.cleanup)
+        self.evidence = Path(temporary.name)
+        self.refresh = self.result("refresh", 0, changed=True)
+        self.write_json("refresh.json", self.refresh)
+
+    @staticmethod
+    def result(operation: str, status: int, *, changed: bool = False) -> dict:
+        return {"operation": operation, "exit_status": status, "changed": changed,
+                "summary": f"{operation} result", "diagnostics": []}
+
+    def write_json(self, name: str, value: object) -> None:
+        (self.evidence / name).write_text(json.dumps(value))
+
+    def attempt(self, stage: str, status: int | None, result: dict,
+                wrapper_status: int | None) -> None:
+        self.write_json("native-stage-v1.json", {"stage": stage, "command_exit_status": status})
+        self.write_json(f"{stage}.json", result)
+        receipt = self.evidence / "native-wrapper-exit-status.txt"
+        if wrapper_status is None:
+            receipt.unlink(missing_ok=True)
+        else:
+            receipt.write_text(f"{wrapper_status}\n")
+
+    def test_failed_create_preserves_install_diagnostic_not_successful_refresh(self) -> None:
+        result = self.result("install", 8, changed=True)
+        result["diagnostics"] = [{"id": "native_backend_unavailable",
+                                  "message": "python3_preinst reason=control_file_mismatch "
+                                  "path=dev/null field=size expected=0 observed=20"}]
+        self.attempt("create", 8, result, 8)
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 0)
+        self.assertEqual((outcome["operation"], outcome["stage"], outcome["exit_status"]),
+                         ("install", "create", 8))
+        self.assertTrue(outcome["changed"])
+        self.assertEqual(outcome["diagnostics"][0], result["diagnostics"][0])
+        self.assertEqual(outcome["workflow_step_outcome"], "failure")
+
+    def test_later_failure_and_post_command_failure_keep_latest_attempt(self) -> None:
+        for stage, result, command, wrapper in (
+            ("update", self.result("upgrade-all", 8), 8, 8),
+            ("create-summary", {"backend": "native", "outcome": "failed"}, 7, 7),
+            ("update", self.result("upgrade-all", 0), 0, 90),
+            ("update", self.result("upgrade-all", 0), 0, 0),
+        ):
+            with self.subTest(stage=stage, command=command, wrapper=wrapper):
+                self.attempt(stage, command, result, wrapper)
+                outcome, status = collect_outcome(self.evidence, "failure")
+                self.assertEqual(status, 0)
+                self.assertEqual(outcome["stage"], stage)
+                self.assertEqual(outcome["command_exit_status"], command)
+                self.assertEqual(outcome["wrapper_exit_status"], wrapper)
+                self.assertEqual(outcome["exit_status"], wrapper or 1)
+                self.assertNotEqual(outcome["operation"], "refresh")
+                if stage == "create-summary":
+                    self.assertIsNone(outcome["result_exit_status"])
+
+    def test_missing_empty_corrupt_and_unsafe_latest_result_never_fall_back(self) -> None:
+        self.attempt("update", 1, self.result("upgrade-all", 1), 1)
+        path = self.evidence / "update.json"
+        for data in (None, b"", b"{broken", b"null", b"[]", b"{}",
+                     b'{"operation":"upgrade-all","exit_status":false,"changed":false,'
+                     b'"summary":"bad","diagnostics":[]}'):
+            with self.subTest(data=data):
+                path.unlink(missing_ok=True)
+                if data is not None:
+                    path.write_bytes(data)
+                outcome, status = collect_outcome(self.evidence, "failure")
+                self.assertEqual(status, 1)
+                self.assertEqual(outcome["stage"], "update")
+                self.assertEqual(outcome["operation"], "upgrade-all")
+                self.assertFalse(outcome["result_available"])
+                self.assertNotEqual(outcome["exit_status"], 0)
+                self.assertTrue(outcome["diagnostics"][-1]["id"].startswith("native_acceptance_evidence_"))
+        path.unlink()
+        path.symlink_to(self.evidence / "refresh.json")
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 1)
+        self.assertFalse(outcome["result_available"])
+
+    def test_unrecorded_attempt_exit_and_missing_marker_are_explicitly_unavailable(self) -> None:
+        self.attempt("create", None, self.result("install", 0), None)
+        outcome, status = collect_outcome(self.evidence, "cancelled")
+        self.assertEqual(status, 1)
+        self.assertEqual(outcome["stage"], "create")
+        self.assertIsNone(outcome["command_exit_status"])
+        self.assertEqual(outcome["diagnostics"][-1]["id"], "native_acceptance_evidence_unavailable")
+        (self.evidence / "native-stage-v1.json").unlink()
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 1)
+        self.assertIsNone(outcome["stage"])
+        self.assertNotEqual(outcome["operation"], "refresh")
+
+    def test_expected_negative_control_is_not_wrapper_success_without_completion(self) -> None:
+        self.attempt("injected-failure", 5, self.result("plan", 5), 0)
+        outcome, status = collect_outcome(self.evidence, "success")
+        self.assertEqual(status, 0)
+        self.assertEqual((outcome["exit_status"], outcome["command_exit_status"],
+                          outcome["result_exit_status"]), (0, 5, 5))
+        self.assertTrue(outcome["expected_refusal"])
+        self.attempt("injected-failure", 5, self.result("plan", 5), 1)
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome["exit_status"], 1)
+        self.assertTrue(outcome["expected_refusal"])
+        for workflow in ("success", "skipped", "unavailable"):
+            with self.subTest(workflow=workflow):
+                outcome, status = collect_outcome(self.evidence, workflow)
+                self.assertEqual(status, 1)
+                self.assertNotEqual(outcome["exit_status"], 0)
+
+    def test_latest_result_operation_must_match_recorded_attempt(self) -> None:
+        for stage, command, wrapper, workflow in (
+            ("create", 0, 1, "failure"),
+            ("injected-failure", 5, 0, "success"),
+        ):
+            with self.subTest(stage=stage):
+                self.attempt(stage, command, self.result("refresh", command), wrapper)
+                outcome, status = collect_outcome(self.evidence, workflow)
+                self.assertEqual(status, 1)
+                self.assertEqual(outcome["operation"], "install" if stage == "create" else "plan")
+                self.assertFalse(outcome["result_available"])
+                self.assertNotEqual(outcome["exit_status"], 0)
+                self.assertEqual(outcome["diagnostics"][-1]["id"], "native_acceptance_evidence_invalid")
 
 
 if __name__ == "__main__":

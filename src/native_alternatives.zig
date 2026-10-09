@@ -3832,75 +3832,168 @@ test "native_alternatives.test.signed python3 install preinst has no alternative
     );
 }
 
+fn testClonedEntryFactEqual(left: EntryFact, right: EntryFact) bool {
+    // Independent fixture copies have new inode identities and ctimes.
+    var relocated = right;
+    relocated.device = left.device;
+    relocated.inode = left.inode;
+    relocated.change_nanoseconds = left.change_nanoseconds;
+    return entryFactEqual(left, relocated);
+}
+
+test "native_alternatives.test.cloned facts preserve content and metadata without sharing inode identity" {
+    const original: EntryFact = .{
+        .path = "etc/alternatives/editor",
+        .kind = .symlink,
+        .mode = 0o777,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .size = 12,
+        .modified_nanoseconds = 3,
+        .change_nanoseconds = 4,
+        .link_target = "/usr/bin/vim",
+    };
+    var cloned = original;
+    cloned.device = 5;
+    cloned.inode = 6;
+    cloned.change_nanoseconds = 7;
+    try std.testing.expect(!entryFactEqual(original, cloned));
+    try std.testing.expect(testClonedEntryFactEqual(original, cloned));
+    for (0..10) |mutation| {
+        var changed = cloned;
+        switch (mutation) {
+            0 => changed.path = "etc/alternatives/pager",
+            1 => changed.kind = .regular,
+            2 => changed.mode = 0o775,
+            3 => changed.uid = 1,
+            4 => changed.gid = 1,
+            5 => changed.link_count = 2,
+            6 => changed.size += 1,
+            7 => changed.modified_nanoseconds += 1,
+            8 => changed.sha256 = @splat(1),
+            9 => changed.link_target = "/usr/bin/less",
+            else => unreachable,
+        }
+        try std.testing.expect(!testClonedEntryFactEqual(original, changed));
+    }
+    var record = cloned;
+    record.kind = .regular;
+    record.link_target = null;
+    record.sha256 = @splat(1);
+    var changed_record = record;
+    changed_record.sha256.?[0] ^= 1;
+    try std.testing.expect(!testClonedEntryFactEqual(record, changed_record));
+}
+
 test "native_alternatives.test.protected signed python3 preinst preserves all records and selectors" {
     const testing = std.testing;
-    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
-    const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse
-        return error.TestUnexpectedResult;
-    var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
-    defer before_root.close();
-    var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
-    defer after_root.close();
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") == null) return;
     var script = try discoverScriptAuthority(
         testing.allocator,
         @embedFile("fixtures/ubuntu-resolute-python3.preinst"),
         .{},
     );
     defer script.deinit();
-    var listed = try listGroups(testing.allocator, before_root.root, .{});
-    defer listed.deinit();
-    try testing.expectEqual(@as(usize, 14), listed.names.len);
-    const groups = try testing.allocator.alloc(GroupAuthority, listed.names.len);
-    defer testing.allocator.free(groups);
-    for (listed.names, groups) |name, *allowed|
-        allowed.* = .{ .name = name, .mutable = false };
-    const authority: Authority = .{ .groups = groups };
-    var before = try capture(testing.allocator, before_root.root, authority);
-    defer before.deinit();
-    try testing.expect(before.group("python3") == null);
-    var inputs = try captureScriptInputs(testing.allocator, before_root.root, script, before, .{});
-    defer inputs.deinit();
-    try validateScriptInputs(testing.allocator, before_root.root, script, before, inputs, .{});
-    var same = try capture(testing.allocator, before_root.root, authority);
-    defer same.deinit();
-    try validateScriptTransition(testing.allocator, before, same, script, authority);
-    var after = try capture(testing.allocator, after_root.root, authority);
-    defer after.deinit();
-    try testing.expect(after.group("python3") == null);
-    for (listed.names) |name| {
-        const path = try std.fmt.allocPrint(
-            testing.allocator,
-            "{s}/{s}",
-            .{ database_directory, name },
+    for ([_][2][:0]const u8{
+        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER" },
+        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },
+    }) |coordinate| {
+        var phase: []const u8 = "open-roots";
+        var group_name: []const u8 = "-";
+        errdefer |err| std.debug.print(
+            "protected Python alternatives: coordinate={s} phase={s} group={s} error={s}\n",
+            .{ coordinate[0], phase, group_name, @errorName(err) },
         );
-        defer testing.allocator.free(path);
-        const old_record = try before_root.root.readFileAlloc(
-            testing.allocator,
-            try root_fs.Path.init(path),
-            1024 * 1024,
-        );
-        defer testing.allocator.free(old_record);
-        const new_record = try after_root.root.readFileAlloc(
-            testing.allocator,
-            try root_fs.Path.init(path),
-            1024 * 1024,
-        );
-        defer testing.allocator.free(new_record);
-        try testing.expectEqualSlices(u8, old_record, new_record);
-        try testing.expectEqualStrings(
-            before.group(name).?.selected,
-            after.group(name).?.selected,
+        const before_path = std.c.getenv(coordinate[0]) orelse return error.TestUnexpectedResult;
+        const after_path = std.c.getenv(coordinate[1]) orelse return error.TestUnexpectedResult;
+        var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+        defer before_root.close();
+        var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
+        defer after_root.close();
+        phase = "inventory";
+        var listed = try listGroups(testing.allocator, before_root.root, .{});
+        defer listed.deinit();
+        try testing.expect(listed.names.len != 0);
+        var listed_after = try listGroups(testing.allocator, after_root.root, .{});
+        defer listed_after.deinit();
+        try testing.expectEqualDeep(listed.names, listed_after.names);
+        const groups = try testing.allocator.alloc(GroupAuthority, listed.names.len);
+        defer testing.allocator.free(groups);
+        for (listed.names, groups) |name, *allowed|
+            allowed.* = .{ .name = name, .mutable = false };
+        const authority: Authority = .{ .groups = groups };
+        phase = "capture-before";
+        var before = try capture(testing.allocator, before_root.root, authority);
+        defer before.deinit();
+        try testing.expect(before.group("python3") == null);
+        phase = "script-inputs";
+        var inputs = try captureScriptInputs(testing.allocator, before_root.root, script, before, .{});
+        defer inputs.deinit();
+        try validateScriptInputs(testing.allocator, before_root.root, script, before, inputs, .{});
+        phase = "before-stability";
+        var same = try capture(testing.allocator, before_root.root, authority);
+        defer same.deinit();
+        try validateScriptTransition(testing.allocator, before, same, script, authority);
+        phase = "capture-after";
+        var after = try capture(testing.allocator, after_root.root, authority);
+        defer after.deinit();
+        try testing.expect(after.group("python3") == null);
+        phase = "after-stability";
+        var after_same = try capture(testing.allocator, after_root.root, authority);
+        defer after_same.deinit();
+        try validateScriptTransition(testing.allocator, after, after_same, script, authority);
+        phase = "clone-preservation";
+        for (listed.names) |name| {
+            group_name = name;
+            const path = try std.fmt.allocPrint(
+                testing.allocator,
+                "{s}/{s}",
+                .{ database_directory, name },
+            );
+            defer testing.allocator.free(path);
+            const old_record = try before_root.root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(path),
+                1024 * 1024,
+            );
+            defer testing.allocator.free(old_record);
+            const new_record = try after_root.root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(path),
+                1024 * 1024,
+            );
+            defer testing.allocator.free(new_record);
+            try testing.expectEqualSlices(u8, old_record, new_record);
+            const old_group = before.group(name).?;
+            const new_group = after.group(name).?;
+            try testing.expectEqualDeep(old_group.record, new_group.record);
+            try testing.expectEqualStrings(old_group.selected, new_group.selected);
+            try testing.expectEqualDeep(old_group.links, new_group.links);
+            try testing.expectEqualDeep(old_group.missing_master_targets, new_group.missing_master_targets);
+            try testing.expectEqual(old_group.facts.len, new_group.facts.len);
+            for (old_group.facts, new_group.facts) |left, right|
+                try testing.expect(testClonedEntryFactEqual(left, right));
+        }
+        phase = "forged-transition-refusal";
+        group_name = "-";
+        const forged_groups = try testing.allocator.dupe(GroupState, before.groups);
+        defer testing.allocator.free(forged_groups);
+        forged_groups[0].digest[0] ^= 1;
+        var forged_after = before;
+        forged_after.groups = forged_groups;
+        try testing.expectError(
+            error.AlternativesStateChanged,
+            validateScriptTransition(testing.allocator, before, forged_after, script, authority),
         );
     }
-    const forged_groups = try testing.allocator.dupe(GroupState, before.groups);
-    defer testing.allocator.free(forged_groups);
-    forged_groups[0].digest[0] ^= 1;
-    var forged_after = before;
-    forged_after.groups = forged_groups;
-    try testing.expectError(
-        error.AlternativesStateChanged,
-        validateScriptTransition(testing.allocator, before, forged_after, script, authority),
-    );
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")) |path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed Python alternatives records and selectors executed without skips\n");
+    }
 }
 
 test "native_alternatives.test.snapshot less postinst pins one quiet install" {

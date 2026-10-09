@@ -48,12 +48,12 @@ CI_GHR_ZIG_JOBS = (
     "native-recovery-zig-family",
     "native-recovery-zig-scenarios",
     "native-recovery-zig-diversions",
+    "signed-proc-protected-replay",
     "security-audit",
     "release-dry-run",
     "fuzz",
     "integration-required",
     "integration-full",
-    "ubuntu-real-snapshot",
 )
 
 

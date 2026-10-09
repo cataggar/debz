@@ -283,6 +283,19 @@ relabeling the v1 report. Both Python list prestates are rederived for arm64;
 this ordinary byte proof does not establish protected execution or behavioral
 prestates.
 
+PR411 composition also retains the exact arm64 `less 668-1build1` archive
+for its new `less.list` prestate. Its archive coordinates are rederived from
+the already-retained arm64 lock and original signed Packages index; the
+original report, locks, InRelease and indexes remain unchanged. This adds
+the missing source bytes, not a new probe or a protected less replay claim.
+
+Ownership-list pins bind the original data-tar member order, not a sorted
+path set. Less sealing and Python empty-fixture preparation validate those
+exact archive-derived bytes without rewriting the `.list` files. Reordering
+or unsafe path mutations still refuse even when the apparent path set is
+unchanged; Python validates both lists before replacing its captured null
+device. Descriptor-rooted no-follow and single-link ownership checks remain.
+
 The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
 evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;
 duplicate/unsafe paths and unsupported ZIP entry types fail closed.
@@ -293,7 +306,7 @@ Package tar parsing uses the standard library. Zstd-compressed packages use
 Python 3.14's `compression.zstd`, or the existing bounded `zstd` fallback.
 
 This gate covers the archive-derived `python3.list`, `python3-minimal.list`,
-`sudo.list`, `console-setup-linux.list` and glib trigger declaration, plus
+`sudo.list`, `console-setup-linux.list`, arm64 `less.list` and glib trigger declaration, plus
 the keyring deb/member. The two sudo alternatives databases and
 `preinst-dev-null` are behavioral outputs, not archive members or ownership
 lists. Their reality still requires separately retained protected-run byte

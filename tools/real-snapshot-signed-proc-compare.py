@@ -26,8 +26,8 @@ MAXIMUM_READ_BYTES = 4 * 1024 * 1024
 MAXIMUM_REPORTED = 400
 
 PINNED_DPKG_SHA256 = "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5"
-SNAPSHOT_DPKG_SHA256 = "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f"
-SETPRIV_SHA256 = "9e0d70d26a02c1cb4b984ab6f49a582b7a2c3508b1063ac23adc60073292ae7e"
+SNAPSHOT_DPKG_SHA256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517"
+SETPRIV_SHA256 = "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993"
 TARGETS = ("systemd", "udev", "sudo")
 ARCHITECTURE = "amd64"
 
@@ -211,20 +211,28 @@ def status_transition(target: str, native: bytes, proof: bytes, read_proof: Read
     )
 
 
-def dpkg_log(target: str, data: bytes) -> bool:
+def dpkg_log(target: str, data: bytes, fields: dict[str, str]) -> bool:
     """The proof's own dpkg log records only its configure of the target."""
+    version, state = fields.get("Version"), fields.get("Status")
+    if not version or state not in ("install ok unpacked", "install ok half-configured"):
+        return False
     stamp = r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}"
-    package = re.escape(f"{target}:{ARCHITECTURE}")
-    allowed = re.compile(
-        rf"{stamp} (startup packages configure"
-        rf"|configure {package} \S+ \S+"
-        rf"|status (unpacked|half-configured|installed) {package} \S+)"
-    )
+    package = f"{target}:{ARCHITECTURE}"
+    expected = [
+        "startup packages configure",
+        f"configure {package} {version} <none>",
+    ]
+    if state == "install ok unpacked":
+        expected.append(f"status unpacked {package} {version}")
+    expected.extend((
+        f"status half-configured {package} {version}",
+        f"status installed {package} {version}",
+    ))
     lines = data.decode("utf-8").split("\n")
     return (
-        len(lines) >= 3 and lines[-1] == "" and lines[0].endswith(" startup packages configure")
-        and re.search(rf" status installed {package} \S+$", lines[-2]) is not None
-        and all(allowed.fullmatch(line) for line in lines[:-1])
+        len(lines) == len(expected) + 1 and lines[-1] == ""
+        and all(re.fullmatch(rf"{stamp} {re.escape(event)}", line)
+                for event, line in zip(expected, lines[:-1]))
     )
 
 
@@ -271,8 +279,17 @@ def classify(
         ):
             return "proof harness: receipt-verified pinned dpkg replaces the snapshot dpkg"
     elif path == "var/log/dpkg.log":
-        if left is None and root_file(right, "0o644") and dpkg_log(target, read_proof(path)):
-            return "proof harness: pinned dpkg logs only its configure of the target"
+        if root_file(right, "0o644") and (left is None or root_file(left, "0o644")):
+            before = b"" if left is None else read_native(path)
+            after = read_proof(path)
+            fields = dict(stanzas(read_native("var/lib/dpkg/status")).get(
+                f"{target}:{ARCHITECTURE}", [],
+            ))
+            if (
+                (not before or before.endswith(b"\n")) and after.startswith(before)
+                and dpkg_log(target, after[len(before):], fields)
+            ):
+                return "proof harness: unchanged raw history followed only by target configure"
     elif path == "var/lib/dpkg/status":
         if (
             root_file(left, "0o644") and root_file(right, "0o644")

@@ -1640,7 +1640,22 @@ def audit_production_sources() -> None:
         "verifySnapshotPython3PreinstInputs(allocator, root, program)",
         "verifySnapshotPython3NullOutput(allocator, root)",
         "observed.entry.mode != 0o600 and observed.entry.mode != 0o644",
-        'root,\n        0,\n        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"',
+        "verifySnapshotPython3NullInput(allocator, root, program)",
+        'if (!std.mem.eql(u8, architecture, "amd64"))',
+        'try verifySnapshotPython3PreinstArtifacts(program.artifacts, "amd64");',
+        "for (snapshot_python3_minimal_null_sources) |binding| try verifySignedDebconfControlFile(",
+        'const snapshot_python3_minimal_null_input = SignedDebconfControlFile{\n'
+        '    .path = "dev/null",\n    .size = 20,\n    .mode = 0o644,\n'
+        '    .sha256 = "e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e",',
+        'const snapshot_python3_minimal_postinst = SignedDebconfControlFile{\n'
+        '    .path = "var/lib/dpkg/info/python3-minimal.postinst",\n'
+        '    .size = 117,\n    .mode = 0o755,\n'
+        '    .sha256 = "be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",',
+        '        .path = "usr/bin/py3compile",\n        .size = 13312,\n'
+        '        .mode = 0o755,\n'
+        '        .sha256 = "a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",',
+        '        .size = 0,\n        .mode = @intCast(entry.mode),\n'
+        '        .sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",',
         'root,\n        96,\n        "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc"',
         '"usr/sbin/rm"',
     ):
@@ -1665,6 +1680,57 @@ def audit_production_sources() -> None:
     ):
         if required not in unpack:
             fail(f"reviewed automatic file-trigger self-interest boundary changed: {required}")
+    for required in (
+        'const arm64 = std.mem.eql(u8, architecture, "arm64") and\n'
+        '        std.mem.eql(u8, package.architecture, "arm64");',
+        "if ((!amd64 and !arm64) or",
+        "const snapshot_less_arm64_artifacts = [_]struct {",
+        "const snapshot_less_arm64_controls = [_]SignedDebconfControlFile{",
+        'if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))',
+        "try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture);",
+        "try bindSnapshotLessArm64ImmutableInputs(&script);",
+        'stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)',
+        '"etc/ld.so.preload",\n    "etc/ld.so.cache",',
+        "var contents = try proc.observeAlloc(allocator, 0, 0);",
+        "entry.mode != 0o777 or entry.uid != 0 or entry.gid != 0 or",
+        "try attempt.requireRecovery(allocator, .script);",
+    ):
+        if required not in unpack:
+            fail(f"reviewed exact arm64 less inert boundary changed: {required}")
+    less_reference = (ROOT / "tools/real-snapshot-less-reference.sh").read_text(errors="strict")
+    for required in (
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT="$source_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT="$source_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SCRIPT_AFTER="$script_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_DPKG_AFTER="$dpkg_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_SCRIPT_ROOT="$bad_script"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_MODE_ROOT="$bad_mode"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_TOOL_ROOT="$bad_tool"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_ALIAS_ROOT="$bad_alias"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_PRESTATE_ROOT="$bad_prestate"',
+        '"$zig" build test-native-unpack -Doptimize=ReleaseSafe -j2 --summary all',
+        "unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private --",
+        "/bin/sh /var/lib/debz-lifecycle-scripts/less.preinst install",
+    ):
+        if required not in less_reference:
+            fail(f"protected arm64 less activated proof wiring changed: {required}")
+    if ("\ncheck_source_inputs\n" not in less_reference or
+            less_reference.index("\ncheck_source_inputs\n") > less_reference.index("cp -a --reflink=auto")):
+        fail("protected arm64 less source guard must run before fixture copies/mutations")
+    less_fixtures = (ROOT / "tools/real_snapshot_less_fixtures.py").read_text(errors="strict")
+    for required in (
+        "parent_fd = open_beneath(root_fd, parent, directory=True)",
+        "os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC",
+        "metadata = os.fstat(descriptor)",
+        "not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1",
+        "regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)",
+        "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC",
+        "protected(root, directory=True)",
+    ):
+        if required not in less_fixtures:
+            fail(f"protected arm64 less no-follow fixture mutation boundary changed: {required}")
+    if "os.O_TRUNC" in less_fixtures:
+        fail("protected arm64 less fixture must check opened metadata before truncation")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
@@ -2505,6 +2571,23 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/verify-minisign.py",
     "tools/real-snapshot-reference-tree-check.py",
+    "tools/real-snapshot-protected-native-ci.sh",
+    "tools/real-snapshot-acceptance.sh",
+    "tools/real-snapshot-reference.sh",
+    "tools/real_snapshot_reference_paths.py",
+    "tools/real_snapshot_outcome.py",
+    "tools/real-snapshot-python3-protected-stage.sh",
+    "tools/real-snapshot-python3-reference.sh",
+    "tools/real-snapshot-signed-proc-bindings.sh",
+    "tools/real-snapshot-signed-proc-prestates.sh",
+    "src/native_unpack.zig",
+    "src/native_alternatives.zig",
+    "tools/real-snapshot-less-protected-stage.sh",
+    "tools/real-snapshot-less-reference.sh",
+    "tools/real_snapshot_less_stage.py",
+    "tools/real_snapshot_less_fixtures.py",
+    "tools/real_snapshot_python_fixtures.py",
+    "tools/prepare-native-dpkg.py",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2521,8 +2604,9 @@ PROTECTED_REFERENCE_HEADER = (
     '    runs-on: ${{ matrix.runner }}\n'
     '    # Root-run staging: Zig download and package fetch 5, debz build 15,\n'
     '    # snapshot staging 15, preflight refusals 5 and the proof 45 (its own\n'
-    '    # timeout), leaving 5 for evidence, upload and cleanup.\n'
-    '    timeout-minutes: 90\n'
+    '    # timeout), plus amd64 Python staging/replay 40 and Zig guards 10,\n'
+    '    # leaving 5 for evidence, upload and cleanup.\n'
+    '    timeout-minutes: 140\n'
     '    strategy:\n'
     '      fail-fast: false\n'
     '      matrix:\n'
@@ -2542,7 +2626,7 @@ PROTECTED_REFERENCE_HEADER = (
 
 PROTECTED_REFERENCE_BOOTSTRAP = (
     '      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n'
-    '        timeout-minutes: 80\n'
+    '        timeout-minutes: 130\n'
     '        run: |\n'
     '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
     '          test -z "$(git status --porcelain)"\n'
@@ -2555,7 +2639,7 @@ PROTECTED_REFERENCE_BOOTSTRAP = (
     '            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]\n'
     '            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]\n'
     '            umask 022\n'
-    '            install -d -o root -g root -m 0755 /srv/debz-protected\n'
+    '            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected\n'
     '            for ancestor in / /srv /srv/debz-protected; do\n'
     '              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]\n'
     '              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))\n'
@@ -2635,6 +2719,14 @@ PROTECTED_REFERENCE_CLEANUP = (
 
 PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "set -euo pipefail",
+    'if [[ ${1:-} == --check-keyring && $# == 2 ]]; then',
+    'print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))',
+    'if [[ ${1:-} == --stage-native ]]; then',
+    "  mode=native-staging\n",
+    '[[ $mode == proof ]] || prefix=native-ci',
+    'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
+    'module.verify_extracted_bindings(prefix, architecture)',
+    'print(toolchain(Path(sys.argv[2])))',
     "readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb",
     "readonly archive_keyring_deb_sha512=80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
@@ -2644,7 +2736,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "readonly archive_keyring_size=3607",
     "    zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00\n    zig_size=55478392\n",
     "    zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17\n    zig_size=51211944\n",
-    '[[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
+    '[[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
     '[[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-reference-protected-ci.sh" ]] || {',
     'test "$(git -C "$checkout" rev-parse HEAD)" = "$commit"',
     "trap collect EXIT",
@@ -2666,7 +2758,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     'require_root_owned_file("staged-keyring", target, target_stat, 0o644)',
     "os.unlink(target)",
     'staged_archive_keyring=\nstage_verified_archive_keyring\nreadonly staged_archive_keyring',
-    '"DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
+    'step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
     'step tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"',
     "mutable=$negatives/mutable-ancestor\n[[ ! -e \"$mutable\" && ! -L \"$mutable\" ]]\ninstall -d -o root -g root -m 0777 \"$mutable\"",
     'negative mutable-ancestor "writable or non-root ancestor" \\',
@@ -2682,12 +2774,213 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "[[ ${#proof_arguments[@]} == 13 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "tools/prepare-native-dpkg.py": (
+        'with path.open("x", encoding="utf-8") as output:',
+    ),
+    "tools/real-snapshot-less-protected-stage.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
+        '"$workspace" == "$checkout/.real-snapshot/less-arm64"',
+        'toolchain(Path(sys.argv[3]))',
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-reference-protected-stage.sh --arm64-less-source',
+        'python3 -B -I tools/real_snapshot_less_stage.py prepare',
+        '"$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json"',
+        'python3 -B -I tools/real_snapshot_less_stage.py seal',
+        '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb',
+        'bash tools/real-snapshot-less-reference.sh',
+        'bytes <= 8 * 1024 * 1024 * 1024',
+    ),
+    "tools/real_snapshot_less_stage.py": (
+        'def alias(root: Path, relative: str, target: str) -> None:\n    with parent_descriptor(root, relative) as (parent, name):',
+        'os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW',
+        'entry["origin"]["type"] != "authenticated_repository"',
+        'raise ValueError("source archive differs from exact production authority")',
+        'for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):',
+        'for package in SOURCE_ARTIFACTS:\n        archive(locks["dpkg" if package == "libc6" else package], cache, package)',
+        'f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8',
+        'c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e',
+        '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
+        '865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7',
+        'regular_descriptor(root, "var/lib/dpkg/info/less.list")',
+        'content = os.read(descriptor, 2048)',
+        'if (len(content) != 583 or hashlib.sha256(content).hexdigest() !=',
+        'raise ValueError("signed less ownership path set changed")',
+        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", script, 0o755)',
+        'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
+    ),
+    "tools/real-snapshot-less-reference.sh": (
+        'for file in "$pinned" "$lock" "$less_lock" "$dash_lock" "$archive" "$zig";',
+        'for path in "$pinned" "$source_root" "$lock" "$less_lock" "$dash_lock" "$archive" "$script_root" "$dpkg_root";',
+        'require_lock_artifact less 668-1build1 171138 "$digest" "$less_lock"',
+        '\ncheck_source_inputs\n',
+        'mutate_negative_roots([Path(root) for root in sys.argv[1:]])',
+        'stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))',
+    ),
+    "tools/real_snapshot_less_fixtures.py": (
+        'parent_fd = open_beneath(root_fd, parent, directory=True)',
+        'regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)',
+        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC',
+    ),
+    "tools/real-snapshot-protected-native-ci.sh": (
+        "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
+        "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
+        "protected(Path(sys.argv[2]))",
+        '"tools/real_snapshot_outcome.py",',
+        '[[ ${#inputs[@]} == 3 ]]',
+        "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
+        'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
+        'exec bash tools/real-snapshot-reference.sh "$REFERENCE_DPKG"',
+        'timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py',
+        'if [[ -d "$work/root/var/lib/dpkg/info" ]]; then',
+        'reference_snapshot_present=%s\\nnative_snapshot_present=%s',
+        "not stat.S_ISREG(meta.st_mode) or meta.st_size > 128 * 1024 * 1024",
+        "total > 512 * 1024 * 1024",
+        "os.open(name, flags | os.O_NOFOLLOW)",
+        'python3 -I tools/real_snapshot_outcome.py "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \\',
+        '>"$evidence/acceptance-outcome-v1.json" || outcome_status=$?',
+        '(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 ))',
+    ),
+    "tools/real-snapshot-acceptance.sh": (
+        "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
+        '--check-keyring "$keyring" >/dev/null',
+        'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
+        'protected(repository, directory=True)',
+        'protected(repository / ".real-snapshot", directory=True)',
+        'local wrapper_status=$?',
+        'printf \'%s\\n\' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"',
+        'printf \'{"stage":"%s","command_exit_status":null}\\n\' "$name" >"$evidence/native-stage-v1.json"',
+        'printf \'{"stage":"%s","command_exit_status":%s}\\n\' "$name" "$status" >"$evidence/native-stage-v1.json"',
+    ),
+    "tools/real_snapshot_outcome.py": (
+        'read_root_file(evidence, "native-stage-v1.json", 4096)',
+        'read_root_file(evidence, f"{stage}.json", 128 * 1024 * 1024)',
+        'read_root_file(evidence, "native-wrapper-exit-status.txt", 32)',
+        'if workflow_outcome == "success":',
+        'if wrapper_status != 0 or not expected_refusal:',
+        'if command_status is None:',
+        '"id": f"native_acceptance_evidence_{kind}"',
+    ),
+    "tools/real-snapshot-python3-protected-stage.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == x86_64',
+        '"$workspace" == "$checkout/.real-snapshot/python3-amd64"',
+        'toolchain(Path(sys.argv[3]))',
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-signed-proc-bindings.sh "$debz" "$workspace"',
+        'bash tools/real-snapshot-signed-proc-prestates.sh --python3 "$pinned" "$workspace"',
+        'fixture empty "$before"',
+        'fixture mode "$before_0644" 0644',
+        'fixture capture "$workspace" "evidence/replay-$mode.txt" "evidence/replay-$mode.stderr"',
+        'fixture basic "$workspace/bad-html" "$workspace/bad-link" "$workspace/bad-shadow"',
+        'create_exclusive(root, "evidence/python3-reference.args", content, 0o600)',
+        'for mode in 0600 0644; do',
+        'bash tools/real-snapshot-python3-reference.sh "$pinned" "$input" "$lock" "$archive"',
+        '"-Dpython3-reference-root-py3compile=$after-py3compile-before"',
+        '"-Dpython3-reference-after-py3compile=$after-py3compile-after"',
+        '"-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler"',
+        '"-Dpython3-reference-inputs-proof=$evidence/inputs-proof.txt"',
+        '"-Dpython3-reference-alternatives-proof=$evidence/alternatives-proof.txt"',
+        'bytes <= 16 * 1024 * 1024 * 1024',
+    ),
+    "tools/real-snapshot-python3-reference.sh": (
+        'unset ZIG_LIB_DIR',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+        'fixture preflight "$source_root"',
+        '"$zig" build test-real-snapshot-python3-source-protected',
+        '"-Dpython3-source-root=$source_root" "-Dpython3-source-proof=$source_proof"',
+        'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"',
+        'fixture dpkg "$dpkg_root" "$pinned" "$archive"',
+        'fixture dpkg "$py3compile_dpkg" "$pinned" "$archive"',
+        'fixture mode "$py3compile_before" 0644',
+        'fixture strict "$py3compile_bad_hash" "$py3compile_bad_mode"',
+        'require_protected_file "$source_root/dev/null"',
+        '0:0:600:0:1',
+        '0:0:644:0:1',
+        '0:0:644:20:1',
+        """[[ $(stat -c '%u:%g:%a:%s:%h' "$py3compile_after/dev/null") == 0:0:644:96:1 ]]""",
+        'e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e',
+        '[[ $(sha256sum "$py3compile_after/dev/null" | cut -d\' \' -f1) == \\\n'
+        '  3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]',
+    ),
+    "tools/real_snapshot_python_fixtures.py": (
+        'maximum = 16 * 1024 * 1024',
+        'raise ValueError("Python reference capture exceeds its byte limit")',
+        'content = read_regular(root, relative, 2048)',
+        'if len(content) != size or hashlib.sha256(content).hexdigest() != digest:',
+        'raise ValueError(f"signed Python list path set changed: {name}")',
+        'not stat.S_ISCHR(metadata.st_mode) or metadata.st_rdev != os.makedev(1, 3)',
+        'create_exclusive(root, "dev/null", b"", 0o600)',
+        'create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)',
+        'stage_dpkg_reference(*roots, archive_relative="var/lib/dpkg/python3-probe.deb")',
+        'with regular_descriptor(postinst, "var/lib/dpkg/info/python3-minimal.postinst") as descriptor:',
+    ),
+    "tools/real-snapshot-signed-proc-prestates.sh": (
+        'if [[ ${1:-} == --python3 ]]; then',
+        'require_protected_file "$snapshot/evidence/refresh.json"',
+        '--slurpfile refreshed "$snapshot/evidence/refresh.json"',
+        '([$frozen.witnesses[].repository_id] | sort) ==',
+        '.repository.snapshot_digest == ("sha256:" + $repository.snapshot_sha256)',
+        '.repository.release_digest == ("sha256:" + $repository.release_sha256)',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+        '--prestate "python3:amd64=unpacked:$prestates/python3"',
+        'protected Python pre-configure source captured; no full reference completion claimed',
+        'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")',
+        '[[ $actual_record == "$expected_record" ]]',
+        'signed prestate record differs from exact requested selectors/statuses/destinations',
+        'readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993',
+        '  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"',
+        'list=$prestates/sudo/var/lib/dpkg/info/sudo.list',
+        'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8',
+    ),
+    "src/native_unpack.zig": (
+        'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")',
+        'signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips',
+    ),
+    "src/native_alternatives.zig": (
+        'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")',
+        'signed Python alternatives records and selectors executed without skips',
+    ),
+    "tools/real-snapshot-reference.sh": (
+        "unset ZIG_LIB_DIR",
+        'zig=${DEBZ_ZIG:-$(command -v zig || true)}',
+        "toolchain(Path(sys.argv[6]))",
+        '"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+    ),
+    "tools/real_snapshot_reference_paths.py": (
+        "def open_protected(",
+        "def verify_keyring(",
+        "fd = open_protected(path)",
+        "meta.st_size != size or len(payload) != size or actual != digest",
+        "def toolchain(",
+        "protected(library, directory=True)",
+        "if not target.is_relative_to(library):",
+    ),
     "build.zig": (
+        'b.step("test-real-snapshot-python3-source-protected",',
+        'run_python3_source_tests.has_side_effects = true;',
+        'run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_ROOT", b.option([]const u8, "python3-source-root", "Required protected Python source") orelse "");',
+        'run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF", b.option([]const u8, "python3-source-proof", "Exclusive pre-mutation Python source proof") orelse "");',
+        'b.step("test-real-snapshot-python3-protected",',
+        'run_python3_reference_tests.has_side_effects = true;',
+        'run_python3_alternatives_tests.has_side_effects = true;',
+        'python3_reference_step.dependOn(&run_python3_reference_tests.step);',
+        'python3_reference_step.dependOn(&run_python3_alternatives_tests.step);',
+        '"native_unpack.test.protected signed python3 inputs and redirected tool witness are exact"',
+        '"native_alternatives.test.protected signed python3 preinst preserves all records and selectors"',
+        'for (python3_coordinates, &python3_values)',
+        'for (python3_coordinates, python3_values)',
+        '"Required protected Python proof coordinate") orelse ""',
+        'b.fmt("DEBZ_REQUIRE_SIGNED_PYTHON3_{s}", .{coordinate.environment}),\n'
+        '            value.*,',
         '        "--profile-scripts",\n'
         '        b.option([]const u8, "reference-protected-profile-scripts", ',
         'b.step("test-real-snapshot-reference-protected", ',
     ),
     "tools/real-snapshot-reference-protected-stage.sh": (
+        '  for package in less dash util-linux; do',
+        '    authenticated_lock "$package_lock"',
+        'module.receipt_from_extracted_archive(\n    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])',
+        '--architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"',
         "  for profile in systemd udev sudo; do\n",
         """  printf -- '-Dreference-protected-profile-scripts=%s\\n' "$profiles"\n""",
         "staging path is not root-owned and protected: $current (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
@@ -2728,10 +3021,225 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
 def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     """The protected reference job stages only reviewed, root-owned inputs and cannot skip."""
     failures: list[str] = []
+    python_alternatives = texts.get("src/native_alternatives.zig", "").partition(
+        'test "native_alternatives.test.protected signed python3 preinst preserves all records and selectors" {'
+    )[2].partition('\ntest "')[0]
+    for token in (
+        '"DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644"',
+        "try testing.expect(listed.names.len != 0);",
+        "try testing.expectEqualDeep(listed.names, listed_after.names);",
+        "try validateScriptTransition(testing.allocator, before, same, script, authority);",
+        "try validateScriptTransition(testing.allocator, after, after_same, script, authority);",
+        "try testing.expectEqualDeep(old_group.record, new_group.record);",
+        "try testing.expectEqualDeep(old_group.links, new_group.links);",
+        "try testing.expectEqualDeep(old_group.missing_master_targets, new_group.missing_master_targets);",
+        "try testing.expectEqual(old_group.facts.len, new_group.facts.len);",
+        "try testing.expect(testClonedEntryFactEqual(left, right));",
+        "try testing.expectEqualSlices(u8, old_record, new_record);",
+        "errdefer |err| std.debug.print(",
+        "protected Python alternatives: coordinate={s} phase={s} group={s} error={s}",
+    ):
+        if token not in python_alternatives:
+            failures.append(f"protected Python alternatives must preserve complete inventories in both modes: {token}")
+    for path, count in (
+        ("tools/real-snapshot-less-protected-stage.sh", 1),
+        ("tools/real-snapshot-less-reference.sh", 2),
+    ):
+        commands = re.findall(
+            r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
+            texts.get(path, ""), re.DOTALL,
+        )
+        if len(commands) != count or any(
+                "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C" not in command or
+                command.find("/usr/bin/env -i") > command.find("chroot ") or
+                "env -i" in command.partition("chroot ")[2] or
+                "--bounding-set=-sys_admin --no-new-privs" not in command
+                for command in commands):
+            failures.append(f"protected less environment must be sanitized before chroot without guest env: {path}")
+    arm_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
+    arm_start = 'elif [[ $architecture == arm64 ]]; then\n  less_workspace='
+    arm_body = arm_ci.partition(arm_start)[2].partition('\n# The protected proof on the staged new empty workspace')[0]
+    for token in (
+        '$checkout/.real-snapshot/less-arm64',
+        'step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
+        'bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"',
+        'step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-arm64-less-protected',
+        '"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate"',
+        '"$less_workspace/evidence/less-source-proof.txt"',
+        '"$less_workspace/evidence/less-replay-proof.txt"',
+        'grep -F " $less_workspace" /proc/self/mountinfo',
+        'rm -rf --one-file-system -- "$less_workspace"',
+    ):
+        if token not in arm_body:
+            failures.append(f"protected arm64 less activation lost {token}")
+    if "|| true" in arm_body or "SkipZigTest" in arm_body:
+        failures.append("protected arm64 less activation must not skip or swallow errors")
+    arm_build = texts.get("build.zig", "")
+    for token in (
+        'b.step("test-real-snapshot-arm64-less-protected",',
+        'run_arm64_less_tests.has_side_effects = true;',
+        '"Required protected ARM less proof coordinate") orelse ""',
+        'setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT", value)',
+    ):
+        if token not in arm_build:
+            failures.append(f"protected arm64 less build lost {token}")
+    for name, calls in (
+        ("source is validated before fixture mutation", (
+            'try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_PROOF',
+        )),
+        ("inert input and replay roots are exact", (
+            'prepareAlternativesScriptBoundary(',
+            'try testing.expectEqualDeep(before.record, after.record);',
+            'try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Inputs(',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_REPLAY_PROOF',
+        )),
+    ):
+        text = texts.get("src/native_unpack.zig", "")
+        body = text.partition(f'test "native_unpack.test.protected signed arm64 less {name}" {{')[2].partition('\n}\n')[0]
+        for token in (*calls, '.exclusive = true', 'try proof.writeStreamingAll('):
+            if token not in body:
+                failures.append(f"protected arm64 less test body lost {token}")
+    python_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
+    python_start = 'if [[ $architecture == amd64 ]]; then\n  python3_workspace='
+    python_end = '\n# The protected proof on the staged new empty workspace'
+    python_body = python_ci.partition(python_start)[2].partition(python_end)[0]
+    for token in (
+        '$checkout/.real-snapshot/python3-amd64',
+        'step python3-stage 0 "all 18 root coordinates staged" timeout --signal=TERM --kill-after=60s 40m',
+        '"DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
+        'bash tools/real-snapshot-python3-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz"',
+        '[[ ${#python3_arguments[@]} == 20 ]]',
+        'step python3-guards 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-python3-protected "${python3_arguments[@]}"',
+        '-Doptimize=ReleaseSafe -j2 --summary all',
+        '"$python3_workspace/evidence/inputs-proof.txt"',
+        '"$python3_workspace/evidence/alternatives-proof.txt"',
+        'grep -F " $python3_workspace" /proc/self/mountinfo',
+        'rm -rf --one-file-system -- "$python3_workspace"',
+    ):
+        if token not in python_body:
+            failures.append(f"protected amd64 Python activation lost {token}")
+    if ("|| true" in python_body or "SkipZigTest" in python_body or
+            "test-integration-arm64" in python_body):
+        failures.append("protected Python activation must not skip, swallow errors or activate ARM397")
+    for path, name, tokens in (
+        ("src/native_unpack.zig",
+         "native_unpack.test.protected signed python3 source is validated before fixture mutation", (
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+        ("src/native_unpack.zig",
+         "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact", (
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);",
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);",
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after.root);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after_0644.root);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);",
+             "error.DirectoryTooLarge",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+        ("src/native_alternatives.zig",
+         "native_alternatives.test.protected signed python3 preinst preserves all records and selectors", (
+             "try validateScriptInputs(",
+             "try validateScriptTransition(",
+             "try testing.expectEqualSlices(u8, old_record, new_record);",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+    ):
+        body = texts.get(path, "").partition(f'test "{name}" {{')[2].partition('\ntest "')[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"{path}: protected Python test body lost {token}")
+    python_reference = texts.get("tools/real-snapshot-python3-reference.sh", "")
+    guard = 'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"'
+    if (guard not in python_reference or
+            python_reference.index(guard) > python_reference.index("cp -a --reflink=auto")):
+        failures.append("protected Python source guard must execute before copies/mutations")
+    fixtures = texts.get("tools/real_snapshot_less_fixtures.py", "")
+    if "os.O_TRUNC" in fixtures:
+        failures.append("shared reference mutations must inspect the descriptor before truncation")
+    for path, name in (
+        ("tools/real_snapshot_less_stage.py", "seal"),
+        ("tools/real_snapshot_python_fixtures.py", "prepare_empty"),
+    ):
+        body = texts.get(path, "").partition(f"def {name}(")[2].partition("\ndef ")[0]
+        if not body or re.search(
+            r"\b(?:sorted|overwrite_regular|replace_contents|ftruncate|write|write_bytes|write_text)\s*\(",
+            body,
+        ):
+            failures.append(f"{path}: fixture lists must retain authenticated original bytes without rewriting")
+    sudo_list = texts.get("tools/real-snapshot-signed-proc-prestates.sh", "").partition(
+        "list=$prestates/sudo/var/lib/dpkg/info/sudo.list\n"
+    )[2].partition("# The pre-sudo record")[0]
+    if not sudo_list or re.search(r"\b(?:sort|chmod|mv|cp|install|tee|dd)\b|>", sudo_list):
+        failures.append("signed sudo fixture list must retain authenticated original bytes without rewriting")
+    binding_list = texts.get("tools/real-snapshot-signed-proc-bindings.sh", "").partition(
+        """awk -F'\\t' '$1 == "sudo" { print "/" $2 }' "$listing" | sed 's#^/$#/.#'"""
+    )[2].partition("\ncopy_input()")[0]
+    if (not binding_list or re.search(r"\bsort\b", binding_list) or
+            '>"$source_root/var/lib/dpkg/info/sudo.list"' not in binding_list):
+        failures.append("signed sudo binding list must retain authenticated archive member order")
+    producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
+        "def receipt_from_extracted_archive("
+    )[2].partition("\ndef ")[0]
+    for token in ("verify_file(archive, PINS[architecture][\"archive\"])",
+                  "verify_archive_metadata(archive, architecture)",
+                  "verify_extracted_bindings(prefix, architecture)", "write_receipt(",
+                  "verify_receipt(prefix / RECEIPT, architecture)",
+                  "metadata.st_nlink != 1 or metadata.st_mode & 0o022",
+                  "path.resolve(strict=True) != path"):
+        if token not in producer:
+            failures.append(f"protected extracted reference receipt producer lost {token}")
     ci = texts.get(".github/workflows/ci.yml", "")
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
     ))
+    native_job = jobs.get("ubuntu-real-snapshot", "")
+    for token in (
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot\n",
+        "    timeout-minutes: 320\n",
+        "      max-parallel: 1\n",
+        "          - architecture: amd64\n            runner: ubuntu-24.04\n",
+        "          - architecture: arm64\n            runner: ubuntu-24.04-arm\n",
+        "      PROTECTED_TREE: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}\n",
+        '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n          test -z "$(git status --porcelain)"\n',
+        '          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+        '            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \\\n',
+        '            mkdir -m 0700 -- "$tree"\n',
+        '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n',
+        '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n',
+        '            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --stage-native "$tree" "$architecture" "$expected"\n',
+        "      - name: Create and replay exact native Ubuntu root\n        id: native\n        timeout-minutes: 220\n",
+        '            native "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"\n',
+        "      - name: Install exact closure with pinned dpkg reference\n        timeout-minutes: 50\n        run: |\n",
+        '            reference "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
+        "      - name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: 15\n"
+        "        env:\n          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        '            NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME" \\\n',
+        '            collect "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
+        "      - name: Copy bounded native evidence\n        if: always()\n",
+        '            sudo -n tar -C "$PROTECTED_TREE/native-upload" -cf - . >"$PWD/.native-evidence.tar"\n',
+        "      - name: Kill native descendants and remove only the named tree\n        if: always()\n        timeout-minutes: 3\n",
+        '              kill -KILL "${victims[@]}" 2>/dev/null || true\n',
+        '            rm -rf --one-file-system -- "$tree"\n',
+        "      - name: Upload real acceptance evidence\n        if: always()\n",
+        "          path: .real-snapshot/${{ matrix.architecture }}/evidence/\n",
+        "          if-no-files-found: error\n          retention-days: 14\n",
+    ):
+        if native_job.count(token) != 1:
+            failures.append(f"native snapshot CI lost protected wiring: {token.strip()}")
+    if ("continue-on-error" in native_job or "cataggar/ghr" in native_job
+        or "chown" in native_job or re.search(r"\bsudo (?!-n )", native_job)):
+        failures.append("native snapshot CI must retain protected tools and failures without ownership transfer")
     job = jobs.get("protected-reference")
     on = ci.partition("\nconcurrency:\n")[0]
     if (
@@ -2766,7 +3274,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             failures.append(f"protected reference CI script lost {token.strip()}")
     if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|SkipTest|--skip", script) or script.count(
         'python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"'
-    ) != 4:
+    ) != 5:
         failures.append("protected reference CI script must not skip and must check the tree at every stage")
     for path, tokens in PROTECTED_REFERENCE_SOURCE_TOKENS.items():
         for token in tokens:
@@ -2956,6 +3464,187 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         or len(re.findall(r"(?m)^    needs:", gate)) != 1
     ):
         failures.append("ci.yml: existing required build checks must reject any incomplete workload")
+    return failures
+
+
+SIGNED_PROC_CI_JOB = (
+    "    name: Signed proc replay in protected amd64 roots (${{ matrix.optimize }})",
+    "    runs-on: ubuntu-24.04",
+    "    timeout-minutes: 35",
+    "      fail-fast: false",
+    "        optimize: [Debug, ReleaseSafe]",
+    "      OPTIMIZE: ${{ matrix.optimize }}",
+    "      PROTECTED: /srv/debz-protected/signed-proc",
+    "      UBUNTU_ARCHIVE_KEYRING_SHA256: 80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
+)
+SIGNED_PROC_CI_STEPS = {
+    "Install Zig via ghr": (),
+    "Validate Zig version": ('        run: test "$(zig version)" = 0.16.0',),
+    "Bind the reviewed commit to a hosted amd64 runner": (
+        '          test "$RUNNER_ARCH" = X64',
+        '          test "$(uname -m)" = x86_64',
+        '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        '          test ! -e "$PROTECTED" && test ! -L "$PROTECTED"',
+    ),
+    "Install metadata decompression dependency": (),
+    "Prepare pinned dpkg as the runner user": (
+        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"',
+        '          test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/amd64/usr/bin/dpkg"',
+    ),
+    "Refuse unprotected and incomplete signed replay inputs": (
+        "          set -euo pipefail",
+        "          grep -Fq 'prestate path is writable by an unprivileged user' .tmp/unprotected-prestates.log",
+        "          grep -Fq 'fixture path is writable by an unprivileged user' .tmp/unprotected-bindings.log",
+        "          grep -Fq 'signed proc replay requires -Dsigned-systemd-proc-root' .tmp/missing-roots.log",
+        "          grep -Fq 'three distinct absolute disposable root paths' .tmp/relative-roots.log",
+    ),
+    "Stage the reviewed commit, Zig and pinned dpkg under root-owned ancestry": (
+        "          set -euo pipefail",
+        "          git -c tar.umask=0022 archive --format=tar -o .tmp/protected-checkout.tar HEAD",
+        '          sudo -n tar -C "$PROTECTED/checkout" --no-same-owner -xf "$PROTECTED/checkout.tar"',
+        "          sudo -n install -o root -g root -m 0644 /usr/share/keyrings/ubuntu-archive-keyring.gpg \\",
+        '            <<<"$UBUNTU_ARCHIVE_KEYRING_SHA256  $PROTECTED/keyrings/ubuntu-archive-keyring.gpg"',
+        '          sudo -n chmod -R go-w "$PROTECTED"',
+        '          sudo -n find "$PROTECTED" -xdev \\( ! -uid 0 -o ! -gid 0 -o -perm /022 \\) ! -type l \\',
+        "          test ! -s .tmp/protected-writable.txt",
+        '          for path in / /srv /srv/debz-protected "$PROTECTED"; do',
+        "            test \"$(stat -c '%u:%g' \"$path\")\" = 0:0",
+        "            test $(( 8#$(stat -c '%a' \"$path\") & 022 )) -eq 0",
+        '          sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"',
+        '            --verify-only "$PROTECTED/checkout/.real-snapshot/pinned-dpkg/usr/bin/dpkg"',
+    ),
+    "Build the protected snapshot client": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "            zig build -Doptimize=Debug -j2 --summary all",
+    ),
+    "Authenticate the snapshot closure and generate fresh signed prestates": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        '            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \\',
+        '            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \\',
+        "            tools/real-snapshot-signed-proc-prestates.sh \\",
+        '            "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"',
+        '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json"',
+        '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/openssl-cycle-after.json"',
+    ),
+    "Run pinned dpkg proofs on separate prestate copies": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        '                cp -a -- "$ws/prestates/$target" "$ws/native/$target"',
+        '                cp -a -- "$ws/prestates/$target" "$ws/proof-sources/$target"',
+        '              ln -sfn -- sudo.ws "$ws/native/sudo/usr/bin/sudoedit"',
+        '              ln -sfn -- sudo.ws.8.gz "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz"',
+        '              test "$(readlink -- "$ws/native/sudo/usr/bin/sudoedit")" = sudo.ws',
+        '              test "$(readlink -- "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz")" = sudo.ws.8.gz',
+        '              tools/real-snapshot-systemd-proc-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/systemd" "$ws/proofs/systemd"',
+        '              tools/real-snapshot-udev-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/udev" "$ws/proofs/udev"',
+        '              tools/real-snapshot-sudo-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/sudo" "$ws/proofs/sudo"',
+    ),
+    "Replay signed systemd, udev and sudo postinsts natively without skips": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "          set -euo pipefail",
+        '            zig build test-native-signed-proc -Doptimize="$OPTIMIZE" -j2 --summary all \\',
+        '              -Dsigned-systemd-proc-root="$ws/native/systemd" \\',
+        '              -Dsigned-udev-proc-root="$ws/native/udev" \\',
+        '              -Dsigned-sudo-proc-root="$ws/native/sudo" \\',
+        '          test "${status:-0}" -eq 0',
+        "          grep -Fxq 'All 4 tests passed.' \"$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log\"",
+        "          for name in 'systemd postinst uses scoped masked proc' \\",
+        "            'udev postinst uses only PID proc and applies static permissions' \\",
+        "            'sudo postinst repairs only pinned alternatives with PID-only proc'; do",
+        '            grep -Fq "maintainer_script.test.signed $name...OK" "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"',
+    ),
+    "Compare native replays with pinned dpkg proofs": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py",
+        "              for target in systemd udev sudo; do",
+        '                python3 tools/real-snapshot-signed-proc-compare.py "$target" \\',
+        '                  "$ws/native/$target" "$ws/proofs/$target" "$ws/compare/$target.json"',
+    ),
+    "Execute signed binding refusal fixtures": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "          set -euo pipefail",
+        "            DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \\",
+        '            sh "$PWD/.real-snapshot/ws/bindings.env" "$OPTIMIZE" \\',
+        '          test "${status:-0}" -eq 0',
+        "          grep -Eq 'run test [0-9]+ pass, 3 skip \\([0-9]+ total\\)' "
+        '"$GITHUB_WORKSPACE/.tmp/signed-bindings.log"',
+    ),
+    "Copy bounded evidence and remove named protected roots": (
+        "        if: ${{ always() }}",
+        "          set -euo pipefail",
+        '          if grep -F "$PROTECTED" .tmp/signed-proc-mounts.txt; then',
+        '          sudo -n rm -rf --one-file-system -- "$PROTECTED"',
+        '          test ! -e "$PROTECTED"',
+        "                snapshot/evidence/refresh.json snapshot/evidence/refresh.stderr \\",
+        "                snapshot/evidence/plan.json snapshot/evidence/plan.stderr \\",
+        "                snapshot/evidence/download.json snapshot/evidence/download.stderr \\",
+        "                prestate-build/evidence/base-cycle-before.json \\",
+        "                prestate-build/evidence/base-cycle-after.json \\",
+        "                prestate-build/evidence/openssl-cycle-before.json \\",
+        "                prestate-build/evidence/openssl-cycle-after.json \\",
+        "                prestate-build/evidence/openssl-cycle-refusals.json \\",
+        "                prestate-build/evidence/reference-no-progress.json \\",
+        "                prestate-build/evidence/base-cycle-proof/comparison.json \\",
+        "                native/systemd/var/log/dpkg.log native/udev/var/log/dpkg.log \\",
+        "                native/sudo/var/log/dpkg.log \\",
+        "                native/systemd/var/lib/dpkg/status native/udev/var/lib/dpkg/status \\",
+        "                native/sudo/var/lib/dpkg/status \\",
+        "                native/systemd/var/lib/dpkg/status-old native/udev/var/lib/dpkg/status-old \\",
+        "                native/sudo/var/lib/dpkg/status-old \\",
+        "                proofs/systemd/var/lib/dpkg/status proofs/udev/var/lib/dpkg/status \\",
+        "                proofs/sudo/var/lib/dpkg/status \\",
+        "                proofs/systemd/var/lib/dpkg/status-old proofs/udev/var/lib/dpkg/status-old \\",
+        "                proofs/sudo/var/lib/dpkg/status-old \\",
+        "                native/udev/etc/group proofs/udev/etc/group \\",
+    ),
+    "Upload bounded signed replay evidence": (
+        "        if: ${{ always() }}",
+        "          if-no-files-found: error",
+    ),
+}
+
+
+def signed_proc_ci_failures(text: str) -> list[str]:
+    """Require the hosted amd64 non-skipped signed proc replay job as reviewed.
+
+    The job is deliberately outside the required aggregate: the pinned
+    snapshot's Valid-Until and the #262 repin change the signed identities.
+    """
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        text,
+    ))
+    body = jobs.get("signed-proc-protected-replay", "")
+    lines = body.splitlines()
+    failures = []
+    if (
+        any(line not in lines for line in SIGNED_PROC_CI_JOB)
+        or re.search(r"(?m)^    (if|needs|continue-on-error):", body)
+        or re.search(r"(?m)^        (include|exclude):", body)
+        or "continue-on-error" in body
+    ):
+        failures.append("ci.yml: signed proc replay job must run both modes on hosted amd64 within 35 minutes")
+    steps = re.findall(r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body)
+    if [name for name, _ in steps] != list(SIGNED_PROC_CI_STEPS):
+        failures.append("ci.yml: signed proc replay steps changed from the reviewed sequence")
+    for name, step_body in steps:
+        required = SIGNED_PROC_CI_STEPS.get(name, ())
+        step_lines = step_body.splitlines()
+        conditions = [line for line in step_lines if re.match(r"^        if:", line)]
+        if (
+            any(line not in step_lines for line in required)
+            or conditions not in ([], ["        if: ${{ always() }}"])
+            or (conditions and "        if: ${{ always() }}" not in required)
+            or any(
+                not 1 <= int(minutes) <= 25
+                for minutes in re.findall(r"(?m)^        timeout-minutes: ([0-9]+)$", step_body)
+            )
+        ):
+            failures.append(f"ci.yml: signed proc replay step changed: {name}")
+    if "--report-only" in body or "DEBZ_REQUIRE_SIGNED_PROC_ROOTS=0" in body:
+        failures.append("ci.yml: signed proc replay comparison and roots must fail closed")
     return failures
 
 
@@ -4122,6 +4811,8 @@ def audit_ci_pins() -> None:
                 for path in PROTECTED_REFERENCE_PATHS if (ROOT / path).is_file()
             }):
                 fail(failure)
+            for failure in signed_proc_ci_failures(text):
+                fail(failure)
         expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
@@ -5090,6 +5781,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = native_recovery_ci_failures(text)
     elif kind == "workload-build":
         failures = workload_partition_failures(text)
+    elif kind == "ci-signed-proc":
+        failures = signed_proc_ci_failures(text)
     elif kind in {
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",

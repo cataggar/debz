@@ -8,9 +8,16 @@
 # half-configured and was denied execution of the unchanged signed postinst;
 # sudo is copied while it is still unpacked. The copies are disposable
 # fixtures, not native installation results.
+# --python3 reuses this fixture producer to stop just before Python configure
+# on an independent workspace. It does not enable any additional proc profile.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+purpose=proc
+if [[ ${1:-} == --python3 ]]; then
+  purpose=python3
+  shift
+fi
 
 # The lock document digest also covers the local keyring path, so bind the
 # authenticated snapshot Release, its signer and the exact archive closure.
@@ -26,9 +33,10 @@ readonly closure_sha256=5223cb19af6f686faa591eb6575b6d585a830473d98550df52ef958f
 readonly pinned_dpkg_sha256=0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5
 readonly signed_dpkg='usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517'
 readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993
+readonly setpriv_runtime_sha256=60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f
 
 [[ $# == 2 && $(id -u) == 0 ]] || {
-  echo "usage (as root): $0 PINNED_DPKG BINDING_WORKSPACE" >&2
+  echo "usage (as root): $0 [--python3] PINNED_DPKG BINDING_WORKSPACE" >&2
   exit 2
 }
 [[ $(uname -m) == x86_64 ]] || {
@@ -119,6 +127,7 @@ snapshot=$workspace/snapshot
 lock=$snapshot/evidence/ubuntu-minimal.lock.json
 cache=$snapshot/cache
 require_protected_file "$lock"
+require_protected_file "$snapshot/evidence/refresh.json"
 require_protected_path "$cache/packages-v2/objects"
 prestates=$workspace/prestates
 build=$workspace/prestate-build
@@ -131,17 +140,41 @@ for path in "$prestates" "$build" "$tools" "$workspace/prestates.env"; do
 done
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 
-# The signed proc profiles bind these exact package identities.
+# Locks contain selected origins, not unused freshness witnesses. Bind both
+# witnesses through the fresh authentication report, and every selected origin
+# to that same admission without changing the exact package closure.
 jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
-  --arg security "$security_release_sha256" --arg signer "$release_signer" '
+  --arg security "$security_release_sha256" --arg signer "$release_signer" \
+  --slurpfile refreshed "$snapshot/evidence/refresh.json" '
+  $refreshed[0] as $report |
+  $report.items as $sources |
+  ([$sources[] | select(.repository.release_digest == ("sha256:" + $release))][0]
+    .repository.frozen) as $frozen |
+  ($refreshed | length) == 1 and
+  $report.schema == "io.github.cataggar.debz.command.v1" and
+  $report.api_version == 1 and $report.operation == "refresh" and $report.exit_status == 0 and
+  ($sources | length) == 3 and ([$sources[].package] | unique | length) == 3 and
+  ([$sources[].repository.release_digest] | sort) ==
+    (["sha256:" + $release, "sha256:" + $updates, "sha256:" + $security] | sort) and
+  all($sources[]; .repository.signer_fingerprints == [$signer]) and
+  $frozen.release_digest == ("sha256:" + $release) and
+  ([$frozen.witnesses[].repository_id] | sort) ==
+    ([$sources[] | select(.repository.release_digest != ("sha256:" + $release)) | .package] | sort) and
+  all($frozen.witnesses[]; . as $witness |
+    any($sources[]; .package == $witness.repository_id and
+      .repository.snapshot_digest == $witness.snapshot_digest and
+      .repository.signer_fingerprints == [$witness.primary_fingerprint])) and
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
   .version == 3 and .target_architecture == "amd64" and
-  (.repositories | length) == 3 and
+  (.repositories | length) >= 2 and (.repositories | length) <= 3 and
+  ([.repositories[].id] | unique | length) == (.repositories | length) and
   all(.repositories[]; .index_identity.primary == "sha256") and
-  ([.repositories[].release_sha256] |
-    index($release) != null and index($updates) != null and index($security) != null) and
-  all(.repositories[].release_sha256; . == $release or . == $updates or . == $security) and
-  ([.repositories[].signer_fingerprints[]] | unique) == [$signer] and
+  ([.repositories[].release_sha256] | index($release) != null) and
+  all(.repositories[]; . as $repository |
+    any($sources[]; .package == $repository.id and
+      .repository.snapshot_digest == ("sha256:" + $repository.snapshot_sha256) and
+      .repository.release_digest == ("sha256:" + $repository.release_sha256) and
+      .repository.signer_fingerprints == $repository.signer_fingerprints)) and
   all(.packages[]; .archive_identity.primary == "sha512" and
     ([.archive_identity.digests[] | select(.algorithm == "sha512")] | length) == 1) and
   ([.packages[] | select(.architecture == "amd64" and (
@@ -149,8 +182,12 @@ jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
     (.name == "udev" and .version == "259.5-0ubuntu3.4") or
     (.name == "sudo" and .version == "1.9.17p2-1ubuntu3.1") or
     (.name == "sudo-rs" and .version == "0.2.13-0ubuntu1.2") or
-    (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2")))] | length) == 5
-' "$lock" >/dev/null
+    (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2") or
+    (.name == "libcap-ng0" and .version == "0.8.5-4build5")))] | length) == 6
+' "$lock" >/dev/null || {
+  echo "prestate lock or fresh authenticated repository admission differs from reviewed authority" >&2
+  exit 1
+}
 
 install -d -o root -g root -m 0700 "$build" "$build/evidence" "$build/tmp" "$prestates" "$tools"
 evidence=$build/evidence
@@ -167,6 +204,7 @@ jq -r '
 
 bootstrap=()
 util_linux=
+libcap_ng=
 while IFS=$'\t' read -r name version package_arch digest size; do
   [[ "$name" =~ ^[a-z0-9][a-z0-9+.-]*$ &&
      "$version" != *$'\t'* && "$version" != *$'\n'* &&
@@ -183,9 +221,10 @@ while IFS=$'\t' read -r name version package_arch digest size; do
     libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl3t64|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
       bootstrap+=("$archive") ;;
     util-linux) util_linux=$archive ;;
+    libcap-ng0) libcap_ng=$archive ;;
   esac
 done <"$evidence/reference-archives.tsv"
-(( ${#bootstrap[@]} == 30 )) && [[ -n "$util_linux" ]] || {
+(( ${#bootstrap[@]} == 30 )) && [[ -n "$util_linux" && -n "$libcap_ng" ]] || {
   echo "prestate bootstrap tool closure is incomplete" >&2
   exit 1
 }
@@ -220,11 +259,49 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nc
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
 launcher=$tools/reference-launcher
 "$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$tools/zig-cache" \
   --global-cache-dir "$tools/zig-global-cache" \
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
 require_protected_file "$launcher"
+
+# This oracle has only the four reviewed packages registered. Its one possible
+# libc6 callback is denied before exec; --pending is never used on the closure.
+dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
+chmod 0755 "$tools/setpriv"
+[[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
+sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
+# setpriv needs libcap-ng.so.0, absent from the unchanged 30-archive bootstrap.
+dpkg-deb --fsys-tarfile "$libcap_ng" |
+  tar -xO ./usr/lib/x86_64-linux-gnu/libcap-ng.so.0.0.0 >"$tools/libcap-ng.so.0.0.0"
+chmod 0644 "$tools/libcap-ng.so.0.0.0"
+require_protected_file "$tools/libcap-ng.so.0.0.0"
+[[ $(stat -c '%s' "$tools/libcap-ng.so.0.0.0") == 26928 &&
+   $(sha256sum "$tools/libcap-ng.so.0.0.0" | cut -d' ' -f1) == "$setpriv_runtime_sha256" ]]
+env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
+  unshare --mount --propagation private -- \
+  timeout --signal=TERM --kill-after=30s 5m \
+  python3 tools/real-snapshot-reference-order.py \
+    --launcher "$launcher" --architecture amd64 \
+    --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
+    --prove-base-cycle "$tools/setpriv"
+[[ -s "$evidence/base-cycle-proof/comparison.json" ]]
+
+if [[ $purpose == python3 ]]; then
+  env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
+    unshare --mount --propagation private -- \
+    timeout --signal=TERM --kill-after=30s 20m \
+    python3 -B tools/real-snapshot-reference-order.py \
+      --launcher "$launcher" --architecture amd64 \
+      --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
+      --prestate "python3:amd64=unpacked:$prestates/python3"
+  [[ $(cat "$prestates/prestates.tsv") == \
+    "$(printf 'python3:amd64\t3.14.3-0ubuntu2 install ok unpacked\t%s' "$prestates/python3")" ]]
+  printf 'PYTHON3_PRESTATE=%s\n' "$prestates/python3" >"$workspace/prestates.env"
+  echo "protected Python pre-configure source captured; no full reference completion claimed"
+  exit 0
+fi
 
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
@@ -243,8 +320,12 @@ rm -rf --one-file-system -- "$root" "$build/tmp"
 expected_record=$(printf '%s\t%s\t%s\n' \
   systemd:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/systemd" \
   udev:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/udev" \
-  sudo:amd64 '1.9.17p2-1ubuntu3.1 install ok unpacked' "$prestates/sudo")
-[[ $(cat "$prestates/prestates.tsv") == "$expected_record" ]]
+  sudo:amd64 '1.9.17p2-1ubuntu3.1 install ok unpacked' "$prestates/sudo" | LC_ALL=C sort)
+actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")
+[[ $actual_record == "$expected_record" ]] || {
+  echo "signed prestate record differs from exact requested selectors/statuses/destinations" >&2
+  exit 1
+}
 
 require_control() { # root name:size:mode:sha256
   local name size mode digest file
@@ -266,7 +347,8 @@ require_prestate() { # package status control
   [[ $(dpkg-query --admindir="$target/var/lib/dpkg" -W -f='${Version} ${Status}' "$1") == "$2" ]]
   require_control "$target" "$3"
   require_control "$target" "$signed_dpkg"
-  [[ ! -e "$target/usr/bin/setpriv" && ! -L "$target/usr/bin/setpriv" ]]
+  # Util-linux is in this full signed closure, not the 30-archive bootstrap.
+  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"
 }
 require_prestate systemd '259.5-0ubuntu3.4 install ok half-configured' \
   'var/lib/dpkg/info/systemd.postinst:5037:755:d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d'
@@ -275,18 +357,13 @@ require_prestate udev '259.5-0ubuntu3.4 install ok half-configured' \
 require_prestate sudo '1.9.17p2-1ubuntu3.1 install ok unpacked' \
   'var/lib/dpkg/info/sudo.postinst:1747:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383'
 
-# Pinned dpkg writes sudo.list in extraction order, symbolic links last; the
-# signed sudo binding pins the native engine's C-sorted list. Only the order
-# changes: the pinned digest proves the sorted list is the exact path set.
+# The signed sudo binding pins the original archive-derived ownership bytes.
 list=$prestates/sudo/var/lib/dpkg/info/sudo.list
 require_protected_file "$list"
 [[ $(stat -c '%u:%g:%a:%h' "$list") == 0:0:644:1 ]]
-LC_ALL=C sort -- "$list" >"$list.sorted"
-chmod 0644 "$list.sorted"
-mv -- "$list.sorted" "$list"
-# The pre-sudo record is sudo-rs's registration before sudo's postinst.
 require_control "$prestates/sudo" \
   'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8'
+# The pre-sudo record is sudo-rs's registration before sudo's postinst.
 require_control "$prestates/sudo" \
   'var/lib/dpkg/alternatives/sudo:464:644:4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6'
 [[ $(dpkg-query --admindir="$prestates/sudo/var/lib/dpkg" -W \
@@ -306,13 +383,6 @@ install -d -o root -g root -m 0755 "$prestates/udev/dev/snd"
 for node in dev/kvm dev/fuse dev/snd/seq; do
   install -o root -g root -m 0600 /dev/null "$prestates/udev/$node"
 done
-
-# Reference-only: the pinned-dpkg proof harnesses drop CAP_SYS_ADMIN with the
-# closure's setpriv, which util-linux has not unpacked yet in these states.
-dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
-chmod 0755 "$tools/setpriv"
-[[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
-sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
 
 printf 'SIGNED_SYSTEMD_PRESTATE=%s\nSIGNED_UDEV_PRESTATE=%s\nSIGNED_SUDO_PRESTATE=%s\nREFERENCE_SETPRIV=%s\n' \
   "$prestates/systemd" "$prestates/udev" "$prestates/sudo" "$tools/setpriv" \

@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     if (equals(operation, "refresh") and equals(scenario, "freshness-failure")) {
         try std.Io.File.stdout().writeStreamingAll(io,
             \\{"operation":"refresh","exit_status":4,"changed":false,"summary":"ReleaseExpired","diagnostics":[{"id":"repository_authentication_failed","message":"ReleaseExpired"}]}
-            ++ "\n");
+        ++ "\n");
         std.process.exit(4);
     }
 
@@ -48,8 +48,16 @@ pub fn main(init: std.process.Init) !void {
     defer if (parsed_lock) |*parsed| parsed.deinit();
     const digest: ?[]const u8 = if (parsed_lock) |parsed| parsed.value.object.get("digest_sha256").?.string else null;
     if (equals(operation, "plan") and digest != null and std.mem.startsWith(u8, digest.?, "0")) {
-        try std.Io.File.stdout().writeStreamingAll(io, "{\"exit_status\":5}\n");
+        try std.Io.File.stdout().writeStreamingAll(io,
+            \\{"operation":"plan","exit_status":5,"changed":false,"summary":"invalid lock refused","diagnostics":[]}
+        ++ "\n");
         std.process.exit(5);
+    }
+    if (equals(operation, "install") and equals(scenario, "failed-create")) {
+        try std.Io.File.stdout().writeStreamingAll(io,
+            \\{"operation":"install","exit_status":8,"changed":true,"summary":"fixture install failure","diagnostics":[]}
+        ++ "\n");
+        std.process.exit(8);
     }
     if (equals(operation, "plan")) {
         const intent: []const u8 = if (equals(args[args.len - 1], "ubuntu-minimal")) "install" else "upgrade-all";
@@ -113,9 +121,7 @@ pub fn main(init: std.process.Init) !void {
         if (equals(operation, "install")) try installProgress(io, allocator, root, scenario);
         if (equals(operation, "install")) {
             const arch = option(args, "--architecture") orelse return error.MissingArchitecture;
-            const status = try std.fmt.allocPrint(allocator,
-                "Package: ubuntu-minimal\nStatus: install ok installed\nArchitecture: {s}\nVersion: 1.0\nDescription: offline driver fixture\n\n",
-                .{arch});
+            const status = try std.fmt.allocPrint(allocator, "Package: ubuntu-minimal\nStatus: install ok installed\nArchitecture: {s}\nVersion: 1.0\nDescription: offline driver fixture\n\n", .{arch});
             try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = status });
             try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/ubuntu-minimal.list", .data = if (equals(scenario, "owned-excluded-device"))
                 "/.\n/usr\n/dev/null\n"

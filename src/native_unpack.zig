@@ -22171,8 +22171,11 @@ fn snapshotLessPreinstIsInert(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotLessPreinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    const amd64 = std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64");
+    const arm64 = std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64");
+    if ((!amd64 and !arm64) or
         !std.mem.eql(u8, package.name, "less") or
         !std.mem.eql(u8, package.version, "668-1build1") or
         kind != .preinst or source != .new_package or
@@ -22180,6 +22183,190 @@ fn snapshotLessPreinstIsInert(
         !std.mem.eql(u8, arguments[0], "install"))
         return error.InvalidAlternativesScriptAuthority;
     return true;
+}
+
+const snapshot_less_arm64_artifacts = [_]struct {
+    name: []const u8,
+    version: []const u8,
+    size: u64,
+    sha512: []const u8,
+}{
+    .{
+        .name = "less",
+        .version = "668-1build1",
+        .size = 171138,
+        .sha512 = "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8",
+    },
+    .{
+        .name = "dash",
+        .version = "0.5.12-12ubuntu3",
+        .size = 95716,
+        .sha512 = "c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e",
+    },
+    .{
+        .name = "dpkg",
+        .version = "1.23.7ubuntu1",
+        .size = 1260980,
+        .sha512 = "824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5",
+    },
+    .{
+        .name = "libc6",
+        .version = "2.43-2ubuntu2.4",
+        .size = 1642036,
+        .sha512 = "865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7",
+    },
+};
+
+const snapshot_less_arm64_controls = [_]SignedDebconfControlFile{
+    .{
+        .path = "var/lib/dpkg/info/less.preinst",
+        .size = 292,
+        .mode = 0o755,
+        .sha256 = "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
+    },
+    .{
+        .path = lifecycle_tmp_ci ++ "/less.preinst",
+        .size = 292,
+        .mode = 0o755,
+        .sha256 = "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
+    },
+    .{
+        .path = "var/lib/dpkg/info/less.list",
+        .size = 583,
+        .mode = 0o644,
+        .sha256 = "0206e202ee08fa90d694df6ee0a0f438258ce7f442ff3bc8db4ead65514c62ae",
+    },
+    .{
+        .path = "usr/bin/dash",
+        .size = 133864,
+        .mode = 0o755,
+        .sha256 = "87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9",
+    },
+    .{
+        .path = "usr/bin/update-alternatives",
+        .size = 68032,
+        .mode = 0o755,
+        .sha256 = "dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807",
+    },
+    .{
+        .path = "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        .size = 201872,
+        .mode = 0o755,
+        .sha256 = "7cdd4ce693d93790bf088dca2e86857f758335b6010d913e086fa384e7704a46",
+    },
+    .{
+        .path = "usr/lib/aarch64-linux-gnu/libc.so.6",
+        .size = 1788240,
+        .mode = 0o755,
+        .sha256 = "7b17086ce95b15145e6c2c5f8146395f80e2df1af2636fbf78e90c546a70df06",
+    },
+};
+
+const SnapshotLessArm64Alias = struct { path: []const u8, target: []const u8 };
+const snapshot_less_arm64_aliases = [_]SnapshotLessArm64Alias{
+    .{ .path = "bin", .target = "usr/bin" },
+    .{ .path = "sbin", .target = "usr/sbin" },
+    .{ .path = "lib", .target = "usr/lib" },
+    .{ .path = "usr/bin/sh", .target = "dash" },
+    .{ .path = "usr/lib/ld-linux-aarch64.so.1", .target = "aarch64-linux-gnu/ld-linux-aarch64.so.1" },
+};
+const snapshot_less_arm64_absent = [_][]const u8{
+    "etc/ld.so.preload",
+    "etc/ld.so.cache",
+    "usr/lib/aarch64-linux-gnu/glibc-hwcaps",
+    "usr/sbin/update-alternatives",
+    "lib64",
+};
+
+fn verifySnapshotLessArm64Artifacts(
+    artifacts: []const native_program.ProgramArtifact,
+    architecture: []const u8,
+) !void {
+    if (!std.mem.eql(u8, architecture, "arm64"))
+        return error.InvalidAlternativesScriptAuthority;
+    for (snapshot_less_arm64_artifacts) |binding|
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
+            binding.size,
+            binding.sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+}
+
+fn verifySnapshotLessArm64AliasBinding(
+    entry: root_fs.Entry,
+    target: []const u8,
+    binding: SnapshotLessArm64Alias,
+) !void {
+    if (!entry.modeled or entry.kind != .sym_link or
+        entry.mode != 0o777 or entry.uid != 0 or entry.gid != 0 or
+        entry.link_count != 1 or entry.size != binding.target.len or
+        !std.mem.eql(u8, target, binding.target))
+        return error.InvalidAlternativesScriptAuthority;
+}
+
+fn verifySnapshotLessArm64Inputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    artifacts: []const native_program.ProgramArtifact,
+    architecture: []const u8,
+) !void {
+    try verifySnapshotLessArm64Artifacts(artifacts, architecture);
+    const linux = std.os.linux;
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(root.dir.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat)) != .SUCCESS or
+        !stat.mask.TYPE or !stat.mask.MODE or !stat.mask.UID or !stat.mask.GID or
+        stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)
+        return error.InvalidAlternativesScriptAuthority;
+    var proc = try root.pinDirectory(try root_fs.Path.init("proc"));
+    defer proc.close();
+    const entry = (try proc.metadata()).entry;
+    try verifyModeledEntry(entry, "proc", .directory, error.InvalidAlternativesScriptAuthority);
+    if (entry.mode != 0o755 or entry.uid != 0 or entry.gid != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    var contents = try proc.observeAlloc(allocator, 0, 0);
+    defer contents.deinit();
+    for (snapshot_less_arm64_controls) |binding| {
+        var pinned = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+        defer pinned.close();
+        const observed = try pinned.observeStableAlloc(allocator, 2 * 1024 * 1024);
+        defer allocator.free(observed.bytes);
+        var digest: [32]u8 = undefined;
+        Sha256.hash(observed.bytes, &digest, .{});
+        try verifySignedDebconfControlFileBinding(
+            observed.entry,
+            digest,
+            binding,
+            error.InvalidAlternativesScriptAuthority,
+        );
+    }
+    for (snapshot_less_arm64_aliases) |binding| {
+        var link = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
+        defer link.close();
+        var buffer: [128]u8 = undefined;
+        const observed = try link.observe(&buffer);
+        try verifySnapshotLessArm64AliasBinding(observed.entry, observed.target, binding);
+    }
+    for (snapshot_less_arm64_absent) |path|
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidAlternativesScriptAuthority;
+}
+
+fn bindSnapshotLessArm64ImmutableInputs(script: *native_alternatives.ScriptAuthority) !void {
+    const allocator = script.arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    try paths.appendSlice(allocator, script.immutable_targets);
+    for (snapshot_less_arm64_controls) |binding|
+        try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{binding.path}));
+    // Directory aliases are rechecked separately before and after execution.
+    for (snapshot_less_arm64_aliases) |binding| {
+        if (std.mem.indexOfScalar(u8, binding.path, '/') == null) continue;
+        try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{binding.path}));
+    }
+    for (snapshot_less_arm64_absent) |path|
+        try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{path}));
+    script.immutable_targets = try paths.toOwnedSlice(allocator);
 }
 
 fn snapshotPython3PreinstIsInert(
@@ -22738,12 +22925,7 @@ fn verifySnapshotPython3PreinstInputs(
         root,
         program.target_architecture,
     );
-    try verifySnapshotPython3NullFile(
-        allocator,
-        root,
-        0,
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    );
+    try verifySnapshotPython3NullInput(allocator, root, program);
 }
 
 const SnapshotPython3PreinstBinding = struct {
@@ -23214,10 +23396,11 @@ test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings"
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
     );
+    const null_entry = try null_root.entry(null_path);
     try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
         "reason=control_file_mismatch",
         "path=dev/null",
-        "field=uid",
+        if (null_entry.uid != 0) "field=uid" else if (null_entry.gid != 0) "field=gid" else "field=size",
         "expected=0",
         "observed=",
     });
@@ -23253,6 +23436,227 @@ fn verifySnapshotPython3NullFile(
     }, error.InvalidPython3PreinstControl);
 }
 
+const snapshot_python3_minimal_postinst = SignedDebconfControlFile{
+    .path = "var/lib/dpkg/info/python3-minimal.postinst",
+    .size = 117,
+    .mode = 0o755,
+    .sha256 = "be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",
+};
+const snapshot_python3_minimal_null_sources = [_]SignedDebconfControlFile{
+    snapshot_python3_minimal_postinst,
+    .{
+        .path = "usr/bin/py3compile",
+        .size = 13312,
+        .mode = 0o755,
+        .sha256 = "a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",
+    },
+};
+const snapshot_python3_minimal_null_input = SignedDebconfControlFile{
+    .path = "dev/null",
+    .size = 20,
+    .mode = 0o644,
+    .sha256 = "e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e",
+};
+
+fn verifySnapshotPython3NullInputBinding(
+    entry: root_fs.Entry,
+    digest: [32]u8,
+    architecture: []const u8,
+) !bool {
+    if (entry.size == snapshot_python3_minimal_null_input.size) {
+        if (!std.mem.eql(u8, architecture, "amd64"))
+            return invalidPython3Preinst(
+                "reason=null_prestate_architecture_unbound path=dev/null field=target_architecture expected=amd64 observed={s}",
+                .{architecture},
+            );
+        try verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_null_input,
+            error.InvalidPython3PreinstControl,
+        );
+        return true;
+    }
+    if (entry.mode != 0o600 and entry.mode != 0o644)
+        return invalidPython3Preinst(
+            "reason=null_file_mode_mismatch path=dev/null field=mode expected=0o600-or-0o644 observed=0o{o}",
+            .{entry.mode},
+        );
+    try verifySignedDebconfControlFileBinding(entry, digest, .{
+        .path = "dev/null",
+        .size = 0,
+        .mode = @intCast(entry.mode),
+        .sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    }, error.InvalidPython3PreinstControl);
+    return false;
+}
+
+fn verifySnapshotPython3NullInput(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    var pinned = root.pinRegularFile(try root_fs.Path.init("dev/null")) catch |err|
+        return python3PreinstError(
+            err,
+            "reason=null_file_open_failed path=dev/null field=kind expected=regular observed={s}",
+            .{@errorName(err)},
+        );
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, 1024 * 1024);
+    defer allocator.free(observed.bytes);
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observed.bytes, &digest, .{});
+    if (try verifySnapshotPython3NullInputBinding(
+        observed.entry,
+        digest,
+        program.target_architecture,
+    )) {
+        try verifySnapshotPython3PreinstArtifacts(program.artifacts, "amd64");
+        for (snapshot_python3_minimal_null_sources) |binding| try verifySignedDebconfControlFile(
+            allocator,
+            root,
+            binding,
+            error.InvalidPython3PreinstControl,
+        );
+    }
+}
+
+test "native_unpack.test.python3 null input admits only empty or exact amd64 minimal callback witness" {
+    const witness = "/usr/bin/py3compile\n";
+    var digest: [32]u8 = undefined;
+    Sha256.hash(witness, &digest, .{});
+    const entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = witness.len,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try testing.expect(try verifySnapshotPython3NullInputBinding(entry, digest, "amd64"));
+    for ([_][]const u8{ "arm64", "all", "riscv64" }) |architecture|
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3NullInputBinding(entry, digest, architecture),
+        );
+    for ([_]struct {
+        mode: u32 = 0o644,
+        uid: u32 = 0,
+        gid: u32 = 0,
+        link_count: u64 = 1,
+        kind: std.Io.File.Kind = .file,
+        size: u64 = witness.len,
+        modeled: bool = true,
+    }{
+        .{ .mode = 0o600 },
+        .{ .mode = 0o640 },
+        .{ .mode = 0o666 },
+        .{ .uid = 1 },
+        .{ .gid = 1 },
+        .{ .link_count = 2 },
+        .{ .kind = .sym_link },
+        .{ .size = witness.len - 1 },
+        .{ .size = witness.len + 1 },
+        .{ .modeled = false },
+    }) |mutation| {
+        var changed = entry;
+        changed.mode = mutation.mode;
+        changed.uid = mutation.uid;
+        changed.gid = mutation.gid;
+        changed.link_count = mutation.link_count;
+        changed.kind = mutation.kind;
+        changed.size = mutation.size;
+        changed.modeled = mutation.modeled;
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3NullInputBinding(changed, digest, "amd64"),
+        );
+    }
+    var wrong_digest: [32]u8 = undefined;
+    Sha256.hash("/usr/bin/py3compile ", &wrong_digest, .{});
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(entry, wrong_digest, "amd64"),
+    );
+    var empty = entry;
+    empty.size = 0;
+    var empty_digest: [32]u8 = undefined;
+    Sha256.hash("", &empty_digest, .{});
+    for ([_]u32{ 0o600, 0o644 }) |mode| {
+        empty.mode = mode;
+        try testing.expect(!(try verifySnapshotPython3NullInputBinding(empty, empty_digest, "amd64")));
+    }
+    empty.mode = 0o666;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(empty, empty_digest, "amd64"),
+    );
+    var after = entry;
+    after.size = 96;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(
+            after,
+            parseHex(32, "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc").?,
+            "amd64",
+        ),
+    );
+}
+
+test "native_unpack.test.python3 minimal callback source refuses stale semantic controls" {
+    const script = @embedFile("fixtures/ubuntu-resolute-python3-minimal.postinst");
+    var digest: [32]u8 = undefined;
+    Sha256.hash(script, &digest, .{});
+    var entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = script.len,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySignedDebconfControlFileBinding(
+        entry,
+        digest,
+        snapshot_python3_minimal_postinst,
+        error.InvalidPython3PreinstControl,
+    );
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    const offset = std.mem.indexOf(u8, changed, "which").?;
+    @memcpy(changed[offset .. offset + 5], "false");
+    Sha256.hash(changed, &digest, .{});
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_postinst,
+            error.InvalidPython3PreinstControl,
+        ),
+    );
+    Sha256.hash(script, &digest, .{});
+    entry.mode = 0o644;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_postinst,
+            error.InvalidPython3PreinstControl,
+        ),
+    );
+}
+
 fn verifySnapshotPython3NullOutput(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -23265,6 +23669,38 @@ fn verifySnapshotPython3NullOutput(
     );
 }
 
+test "native_unpack.test.protected signed python3 source is validated before fixture mutation" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_ROOT") orelse return;
+    const selected = try snapshotPython3PreinstBinding("amd64");
+    var artifacts: [2]native_program.ProgramArtifact = undefined;
+    for (selected.artifacts, &artifacts, 0..) |binding, *artifact, index| {
+        artifact.* = .{
+            .index = @intCast(index),
+            .package = .{ .name = binding.name, .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .archive_identity = content_digest.JsonIdentity.init(try content_digest.Identity.init(
+                .{ .sha512 = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512 },
+                .sha512,
+            )),
+            .size = binding.size,
+            .application_sha256 = @splat('0'),
+            .origin_v2 = .{ .authenticated_repository = .{
+                .repository_id = @splat('0'),
+                .repository_snapshot_sha256 = @splat('0'),
+            } },
+        };
+    }
+    var program = std.mem.zeroes(native_program.Program);
+    program.target_architecture = "amd64";
+    program.artifacts = &artifacts;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed Python source guard executed before fixture mutation\n");
+}
+
 test "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact" {
     const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
     const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse
@@ -23272,6 +23708,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     const before_0644_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644") orelse
         return error.TestUnexpectedResult;
     const after_0644_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644") orelse
+        return error.TestUnexpectedResult;
+    const before_py3compile_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_PY3COMPILE") orelse
+        return error.TestUnexpectedResult;
+    const after_py3compile_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_PY3COMPILE") orelse
         return error.TestUnexpectedResult;
     var before = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
     defer before.close();
@@ -23281,6 +23721,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     defer before_0644.close();
     var after_0644 = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_0644_path));
     defer after_0644.close();
+    var before_py3compile = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_py3compile_path));
+    defer before_py3compile.close();
+    var after_py3compile = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_py3compile_path));
+    defer after_py3compile.close();
     const identities = [_]struct {
         package: native_program.PackageIdentity,
         size: u64,
@@ -23319,6 +23763,7 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     program.target_architecture = "amd64";
     try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);
     try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);
+    try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);
     try verifySnapshotPython3PreinstPaths(
         testing.allocator,
         before.root,
@@ -23335,6 +23780,11 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     );
     try verifySnapshotPython3NullOutput(testing.allocator, after.root);
     try verifySnapshotPython3NullOutput(testing.allocator, after_0644.root);
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullOutput(testing.allocator, before_py3compile.root),
+    );
+    try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);
 
     program.artifacts = artifacts[0..1];
     try testing.expectError(
@@ -23375,6 +23825,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_0640",
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_ROOT",
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_SCRIPT",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_HASH",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_MODE",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_POSTINST",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_COMPILER",
     }) |name| {
         const path = std.c.getenv(name) orelse
             return error.TestUnexpectedResult;
@@ -23393,6 +23847,11 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         error.DirectoryTooLarge,
         verifySnapshotPython3PreinstInputs(testing.allocator, proc_root.root, &program),
     );
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")) |path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips\n");
+    }
 }
 
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
@@ -24512,6 +24971,230 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
     );
 }
 
+fn snapshotLessArm64TestArtifacts() ![snapshot_less_arm64_artifacts.len]native_program.ProgramArtifact {
+    var artifacts: [snapshot_less_arm64_artifacts.len]native_program.ProgramArtifact = undefined;
+    for (snapshot_less_arm64_artifacts, &artifacts, 0..) |binding, *artifact, index|
+        artifact.* = .{
+            .index = @intCast(index),
+            .package = .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
+            .archive_identity = content_digest.JsonIdentity.init(try content_digest.Identity.init(
+                .{ .sha512 = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512 },
+                .sha512,
+            )),
+            .size = binding.size,
+            .application_sha256 = @splat('0'),
+            .origin_v2 = .{ .authenticated_repository = .{
+                .repository_id = @splat('0'),
+                .repository_snapshot_sha256 = @splat('0'),
+            } },
+        };
+    return artifacts;
+}
+
+test "native_unpack.test.signed arm64 less admits only the inert fresh install callback" {
+    const script = @embedFile("fixtures/ubuntu-resolute-less.preinst");
+    const less: native_program.PackageIdentity = .{
+        .name = "less",
+        .version = "668-1build1",
+        .architecture = "arm64",
+    };
+    try testing.expect(try snapshotLessPreinstIsInert(script, "arm64", less, .preinst, .new_package, &.{"install"}));
+    for ([_][]const u8{ "amd64", "all", "riscv64" }) |architecture|
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotLessPreinstIsInert(
+            script,
+            architecture,
+            less,
+            .preinst,
+            .new_package,
+            &.{"install"},
+        ));
+    for ([_][]const []const u8{ &.{"upgrade"}, &.{"abort-upgrade"}, &.{ "install", "668-1build1" }, &.{} }) |arguments|
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotLessPreinstIsInert(
+            script,
+            "arm64",
+            less,
+            .preinst,
+            .new_package,
+            arguments,
+        ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotLessPreinstIsInert(
+        script,
+        "arm64",
+        less,
+        .preinst,
+        .installed_package,
+        &.{"install"},
+    ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotLessPostinstIsBound(
+        @embedFile("fixtures/ubuntu-resolute-less.postinst"),
+        "arm64",
+        less,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[std.mem.indexOf(u8, changed, "exit 0").? + 5] = '1';
+    try testing.expect(!(try snapshotLessPreinstIsInert(changed, "arm64", less, .preinst, .new_package, &.{"install"})));
+    try testing.expectError(error.InvalidAlternativesScript, native_alternatives.discoverScriptAuthority(testing.allocator, changed, .{}));
+}
+
+test "native_unpack.test.arm64 less binds authenticated archives and exact runtime metadata" {
+    const artifacts = try snapshotLessArm64TestArtifacts();
+    try verifySnapshotLessArm64Artifacts(&artifacts, "arm64");
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(&artifacts, "amd64"));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(artifacts[1..], "arm64"));
+    const duplicates = artifacts ++ artifacts[0..1].*;
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(&duplicates, "arm64"));
+    for (artifacts, 0..) |artifact, index| {
+        for (0..5) |mutation| {
+            var changed = artifacts;
+            switch (mutation) {
+                0 => changed[index].package.architecture = "amd64",
+                1 => changed[index].package.version = "unreviewed",
+                2 => changed[index].size += 1,
+                3 => changed[index].origin_v2 = null,
+                4 => {
+                    var digest = artifact.identity().?.digests.sha512.?;
+                    digest[0] ^= 1;
+                    changed[index].archive_identity = content_digest.JsonIdentity.init(try content_digest.Identity.init(.{ .sha512 = digest }, .sha512));
+                },
+                else => unreachable,
+            }
+            try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(&changed, "arm64"));
+        }
+    }
+    const script = @embedFile("fixtures/ubuntu-resolute-less.preinst");
+    var digest: [32]u8 = undefined;
+    Sha256.hash(script, &digest, .{});
+    const entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = script.len,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySignedDebconfControlFileBinding(entry, digest, snapshot_less_arm64_controls[0], error.InvalidAlternativesScriptAuthority);
+    for (0..5) |mutation| {
+        var changed = entry;
+        switch (mutation) {
+            0 => changed.mode = 0o644,
+            1 => changed.uid = 1,
+            2 => changed.gid = 1,
+            3 => changed.link_count = 2,
+            4 => changed.kind = .sym_link,
+            else => unreachable,
+        }
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySignedDebconfControlFileBinding(
+            changed,
+            digest,
+            snapshot_less_arm64_controls[0],
+            error.InvalidAlternativesScriptAuthority,
+        ));
+    }
+    for (snapshot_less_arm64_aliases) |binding| {
+        var link = entry;
+        link.kind = .sym_link;
+        link.mode = 0o777;
+        link.size = binding.target.len;
+        try verifySnapshotLessArm64AliasBinding(link, binding.target, binding);
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64AliasBinding(link, "foreign", binding));
+        link.uid = 1;
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64AliasBinding(link, binding.target, binding));
+    }
+}
+
+test "native_unpack.test.protected signed arm64 less source is validated before fixture mutation" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT") orelse return;
+    const artifacts = try snapshotLessArm64TestArtifacts();
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_PROOF")) |proof_path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed arm64 less source guard executed without skips\n");
+    }
+}
+
+test "native_unpack.test.protected signed arm64 less inert input and replay roots are exact" {
+    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT") orelse return;
+    const script_after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SCRIPT_AFTER") orelse return error.TestUnexpectedResult;
+    const dpkg_after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_DPKG_AFTER") orelse return error.TestUnexpectedResult;
+    const artifacts = try snapshotLessArm64TestArtifacts();
+    var program = std.mem.zeroes(native_program.Program);
+    program.target_architecture = "arm64";
+    program.artifacts = &artifacts;
+    const script = @embedFile("fixtures/ubuntu-resolute-less.preinst");
+    const less: native_program.PackageIdentity = .{ .name = "less", .version = "668-1build1", .architecture = "arm64" };
+    var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+    defer before_root.close();
+    var before_boundary = (try prepareAlternativesScriptBoundary(
+        testing.allocator,
+        before_root.root,
+        &program,
+        "arm64",
+        script,
+        less,
+        .preinst,
+        .new_package,
+        .script,
+        &.{"install"},
+    )) orelse return error.TestUnexpectedResult;
+    defer before_boundary.deinit();
+    for (before_boundary.after_authority.groups) |group| try testing.expect(!group.mutable);
+    for ([_][*:0]const u8{ script_after_path, dpkg_after_path }) |path| {
+        var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer after_root.close();
+        var after_boundary = (try prepareAlternativesScriptBoundary(
+            testing.allocator,
+            after_root.root,
+            &program,
+            "arm64",
+            script,
+            less,
+            .preinst,
+            .new_package,
+            .script,
+            &.{"install"},
+        )) orelse return error.TestUnexpectedResult;
+        defer after_boundary.deinit();
+        try testing.expectEqual(before_boundary.before.groups.len, after_boundary.before.groups.len);
+        for (before_boundary.before.groups, after_boundary.before.groups) |before, after| {
+            try testing.expectEqualDeep(before.record, after.record);
+            try testing.expectEqualStrings(before.selected, after.selected);
+        }
+    }
+    for ([_][:0]const u8{
+        "DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_SCRIPT_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_MODE_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_TOOL_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_ALIAS_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_PRESTATE_ROOT",
+    }) |name| {
+        const path = std.c.getenv(name) orelse return error.TestUnexpectedResult;
+        var changed = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer changed.close();
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Inputs(
+            testing.allocator,
+            changed.root,
+            &artifacts,
+            "arm64",
+        ));
+    }
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_REPLAY_PROOF")) |proof_path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\n");
+    }
+}
+
 fn prepareAlternativesScriptBoundary(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -24633,6 +25316,12 @@ fn prepareAlternativesScriptBoundary(
         return error.InvalidAlternativesScriptAuthority;
     if (procps_trigger_inert)
         try guardSnapshotProcpsTriggerInputs(root, &script);
+    if (less_inert and std.mem.eql(u8, architecture, "arm64")) {
+        if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
+            return error.InvalidAlternativesScriptAuthority;
+        try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
+        try bindSnapshotLessArm64ImmutableInputs(&script);
+    }
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
         root,
@@ -25388,6 +26077,17 @@ fn runLifecycleScript(
             try attempt.requireRecovery(allocator, .script);
             return err;
         };
+        if (std.mem.eql(u8, program.target_architecture, "arm64") and
+            native_alternatives.matchesSnapshotLessPreinst(script_bytes))
+            verifySnapshotLessArm64Inputs(
+                allocator,
+                root,
+                program.artifacts,
+                program.target_architecture,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
         native_alternatives.validateScriptInputs(
             allocator,
             root,

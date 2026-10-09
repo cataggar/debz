@@ -142,9 +142,25 @@ component `main`, and the explicit Ubuntu archive keyring. The frozen
 reviewed `596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834`
 and fresh same-snapshot `resolute-updates` and `resolute-security` witnesses
 both pass.
-Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
-regular, non-symlink Ubuntu archive keyring instead of installing trust material
-on the host. The authenticated lock must identify the reviewed Ubuntu 2018
+Both architecture legs now stage the reviewed commit under a **new**
+root-owned mode-0700 `/srv/debz-protected/native-ci-RUN-ATTEMPT-ARCH` tree,
+separate from the small proof's `ci-RUN-ATTEMPT-ARCH` tree. They reuse
+`real-snapshot-reference-protected-ci.sh --stage-native` for the verified Zig
+archive/library tree, package sources, candidate build, pinned Debian dpkg and
+package-derived trust root; this setup mode does **not** run or claim the small
+protected proof. Native and reference execution stay in that protected checkout.
+The native dispatcher invokes acceptance by its absolute checkout path; source
+metadata guards derive absolute tool paths from the protected repository root,
+including when acceptance is invoked through a relative `tools/` entry point.
+`DEBZ_REAL_SNAPSHOT_KEYRING` is required, with no hosted-image fallback. Its
+absolute regular, non-symlink path and every ancestor must be root-owned and
+not group/world writable. A no-follow descriptor verifies the consumed member
+against the shared reviewed size/digest: ubuntu-keyring
+`2023.11.28.1build1`, deb size 11228 and member size 3607, SHA-256
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`.
+Bootstrap verifies the package's reviewed SHA-512 before extraction.
+Local runs must provide the same protected bytes and protected candidate/checkout,
+not merely an arbitrary image keyring. The authenticated lock must identify the reviewed Ubuntu 2018
 archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
 an existing root is never reused or reset by this script.
 Local candidate installation must run as UID 0: the private helper workspace
@@ -346,12 +362,46 @@ enter the root and skipped that capture. It also keeps the root's final
 `diversions` and `statoverride` databases as `diversions-final` and
 `statoverride-final`.
 
-The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
+The manual `ubuntu-real-snapshot` job therefore allows 320 minutes: 20 for
+protected setup, 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
 planning, download, verification and the zero-action update), 50 for the
 pinned reference step (its own 40-minute dpkg limit plus staging and
-capture), 15 for diagnostics and cleanup, and the remaining 15 for setup,
-build and upload. Step limits keep a slow native install from consuming the
+capture), 15 for diagnostics, and the remaining 15 for bounded export,
+named descendant/mount-checked cleanup and upload. Evidence members remain
+bounded to 128 MiB and the artifact to 512 MiB, indexed by `SHA256SUMS`, with
+14-day retention. Only exported evidence is copied to the runner; the protected
+checkout, tools and live roots are never chowned to it. Collection and cleanup
+have distinct retained outcomes, and both cleanup and upload run on failure.
+`acceptance-outcome-v1.json` uses the latest attempted native command recorded
+in `native-stage-v1.json`, not a successful earlier `refresh.json`. The marker
+is written before command launch and records its exit before trace auditing;
+the EXIT trap separately records `native-wrapper-exit-status.txt`. The
+collector combines these with `steps.native.outcome`. Its original
+`operation`, `exit_status`, `changed`, `summary` and `diagnostics` fields remain;
+`exit_status` now reports the native acceptance failure/completion rather than
+the refresh command alone. Additional stage, workflow, wrapper, command and
+result fields distinguish a failed postcondition or trace audit from the
+command's JSON exit. Verification receipts have their own JSON shape; their
+command exit is retained without inventing a JSON `exit_status`. The deliberately
+refused invalid-lock probe is a successful
+acceptance outcome only after both wrapper and workflow completion, while its
+nonzero command/result exits stay explicit. Missing, empty, corrupt or unsafe
+latest results produce explicit evidence errors and a nonzero `outcome_status`
+in `collection-result.txt`; they never fall back to refresh. `changed: null`
+means the latest result could not establish whether that command changed state.
+
+The separate `/dev/null` diagnostic surface is
+`vendor-state-inventory-v1.json.write_witnesses`: its observed kind, mode, UID/GID,
+size and SHA-256, alongside any control-file mismatch in `create.json` (stderr
+may be empty). Native and reference differential captures explicitly exclude
+`dev/null`, so an empty native `write_witnesses` array is expected for that
+exclusion and is not evidence of an untouched null path. An absent reference
+still yields `comparison-unavailable.txt` and a failed collection, not parity.
+These observations do not identify the writer or authorize truncating/resetting
+root bytes; the native control-file guard is unchanged.
+
+Step limits keep a slow native install from consuming the
 reference or diagnostics budget. The job stays dispatch-only; pull-request
 jobs are unchanged.
 
@@ -643,6 +693,150 @@ signed-lock bindings of dpkg's in-root dynamic loader and runtime libraries
 remain unverified;
 no privileged reference run is authorized on this delta.
 
+The **amd64 base-cycle exception (#401)** is a separate `break_base_cycle`
+operation with the `libgcc_cycle` profile, not ordinary configure authority.
+At genuine scheduler no-progress it rehashes the four exact signed resolute
+archives and reads their control members (the exact lock has no dependency
+fields). The reviewed SCC is `libc6 2.43-2ubuntu2.4 ↔ libgcc-s1
+16-20260322-1ubuntu1`; both must be unpacked. Its only external dependencies,
+`gcc-16-base 16-20260322-1ubuntu1` and `libc-gconv-modules-extra
+2.43-2ubuntu2.4`, must already be installed. All four have no Pre-Depends and
+declare `Multi-Arch: same`, including both already-installed external members.
+Changed identities, graphs, versions, trigger state, unincorporated activations,
+database updates or outside dependencies refuse before the operation.
+
+The deterministic breaker is **libgcc-s1**, whose signed control archive
+contains **no maintainer scripts**. The launcher independently rehashes all
+four pinned archives, rechecks the installed hard-dependency graph and states
+inside the protected chroot, requires both qualified and unqualified script
+paths absent, and binds the installed `activate-noawait ldconfig` metadata.
+It adds only `--force-depends` to the existing common dpkg flags and
+`--no-triggers --configure libgcc-s1:amd64`. No `--force-all`,
+`--force-depends-version`, arbitrary selector, pending batch, proc mount or
+callback is authorized. The expected transition is only libgcc-s1
+unpacked → installed; all other status fields and trigger-database bytes must
+be unchanged. Normal unforced scheduling then resumes, preserving the signed
+systemd/udev half-configured and sudo unpacked capture semantics. That authority
+is never reused; neither bootstrap status registration nor trigger clearing is
+performed.
+
+When several prestates are requested, the producer's intentional interrupted
+systemd/udev postinst leaves the working package half-configured after its
+independent copy is captured. Only the separate `continue_prestate` verb may
+resume that state, with the existing exact amd64 systemd/udev version,
+selector, postinst digest and proc/privilege profile. Ordinary `configure`
+still requires unpacked, and sudo/other packages cannot use the continuation.
+The last requested target returns without continuation, preserving its
+captured state.
+
+The capture ledger records dependency-ready capture order, not CLI request
+order. Run `37840440734` produced all three rows in `sudo, systemd, udev`
+order, then its shell's request-order comparison silently refused. The retained
+`signed-proc-capture-record-v1.tsv` is that observed receipt (both modes, artifact
+IDs `11578395734` and `11577184247`), not a protected replay acceptance claim.
+The consumer compares C-sorted exact rows without rewriting the ledger or
+deduplicating: missing, duplicate, changed selector/version/status/destination
+or extra rows still refuse. This receipt comparison does **not** normalize any
+authenticated ownership-list bytes.
+
+The same authenticated sudo archive derives its original 2376-byte list with
+the reviewed `39fe94bd…` digest; C-sorting changes it to `92f90d6a…`, contradicting
+that pin. The consumer now validates the original list without sorting,
+replacing or changing its inode, just like the retained less/Python lists.
+Canonicalizing ledger row order is not permission to rewrite package inputs.
+
+That run's stopped database also leaves `sudo-rs` unpacked. The reviewed sudo
+fixture requires its already-existing registration and installed
+`sudo-rs:amd64 0.2.13-0ubuntu1.2`, but sudo only Recommends sudo-rs: an ordinary
+dpkg configure probe cannot establish that prestate requirement. Only a
+requested sudo capture therefore waits for this exact signed-closure companion
+to become installed through the unchanged ordinary scheduler. Sudo itself
+remains unpacked until capture. Missing or changed companion identities refuse;
+no dependencies are forced, statuses synthesized or script/proc authority
+added. Normal installs without the capture request retain their old order.
+
+Run `37854267473` confirms those captures and sudo-rs readiness completed in
+both modes. Its next silent refusal was an absence guard for `usr/bin/setpriv`,
+although signed `util-linux:amd64 2.41.3-3ubuntu2.2` was unpacked before every
+capture. The full closure necessarily contains that already-reviewed 47576-byte,
+0755 regular binary (`86965a01…`); only the smaller unregistered bootstrap lacks
+it. Prestate validation now requires its exact existing digest, size, mode,
+root ownership and single hardlink instead of deleting it or accepting arbitrary
+helpers. Native script/tool/proc authority is unchanged: this is package data,
+not a new native executable admission. The reference-only capability drop and
+the narrow comparator's absent-native/present-reference allowance remain
+unchanged. Both fresh artifacts retain the earlier pre-OpenSSL stall report;
+that report is not their terminal failure.
+
+The next signed stall is `libssl3t64 3.5.5-1ubuntu3.6 ↔
+openssl-provider-legacy 3.5.5-1ubuntu3.6`, not a coreutils or Python callback
+failure. Its two single-package pinned-dpkg dry runs refuse their unconfigured
+peer. An exact two-package dry run succeeds without dependency force flags.
+The expected peer spelling follows pinned dpkg 1.22.22's `pnaw_nonambig`:
+the authenticated native-amd64 `Multi-Arch: foreign` provider is unqualified
+(`Package openssl-provider-legacy is not configured yet.`), while the
+`Multi-Arch: same` libssl peer is qualified. Wrong peers or wrong qualification
+refuse; running amd64 metadata on an arm64 dpkg is not a native-amd64 proof.
+Both signed control archives contain **no maintainer scripts**. This separate
+`configure_openssl_cycle` operation uses the `openssl_cycle` profile, only on
+amd64 after the base bridge at genuine no-progress. It rehashes the exact pair
+and the already-installed external dependencies (`libc6 2.43-2ubuntu2.4`,
+`libzstd1 1.5.7+dfsg-3`, `zlib1g
+1:1.3.dfsg+really1.3.1-1ubuntu3.1`), and checks their signed and installed hard
+graphs, states, absent callbacks and unchanged trigger database. The launcher
+independently checks the five archive identities and the installed graph
+inside the protected chroot. Its fixed argv is
+`--no-triggers --configure libssl3t64:amd64 openssl-provider-legacy:amd64`
+with the existing common flags only: **no new force flags, pending batch,
+arbitrary selectors, callback or proc authority**. Only the pair may transition
+unpacked → installed; the signed `activate-noawait ldconfig` registration is
+not executed or cleared. Normal single-package scheduling and prestate capture
+then resume. Any later stall refuses rather than reusing either authority.
+
+`openssl-cycle-refusals.json` retains both real dry-run refusals and
+`openssl-cycle-before.json` / `openssl-cycle-after.json` retain the bounded
+transition. `reference-no-progress.json` preserves the latest stalled selectors
+and bounded probe prefixes/digests, including on an unknown successor cycle.
+The checked-in graph fixture is projected from authenticated, rehashed archive
+controls; its statuses are unit-test input, not a bootstrap database.
+Nonprivileged exact-byte dry runs and unit tests do **not** prove protected
+script replay. Fresh hosted Debug/ReleaseSafe signed-proc runs and actual
+protected Python/ARM fixture dispatches remain required; optional PR-job skips
+do not satisfy those gates.
+
+The restored `signed-proc-protected-replay` job runs both Debug and ReleaseSafe,
+with the historical protected staging, non-skipped signed systemd/udev/sudo
+proofs and native replays, comparison, refusal mutations and bounded evidence.
+The signed udev static-node rule names the `kvm` group; the replay checks
+`dev/kvm` against that unique named entry in the disposable root's `etc/group`,
+not a bootstrap-specific allocated GID. Modes and the PID-only proc contract
+remain unchanged. Comparison uses the current authenticated snapshot dpkg and
+setpriv byte identities. The pinned proof may append only the exact target's
+configure sequence and version to the byte-identical inherited dpkg log;
+changed, truncated or reordered history remains a refusal. Raw native/proof
+`status`/`status-old`, udev group databases and both dpkg log histories are retained as
+bounded diagnostic evidence, not rewritten or substituted for proof.
+Before the full prestate install, a fresh **four-package** fixture reproduces
+both single-configure refusals and compares this callback-free transition with
+protected real pinned `dpkg --no-triggers --configure --pending`. Its only
+possible libc6 postinst is byte-checked and made read-only/noexec **before**
+launch; the real pending scheduler configures libgcc-s1 and attempts libc6,
+whose callback is denied. The candidate leaves libc6 unpacked while the
+interrupted baseline records it half-configured. This deliberately bounded
+schedule comparison is **not full callback or command-scheduling parity**.
+Only that pending-oracle copy receives the exact signed amd64 libcap-ng0
+`0.8.5-4build5` library needed by signed setpriv. Its member size, mode and
+SHA-256 are checked before launch; it is not registered in dpkg, added to the
+30-archive bootstrap, or staged into the candidate or target prestates.
+The oracle retains bounded stdout/stderr, exact argv/exit status, runtime
+identity and database observations **before** classifying a refusal. Loader
+or setup failures still refuse; they are never accepted as callback denial.
+The job retains graph/status/trigger before/after evidence, both argv/output
+histories and a launcher injected-callback refusal. Hosted success is required
+before #401 closure; local unit tests and an archive rehash are not that proof.
+The authenticated runtime and individually authorized final triggered-handler
+contracts remain separate follow-ups.
+
 This is **not yet an executable full parity gate**: the closed launcher
 refuses `--configure --pending`, `--triggers-only --pending` and **also**
 single-package trigger actions. A disposable unprivileged dpkg 1.22.22
@@ -666,7 +860,7 @@ listener's **triggered** script bytes to the exact authenticated archive,
 verify the pinned installed script, status/trigger queue and version again
 in the launcher before exec, establish that no other script is invoked, and
 compare per-listener ordering and state with pinned dpkg. The current
-launcher has only `configure`/`probe_configure` and an exact
+launcher's normal configure path has an exact
 `["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
 profile for any of them. The Python command builder refuses all trigger
 verbs, including attempts to reuse those configure-only profiles. Until
@@ -674,10 +868,15 @@ these distinct identities and closure ordering are proved, finalization
 refuses rather than silently changing `--pending` behavior. Privileged
 namespace/archive-mount, death/timeout cleanup and
 exact result equivalence still require independently protected small-root
-proof and review before any 175-package comparison. The current CI checkout
-and cleanup are not root-owned protected ancestry; arm64 signed script
-profiles are unproved. Running the manual full-reference step there must
-fail closed until the runner's staging and cleanup contract is redesigned.
+proof and review before any full-closure comparison. The manual full-reference
+step now uses the independent protected native staging tree and explicit absolute
+`DEBZ_ZIG`, not a bare compiler in the fixed `/usr/sbin:/usr/bin:/sbin:/bin`
+PATH. Compiler and library ancestry/bytes stay bound to that protected
+toolchain, with an explicit `--zig-lib-dir` and no ambient `ZIG_LIB_DIR`.
+Arm64 signed script profiles, loader/runtime binding (#263), cycle ordering
+and trigger finalization remain separate gates. Ordinary tests and a green
+small protected proof do not establish that this full reference step executed:
+native completion is still required before it can compile and reach ordering.
 The reference-only
 `dev/null` chroot device is excluded from both bounded captures only when no
 package claims it; no package payload path is excluded.

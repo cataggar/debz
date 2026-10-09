@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Root-only hosted-CI staging and protected per-operation reference proof (#268).
+# Shared root-only staging/trust bootstrap and small protected proof (#268).
 #
 # The workflow bootstrap clones the reviewed commit, verified by SHA, from a
 # root-owned bare copy into TREE/checkout, where TREE is a new root-owned
@@ -12,10 +12,14 @@
 # negatives on new workspaces, and runs the protected proof on a new empty
 # workspace. Bounded evidence is copied into TREE/upload; nothing outside TREE
 # is written.
+# --stage-native stages the same trusted inputs in a distinct native-ci tree,
+# without running or reusing the small proof. --check-keyring verifies protected
+# member bytes against the same reviewed constants for the acceptance consumer.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+unset ZIG_LIB_DIR
 
 readonly zig_version=0.16.0
 readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.16.0
@@ -33,12 +37,32 @@ readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg
 readonly archive_keyring_sha256=80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31
 readonly archive_keyring_size=3607
 
+if [[ ${1:-} == --check-keyring && $# == 2 ]]; then
+  python3 -I - "$(dirname -- "${BASH_SOURCE[0]}")" "$2" \
+    "$archive_keyring_size" "$archive_keyring_sha256" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import verify_keyring
+print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))
+PY
+  exit "$?"
+fi
+
+mode=proof
+if [[ ${1:-} == --stage-native ]]; then
+  mode=native-staging
+  shift
+fi
+readonly mode
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
   echo "usage (as root, from the protected clone): $0 TREE ARCHITECTURE COMMIT" >&2
   exit 2
 }
 tree=$1 architecture=$2 commit=$3
-[[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&
+prefix=ci
+[[ $mode == proof ]] || prefix=native-ci
+[[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&
   $commit =~ ^[0-9a-f]{40}$ ]] || {
   echo "the protected tree, architecture and commit must be the workflow's named values" >&2
   exit 2
@@ -81,7 +105,7 @@ collect() {
   local status=$?
   set +e
   local workspace=$checkout/.real-snapshot/$architecture
-  install -d -o root -g root -m 0755 "$upload/staging" "$upload/proof" "$upload/negatives"
+  install -d -o root -g root -m 0755 "$upload/staging" "$upload/proof" "$upload/negatives" "$upload/python3"
   find "$evidence" -maxdepth 1 -type f -size -16777217c -exec install -m 0644 -t "$upload" {} +
   if [[ -d $workspace/evidence ]]; then
     find "$workspace/evidence" -maxdepth 1 -type f -size -16777217c -exec install -m 0644 -t "$upload/staging" {} +
@@ -93,12 +117,29 @@ collect() {
     find "$workspace/proof" -maxdepth 1 -type f \( -name '*.json' -o -name '*.stdout' -o -name '*.stderr' \) \
       -size -16777217c -exec install -m 0644 -t "$upload/proof" {} +
   fi
+  if [[ -d $checkout/.real-snapshot/python3-amd64/evidence ]]; then
+    find "$checkout/.real-snapshot/python3-amd64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/python3" {} +
+  fi
+  if [[ -d $checkout/.real-snapshot/less-arm64/evidence &&
+        ! -L $checkout/.real-snapshot/less-arm64/evidence ]]; then
+    install -d -o root -g root -m 0755 "$upload/arm64-less"
+    find "$checkout/.real-snapshot/less-arm64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/arm64-less" {} +
+  fi
+  for source in snapshot/evidence prestate-build/evidence; do
+    local python3_evidence=$checkout/.real-snapshot/python3-amd64/$source
+    [[ -d $python3_evidence && ! -L $python3_evidence ]] || continue
+    install -d -o root -g root -m 0755 "$upload/python3/$source"
+    find "$python3_evidence" -maxdepth 1 -type f -size -16777217c \
+      -exec install -m 0644 -t "$upload/python3/$source" {} +
+  done
   for directory in "$workspace"/negative-*; do
     [[ -d $directory && ! -L $directory ]] || continue
     find "$directory" -maxdepth 1 -printf '%M %u:%g %s %P\n' >"$upload/negatives/${directory##*/}.listing"
   done
-  printf 'status=%s\ncommit=%s\narchitecture=%s\nfinished=%s\n' \
-    "$status" "$commit" "$architecture" "$(date -u +%FT%TZ)" >"$upload/result.txt"
+  printf 'status=%s\nmode=%s\ncommit=%s\narchitecture=%s\nfinished=%s\n' \
+    "$status" "$mode" "$commit" "$architecture" "$(date -u +%FT%TZ)" >"$upload/result.txt"
   local bytes
   bytes=$(du -sb "$upload" | cut -f1)
   if ((bytes > 256 * 1024 * 1024)); then
@@ -480,6 +521,13 @@ with tarfile.open(sys.argv[1]) as archive:
     archive.extractall(sys.argv[2], filter="data")
 ' "$downloads/$zig_name.tar.xz" "$tree/zig"
 zig=$tree/zig/$zig_name/zig
+step zig-library-check 0 "" python3 -I - "$checkout/tools" "$zig" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import toolchain
+print(toolchain(Path(sys.argv[2])))
+PY
 zenv=(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C
   "ZIG_GLOBAL_CACHE_DIR=$tree/zig-global" "ZIG_LOCAL_CACHE_DIR=$checkout/.zig-cache")
 step zig-version 0 "$zig_version" "${zenv[@]}" "$zig" version
@@ -495,9 +543,42 @@ find zig-pkg "$tree/zig-global" -xdev -perm /0022 ! -type l -printf '%M %u:%g %p
 chmod -R go-w zig-pkg "$tree/zig-global"
 step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \
   "$checkout/zig-pkg" "$evidence/zig-pkg-manifest.txt"
-step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j4
+step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j2
 chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$checkout/zig-out"
 step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+
+stage_native_inputs() {
+  step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
+  python3 -I - "$checkout/tools" "$architecture" "$tree/reference-dpkg" <<'PY'
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("prepare_native_dpkg", Path(sys.argv[1]) / "prepare-native-dpkg.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+architecture, prefix = sys.argv[2], Path(sys.argv[3])
+url, content = module.download_archive(architecture)
+archive = prefix.parent / "reference-dpkg.deb"
+archive.write_bytes(content)
+module.verify_file(archive, module.PINS[architecture]["archive"])
+module.verify_archive_metadata(archive, architecture)
+subprocess.run(["dpkg-deb", "--extract", str(archive), str(prefix)], check=True, timeout=60)
+module.verify_extracted_bindings(prefix, architecture)
+module.write_receipt(architecture, url, content, prefix)
+module.verify_receipt(prefix / module.RECEIPT, architecture)
+PY
+  install -d -o root -g root -m 0700 "$checkout/.real-snapshot"
+  printf '%s\n' "$zig" "$tree/reference-dpkg/usr/bin/dpkg" "$staged_archive_keyring" \
+    >"$tree/native-inputs.args"
+  step native-tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+}
+if [[ $mode == native-staging ]]; then
+  stage_native_inputs
+  echo "protected native inputs staged; native wrapper and full reference have not executed"
+  exit "$?"
+fi
 
 workspace=$checkout/.real-snapshot/$architecture
 install -d -o root -g root -m 0700 .real-snapshot
@@ -520,7 +601,7 @@ negative() { # NAME PATTERN sed-expression...
   sed "${edits[@]}" "$arguments" >"$evidence/negative-$name.args"
   mapfile -t negative_arguments <"$evidence/negative-$name.args"
   step "negative-$name" refused "$pattern" "${zenv[@]}" "$zig" build test-real-snapshot-reference-protected \
-    "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j4
+    "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j2
   [[ -z $(find "$ws" -mindepth 1 -print -quit) ]] || {
     echo "negative-$name launched before refusing" >&2
     exit 1
@@ -553,7 +634,7 @@ sed "s|^-Dreference-protected-workspace=.*|-Dreference-protected-workspace=$work
   "$arguments" >"$evidence/negative-reused-workspace.args"
 mapfile -t negative_arguments <"$evidence/negative-reused-workspace.args"
 step negative-reused-workspace refused "must be new and empty" "${zenv[@]}" "$zig" build \
-  test-real-snapshot-reference-protected "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j4
+  test-real-snapshot-reference-protected "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j2
 # A valid OpenPGP keyring for a different signer must fail the authenticated
 # refresh before staging locks or downloads anything.
 swapped_keyring_stage() {
@@ -572,11 +653,71 @@ step negative-swapped-keyring refused '"summary":"WrongSigningKey"' swapped_keyr
   exit 1
 }
 
+if [[ $architecture == amd64 ]]; then
+  python3_workspace=$checkout/.real-snapshot/python3-amd64
+  step python3-stage 0 "all 18 root coordinates staged" timeout --signal=TERM --kill-after=60s 40m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-python3-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" \
+    "$workspace/dpkg/usr/bin/dpkg" "$python3_workspace"
+  python3 -B -I - "$checkout/tools" "$python3_workspace/evidence/python3-reference.args" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import protected
+protected(Path(sys.argv[2]))
+PY
+  mapfile -t python3_arguments <"$python3_workspace/evidence/python3-reference.args"
+  [[ ${#python3_arguments[@]} == 20 ]]
+  step python3-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-python3-protected "${python3_arguments[@]}" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips" \
+    "$python3_workspace/evidence/inputs-proof.txt"
+  grep -Fx "signed Python alternatives records and selectors executed without skips" \
+    "$python3_workspace/evidence/alternatives-proof.txt"
+  find "$python3_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  # Remove only the fresh replay workspace, not package-owned bytes or bad
+  # inputs "repaired" to satisfy the final protected tool-tree check.
+  if grep -F " $python3_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the Python replay workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$python3_workspace"
+elif [[ $architecture == arm64 ]]; then
+  less_workspace=$checkout/.real-snapshot/less-arm64
+  step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"
+  step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-arm64-less-protected \
+    "-Darm64-less-reference-root=$less_workspace/source" \
+    "-Darm64-less-reference-script-after=$less_workspace/script-after" \
+    "-Darm64-less-reference-dpkg-after=$less_workspace/dpkg-after" \
+    "-Darm64-less-reference-bad-script=$less_workspace/script-after-bad-script" \
+    "-Darm64-less-reference-bad-mode=$less_workspace/script-after-bad-mode" \
+    "-Darm64-less-reference-bad-tool=$less_workspace/script-after-bad-tool" \
+    "-Darm64-less-reference-bad-alias=$less_workspace/script-after-bad-alias" \
+    "-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate" \
+    "-Darm64-less-reference-source-proof=$less_workspace/evidence/less-source-proof.txt" \
+    "-Darm64-less-reference-replay-proof=$less_workspace/evidence/less-replay-proof.txt" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed arm64 less source guard executed without skips" "$less_workspace/evidence/less-source-proof.txt"
+  grep -Fx "signed arm64 less eight replay roots executed without skips" "$less_workspace/evidence/less-replay-proof.txt"
+  find "$less_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  if grep -F " $less_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the ARM less replay workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$less_workspace"
+fi
+
 # The protected proof on the staged new empty workspace, bounded by a timeout
 # that kills the proof's process group.
 step proof 0 "executed without skips" timeout --signal=TERM --kill-after=60s 45m \
   "${zenv[@]}" "$zig" build test-real-snapshot-reference-protected "${proof_arguments[@]}" \
-  -Doptimize=ReleaseSafe -j4 --summary all
+  -Doptimize=ReleaseSafe -j2 --summary all
 grep -F "executed without skips" "$evidence/proof.log" >"$evidence/proof-summary.txt"
 if grep -F " $tree" /proc/self/mountinfo >"$evidence/mounts-after.txt"; then
   echo "mounts remain beneath the protected tree" >&2

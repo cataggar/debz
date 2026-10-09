@@ -95,10 +95,71 @@ class SignedProcCompareTests(unittest.TestCase):
         ))
 
     def test_dpkg_log_mentions_only_the_target_configure(self) -> None:
-        self.assertIsNotNone(self.classify("var/log/dpkg.log", {}, {"var/log/dpkg.log": DPKG_LOG}))
+        native = {"var/lib/dpkg/status": BEFORE}
+        self.assertIsNotNone(self.classify("var/log/dpkg.log", native, {"var/log/dpkg.log": DPKG_LOG}))
         other = DPKG_LOG + b"2026-09-30 18:09:19 status installed sudo-rs:amd64 0.2.14-1ubuntu2\n"
-        self.assertIsNone(self.classify("var/log/dpkg.log", {}, {"var/log/dpkg.log": other}))
-        self.assertIsNone(self.classify("var/log/dpkg.log", {}, {"var/log/dpkg.log": DPKG_LOG}, "udev"))
+        self.assertIsNone(self.classify("var/log/dpkg.log", native, {"var/log/dpkg.log": other}))
+        self.assertIsNone(self.classify("var/log/dpkg.log", native, {"var/log/dpkg.log": DPKG_LOG}, "udev"))
+
+    def test_full_closure_dpkg_log_requires_unchanged_prefix_and_only_target_append(self) -> None:
+        path = "var/log/dpkg.log"
+        before = (
+            b"2026-10-09 00:50:32 status installed sudo-rs:amd64 0.2.13-0ubuntu1.2\n"
+            b"2026-10-09 00:50:33 configure sudo:amd64 1.9.17p2-1ubuntu3.1 <none>\n"
+        )
+        native = {path: before, "var/lib/dpkg/status": BEFORE}
+        self.assertIsNotNone(self.classify(path, native, {path: before + DPKG_LOG}))
+        for changed in (
+            DPKG_LOG, before.replace(b"installed", b"unpacked") + DPKG_LOG,
+            before + DPKG_LOG.replace(b"sudo:amd64", b"udev:amd64"),
+            before + DPKG_LOG + before, before + DPKG_LOG.rstrip(b"\n"),
+            before + DPKG_LOG.replace(b"1.9.17p2-7ubuntu3", b"1.9.17p2-5ubuntu1.2"),
+            b"".join(before.splitlines(keepends=True)[::-1]) + DPKG_LOG,
+            before + DPKG_LOG + DPKG_LOG,
+            before + b"\n".join(DPKG_LOG.split(b"\n")[:-3][::-1] + DPKG_LOG.split(b"\n")[-3:]),
+        ):
+            self.assertIsNone(self.classify(path, native, {path: changed}))
+        for changed in ({"mode": "0o600"}, {"uid": 1}, {"links": 2}):
+            for side, content in (("native_extra", before), ("proof_extra", before + DPKG_LOG)):
+                self.assertIsNone(self.classify(
+                    path, native, {path: before + DPKG_LOG},
+                    **{side: {path: {**regular(content), **changed}}},
+                ))
+
+    def test_half_configured_log_does_not_replay_an_unpacked_transition(self) -> None:
+        path = "var/log/dpkg.log"
+        native = {"var/lib/dpkg/status": BEFORE.replace(b"install ok unpacked", b"install ok half-configured")}
+        half = DPKG_LOG.replace(
+            b"2026-09-30 18:09:19 status unpacked sudo:amd64 1.9.17p2-7ubuntu3\n", b"",
+        )
+        self.assertIsNotNone(self.classify(path, native, {path: half}))
+        self.assertIsNone(self.classify(path, native, {path: DPKG_LOG}))
+        self.assertIsNone(self.classify(path, native, {path: half.replace(b" <none>", b" 1.0")}))
+        installed = {"var/lib/dpkg/status": AFTER}
+        self.assertIsNone(self.classify(path, installed, {path: half}))
+
+    def test_current_authenticated_tool_descriptors_refuse_obsolete_pins(self) -> None:
+        snapshot = {**regular(b"snapshot", "0o755"),
+                    "sha256": "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517"}
+        pinned = {**regular(b"pinned", "0o755"), "sha256": compare.PINNED_DPKG_SHA256}
+        self.assertIsNotNone(self.classify(
+            "usr/bin/dpkg", {}, {}, "systemd",
+            native_extra={"usr/bin/dpkg": snapshot}, proof_extra={"usr/bin/dpkg": pinned},
+        ))
+        stale = {**snapshot, "sha256": "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f"}
+        self.assertIsNone(self.classify(
+            "usr/bin/dpkg", {}, {}, "systemd",
+            native_extra={"usr/bin/dpkg": stale}, proof_extra={"usr/bin/dpkg": pinned},
+        ))
+        setpriv = {**regular(b"setpriv", "0o755"),
+                   "sha256": "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993"}
+        self.assertIsNotNone(self.classify(
+            "usr/bin/setpriv", {}, {}, proof_extra={"usr/bin/setpriv": setpriv},
+        ))
+        setpriv["sha256"] = "9e0d70d26a02c1cb4b984ab6f49a582b7a2c3508b1063ac23adc60073292ae7e"
+        self.assertIsNone(self.classify(
+            "usr/bin/setpriv", {}, {}, proof_extra={"usr/bin/setpriv": setpriv},
+        ))
 
     def test_status_accepts_only_the_target_configure(self) -> None:
         files = {"var/lib/dpkg/status": BEFORE}
