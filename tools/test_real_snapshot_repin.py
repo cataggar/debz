@@ -1,7 +1,8 @@
 """Unit coverage for the pure logic of tools/real-snapshot-repin.py.
 
-These tests use synthetic fixtures only and never touch the network. The
-end-to-end probe through a real debz binary is in test/real-snapshot-repin.zig.
+These tests stay offline, using synthetic fixtures and the original in-tree
+source bundle for architecture binding. The end-to-end probe through a real
+debz binary is in test/real-snapshot-repin.zig.
 """
 
 from __future__ import annotations
@@ -1064,6 +1065,86 @@ class CoordinateTests(unittest.TestCase):
             value["consumers"][0]["bindings"] = bindings
             with self.subTest(bindings=bindings), self.assertRaises(repin.RepinError):
                 repin.validate_identity(value, 0)
+
+
+class ArchitectureBindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        self.target = next(item for item in self.manifest["identities"] if item["id"] == "script:less/postinst")
+        self.target["architectures"] = ["amd64"]
+        self.target["provenance"]["archives"].pop("arm64", None)
+        self.evidence = (ROOT / self.manifest["prestate_evidence"]).read_bytes()
+        self.now = self.manifest["snapshot"]["admission_deadline"] - 1
+
+    def bind(self, **overrides) -> dict:
+        arguments = {
+            "manifest": self.manifest, "identity_id": "script:less/postinst",
+            "architecture": "arm64", "review": "#393", "evidence": self.evidence, "now": self.now,
+        }
+        arguments.update(overrides)
+        return repin.bind_architecture(**arguments)
+
+    def test_new_architecture_is_derived_from_original_signed_archive_not_other_architecture(self) -> None:
+        original = copy.deepcopy(self.manifest)
+        with patch.object(repin, "fetch", side_effect=AssertionError("offline")):
+            updated = self.bind()
+        item = next(item for item in updated["identities"] if item["id"] == self.target["id"])
+        with zipfile.ZipFile(io.BytesIO(self.evidence)) as archive:
+            index = json.loads(archive.read("evidence.json"))
+            source = next(source for source in index["sources"]
+                          if source["architecture"] == "arm64" and source["package"] == "less")
+            lock = json.loads(archive.read(source["lock_file"]))
+            entry = next(entry for entry in lock["packages"] if entry["name"] == "less")
+            data = archive.read(source["archive_file"])
+            member, mode = repin.tar_member(data, "control.tar", "postinst")
+        self.assertEqual(item["architectures"], ["amd64", "arm64"])
+        self.assertEqual(item["provenance"]["archives"]["arm64"], repin.source_archive_digest(entry))
+        self.assertNotEqual(item["provenance"]["archives"]["arm64"], item["provenance"]["archives"]["amd64"])
+        self.assertEqual((item["digest"], item["size"], item["mode"]), (sha256(member), len(member), f"0{mode:03o}"))
+        self.assertEqual(item["review"], "#393")
+        self.assertEqual(self.manifest, original)
+        item["provenance"]["archives"]["arm64"] = item["provenance"]["archives"]["amd64"]
+        self.assertTrue(any("disagrees on archive provenance" in failure
+                            for failure in repin.check_prestate_evidence(updated, self.evidence)))
+
+    def test_differing_script_coordinates_cannot_extend_shared_identity(self) -> None:
+        for key, value in (("digest", sha256(b"unreviewed")), ("size", 1), ("mode", "0644")):
+            with self.subTest(coordinate=key):
+                changed = copy.deepcopy(self.manifest)
+                target = next(item for item in changed["identities"] if item["id"] == self.target["id"])
+                target[key] = value
+                with self.assertRaisesRegex(repin.RepinError, "record a separate identity"):
+                    self.bind(manifest=changed)
+        changed = copy.deepcopy(self.manifest)
+        next(item for item in changed["identities"] if item["id"] == self.target["id"])["provenance"]["version"] = "unreviewed"
+        with self.assertRaisesRegex(repin.RepinError, "record a separate identity"):
+            self.bind(manifest=changed)
+
+    def test_missing_source_review_expiration_or_existing_architecture_refuses(self) -> None:
+        for overrides, message in (
+            ({"architecture": "amd64"}, "new architecture"),
+            ({"identity_id": "script:unknown/postinst"}, "existing script"),
+            ({"review": "unreviewed"}, "review reference"),
+            ({"now": self.now + 1}, "currently admissible"),
+            ({"identity_id": "script:systemd/postinst"}, "no unique independently retained"),
+            ({"evidence": b"not a source ZIP"}, "source evidence refused"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(repin.RepinError, message):
+                    self.bind(**overrides)
+
+    def test_tampered_original_archive_cannot_record_new_architecture(self) -> None:
+        with zipfile.ZipFile(io.BytesIO(self.evidence)) as source:
+            index = json.loads(source.read("evidence.json"))
+            path = next(item["archive_file"] for item in index["sources"]
+                        if item["architecture"] == "arm64" and item["package"] == "less")
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as changed:
+                for item in source.infolist():
+                    data = source.read(item.filename)
+                    changed.writestr(item, data + b"changed" if item.filename == path else data)
+        with self.assertRaisesRegex(repin.RepinError, "authenticated lock digest or size"):
+            self.bind(evidence=output.getvalue())
 
 
 class SourceEvidenceTests(unittest.TestCase):

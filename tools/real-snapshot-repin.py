@@ -1913,14 +1913,87 @@ def record_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def bind_architecture(
+    manifest: dict,
+    identity_id: str,
+    architecture: str,
+    review: str,
+    evidence: bytes,
+    now: int | None = None,
+) -> dict:
+    validate_manifest(manifest)
+    identities = [item for item in manifest["identities"] if item["id"] == identity_id]
+    if len(identities) != 1 or identities[0]["kind"] != "script":
+        fail("architecture binding requires an existing script identity")
+    identity = identities[0]
+    if architecture not in manifest["series"]["architectures"] or architecture in identity["architectures"]:
+        fail("architecture binding requires a new architecture from the series profile")
+    if not REVIEW_REFERENCE.fullmatch(review):
+        fail("architecture binding requires a PR or issue review reference")
+    now = int(time.time()) if now is None else now
+    if manifest["snapshot"]["status"] != "probed" or now >= manifest["snapshot"]["admission_deadline"]:
+        fail("architecture binding requires a currently admissible recorded snapshot")
+    try:
+        failures = check_prestate_evidence(manifest, evidence)
+    except (zipfile.BadZipFile, KeyError, ValueError, TypeError, OSError, EOFError) as error:
+        fail(f"architecture binding source evidence refused: {error}")
+    if failures:
+        fail("architecture binding source evidence refused: " + "; ".join(failures))
+    with zipfile.ZipFile(io.BytesIO(evidence)) as archive:
+        index = json.loads(archive.read("evidence.json"))
+        sources = [source for source in index["sources"]
+                   if source["architecture"] == architecture and source["package"] == identity["package"]]
+        if len(sources) != 1:
+            fail("architecture binding has no unique independently retained source archive; run a new probe")
+        source = sources[0]
+        report = json.loads(archive.read("report.json"))
+        lock = json.loads(archive.read(source["lock_file"]))
+        entry = authenticated_source_package(report, lock, identity["package"], architecture)
+        data = archive.read(source["archive_file"])
+        verify_source_archive(data, entry)
+        member, mode = tar_member(data, "control.tar", identity["path"])
+    if (tagged("sha256", member) != identity["digest"] or len(member) != identity["size"]
+            or f"0{mode:03o}" != identity["mode"] or not isinstance(identity["provenance"], dict)
+            or entry["version"] != identity["provenance"]["version"]):
+        fail("architecture binding differs in script bytes, size, mode or version; record a separate identity")
+    updated = copy.deepcopy(manifest)
+    target = next(item for item in updated["identities"] if item["id"] == identity_id)
+    target["architectures"].append(architecture)
+    target["provenance"]["archives"][architecture] = source_archive_digest(entry)
+    target["review"] = review
+    validate_manifest(updated)
+    failures = check_prestate_evidence(updated, evidence)
+    if failures:
+        fail("architecture binding recorded source refused: " + "; ".join(failures))
+    return updated
+
+
+def bind_architecture_command(args: argparse.Namespace) -> int:
+    manifest = validate_manifest(load_json(args.manifest))
+    root = args.root.resolve()
+    if "prestate_evidence" not in manifest:
+        fail("architecture binding requires independently retained source evidence")
+    evidence = read_source_file(root / manifest["prestate_evidence"], root, MAXIMUM_EVIDENCE_BYTES,
+                                "architecture binding source evidence")
+    updated = bind_architecture(manifest, args.identity, args.architecture, args.reviewed, evidence)
+    write_json(args.manifest, updated)
+    print(f"recorded original {args.architecture} source binding for {args.identity}; script execution admission is unchanged")
+    return 0
+
+
 # Check.
 
 def source_evidence_identities(manifest: dict) -> list[dict]:
-    return [
+    identities = [
         identity for identity in manifest["identities"]
         if any(prestate_derivation(identity, arch) is not None for arch in identity["architectures"])
         or any(consumer["form"] == "shell" and "url" in consumer["bindings"] for consumer in identity["consumers"])
     ]
+    identities.extend(
+        identity for identity in manifest["identities"]
+        if identity["kind"] == "script" and len(identity["architectures"]) > 1
+    )
+    return identities
 
 
 def archive_package_fields(data: bytes) -> dict[str, str]:
@@ -2230,7 +2303,8 @@ def check_prestate_evidence(manifest: dict, data: bytes) -> list[str]:
                     if identity["digest"] != source_archive_digest(entry) or identity["size"] != len(archive_bytes):
                         failures.append(f"{where} archive digest or size disagrees")
                 else:
-                    member, mode = tar_member(archive_bytes, "data.tar", identity["path"])
+                    prefix = "control.tar" if identity["kind"] == "script" else "data.tar"
+                    member, mode = tar_member(archive_bytes, prefix, identity["path"])
                     if (tagged("sha256", member) != identity["digest"] or len(member) != identity["size"]
                             or f"0{mode:03o}" != identity["mode"]):
                         failures.append(f"{where} member bytes disagree on digest, size or mode")
@@ -2677,6 +2751,15 @@ def main(argv: list[str] | None = None) -> int:
     record_parser.add_argument("--root", type=Path, default=ROOT)
     record_parser.add_argument("--allow-series-migration", action="store_true")
 
+    architecture_parser = commands.add_parser(
+        "bind-architecture", help="bind a byte-identical script from retained authenticated source archives",
+    )
+    architecture_parser.add_argument("--identity", required=True)
+    architecture_parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
+    architecture_parser.add_argument("--reviewed", required=True, metavar="REF")
+    architecture_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)
+    architecture_parser.add_argument("--root", type=Path, default=ROOT)
+
     check_parser = commands.add_parser("check", help="offline: verify in-tree pins against the manifest")
     check_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)
     check_parser.add_argument("--root", type=Path, default=ROOT)
@@ -2690,6 +2773,8 @@ def main(argv: list[str] | None = None) -> int:
             return diff_command(args)
         if args.command == "record":
             return record_command(args)
+        if args.command == "bind-architecture":
+            return bind_architecture_command(args)
         return check_command(args)
     except RepinError as error:
         print(f"real-snapshot-repin: {error}", file=sys.stderr)
