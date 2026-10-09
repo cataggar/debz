@@ -192,6 +192,25 @@ diff N`, and `--pr-diff-file` scans a saved diff. Each lists the added lines
 that pin a manifest value (URI, timestamp, Release, InRelease, closure,
 identity or archive digest) and marks the pins this repin makes stale.
 
+### `bind-architecture`
+
+```sh
+python3 tools/real-snapshot-repin.py bind-architecture \
+    --identity script:less/postinst --architecture arm64 --reviewed '#393'
+```
+
+For a byte-identical script, this records an additional architecture without
+hand-editing the manifest. The snapshot must still be admissible. The tool
+revalidates the retained original locks, InRelease, signed Packages indices and
+archive bytes, then derives the exact control member. Digest, size, mode and
+version must match the existing identity; otherwise a separate identity is
+required. Missing original sources require a new probe, not borrowed provenance.
+The added architecture's archive provenance is also rederived by offline `check`.
+
+This records source identity only. It does not admit execution or prove the
+new architecture's helper, loader, alias, prestate or namespace environment;
+those remain independent native guards and protected replay requirements.
+
 ### `record`
 
 ```sh
