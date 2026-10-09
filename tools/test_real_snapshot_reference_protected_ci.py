@@ -841,6 +841,32 @@ timeout() {
         self.assertIn("explicit regular Ubuntu archive keyring", result.stderr)
 
 
+class SignedBindingSummaryTests(unittest.TestCase):
+    def test_gate_reads_actual_test_result_not_opaque_env_build_summary(self) -> None:
+        workflow = (TOOLS.parent / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Execute signed binding refusal fixtures\n", 1)[1]
+        step = step.split("      - name:", 1)[0]
+        gate = next(line.strip() for line in step.splitlines() if "grep -Eq" in line)
+        command = shlex.split(gate)
+        cases = (
+            ("56 passed; 3 skipped; 0 failed.\nBuild Summary: 13/13 steps succeeded\n"
+             "+- run env success 4s\n", True),
+            ("56 passed; 4 skipped; 0 failed.\n+- run env success 4s\n", False),
+            ("55 passed; 3 skipped; 1 failed.\n+- run env success 4s\n", False),
+            ("Build Summary: 13/13 steps succeeded\n+- run env success 4s\n", False),
+            ("0 passed; 3 skipped; 0 failed.\n+- run env success 4s\n", False),
+        )
+        with tempfile.TemporaryDirectory(prefix="debz-signed-summary-test-") as temporary:
+            log = Path(temporary) / "signed-bindings.log"
+            for contents, accepted in cases:
+                with self.subTest(contents=contents):
+                    log.write_text(contents)
+                    result = subprocess.run(
+                        [*command[:-1], str(log)], capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0 if accepted else 1, result.stderr)
+
+
 class ProtectedInputTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")

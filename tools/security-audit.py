@@ -3579,7 +3579,7 @@ SIGNED_PROC_CI_STEPS = {
         "            DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \\",
         '            sh "$PWD/.real-snapshot/ws/bindings.env" "$OPTIMIZE" \\',
         '          test "${status:-0}" -eq 0',
-        "          grep -Eq 'run test [0-9]+ pass, 3 skip \\([0-9]+ total\\)' "
+        "          grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\\.$' "
         '"$GITHUB_WORKSPACE/.tmp/signed-bindings.log"',
     ),
     "Copy bounded evidence and remove named protected roots": (
