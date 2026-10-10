@@ -843,8 +843,9 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertEqual(sorted(output.splitlines()), [b"stderr witness", b"stdout witness"])
         self.assertEqual(list(evidence.iterdir()), [])
 
-    def cycle_fixture(self, openssl: bool = False) -> tuple[tuple, dict, dict]:
-        filename = "openssl-cycle-controls-v1.json" if openssl else "base-cycle-controls-v1.json"
+    def cycle_fixture(self, openssl: bool = False, kbd: bool = False) -> tuple[tuple, dict, dict]:
+        filename = ("kbd-cycle-controls-v1.json" if kbd else
+                    "openssl-cycle-controls-v1.json" if openssl else "base-cycle-controls-v1.json")
         fixture = json.loads((TOOLS / "fixtures/real-snapshot" / filename).read_text())
         packages = []
         records, controls = {}, {}
@@ -854,7 +855,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                                     entry["archive_sha512"], entry["archive_size"],
                                     self.root / f'{fields["package"]}.deb')
             packages.append(package)
-            records[(package.name, "amd64")] = {
+            records[(package.name, package.architecture)] = {
                 **fields, "status": entry["status"],
             }
             data = io.BytesIO()
@@ -862,7 +863,11 @@ class ReferenceLauncherTests(unittest.TestCase):
                 entries = {"./control": "".join(
                     f"{key}: {value}\n" for key, value in fields.items()
                 ).encode()}
-                if (openssl and index == 0) or (not openssl and index == 1):
+                if kbd:
+                    entries.update({name: b"" for name in entry["control_members"] if name != "./control"})
+                    if index == 0:
+                        entries["./triggers"] = ORDER.KBD_TRIGGERS
+                elif (openssl and index == 0) or (not openssl and index == 1):
                     entries.update({".": b"", "./md5sums": b"", "./shlibs": b"",
                                     "./symbols": b"", "./triggers": ORDER.LIBGCC_TRIGGERS})
                 elif openssl and index == 1:
@@ -877,9 +882,116 @@ class ReferenceLauncherTests(unittest.TestCase):
         (self.root / "var/lib/dpkg/triggers").mkdir()
         (self.root / "var/lib/dpkg/updates").mkdir()
         (self.root / "var/lib/dpkg/status").write_bytes(b"synthetic unit fixture only\n")
-        trigger = "libssl3t64" if openssl else "libgcc-s1"
-        (info / f"{trigger}:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
+        trigger = "kbd" if kbd else "libssl3t64" if openssl else "libgcc-s1"
+        activation = f"{trigger}.triggers" if kbd else f"{trigger}:amd64.triggers"
+        (info / activation).write_bytes(ORDER.KBD_TRIGGERS if kbd else ORDER.LIBGCC_TRIGGERS)
         return tuple(packages), records, controls
+
+    def test_kbd_operation_requires_exact_original_archives_and_only_its_scriptless_selector(self) -> None:
+        cycle, _, _ = self.cycle_fixture(kbd=True)
+        command = ORDER.dpkg_command(self.launcher, self.root / "dpkg", self.root,
+                                     "amd64", "kbd_cycle", "break_kbd_cycle", cycle[0], cycle)
+        self.assertEqual(command[3:7], ["amd64", "kbd_cycle", "break_kbd_cycle", "kbd:amd64"])
+        for architecture, profile, selected, archives in (
+            ("arm64", "kbd_cycle", cycle[0], cycle),
+            ("amd64", "none", cycle[0], cycle),
+            ("amd64", "kbd_cycle", cycle[1], cycle),
+            ("amd64", "kbd_cycle", cycle[0], cycle[:3]),
+            ("amd64", "kbd_cycle", cycle[0], (cycle[0], cycle[2], cycle[1], cycle[3])),
+        ):
+            with self.subTest(architecture=architecture, profile=profile, selected=selected.name):
+                with self.assertRaises(ORDER.CycleRefusal):
+                    ORDER.dpkg_command(self.launcher, self.root / "dpkg", self.root,
+                                       architecture, profile, "break_kbd_cycle", selected, archives)
+        changed = ORDER.Package(cycle[0].name, cycle[0].version, cycle[0].architecture,
+                                "0" * 128, cycle[0].size, cycle[0].archive)
+        with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleIdentityChanged"):
+            ORDER.kbd_cycle_packages([changed, *cycle[1:]], "amd64")
+
+    def test_kbd_cycle_refuses_changed_peers_outside_libc_callback_and_pending_activation(self) -> None:
+        cycle, records, controls = self.cycle_fixture(kbd=True)
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, controls[command[2]], b"")
+        with (mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "database_fields", return_value=records),
+              mock.patch.object(ORDER.subprocess, "run", side_effect=run),
+              mock.patch.object(ORDER, "apply") as applied):
+            self.assertEqual(ORDER.verify_kbd_cycle(self.root, cycle)["callbacks"], [])
+            for name, arch, field, changed in (
+                ("kbd", "amd64", "depends", "unknown"),
+                ("kbd", "amd64", "triggers-pending", "update-initramfs"),
+                ("console-setup-linux", "all", "multi-arch", "same"),
+                ("console-setup", "all", "pre-depends", ""),
+                ("console-setup", "all", "status", "install ok installed"),
+                ("libc6", "amd64", "status", "install ok unpacked"),
+            ):
+                record = records[(name, arch)]
+                saved = dict(record)
+                record[field] = changed
+                with self.subTest(name=name, field=field):
+                    with self.assertRaises(ORDER.CycleRefusal):
+                        ORDER.break_kbd_cycle(self.launcher, self.root / "dpkg", self.root, self.root,
+                                              "amd64", list(cycle), {}, self.root / "out", self.root / "err")
+                record.clear()
+                record.update(saved)
+            for name in ("kbd.postinst", "kbd:amd64.config", "kbd:amd64.triggers"):
+                path = self.root / "var/lib/dpkg/info" / name
+                path.symlink_to("/missing-unreviewed-callback")
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                    ORDER.verify_kbd_cycle(self.root, cycle)
+                path.unlink()
+            activation = self.root / "var/lib/dpkg/info/kbd.triggers"
+            activation.write_bytes(b"activate update-initramfs\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_kbd_cycle(self.root, cycle)
+            activation.write_bytes(ORDER.KBD_TRIGGERS)
+            (self.root / "var/lib/dpkg/triggers/Unincorp").write_bytes(b"update-initramfs kbd\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_kbd_cycle(self.root, cycle)
+            applied.assert_not_called()
+
+    def test_kbd_success_requires_only_its_one_real_transition_and_unchanged_trigger_database(self) -> None:
+        cycle, records, _ = self.cycle_fixture(kbd=True)
+        before = {"records": records, "callbacks": [], "graph": {}, "trigger_database": {}}
+        after = {key: dict(value) for key, value in records.items()}
+        after[("kbd", "amd64")]["status"] = "install ok installed"
+        refusal = (1, b"dependency problems: Package console-setup is not configured yet.")
+        with (mock.patch.object(ORDER, "verify_kbd_cycle", return_value=before),
+              mock.patch.object(ORDER, "probe", return_value=refusal),
+              mock.patch.object(ORDER, "database_fields", return_value=after),
+              mock.patch.object(ORDER, "apply") as applied):
+            selected = ORDER.break_kbd_cycle(self.launcher, self.root / "dpkg", self.root, self.root,
+                                             "amd64", list(cycle), {}, self.root / "out", self.root / "err")
+            self.assertEqual(selected, cycle[0])
+            self.assertEqual(applied.call_args.args[0][5:7], ["break_kbd_cycle", "kbd:amd64"])
+            after[("console-setup-linux", "all")]["status"] = "install ok installed"
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                ORDER.break_kbd_cycle(self.launcher, self.root / "dpkg", self.root, self.root,
+                                      "amd64", list(cycle), {}, self.root / "out", self.root / "err")
+            after[("console-setup-linux", "all")]["status"] = "install ok unpacked"
+            with mock.patch.object(ORDER, "trigger_database", return_value={"unexpected": {}}):
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                    ORDER.break_kbd_cycle(self.launcher, self.root / "dpkg", self.root, self.root,
+                                          "amd64", list(cycle), {}, self.root / "out", self.root / "err")
+
+    def test_kbd_production_activation_retains_exact_selector_before_exec_and_state_conservation(self) -> None:
+        spec = importlib.util.spec_from_file_location("kbd_production_audit", TOOLS / "security-audit.py")
+        audit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(audit)
+        texts = {path: (ROOT / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("tools/real-snapshot-reference-launcher.zig", 'if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))'),
+            ("tools/real-snapshot-reference-launcher.zig", 'for (paths, kbd_cycle) |path, binding| {'),
+            ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .break_kbd_cycle)\n        verifyCycle(.kbd)'),
+            ("tools/real-snapshot-reference-order.py", 'before = verify_kbd_cycle(root, cycle)'),
+            ("tools/real-snapshot-reference-order.py", 'expected[("kbd", "amd64")]["status"] = "install ok installed"'),
+            ("tools/real-snapshot-reference-order.py", '"reference trigger closure refused: the launcher has no exact triggered "'),
+        ):
+            with self.subTest(path=path, token=token):
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
 
     def pending_oracle_fixture(self, stderr: bytes, *, returncode: int = 1,
                                configured: bool = True) -> Path:

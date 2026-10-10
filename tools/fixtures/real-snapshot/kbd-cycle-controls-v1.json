@@ -1,0 +1,68 @@
+{
+  "schema": "io.github.cataggar.debz.kbd-cycle-controls.v1",
+  "source": "Hard-graph fields and member inventories projected from four independently rehashed original archives tied to the latest native lock and retained signed Release/Packages. Status values are unit-test input, not root registration.",
+  "packages": [
+    {
+      "archive_sha512": "5a1fcb79b59441d380b4f6f38198ab4e7b04e50a759580302643ab1f138d88c900145612dfe0861eab37c5f9ebbb6218bc3a5585366be04d4cd00f85efa16050",
+      "archive_size": 238014,
+      "control": "Package: kbd\nVersion: 2.7.1-2ubuntu2\nArchitecture: amd64\nDepends: libc6 (>= 2.38), console-setup | console-setup-mini\nConflicts: console-utilities\nProvides: console-utilities\n",
+      "control_members": [
+        ".",
+        "./control",
+        "./md5sums",
+        "./triggers"
+      ],
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
+      "archive_size": 6206020,
+      "control": "Package: console-setup-linux\nVersion: 1.237ubuntu3.1\nArchitecture: all\nDepends: kbd (>= 0.99-12) | console-tools (>= 1:0.2.3-16), keyboard-configuration (= 1.237ubuntu3.1), init-system-helpers (>= 1.29~) | initscripts\nBreaks: console-cyrillic (<= 0.9-11), console-setup (<< 1.71), console-terminus\nProvides: console-terminus\nReplaces: console-setup (<< 1.71), console-terminus\nMulti-Arch: foreign\n",
+      "control_members": [
+        ".",
+        "./conffiles",
+        "./control",
+        "./md5sums",
+        "./postinst",
+        "./postrm",
+        "./preinst",
+        "./prerm"
+      ],
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832",
+      "archive_size": 102654,
+      "control": "Package: console-setup\nVersion: 1.237ubuntu3.1\nArchitecture: all\nDepends: console-setup-linux | hurd, xkb-data (>= 0.9), keyboard-configuration (= 1.237ubuntu3.1), debconf (>= 0.5) | debconf-2.0\nPre-Depends: debconf | debconf-2.0\nBreaks: lsb (<< 2.0-6), lsb-base (<< 3.0-6), lsb-core (<< 2.0-6)\nConflicts: console-setup-mini\nMulti-Arch: foreign\n",
+      "control_members": [
+        ".",
+        "./config",
+        "./control",
+        "./md5sums",
+        "./postinst",
+        "./postrm",
+        "./templates"
+      ],
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696",
+      "archive_size": 2104056,
+      "control": "Package: libc6\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\nBreaks: base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)\nReplaces: libc6-amd64\nMulti-Arch: same\n",
+      "control_members": [
+        ".",
+        "./conffiles",
+        "./control",
+        "./md5sums",
+        "./postinst",
+        "./postrm",
+        "./preinst",
+        "./shlibs",
+        "./symbols",
+        "./templates",
+        "./triggers"
+      ],
+      "status": "install ok installed"
+    }
+  ]
+}
