@@ -22306,13 +22306,13 @@ const snapshot_less_arm64_aliases = [_]SnapshotLessArm64Alias{
     .{ .path = "usr/bin/sh", .target = "dash" },
     .{ .path = "usr/lib/ld-linux-aarch64.so.1", .target = "aarch64-linux-gnu/ld-linux-aarch64.so.1" },
 };
-const snapshot_less_arm64_absent = [_][]const u8{
+const snapshot_loader_arm64_absent = [_][]const u8{
     "etc/ld.so.preload",
-    "etc/ld.so.cache",
     "usr/lib/aarch64-linux-gnu/glibc-hwcaps",
     "usr/sbin/update-alternatives",
     "lib64",
 };
+const snapshot_less_arm64_absent = snapshot_loader_arm64_absent ++ [_][]const u8{"etc/ld.so.cache"};
 
 fn verifySnapshotLessArm64Artifacts(
     artifacts: []const native_program.ProgramArtifact,
@@ -22564,17 +22564,145 @@ const snapshot_bash_arm64_controls = [_]SignedDebconfControlFile{
 const snapshot_bash_arm64_aliases = snapshot_less_arm64_aliases ++ [_]SnapshotLessArm64Alias{
     .{ .path = "usr/lib/aarch64-linux-gnu/libtinfo.so.6", .target = "libtinfo.so.6.6" },
 };
-const snapshot_bash_arm64_absent = snapshot_less_arm64_absent ++ [_][]const u8{
+const snapshot_bash_arm64_absent = snapshot_loader_arm64_absent ++ [_][]const u8{
     "usr/bin/update-menus",
     "usr/sbin/update-menus",
 };
+
+const snapshot_bash_cache_limit = 1024 * 1024;
+
+fn cacheWord(bytes: []const u8, offset: usize) u32 {
+    return std.mem.readInt(u32, bytes[offset..][0..4], .little);
+}
+
+fn cacheString(bytes: []const u8, offset: u32, start: usize, end: usize) ![]const u8 {
+    if (offset < start or offset >= end) return error.InvalidAlternativesScriptAuthority;
+    const remaining = bytes[offset..end];
+    const length = std.mem.indexOfScalar(u8, remaining, 0) orelse return error.InvalidAlternativesScriptAuthority;
+    if (length == 0 or length > 4096) return error.InvalidAlternativesScriptAuthority;
+    return remaining[0..length];
+}
+
+fn canonicalCacheName(name: []const u8) bool {
+    if (name.len > 255) return false;
+    var index: usize = 0;
+    while (index < name.len) {
+        if (std.ascii.isDigit(name[index])) {
+            const start = index;
+            while (index < name.len and std.ascii.isDigit(name[index])) : (index += 1) {}
+            const digits = name[start..index];
+            // glibc compares digit runs numerically, not byte-for-byte.
+            if (digits.len > 9 or (digits.len > 1 and digits[0] == '0')) return false;
+        } else {
+            if (!std.ascii.isAlphanumeric(name[index]) and std.mem.indexOfScalar(u8, "-+._", name[index]) == null)
+                return false;
+            index += 1;
+        }
+    }
+    return true;
+}
+
+fn verifySnapshotBashArm64Cache(bytes: []const u8) !void {
+    if (bytes.len < 48 or bytes.len > snapshot_bash_cache_limit or
+        !std.mem.eql(u8, bytes[0..20], "glibc-ld.so.cache1.1") or bytes[28] != 2 or
+        !std.mem.allEqual(u8, bytes[29..32], 0) or !std.mem.allEqual(u8, bytes[36..48], 0))
+        return error.InvalidAlternativesScriptAuthority;
+    const count = cacheWord(bytes, 20);
+    if (count == 0 or count > 4096 or count > (bytes.len - 48) / 24)
+        return error.InvalidAlternativesScriptAuthority;
+    const strings_start = 48 + @as(usize, count) * 24;
+    const strings_size = cacheWord(bytes, 24);
+    if (strings_size == 0 or strings_size > bytes.len - strings_start)
+        return error.InvalidAlternativesScriptAuthority;
+    const strings_end = strings_start + strings_size;
+    const extension = cacheWord(bytes, 32);
+    if (extension == 0) {
+        if (strings_end != bytes.len) return error.InvalidAlternativesScriptAuthority;
+    } else {
+        // This profile permits only the informational generator extension, never hwcaps.
+        if (extension < strings_end or extension - strings_end > 3 or
+            extension > bytes.len or bytes.len - extension < 24 or extension % 4 != 0 or
+            !std.mem.allEqual(u8, bytes[strings_end..extension], 0) or
+            cacheWord(bytes, extension) != 0xeaa42174 or cacheWord(bytes, extension + 4) != 1 or
+            cacheWord(bytes, extension + 8) != 0 or cacheWord(bytes, extension + 12) != 0 or
+            cacheWord(bytes, extension + 16) != extension + 24)
+            return error.InvalidAlternativesScriptAuthority;
+        const generator_size = cacheWord(bytes, extension + 20);
+        if (generator_size == 0 or generator_size > 512 or generator_size != bytes.len - extension - 24)
+            return error.InvalidAlternativesScriptAuthority;
+        for (bytes[extension + 24 ..]) |byte|
+            if (byte < 0x20 or byte > 0x7e) return error.InvalidAlternativesScriptAuthority;
+    }
+    var libc = false;
+    var tinfo = false;
+    for (0..count) |index| {
+        const entry = 48 + index * 24;
+        if (cacheWord(bytes, entry) != 0x0a03 or !std.mem.allEqual(u8, bytes[entry + 12 ..][0..12], 0))
+            return error.InvalidAlternativesScriptAuthority;
+        const name = try cacheString(bytes, cacheWord(bytes, entry + 4), strings_start, strings_end);
+        const provider = try cacheString(bytes, cacheWord(bytes, entry + 8), strings_start, strings_end);
+        if (!canonicalCacheName(name) or provider[0] != '/')
+            return error.InvalidAlternativesScriptAuthority;
+        if (std.mem.eql(u8, name, "libc.so.6")) {
+            if (!std.mem.eql(u8, provider, "/lib/aarch64-linux-gnu/libc.so.6") and
+                !std.mem.eql(u8, provider, "/usr/lib/aarch64-linux-gnu/libc.so.6"))
+                return error.InvalidAlternativesScriptAuthority;
+            libc = true;
+        } else if (std.mem.eql(u8, name, "libtinfo.so.6")) {
+            var approved = false;
+            for ([_][]const u8{
+                "/lib/aarch64-linux-gnu/libtinfo.so.6",
+                "/usr/lib/aarch64-linux-gnu/libtinfo.so.6",
+                "/lib/aarch64-linux-gnu/libtinfo.so.6.6",
+                "/usr/lib/aarch64-linux-gnu/libtinfo.so.6.6",
+            }) |path| approved = approved or std.mem.eql(u8, provider, path);
+            if (!approved) return error.InvalidAlternativesScriptAuthority;
+            tinfo = true;
+        }
+    }
+    if (!libc or !tinfo) return error.InvalidAlternativesScriptAuthority;
+}
+
+fn verifySnapshotBashArm64CacheEntry(entry: root_fs.Entry) !void {
+    if (!entry.modeled or entry.kind != .file or entry.uid != 0 or entry.gid != 0 or
+        entry.mode != 0o644 or entry.link_count != 1 or entry.size > snapshot_bash_cache_limit)
+        return error.InvalidAlternativesScriptAuthority;
+}
+
+fn verifySnapshotBashArm64CacheInput(allocator: std.mem.Allocator, root: root_fs.Root) !native_alternatives.EntryFact {
+    const path = try root_fs.Path.init("etc/ld.so.cache");
+    const entry = (try root.entryIfExists(path)) orelse return .{ .path = path.text, .kind = .absent };
+    try verifySnapshotBashArm64CacheEntry(entry);
+    var pinned = try root.pinRegularFile(path);
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, snapshot_bash_cache_limit);
+    defer allocator.free(observed.bytes);
+    try verifySnapshotBashArm64CacheEntry(observed.entry);
+    try verifySnapshotBashArm64Cache(observed.bytes);
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observed.bytes, &digest, .{});
+    return .{
+        .path = path.text,
+        .kind = .regular,
+        .mode = observed.entry.mode,
+        .uid = observed.entry.uid,
+        .gid = observed.entry.gid,
+        .device = observed.entry.device,
+        .inode = observed.entry.inode,
+        .link_count = observed.entry.link_count,
+        .size = observed.entry.size,
+        .modified_nanoseconds = observed.entry.modified_nanoseconds,
+        .change_nanoseconds = observed.change_nanoseconds,
+        .sha256 = digest,
+    };
+}
 
 fn verifySnapshotBashArm64Inputs(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     artifacts: []const native_program.ProgramArtifact,
     architecture: []const u8,
-) !void {
+) !native_alternatives.EntryFact {
     if (!std.mem.eql(u8, architecture, "arm64"))
         return error.InvalidAlternativesScriptAuthority;
     for (snapshot_bash_arm64_artifacts) |binding|
@@ -22592,6 +22720,7 @@ fn verifySnapshotBashArm64Inputs(
         &snapshot_bash_arm64_aliases,
         &snapshot_bash_arm64_absent,
     );
+    return try verifySnapshotBashArm64CacheInput(allocator, root);
 }
 
 fn snapshotProcpsPostinstIsInert(
@@ -25496,12 +25625,117 @@ fn expectAlternativesReplayFactEqual(actual: native_alternatives.EntryFact, expe
     try testing.expectEqualDeep(actual, relocated);
 }
 
+fn snapshotBashCacheTestFixture() ![]u8 {
+    const strings = "libtinfo.so.6\x00/usr/lib/aarch64-linux-gnu/libtinfo.so.6\x00libc.so.6\x00/lib/aarch64-linux-gnu/libc.so.6\x00/usr/lib/aarch64-linux-gnu/libc.so.6\x00";
+    const bytes = try testing.allocator.alloc(u8, 48 + 3 * 24 + strings.len);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..20], "glibc-ld.so.cache1.1");
+    std.mem.writeInt(u32, bytes[20..24], 3, .little);
+    std.mem.writeInt(u32, bytes[24..28], strings.len, .little);
+    bytes[28] = 2;
+    @memcpy(bytes[120..], strings);
+    for ([_]struct { name: []const u8, provider: []const u8 }{
+        .{ .name = "libtinfo.so.6", .provider = "/usr/lib/aarch64-linux-gnu/libtinfo.so.6" },
+        .{ .name = "libc.so.6", .provider = "/lib/aarch64-linux-gnu/libc.so.6" },
+        .{ .name = "libc.so.6", .provider = "/usr/lib/aarch64-linux-gnu/libc.so.6" },
+    }, 0..) |binding, index| {
+        const start = 48 + 24 * index;
+        std.mem.writeInt(u32, bytes[start..][0..4], 0x0a03, .little);
+        const name = 120 + std.mem.indexOf(u8, strings, binding.name).?;
+        const provider = 120 + std.mem.indexOf(u8, strings, binding.provider).?;
+        std.mem.writeInt(u32, bytes[start + 4 ..][0..4], @intCast(name), .little);
+        std.mem.writeInt(u32, bytes[start + 8 ..][0..4], @intCast(provider), .little);
+    }
+    return bytes;
+}
+
+test "native_unpack.test.signed arm64 bash cache binds every duplicate libc and tinfo provider" {
+    const bytes = try snapshotBashCacheTestFixture();
+    defer testing.allocator.free(bytes);
+    try verifySnapshotBashArm64Cache(bytes);
+    for (0..3) |index| {
+        const offset = cacheWord(bytes, 48 + 24 * index + 8);
+        const original = bytes[offset + 1];
+        bytes[offset + 1] = 'X';
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64Cache(bytes));
+        bytes[offset + 1] = original;
+    }
+    for ([_][]const u8{ "libc.so.06", "libc.so.0000000000000006", "libc.so.9999999999", "libc.so.6/extra", "libc.so.\xff" }) |name|
+        try testing.expect(!canonicalCacheName(name));
+    const offset = cacheWord(bytes, 52);
+    bytes[offset] = 'X';
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64Cache(bytes));
+}
+
+test "native_unpack.test.signed arm64 bash cache refuses malformed offsets endian flags hwcaps and extensions" {
+    const original = try snapshotBashCacheTestFixture();
+    defer testing.allocator.free(original);
+    for ([_]usize{ 0, 19, 20, 21, 24, 25, 28, 29, 32, 36, 48, 52, 56, 60, 64, 119 }) |offset| {
+        const changed = try testing.allocator.dupe(u8, original);
+        defer testing.allocator.free(changed);
+        changed[offset] ^= 0xff;
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64Cache(changed));
+    }
+    for ([_]usize{ 0, 47, 48, original.len - 1 }) |size|
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64Cache(original[0..size]));
+    const generator = "ldconfig signed fixture";
+    const offset = std.mem.alignForward(usize, original.len, 4);
+    const extended = try testing.allocator.alloc(u8, offset + 24 + generator.len);
+    defer testing.allocator.free(extended);
+    @memset(extended, 0);
+    @memcpy(extended[0..original.len], original);
+    std.mem.writeInt(u32, extended[32..36], @intCast(offset), .little);
+    for ([_]u32{ 0xeaa42174, 1, 0, 0, @intCast(offset + 24), generator.len }, 0..) |word, index|
+        std.mem.writeInt(u32, extended[offset + index * 4 ..][0..4], word, .little);
+    @memcpy(extended[offset + 24 ..], generator);
+    try verifySnapshotBashArm64Cache(extended);
+    for (0..6) |index| {
+        extended[offset + index * 4] ^= 0xff;
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64Cache(extended));
+        extended[offset + index * 4] ^= 0xff;
+    }
+}
+
+test "native_unpack.test.signed arm64 bash cache rejects unsafe entry metadata" {
+    var entry = std.mem.zeroes(root_fs.Entry);
+    entry.kind = .file;
+    entry.modeled = true;
+    entry.mode = 0o644;
+    entry.link_count = 1;
+    entry.size = 256;
+    try verifySnapshotBashArm64CacheEntry(entry);
+    inline for ([_]std.meta.FieldEnum(root_fs.Entry){ .modeled, .kind, .mode, .uid, .gid, .link_count, .size }) |name| {
+        var changed = entry;
+        @field(changed, @tagName(name)) = switch (name) {
+            .modeled => false,
+            .kind => .sym_link,
+            .mode => 0o666,
+            .uid, .gid => 1,
+            .link_count => 2,
+            .size => snapshot_bash_cache_limit + 1,
+            else => unreachable,
+        };
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64CacheEntry(changed));
+    }
+}
+
+test "native_unpack.test.signed arm64 bash cache retains absence but refuses a symbolic cache" {
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.ensureDirectory(try root_fs.Path.init("etc"), root_fs.default_directory_permissions);
+    _ = try verifySnapshotBashArm64CacheInput(testing.allocator, root);
+    try temporary.dir.symLink(testing.io, "/etc/ld.so.cache", "etc/ld.so.cache", .{});
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64CacheInput(testing.allocator, root));
+}
+
 test "native_unpack.test.protected signed arm64 bash source is validated before fixture mutation" {
     const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_SOURCE_ROOT") orelse return;
     const artifacts = try snapshotAlternativesArm64TestArtifacts(&snapshot_bash_arm64_artifacts);
     var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
     defer root.close();
-    try verifySnapshotBashArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+    _ = try verifySnapshotBashArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+    try testing.expect((try root.root.entryIfExists(try root_fs.Path.init("etc/ld.so.cache"))) != null);
     const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_SOURCE_PROOF") orelse return error.TestUnexpectedResult;
     var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
     defer proof.close(testing.io);
@@ -25520,7 +25754,7 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
     const bash: native_program.PackageIdentity = .{ .name = "bash", .version = "5.3-2ubuntu1", .architecture = "arm64" };
     var source = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(source_path));
     defer source.close();
-    try verifySnapshotBashArm64Inputs(testing.allocator, source.root, &artifacts, "arm64");
+    _ = try verifySnapshotBashArm64Inputs(testing.allocator, source.root, &artifacts, "arm64");
     try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
         testing.allocator,
         source.root,
@@ -25553,6 +25787,7 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
         "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_TOOL_ROOT",
         "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_ALIAS_ROOT",
         "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_PRESTATE_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_CACHE_ROOT",
     }) |name| {
         const path = std.c.getenv(name) orelse return error.TestUnexpectedResult;
         var negative = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
@@ -25585,6 +25820,13 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
         &.{ "configure", "" },
     )) orelse return error.TestUnexpectedResult;
     defer boundary.deinit();
+    var cache_bound = false;
+    for (boundary.immutable_before.facts) |fact|
+        if (std.mem.eql(u8, fact.path, "etc/ld.so.cache")) {
+            try testing.expect(fact.kind == .regular and fact.sha256 != null);
+            cache_bound = true;
+        };
+    try testing.expect(cache_bound);
     try testing.expectEqual(@as(usize, 1), boundary.script.commands.len);
     try testing.expectEqualStrings("builtins.7.gz", boundary.script.commands[0].name);
     var script_digest: [32]u8 = undefined;
@@ -25608,7 +25850,7 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
         std.debug.print("signed arm64 bash postinst outcome={any} stderr={s}\n", .{ report.outcome, report.stderr });
     try testing.expect(report.succeeded());
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
-    try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");
+    _ = try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");
     try native_alternatives.validateScriptInputs(
         testing.allocator,
         native.root,
@@ -25622,7 +25864,7 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
     try native_alternatives.validateScriptTransition(testing.allocator, boundary.before, after, boundary.script, boundary.after_authority);
     var reference = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(reference_path));
     defer reference.close();
-    try verifySnapshotBashArm64Inputs(testing.allocator, reference.root, &artifacts, "arm64");
+    _ = try verifySnapshotBashArm64Inputs(testing.allocator, reference.root, &artifacts, "arm64");
     var oracle = try native_alternatives.capture(testing.allocator, reference.root, boundary.after_authority);
     defer oracle.deinit();
     try testing.expectEqual(after.groups.len, oracle.groups.len);
@@ -26018,16 +26260,21 @@ fn prepareAlternativesScriptBoundary(
         try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture, kind);
         try bindSnapshotLessArm64ImmutableInputs(&script, kind);
     }
+    var bash_cache_fact: ?native_alternatives.EntryFact = null;
     if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {
         if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
             return error.InvalidAlternativesScriptAuthority;
-        try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
+        bash_cache_fact = try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
         try bindSnapshotAlternativesArm64ImmutableInputs(
             &script,
             &snapshot_bash_arm64_controls,
             &snapshot_bash_arm64_aliases,
             &snapshot_bash_arm64_absent,
         );
+        const targets = try script.arena.allocator().alloc([]const u8, script.immutable_targets.len + 1);
+        @memcpy(targets[0..script.immutable_targets.len], script.immutable_targets);
+        targets[script.immutable_targets.len] = "/etc/ld.so.cache";
+        script.immutable_targets = targets;
     }
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
@@ -26130,6 +26377,17 @@ fn prepareAlternativesScriptBoundary(
         .{},
     );
     errdefer immutable_before.deinit();
+    if (bash_cache_fact) |expected_cache| {
+        var bound = false;
+        for (immutable_before.facts) |fact| {
+            if (!std.mem.eql(u8, fact.path, expected_cache.path)) continue;
+            var observed = fact;
+            observed.path = expected_cache.path;
+            if (!std.meta.eql(observed, expected_cache)) return error.AlternativesInputChanged;
+            bound = true;
+        }
+        if (!bound) return error.AlternativesInputChanged;
+    }
 
     const after_groups = try scratch.alloc(
         native_alternatives.GroupAuthority,
@@ -26799,7 +27057,7 @@ fn runLifecycleScript(
             };
         if (std.mem.eql(u8, program.target_architecture, "arm64") and
             native_alternatives.matchesSnapshotBashPostinst(script_bytes))
-            verifySnapshotBashArm64Inputs(
+            _ = verifySnapshotBashArm64Inputs(
                 allocator,
                 root,
                 program.artifacts,
