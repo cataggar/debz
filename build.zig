@@ -1055,6 +1055,22 @@ pub fn build(b: *std.Build) void {
     }
     b.step("test-real-snapshot-arm64-less-postinst-protected", "Require actual native ARM less configure and independent pinned dpkg agreement")
         .dependOn(&run_arm64_less_postinst_tests.step);
+    const arm64_util_linux_source_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.protected signed arm64 util-linux archive source is validated without callback admission"},
+    });
+    const run_arm64_util_linux_source_tests = b.addRunArtifact(arm64_util_linux_source_tests);
+    run_arm64_util_linux_source_tests.has_side_effects = true;
+    for ([_]struct { option: []const u8, environment: []const u8 }{
+        .{ .option = "root", .environment = "ROOT" },
+        .{ .option = "postinst", .environment = "POSTINST" },
+        .{ .option = "proof", .environment = "PROOF" },
+    }) |coordinate| {
+        const value = b.option([]const u8, b.fmt("arm64-util-linux-source-{s}", .{coordinate.option}), "Required original protected ARM util-linux source coordinate") orelse "";
+        run_arm64_util_linux_source_tests.setEnvironmentVariable(b.fmt("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_{s}", .{coordinate.environment}), value);
+    }
+    b.step("test-real-snapshot-arm64-util-linux-source-protected", "Require exact original signed ARM util-linux archive sources without callback admission")
+        .dependOn(&run_arm64_util_linux_source_tests.step);
     const arm64_bash_source_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"native_unpack.test.protected signed arm64 bash source is validated before fixture mutation"},
