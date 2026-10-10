@@ -1455,7 +1455,7 @@ class SourceEvidenceTests(unittest.TestCase):
             self.assertEqual(repin.check_prestate_evidence(committed, data), [])
         with zipfile.ZipFile(io.BytesIO(data)) as original:
             sources = json.loads(original.read("evidence.json"))["sources"]
-            for package in ("python3", "python3-minimal"):
+            for package in ("python3", "python3-minimal", "bash"):
                 source = next(item for item in sources
                               if item["architecture"] == "arm64" and item["package"] == package)
                 output = io.BytesIO()

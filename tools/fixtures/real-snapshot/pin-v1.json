@@ -649,7 +649,8 @@
     },
     {
       "architectures": [
-        "amd64"
+        "amd64",
+        "arm64"
       ],
       "consumers": [
         {
@@ -677,11 +678,12 @@
       "path": "postinst",
       "provenance": {
         "archives": {
-          "amd64": "sha512:a36c3eb45112744eda764ba120137da8d3fc1bfc70636bb71154eb581e278b297f74d28549aef8bb00bf68c5079003b6bbf5ad5f359f3b8bdff910e5680993dd"
+          "amd64": "sha512:a36c3eb45112744eda764ba120137da8d3fc1bfc70636bb71154eb581e278b297f74d28549aef8bb00bf68c5079003b6bbf5ad5f359f3b8bdff910e5680993dd",
+          "arm64": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"
         },
         "version": "5.3-2ubuntu1"
       },
-      "review": "#330",
+      "review": "#393",
       "size": 491,
       "version_bound": false
     },
