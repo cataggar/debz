@@ -112,5 +112,47 @@ class ZigInstallPolicyTests(unittest.TestCase):
         self.assertIn("workflow concurrency", " ".join(self.concurrency_failures(weakened)))
 
 
+class StandaloneGhrSmokePolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ci = policy.CI.read_text()
+        self.release = policy.RELEASE.read_text()
+        policy.FAILURES.clear()
+        self.addCleanup(policy.FAILURES.clear)
+
+    def failures(self, ci: str, release: str) -> list[str]:
+        policy.FAILURES.clear()
+        policy.audit_ghr_smoke(ci, release)
+        return list(policy.FAILURES)
+
+    def test_both_native_smoke_consumers_use_the_verified_standalone_bootstrap(self) -> None:
+        self.assertEqual(self.failures(self.ci, self.release), [])
+        for index, original in enumerate((self.ci, self.release)):
+            for changed in (
+                original.replace(policy.GHR_STANDALONE_SETUP, "", 1),
+                original.replace(policy.GHR_STANDALONE_SETUP, policy.GHR_STANDALONE_SETUP.replace("v0.8.1", "latest"), 1),
+                original.replace(policy.GHR_STANDALONE_SETUP, policy.GHR_STANDALONE_SETUP + "          sha256: unreviewed\n", 1),
+                original.replace('          PATH=/no-host-interpreters "$GHR_PATH" install "cataggar/debz@v$VERSION"\n', "", 1),
+                original.replace('          test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.8.1\n', "", 1),
+                original.replace("          GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin\n", "", 1),
+                original.replace('          test "$bin_dir" = "$GHR_BIN_DIR"\n', "", 1),
+            ):
+                with self.subTest(workflow=index, mutation=changed):
+                    workflows = [self.ci, self.release]
+                    workflows[index] = changed
+                    self.assertTrue(self.failures(*workflows))
+
+    def test_balanced_setup_move_to_an_unrelated_job_and_python_bootstrap_restore_refuse(self) -> None:
+        for index, original in enumerate((self.ci, self.release)):
+            moved = original.replace(policy.GHR_STANDALONE_SETUP, "", 1)
+            moved += "\n  unrelated-ghr:\n    steps:\n" + policy.GHR_STANDALONE_SETUP
+            self.assertEqual(moved.count(policy.GHR_STANDALONE_SETUP), 1)
+            for changed in (moved, original + "\n# python3 -m venv .zig-cache/ghr\n",
+                            original + "\n# pip install ghr-bin==0.7.0\n"):
+                with self.subTest(workflow=index):
+                    workflows = [self.ci, self.release]
+                    workflows[index] = changed
+                    self.assertTrue(self.failures(*workflows))
+
+
 if __name__ == "__main__":
     unittest.main()
