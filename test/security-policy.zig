@@ -1568,6 +1568,27 @@ test "security: download action consumes opaque CLI-owned archive and pinned blo
     try support.contains(try f.source("src/package_cache_archive.zig"), "pub const format_id = \"debz-package-cache-archive-v1\"");
 }
 
+test "security: complete CLI smoke uses the real product with no interpreter and bounded private help" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-cli-smoke", "build.zig", &.{
+        "cli_smoke_options.addOptionPath(\"debz\", cli.getEmittedBin());",
+        "cli_smoke_options.addOption([]const u8, \"version\", version);",
+        "const cli_tests = b.addRunArtifact(b.addTest(",
+    });
+    try nativeMutations(&f, "native-cli-smoke", "test/cli-smoke.zig", &.{
+        "try environment.put(\"PATH\", \"/no-host-interpreters\");",
+        ".environ_map = &self.environment,",
+        "case.argv.len + 8000",
+        "try f.run(argv, 5);",
+        "try absent(result.stdout, dangerous);",
+        "try booleanField(install_value, \"receipt_binding\", true);",
+    });
+    const restored = try nativeCheck(&f, "native-cli-smoke", "tools/test-cli.sh", "#!/bin/sh\npython3 -c 'import json'\n");
+    defer restored.deinit();
+    try restored.failsWith("retired shell/Python CLI-smoke driver was restored");
+}
+
 test "security: install action uses pinned bundles and validates before emitting result" {
     var f = try Fixture.init();
     defer f.deinit();
