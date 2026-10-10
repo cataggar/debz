@@ -30,6 +30,18 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`zig build generate-native-baseline-fixture` replaces the actual Python
+baseline generator. It regenerates the two canonical uncompressed `.deb`
+archives, `Packages`, the original fixed RSA keyring and authentic signed
+`InRelease`, preserving every existing fixture byte. To write a separate
+fixture directory, use `-- --output /absolute/path` after the build target.
+`test-native-baseline-fixture` runs the compiled generator with an isolated
+no-interpreter PATH, compares all five outputs with the retained originals,
+and tests regeneration, unrelated-file preservation and symbolic/hardlink
+refusal before any existing file is changed. The required core partition runs
+this suite in both modes on both architectures. The test-only RSA key is not
+production signing authority; this port does not complete PY3 or #420.
+
 | Previous case | Zig test (`test/security-policy.zig`, `security:` prefix) |
 | --- | --- |
 | `test_digest_cutover_rejects_new_raw_package_authority` | new raw package authority, schema digest field and fixed cache layout are rejected |

@@ -165,6 +165,45 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-action-empty-lock", "Test authenticated action fixture derivation and refusal").dependOn(&native_action_empty_lock_tests.step);
     workload_core.dependOn(&native_action_empty_lock_tests.step);
 
+    const baseline_fixture_options = b.addOptions();
+    baseline_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    const baseline_fixture_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    baseline_fixture_module.addImport("debz", debz);
+    baseline_fixture_module.addOptions("baseline_fixture_options", baseline_fixture_options);
+    const baseline_fixture = b.addExecutable(.{
+        .name = "debz-native-baseline-fixture",
+        .root_module = baseline_fixture_module,
+    });
+    const install_baseline_fixture = b.addInstallArtifact(baseline_fixture, .{});
+    b.step("build-native-baseline-fixture", "Build the native signed baseline fixture generator").dependOn(&install_baseline_fixture.step);
+    const regenerate_baseline_fixture = b.addRunArtifact(baseline_fixture);
+    if (b.args) |args| regenerate_baseline_fixture.addArgs(args);
+    b.step("generate-native-baseline-fixture", "Reproduce original signed baseline fixtures without Python").dependOn(&regenerate_baseline_fixture.step);
+    const baseline_fixture_smoke = b.addRunArtifact(baseline_fixture);
+    baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
+    baseline_fixture_smoke.addArg("--output");
+    const generated_baseline_fixture = baseline_fixture_smoke.addOutputDirectoryArg("fixtures");
+    baseline_fixture_smoke.expectExitCode(0);
+    baseline_fixture_smoke.expectStdOutEqual("");
+    baseline_fixture_smoke.expectStdErrEqual("");
+    const baseline_fixture_test_options = b.addOptions();
+    baseline_fixture_test_options.addOptionPath("generated", generated_baseline_fixture);
+    const baseline_fixture_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    baseline_fixture_test_module.addImport("debz", debz);
+    baseline_fixture_test_module.addOptions("baseline_fixture_options", baseline_fixture_options);
+    baseline_fixture_test_module.addOptions("baseline_fixture_test_options", baseline_fixture_test_options);
+    const baseline_fixture_tests = b.addRunArtifact(b.addTest(.{ .root_module = baseline_fixture_test_module }));
+    b.step("test-native-baseline-fixture", "Test exact signed baseline regeneration and safe publication").dependOn(&baseline_fixture_tests.step);
+    workload_core.dependOn(&baseline_fixture_tests.step);
+
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);
