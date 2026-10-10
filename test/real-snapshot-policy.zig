@@ -389,7 +389,7 @@ test "snapshot: relative native caller uses absolute protected source paths befo
 fn nativeOutcome(f: *Driver, workflow: []const u8) !std.json.Parsed(std.json.Value) {
     const evidence = try f.work.path(".real-snapshot/fresh/evidence");
     defer support.allocator.free(evidence);
-    const result = try support.run(&.{ "python3", "-I", "tools/real_snapshot_outcome.py", evidence, workflow });
+    const result = try support.run(&.{ "env", "PATH=/no-host-interpreters", @import("snapshot_policy_options").native_outcome, evidence, workflow });
     defer result.deinit();
     try result.ok();
     return std.json.parseFromSlice(std.json.Value, support.allocator, result.stdout, .{ .allocate = .alloc_always });

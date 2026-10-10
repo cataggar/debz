@@ -28,7 +28,7 @@ for relative in ("tools/real-snapshot-protected-native-ci.sh",
                  "tools/real-snapshot-reference.sh",
                  "tools/capture-vendor-state.py",
                  "tools/real_snapshot_reference_paths.py",
-                 "tools/real_snapshot_outcome.py",
+                 "zig-out/bin/debz-native-outcome",
                  "zig-out/bin/debz", "zig-out/bin/native-differential",
                  "zig-out/bin/real-snapshot-comparator"):
     protected(checkout / relative)
@@ -91,7 +91,7 @@ else
     "$([[ -f "$evidence/native.snapshot.json" ]] && echo true || echo false)" \
     >"$evidence/comparison-unavailable.txt"
 fi
-python3 -I tools/real_snapshot_outcome.py "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \
+PATH=/no-host-interpreters zig-out/bin/debz-native-outcome "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \
   >"$evidence/acceptance-outcome-v1.json" || outcome_status=$?
 
 allowed_script_dpkg_exec=0 allowed_script_dpkg_divert_exec=0 allowed_script_dpkg_statoverride_exec=0

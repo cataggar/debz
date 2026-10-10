@@ -403,6 +403,21 @@ nonzero command/result exits stay explicit. Missing, empty, corrupt or unsafe
 latest results produce explicit evidence errors and a nonzero `outcome_status`
 in `collection-result.txt`; they never fall back to refresh. `changed: null`
 means the latest result could not establish whether that command changed state.
+The actual collector is `debz-native-outcome`, built and tested from the
+protected, verified compiler before collection. Its CLI runs without an
+interpreter directory in `PATH`. Seven Zig tests replace the outcome-only
+Python tests; the independent producer/capture drivers are unchanged.
+Stage/result shape, integer exit statuses, wrapper completion and invalid-lock
+refusal remain distinct. Descriptor-rooted stable reads additionally refuse
+hardlinks and duplicate JSON fields; nesting is explicitly bounded to 64 levels
+instead of depending on Python's recursion limit. Invalid/unavailable reports retain typed
+Zig error names instead of platform-specific Python exception text; original
+command diagnostics, including their original numeric tokens, remain unmodified.
+A well-formed failed native operation
+still has collector exit zero and a nonzero acceptance exit, while malformed
+or unavailable evidence has both a nonzero collector exit and explicit
+evidence diagnostics. No prior successful result or fixture projection can
+stand in for a missing latest result.
 
 The separate `/dev/null` diagnostic surface is
 `vendor-state-inventory-v1.json.write_witnesses`: its observed kind, mode, UID/GID,
