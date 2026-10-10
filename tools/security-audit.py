@@ -2082,7 +2082,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -4783,6 +4783,49 @@ def ghr_zig_workflow_failures(
     return failures
 
 
+ACTION_EMPTY_LOCK_PATHS = (
+    ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
+)
+
+
+def native_action_empty_lock_failures(texts: dict[str, str]) -> list[str]:
+    ci = texts.get(ACTION_EMPTY_LOCK_PATHS[0], "")
+    match = re.search(r"(?ms)^  download-action-cache:\n(?P<body>.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci)
+    body = match["body"] if match else ""
+    required = {
+        ACTION_EMPTY_LOCK_PATHS[0]: (
+            "zig build build-native-action-empty-lock test-native-action-empty-lock",
+            "PATH=/no-host-interpreters zig-out/bin/debz-native-action-empty-lock",
+            '"$workspace/base.native.lock.json" "$workspace/empty.native.lock.json"',
+        ),
+        ACTION_EMPTY_LOCK_PATHS[1]: (
+            'b.step("build-native-action-empty-lock",',
+            'b.step("test-native-action-empty-lock",',
+            "workload_core.dependOn(&native_action_empty_lock_tests.step);",
+        ),
+        ACTION_EMPTY_LOCK_PATHS[2]: (
+            "try locks.decode(allocator, source, locks.maximum_document_bytes)",
+            'Sha256.hash("native-action-empty-cache",',
+            ".target_architecture = original.lock.target_architecture",
+            ".policy_sha256 = original.lock.policy_sha256",
+            ".repositories = &.{},", ".local_artifacts = &.{},", ".packages = &.{},",
+            "return empty.lock.canonicalJson(allocator);",
+            "try input.root.pinRegularFile(",
+            "try file.observeStableAlloc(allocator, locks.maximum_document_bytes)",
+            "if (observed.entry.link_count != 1) return error.HardLinkedFixtureSource;",
+            ".overwrite = .fail_if_exists,",
+        ),
+    }
+    failures = []
+    for path, tokens in required.items():
+        text = body if path == ACTION_EMPTY_LOCK_PATHS[0] else texts.get(path, "")
+        if any(token not in text for token in tokens):
+            failures.append(f"{path}: native empty action-lock generation contract is missing")
+    if "native-action-empty-cache" in body or re.search(r"python[^\n]*empty\.native\.lock", body):
+        failures.append("ci.yml: retired inline Python action-lock generator was restored")
+    return failures
+
+
 def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
     failures: list[str] = []
     for entrypoint in (
@@ -4899,6 +4942,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_action_empty_lock_failures({
+        path: (ROOT / path).read_text() for path in ACTION_EMPTY_LOCK_PATHS
+    }):
+        fail(failure)
     for failure in native_exercise_final_wiring_failures(
         (ROOT / "test/native_recovery_helper.zig").read_text(),
         (ROOT / "test/native_lifecycle_support.zig").read_text(),
@@ -5990,7 +6037,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference",
+        "reference-root", "protected-reference", "native-action-empty-lock",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6012,6 +6059,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             ),
             "reference-root": REFERENCE_ROOT_PATHS,
             "protected-reference": PROTECTED_REFERENCE_PATHS,
+            "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -6068,6 +6116,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = reference_launcher_root_wiring_failures(*(texts.get(path, "") for path in paths))
         elif kind == "protected-reference":
             failures = protected_reference_ci_failures(texts)
+        elif kind == "native-action-empty-lock":
+            failures = native_action_empty_lock_failures(texts)
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

@@ -149,6 +149,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-outcome", "Test actual native outcome evidence and failure distinctions").dependOn(&native_outcome_tests.step);
     workload_native.dependOn(&native_outcome_tests.step);
 
+    const native_action_empty_lock_module = b.createModule(.{
+        .root_source_file = b.path("tools/native-action-empty-lock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_action_empty_lock_module.addImport("debz", debz);
+    const native_action_empty_lock = b.addExecutable(.{
+        .name = "debz-native-action-empty-lock",
+        .root_module = native_action_empty_lock_module,
+    });
+    const install_native_action_empty_lock = b.addInstallArtifact(native_action_empty_lock, .{});
+    b.step("build-native-action-empty-lock", "Build the native action empty-lock fixture generator").dependOn(&install_native_action_empty_lock.step);
+    const native_action_empty_lock_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_action_empty_lock_module }));
+    b.step("test-native-action-empty-lock", "Test authenticated action fixture derivation and refusal").dependOn(&native_action_empty_lock_tests.step);
+    workload_core.dependOn(&native_action_empty_lock_tests.step);
+
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);
