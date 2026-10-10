@@ -2388,6 +2388,9 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-postinst-protected \\\n",
         "    \"-Darm64-less-postinst-bad-prestate=$less_workspace/script-after-postinst-bad-prestate\" \\\n",
         "  grep -Fx \"signed arm64 less native postinst and independent pinned dpkg agree without skips\" \"$less_workspace/evidence/less-postinst-proof.txt\"\n",
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-bash-postinst-protected \\\n",
+        "    \"-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate\" \\\n",
+        "  grep -Fx \"signed arm64 bash native postinst and independent pinned dpkg agree without skips\" \"$bash_workspace/evidence/bash-postinst-proof.txt\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
         "        --force-depends --no-triggers --configure less\n",
@@ -2398,7 +2401,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "  bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
-        "    for package in SOURCE_ARTIFACTS:\n        archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
+        "        for package in SOURCE_ARTIFACTS:\n            archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
         "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
     });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{

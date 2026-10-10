@@ -333,8 +333,23 @@ existing fixture. The previous archives, locks, InRelease and index bytes
 remain unchanged. Only the source index and report's `artifact_sources`
 registrations are supplemented; probe clocks, freshness and admission
 deadline are not renewed. This is source authentication only: native ARM
-bash postinst execution still refuses until its runtime authority and
-protected reference comparison are separately qualified.
+bash postinst execution is a separate authority and protected comparison,
+not an implication of the source binding.
+
+The bounded ARM bash configure authority binds the original provider and
+manpage through `bind-member`, its original ownership-list order, postinst
+and staged callback, plus the exact original `libtinfo6`, dash, dpkg
+alternatives tool and libc runtime artifact/member coordinates. Root mode,
+ownership, single-link regular members, merged-usr/loader/libtinfo aliases
+and the absence of cache, preload, hwcaps, shadow alternatives and optional
+menu helpers are checked before and after the actual callback. Only a new
+package's `postinst configure ""` with matching ARM program/action coordinates
+is admitted. Protected staging builds eight new roots from authenticated
+sources and original pinned-dpkg unpack, requires a source receipt before
+mutating negative copies, and compares the production native launcher with
+separate pinned-dpkg configure, complete alternatives records/selectors and
+unchanged input inventories. This scoped proof is not whole-root parity,
+late-load/helper closure, an upgrade grant or Python-free acceptance.
 
 Ownership-list pins bind the original data-tar member order, not a sorted
 path set. Less sealing and Python empty-fixture preparation validate those

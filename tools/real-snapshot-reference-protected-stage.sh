@@ -13,6 +13,9 @@ purpose=proof
 if [[ ${1:-} == --arm64-less-source ]]; then
   purpose=arm64-less
   shift
+elif [[ ${1:-} == --arm64-bash-source ]]; then
+  purpose=arm64-bash
+  shift
 fi
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
@@ -121,7 +124,7 @@ case "$(uname -m)" in
   *) echo "unsupported native reference architecture" >&2; exit 2 ;;
 esac
 closure_args=("$closure_root")
-if [[ $purpose == arm64-less ]]; then
+if [[ $purpose == arm64-less || $purpose == arm64-bash ]]; then
   [[ $architecture == arm64 ]]
 fi
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -194,9 +197,11 @@ debz_step refresh refresh "$snapshot/root" --assume-yes
 debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "${closure_args[@]}"
 debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "${closure_args[@]}"
 authenticated_lock "$lock"
-if [[ $purpose == arm64-less ]]; then
+if [[ $purpose == arm64-less || $purpose == arm64-bash ]]; then
   # Each CLI request accepts one root. Keep its authenticated lock intact.
-  for package in less dash util-linux; do
+  packages=(less dash util-linux)
+  if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux); fi
+  for package in "${packages[@]}"; do
     package_lock=$evidence/$package.lock.json
     debz_step "$package-plan" plan "$snapshot/root" --transaction-backend native --lock-output "$package_lock" "$package"
     debz_step "$package-download" download "$snapshot/root" --transaction-backend native --lock-input "$package_lock" "$package"
@@ -300,8 +305,8 @@ if [[ -n $(find "$template" \( ! -user 0 -o ! -group 0 \) -print -quit) ]]; then
   echo "the template must contain only root-owned entries" >&2
   exit 1
 fi
-if [[ $purpose == arm64-less ]]; then
-  echo "fresh authenticated arm64 less runtime template staged; no replay claimed"
+if [[ $purpose == arm64-less || $purpose == arm64-bash ]]; then
+  echo "fresh authenticated $purpose runtime template staged; no replay claimed"
   exit 0
 fi
 

@@ -555,7 +555,7 @@ authenticated_lock() { :; }
 debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
 """
         for purpose, architecture in (("proof", "amd64"), ("proof", "arm64"),
-                                       ("arm64-less", "arm64")):
+                                       ("arm64-less", "arm64"), ("arm64-bash", "arm64")):
             with self.subTest(purpose=purpose, architecture=architecture):
                 result = subprocess.run(
                     ["bash", "-euo", "pipefail", "-c", setup + selection + "\n" + calls,
@@ -563,7 +563,8 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                     check=True, capture_output=True, text=True,
                 )
                 rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
-                goals = ("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else ("dpkg",)
+                goals = (("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else
+                         ("dpkg", "bash", "dash", "util-linux") if purpose == "arm64-bash" else ("dpkg",))
                 self.assertEqual(len(rows), 2 * len(goals))
                 for index, package in enumerate(goals):
                     for offset, command in enumerate(("plan", "download")):
@@ -768,7 +769,7 @@ timeout() {
             ("tools/real-snapshot-signed-proc-prestates.sh",
              '      .repository.release_digest == ("sha256:" + $repository.release_sha256)'),
             ("tools/real-snapshot-reference-protected-stage.sh",
-             '  for package in less dash util-linux; do'),
+             '  for package in "${packages[@]}"; do'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
              'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")\n'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
@@ -805,9 +806,28 @@ timeout() {
             ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
             ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
             ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
-            ("tools/real_snapshot_less_stage.py", '    for package in SOURCE_ARTIFACTS:\n        archive(locks["dpkg" if package == "libc6" else package], cache, package)\n'),
+            ("tools/real_snapshot_less_stage.py", '        for package in SOURCE_ARTIFACTS:\n            archive(locks["dpkg" if package == "libc6" else package], cache, package)\n'),
         ):
             with self.subTest(token=token):
+                self.assertIn(token, texts[path])
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def test_arm_bash_receipt_requires_actual_native_callback_and_independent_oracle(self) -> None:
+        audit = load("debz_arm_bash_activation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("src/native_unpack.zig", 'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);'),
+            ("src/native_unpack.zig", 'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n            verifySnapshotBashArm64Inputs('),
+            ("src/native_unpack.zig", 'try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");'),
+            ("src/native_unpack.zig", 'try testing.expectEqualStrings("/usr/share/man/man7/bash-builtins.7.gz", actual.selected);'),
+            ("tools/real-snapshot-bash-protected-stage.sh", '"$zig" build test-real-snapshot-arm64-bash-source-protected'),
+            ("tools/real-snapshot-bash-protected-stage.sh", "--force-depends --no-triggers --configure bash"),
+            ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-bash-postinst-protected'),
+        ):
+            with self.subTest(path=path, token=token):
                 self.assertIn(token, texts[path])
                 changed = dict(texts)
                 changed[path] = texts[path].replace(token, "", 1)
@@ -1241,6 +1261,108 @@ class SignedLessStagingTests(unittest.TestCase):
         path.symlink_to(self.info / "less.preinst")
         with self.assertRaises(OSError):
             self.stage.seal(self.root)
+        self.assertEqual(list(self.lifecycle.iterdir()), [])
+
+
+class SignedBashStagingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-bash-seal-", dir=TOOLS.parent / ".zig-cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.info = self.root / "var/lib/dpkg/info"
+        self.info.mkdir(parents=True)
+        self.lifecycle = self.root / "var/lib/debz-lifecycle-scripts"
+        self.lifecycle.mkdir()
+        repin = load("debz_bash_original_members", "real-snapshot-repin.py")
+        manifest = repin.load_json(TOOLS.parent / repin.DEFAULT_MANIFEST)
+        with zipfile.ZipFile(TOOLS.parent / manifest["prestate_evidence"]) as archive:
+            index = json.loads(archive.read("evidence.json"))
+            source = next(item for item in index["sources"]
+                          if item["architecture"] == "arm64" and item["package"] == "bash")
+            original = archive.read(source["archive_file"])
+        (self.info / "bash.list").write_bytes(repin.dpkg_ownership_list(original))
+        script, mode = repin.tar_member(original, "control.tar", "postinst")
+        (self.info / "bash.postinst").write_bytes(script)
+        (self.info / "bash.postinst").chmod(mode)
+        self.stage = load("debz_bash_seal", "real_snapshot_less_stage.py")
+
+    def test_successful_stage_receipt_is_accepted_only_with_zero_exit_status(self) -> None:
+        stage = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
+        receipt = stage.strip().splitlines()[-1]
+        ci = (TOOLS / "real-snapshot-reference-protected-ci.sh").read_text()
+        helper = re.search(r"^step\(\) \{\n.*?^\}$", ci, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(helper)
+        activation = next(line for line in ci.splitlines()
+                          if line.startswith("  step arm64-bash-stage "))
+        arguments = shlex.split(activation.removesuffix("\\"))[:4]
+        with tempfile.TemporaryDirectory(dir=TOOLS.parent / ".zig-cache") as temporary:
+            environment = {**os.environ, "evidence": temporary,
+                           "codes": str(Path(temporary) / "exit-codes.tsv")}
+            for command, accepted in ((receipt, True), (receipt + "\nexit 1", False),
+                                      ('echo "stage exited without its receipt"', False)):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c",
+                         helper.group(0) + '\nstep "$1" "$2" "$3" bash -c "$4"\n',
+                         arguments[0], *arguments[1:], command],
+                        env=environment, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_fresh_replays_preserve_existing_pinned_dpkg_directory_and_refuse_reuse(self) -> None:
+        script = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
+        copies = re.search(r"^for name in [^\n]+; do\n.*?^done$", script, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(copies)
+        with tempfile.TemporaryDirectory(dir=TOOLS.parent / ".zig-cache") as temporary:
+            workspace = Path(temporary)
+            source = workspace / "source"
+            source.mkdir()
+            original = (self.info / "bash.postinst").read_bytes()
+            (source / "bash.postinst").write_bytes(original)
+            pinned = workspace / "dpkg/usr/bin/dpkg"
+            pinned.parent.mkdir(parents=True)
+            pinned.write_bytes(b"retained pinned dpkg artifact\n")
+            before = (pinned.read_bytes(), pinned.stat())
+            environment = {**os.environ, "workspace": str(workspace), "source": str(source)}
+            command = ["bash", "-euo", "pipefail", "-c", copies.group(0)]
+            subprocess.run(command, env=environment, capture_output=True, check=True, timeout=10)
+            replays = [path for path in workspace.iterdir() if path.name not in ("source", "dpkg")]
+            self.assertEqual(len(replays), 7)
+            for replay in replays:
+                self.assertEqual((replay / "bash.postinst").read_bytes(), original)
+            self.assertEqual(len({(path / "bash.postinst").stat().st_ino
+                                  for path in (source, *replays)}), 8)
+            self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
+            result = subprocess.run(command, env=environment, capture_output=True,
+                                    check=False, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
+
+    def test_seal_preserves_original_controls_and_refuses_overwriting_staged_callback(self) -> None:
+        before = {path.name: (path.read_bytes(), path.stat().st_ino, path.stat().st_mode)
+                  for path in self.info.iterdir()}
+        self.stage.seal_bash(self.root)
+        staged = self.lifecycle / "bash.postinst"
+        self.assertEqual(staged.read_bytes(), before[staged.name][0])
+        self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
+        for path in self.info.iterdir():
+            self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mode), before[path.name])
+        with self.assertRaises(FileExistsError):
+            self.stage.seal_bash(self.root)
+
+    def test_altered_list_or_aliased_script_refuses_before_publishing_callback(self) -> None:
+        listing = self.info / "bash.list"
+        original = listing.read_bytes()
+        listing.write_bytes(original + b"/unreviewed\n")
+        with self.assertRaisesRegex(ValueError, "signed bash ownership path set changed"):
+            self.stage.seal_bash(self.root)
+        self.assertEqual(list(self.lifecycle.iterdir()), [])
+        listing.write_bytes(original)
+        script = self.info / "bash.postinst"
+        script.unlink()
+        script.symlink_to(listing)
+        with self.assertRaises(OSError):
+            self.stage.seal_bash(self.root)
         self.assertEqual(list(self.lifecycle.iterdir()), [])
 
 

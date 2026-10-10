@@ -22185,12 +22185,13 @@ fn snapshotLessPreinstIsInert(
     return true;
 }
 
-const snapshot_less_arm64_artifacts = [_]struct {
+const SnapshotAlternativesArm64Artifact = struct {
     name: []const u8,
     version: []const u8,
     size: u64,
     sha512: []const u8,
-}{
+};
+const snapshot_less_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{
     .{
         .name = "less",
         .version = "668-1build1",
@@ -22350,6 +22351,16 @@ fn verifySnapshotLessArm64Inputs(
 ) !void {
     try verifySnapshotLessArm64Artifacts(artifacts, architecture);
     const controls = try snapshotLessArm64ControlBindings(kind);
+    try verifySnapshotAlternativesArm64Inputs(allocator, root, controls, &snapshot_less_arm64_aliases, &snapshot_less_arm64_absent);
+}
+
+fn verifySnapshotAlternativesArm64Inputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    controls: []const SignedDebconfControlFile,
+    aliases: []const SnapshotLessArm64Alias,
+    absent: []const []const u8,
+) !void {
     const linux = std.os.linux;
     var stat: linux.Statx = undefined;
     if (linux.errno(linux.statx(root.dir.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat)) != .SUCCESS or
@@ -22378,30 +22389,44 @@ fn verifySnapshotLessArm64Inputs(
             error.InvalidAlternativesScriptAuthority,
         );
     }
-    for (snapshot_less_arm64_aliases) |binding| {
+    for (aliases) |binding| {
         var link = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
         defer link.close();
         var buffer: [128]u8 = undefined;
         const observed = try link.observe(&buffer);
         try verifySnapshotLessArm64AliasBinding(observed.entry, observed.target, binding);
     }
-    for (snapshot_less_arm64_absent) |path|
+    for (absent) |path|
         if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
             return error.InvalidAlternativesScriptAuthority;
 }
 
 fn bindSnapshotLessArm64ImmutableInputs(script: *native_alternatives.ScriptAuthority, kind: maintainer_script.Kind) !void {
+    try bindSnapshotAlternativesArm64ImmutableInputs(
+        script,
+        try snapshotLessArm64ControlBindings(kind),
+        &snapshot_less_arm64_aliases,
+        &snapshot_less_arm64_absent,
+    );
+}
+
+fn bindSnapshotAlternativesArm64ImmutableInputs(
+    script: *native_alternatives.ScriptAuthority,
+    controls: []const SignedDebconfControlFile,
+    aliases: []const SnapshotLessArm64Alias,
+    absent: []const []const u8,
+) !void {
     const allocator = script.arena.allocator();
     var paths: std.ArrayList([]const u8) = .empty;
     try paths.appendSlice(allocator, script.immutable_targets);
-    for (try snapshotLessArm64ControlBindings(kind)) |binding|
+    for (controls) |binding|
         try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{binding.path}));
     // Directory aliases are rechecked separately before and after execution.
-    for (snapshot_less_arm64_aliases) |binding| {
+    for (aliases) |binding| {
         if (std.mem.indexOfScalar(u8, binding.path, '/') == null) continue;
         try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{binding.path}));
     }
-    for (snapshot_less_arm64_absent) |path|
+    for (absent) |path|
         try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{path}));
     script.immutable_targets = try paths.toOwnedSlice(allocator);
 }
@@ -22461,8 +22486,11 @@ fn snapshotBashPostinstIsBound(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotBashPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    const amd64 = std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64");
+    const arm64 = std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64");
+    if ((!amd64 and !arm64) or
         !std.mem.eql(u8, package.name, "bash") or
         !std.mem.eql(u8, package.version, "5.3-2ubuntu1") or
         kind != .postinst or source != .new_package or
@@ -22471,6 +22499,99 @@ fn snapshotBashPostinstIsBound(
         arguments[1].len != 0)
         return error.InvalidAlternativesScriptAuthority;
     return true;
+}
+
+const snapshot_bash_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{
+    .{
+        .name = "bash",
+        .version = "5.3-2ubuntu1",
+        .size = 829052,
+        .sha512 = "7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701",
+    },
+    .{
+        .name = "libtinfo6",
+        .version = "6.6+20251231-1",
+        .size = 107766,
+        .sha512 = "301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af",
+    },
+} ++ snapshot_less_arm64_artifacts[1..].*;
+
+const snapshot_bash_arm64_controls = [_]SignedDebconfControlFile{
+    .{
+        .path = "var/lib/dpkg/info/bash.postinst",
+        .size = 491,
+        .mode = 0o755,
+        .sha256 = "72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
+    },
+    .{
+        .path = lifecycle_tmp_ci ++ "/bash.postinst",
+        .size = 491,
+        .mode = 0o755,
+        .sha256 = "72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
+    },
+    .{
+        .path = "var/lib/dpkg/info/bash.list",
+        .size = 1068,
+        .mode = 0o644,
+        .sha256 = "f258025bf7b7200aaef0a62c5793535fab6500c7de9d7fbffc069eb78444505c",
+    },
+    .{
+        .path = "usr/bin/bash",
+        .size = 1609176,
+        .mode = 0o755,
+        .sha256 = "01c006568543d6b6ab9f0a57dd44b9d779d1edc437a5f5d2db0215887c19dbeb",
+    },
+    .{
+        .path = "usr/share/man/man7/bash-builtins.7.gz",
+        .size = 508,
+        .mode = 0o644,
+        .sha256 = "dacf8379c9a1d56a7f8f4ddb330c60ca0444d82a63eea55755db7cc29312b0a3",
+    },
+    .{
+        .path = "usr/lib/aarch64-linux-gnu/libtinfo.so.6.6",
+        .size = 265584,
+        .mode = 0o644,
+        .sha256 = "5bb2b95c8ef8a6880de1caf392086098e96a09323cf5b1600c80f051605c5edd",
+    },
+    .{
+        .path = "var/lib/dpkg/info/libtinfo6:arm64.list",
+        .size = 339,
+        .mode = 0o644,
+        .sha256 = "db5239cbc950b3d9616cc5a62d1c82d6bebf5aa1a99782921012645acd7bf190",
+    },
+} ++ snapshot_less_arm64_controls[3..].*;
+
+const snapshot_bash_arm64_aliases = snapshot_less_arm64_aliases ++ [_]SnapshotLessArm64Alias{
+    .{ .path = "usr/lib/aarch64-linux-gnu/libtinfo.so.6", .target = "libtinfo.so.6.6" },
+};
+const snapshot_bash_arm64_absent = snapshot_less_arm64_absent ++ [_][]const u8{
+    "usr/bin/update-menus",
+    "usr/sbin/update-menus",
+};
+
+fn verifySnapshotBashArm64Inputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    artifacts: []const native_program.ProgramArtifact,
+    architecture: []const u8,
+) !void {
+    if (!std.mem.eql(u8, architecture, "arm64"))
+        return error.InvalidAlternativesScriptAuthority;
+    for (snapshot_bash_arm64_artifacts) |binding|
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
+            binding.size,
+            binding.sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+    try verifySnapshotAlternativesArm64Inputs(
+        allocator,
+        root,
+        &snapshot_bash_arm64_controls,
+        &snapshot_bash_arm64_aliases,
+        &snapshot_bash_arm64_absent,
+    );
 }
 
 fn snapshotProcpsPostinstIsInert(
@@ -25012,8 +25133,14 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
 }
 
 fn snapshotLessArm64TestArtifacts() ![snapshot_less_arm64_artifacts.len]native_program.ProgramArtifact {
-    var artifacts: [snapshot_less_arm64_artifacts.len]native_program.ProgramArtifact = undefined;
-    for (snapshot_less_arm64_artifacts, &artifacts, 0..) |binding, *artifact, index|
+    return snapshotAlternativesArm64TestArtifacts(&snapshot_less_arm64_artifacts);
+}
+
+fn snapshotAlternativesArm64TestArtifacts(
+    comptime bindings: []const SnapshotAlternativesArm64Artifact,
+) ![bindings.len]native_program.ProgramArtifact {
+    var artifacts: [bindings.len]native_program.ProgramArtifact = undefined;
+    for (bindings, &artifacts, 0..) |binding, *artifact, index|
         artifact.* = .{
             .index = @intCast(index),
             .package = .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
@@ -25029,6 +25156,118 @@ fn snapshotLessArm64TestArtifacts() ![snapshot_less_arm64_artifacts.len]native_p
             } },
         };
     return artifacts;
+}
+
+test "native_unpack.test.signed arm64 bash postinst binds only original fresh configure inputs" {
+    const script = @embedFile("fixtures/ubuntu-resolute-bash.postinst");
+    const bash: native_program.PackageIdentity = .{ .name = "bash", .version = "5.3-2ubuntu1", .architecture = "arm64" };
+    try testing.expect(try snapshotBashPostinstIsBound(script, "arm64", bash, .postinst, .new_package, &.{ "configure", "" }));
+    for ([_][]const []const u8{ &.{"configure"}, &.{ "configure", "5.2" }, &.{"triggered"}, &.{ "configure", "", "extra" } }) |arguments|
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotBashPostinstIsBound(
+            script,
+            "arm64",
+            bash,
+            .postinst,
+            .new_package,
+            arguments,
+        ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotBashPostinstIsBound(
+        script,
+        "amd64",
+        bash,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotBashPostinstIsBound(
+        script,
+        "arm64",
+        bash,
+        .postinst,
+        .installed_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotBashPostinstIsBound(
+        script,
+        "arm64",
+        bash,
+        .preinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    var foreign = bash;
+    foreign.version = "unreviewed";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotBashPostinstIsBound(
+        script,
+        "arm64",
+        foreign,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    var digest: [32]u8 = undefined;
+    Sha256.hash(script, &digest, .{});
+    const entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = script.len,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySignedDebconfControlFileBinding(entry, digest, snapshot_bash_arm64_controls[0], error.InvalidAlternativesScriptAuthority);
+    for (0..6) |mutation| {
+        var changed = entry;
+        var changed_digest = digest;
+        switch (mutation) {
+            0 => changed.mode = 0o644,
+            1 => changed.uid = 1,
+            2 => changed.link_count = 2,
+            3 => changed.size += 1,
+            4 => changed.kind = .sym_link,
+            5 => changed_digest[0] ^= 1,
+            else => unreachable,
+        }
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySignedDebconfControlFileBinding(
+            changed,
+            changed_digest,
+            snapshot_bash_arm64_controls[0],
+            error.InvalidAlternativesScriptAuthority,
+        ));
+    }
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[std.mem.indexOf(u8, changed, "exit 0").? + 5] = '1';
+    try testing.expect(!(try snapshotBashPostinstIsBound(changed, "arm64", bash, .postinst, .new_package, &.{ "configure", "" })));
+}
+
+test "native_unpack.test.signed arm64 bash artifacts reject altered or borrowed provider coordinates" {
+    const originals = try snapshotAlternativesArm64TestArtifacts(&snapshot_bash_arm64_artifacts);
+    for (0..originals.len) |index| {
+        for (0..5) |mutation| {
+            var changed = originals;
+            switch (mutation) {
+                0 => changed[index].package.version = "unreviewed",
+                1 => changed[index].package.architecture = "amd64",
+                2 => changed[index].size += 1,
+                3 => changed[index].archive_identity = originals[(index + 1) % originals.len].archive_identity,
+                4 => changed[index].origin_v2 = null,
+                else => unreachable,
+            }
+            const binding = snapshot_bash_arm64_artifacts[index];
+            try testing.expectError(error.InvalidAlternativesScriptAuthority, verifyAuthenticatedSnapshotArtifact(
+                &changed,
+                .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
+                binding.size,
+                binding.sha512,
+                error.InvalidAlternativesScriptAuthority,
+            ));
+        }
+    }
 }
 
 test "native_unpack.test.signed arm64 less preinst admits only the inert fresh install callback" {
@@ -25245,6 +25484,164 @@ test "native_unpack.test.arm64 less binds authenticated archives and exact runti
         link.uid = 1;
         try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64AliasBinding(link, binding.target, binding));
     }
+}
+
+fn expectAlternativesReplayFactEqual(actual: native_alternatives.EntryFact, expected: native_alternatives.EntryFact) !void {
+    // Independent replay roots and writes have different inode identities and clocks.
+    var relocated = expected;
+    relocated.device = actual.device;
+    relocated.inode = actual.inode;
+    relocated.modified_nanoseconds = actual.modified_nanoseconds;
+    relocated.change_nanoseconds = actual.change_nanoseconds;
+    try testing.expectEqualDeep(actual, relocated);
+}
+
+test "native_unpack.test.protected signed arm64 bash source is validated before fixture mutation" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_SOURCE_ROOT") orelse return;
+    const artifacts = try snapshotAlternativesArm64TestArtifacts(&snapshot_bash_arm64_artifacts);
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    try verifySnapshotBashArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_SOURCE_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed arm64 bash source guard executed without skips\n");
+}
+
+test "native_unpack.test.protected signed arm64 bash postinst runs natively and matches pinned dpkg" {
+    const source_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_ROOT") orelse return;
+    const native_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_NATIVE_ROOT") orelse return error.TestUnexpectedResult;
+    const reference_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_DPKG_ROOT") orelse return error.TestUnexpectedResult;
+    const artifacts = try snapshotAlternativesArm64TestArtifacts(&snapshot_bash_arm64_artifacts);
+    var program = std.mem.zeroes(native_program.Program);
+    program.target_architecture = "arm64";
+    program.artifacts = &artifacts;
+    const script = @embedFile("fixtures/ubuntu-resolute-bash.postinst");
+    const bash: native_program.PackageIdentity = .{ .name = "bash", .version = "5.3-2ubuntu1", .architecture = "arm64" };
+    var source = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(source_path));
+    defer source.close();
+    try verifySnapshotBashArm64Inputs(testing.allocator, source.root, &artifacts, "arm64");
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+        testing.allocator,
+        source.root,
+        &program,
+        "arm64",
+        script,
+        bash,
+        .postinst,
+        .new_package,
+        .trigger,
+        &.{ "configure", "" },
+    ));
+    program.target_architecture = "amd64";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+        testing.allocator,
+        source.root,
+        &program,
+        "arm64",
+        script,
+        bash,
+        .postinst,
+        .new_package,
+        .script,
+        &.{ "configure", "" },
+    ));
+    program.target_architecture = "arm64";
+    for ([_][:0]const u8{
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_SCRIPT_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_MODE_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_TOOL_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_ALIAS_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_PRESTATE_ROOT",
+    }) |name| {
+        const path = std.c.getenv(name) orelse return error.TestUnexpectedResult;
+        var negative = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer negative.close();
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+            testing.allocator,
+            negative.root,
+            &program,
+            "arm64",
+            script,
+            bash,
+            .postinst,
+            .new_package,
+            .script,
+            &.{ "configure", "" },
+        ));
+    }
+    var native = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(native_path));
+    defer native.close();
+    var boundary = (try prepareAlternativesScriptBoundary(
+        testing.allocator,
+        native.root,
+        &program,
+        "arm64",
+        script,
+        bash,
+        .postinst,
+        .new_package,
+        .script,
+        &.{ "configure", "" },
+    )) orelse return error.TestUnexpectedResult;
+    defer boundary.deinit();
+    try testing.expectEqual(@as(usize, 1), boundary.script.commands.len);
+    try testing.expectEqualStrings("builtins.7.gz", boundary.script.commands[0].name);
+    var script_digest: [32]u8 = undefined;
+    Sha256.hash(script, &script_digest, .{});
+    var launcher: maintainer_script.SystemLauncher = .{};
+    var report = try maintainer_script.run(testing.allocator, .{
+        .root = std.mem.span(native_path),
+        .identity = .{
+            .package = bash.name,
+            .version = bash.version,
+            .architecture = bash.architecture,
+            .kind = .postinst,
+            .script_path = lifecycle_tmp_ci ++ "/bash.postinst",
+            .script_sha256 = script_digest,
+        },
+        .arguments = &.{ "configure", "" },
+        .policy = lifecycleInvocationPolicy(false, false, false),
+    }, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    if (!report.succeeded())
+        std.debug.print("signed arm64 bash postinst outcome={any} stderr={s}\n", .{ report.outcome, report.stderr });
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");
+    try native_alternatives.validateScriptInputs(
+        testing.allocator,
+        native.root,
+        boundary.script,
+        boundary.before,
+        boundary.immutable_before,
+        .{},
+    );
+    var after = try native_alternatives.capture(testing.allocator, native.root, boundary.after_authority);
+    defer after.deinit();
+    try native_alternatives.validateScriptTransition(testing.allocator, boundary.before, after, boundary.script, boundary.after_authority);
+    var reference = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(reference_path));
+    defer reference.close();
+    try verifySnapshotBashArm64Inputs(testing.allocator, reference.root, &artifacts, "arm64");
+    var oracle = try native_alternatives.capture(testing.allocator, reference.root, boundary.after_authority);
+    defer oracle.deinit();
+    try testing.expectEqual(after.groups.len, oracle.groups.len);
+    for (after.groups, oracle.groups) |actual, expected| {
+        try testing.expectEqualDeep(actual.record, expected.record);
+        try testing.expectEqualStrings(actual.selected, expected.selected);
+        try testing.expectEqualDeep(actual.links, expected.links);
+        try testing.expectEqualDeep(actual.missing_master_targets, expected.missing_master_targets);
+        try expectAlternativesReplayFactEqual(actual.record_fact, expected.record_fact);
+        try testing.expectEqual(actual.facts.len, expected.facts.len);
+        for (actual.facts, expected.facts) |left, right|
+            try expectAlternativesReplayFactEqual(left, right);
+        if (std.mem.eql(u8, actual.name, "builtins.7.gz"))
+            try testing.expectEqualStrings("/usr/share/man/man7/bash-builtins.7.gz", actual.selected);
+    }
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed arm64 bash native postinst and independent pinned dpkg agree without skips\n");
 }
 
 test "native_unpack.test.protected signed arm64 less source is validated before fixture mutation" {
@@ -25620,6 +26017,17 @@ fn prepareAlternativesScriptBoundary(
             return error.InvalidAlternativesScriptAuthority;
         try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture, kind);
         try bindSnapshotLessArm64ImmutableInputs(&script, kind);
+    }
+    if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {
+        if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
+            return error.InvalidAlternativesScriptAuthority;
+        try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
+        try bindSnapshotAlternativesArm64ImmutableInputs(
+            &script,
+            &snapshot_bash_arm64_controls,
+            &snapshot_bash_arm64_aliases,
+            &snapshot_bash_arm64_absent,
+        );
     }
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
@@ -26385,6 +26793,17 @@ fn runLifecycleScript(
                 program.artifacts,
                 program.target_architecture,
                 kind,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
+        if (std.mem.eql(u8, program.target_architecture, "arm64") and
+            native_alternatives.matchesSnapshotBashPostinst(script_bytes))
+            verifySnapshotBashArm64Inputs(
+                allocator,
+                root,
+                program.artifacts,
+                program.target_architecture,
             ) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;
