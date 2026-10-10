@@ -214,16 +214,11 @@ jobs:
           esac
           test "$("$DEBZ_PATH" version)" = "$VERSION"
           "$DEBZ_PATH" --help >/dev/null
-      - name: Install smoke tooling
-        run: |
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
-            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-              /etc/apt/apt-mirrors.txt
-          fi
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-            -o Acquire::https::Timeout=30 update
-          sudo apt-get install --yes --no-install-recommends \
-            python3-pip python3-venv
+      - name: Install verified standalone ghr
+        id: ghr
+        uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        with:
+          ghr-version: v0.8.1
       - name: Create signed release download fixture
         id: download-fixture
         env:
@@ -333,27 +328,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_TOKEN: ${{ github.token }}
+          GHR_PATH: ${{ steps.ghr.outputs.ghr-path }}
+          GHR_VERSION: ${{ steps.ghr.outputs.ghr-version }}
+          GHR_TOOL_DIR: ${{ runner.temp }}/debz-release-ghr-tools
+          GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin
+          GHR_CACHE_DIR: ${{ runner.temp }}/debz-release-ghr-cache
           PLATFORM: ${{ matrix.platform }}
           VERSION: ${{ steps.release.outputs.version }}
         run: |
+          test -x "$GHR_PATH"
+          test "$GHR_VERSION" = v0.8.1
+          test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.8.1
           mkdir -p .zig-cache/released
           gh release download "$GITHUB_REF_NAME" --dir .zig-cache/released \
             --pattern "debz-$VERSION-$PLATFORM.tar.gz"
           python3 tools/release.py audit --tag "$GITHUB_REF_NAME" \
             --platform "$PLATFORM" \
             --archive ".zig-cache/released/debz-$VERSION-$PLATFORM.tar.gz" --smoke
-          python3 -m venv .zig-cache/ghr
-          .zig-cache/ghr/bin/pip install ghr-bin==0.7.0
-          .zig-cache/ghr/bin/ghr install cataggar/debz@v$VERSION
-          bin_dir=$(.zig-cache/ghr/bin/ghr path bin)
+          PATH=/no-host-interpreters "$GHR_PATH" install "cataggar/debz@v$VERSION"
+          bin_dir=$(PATH=/no-host-interpreters "$GHR_PATH" path bin)
+          test "$bin_dir" = "$GHR_BIN_DIR"
           test -x "$bin_dir/debz"
-          test "$("$bin_dir/debz" version)" = "$VERSION"
-          "$bin_dir/debz" --help
+          test "$(PATH=/no-host-interpreters "$bin_dir/debz" version)" = "$VERSION"
+          PATH=/no-host-interpreters "$bin_dir/debz" --help
           mkdir -p .zig-cache/smoke/root .zig-cache/smoke/cache .zig-cache/smoke/state
-          "$bin_dir/debz" list-installed \
+          PATH=/no-host-interpreters "$bin_dir/debz" list-installed \
             --install-root "$PWD/.zig-cache/smoke/root" \
             --cache-path "$PWD/.zig-cache/smoke/cache" \
             --state-path "$PWD/.zig-cache/smoke/state" \
             --status-path "$PWD/src/fixtures/dpkg-status/installed.status" \
             --architecture "${{ matrix.architecture }}" --json >.zig-cache/smoke/output.json
-          python3 -c 'import json; value=json.load(open(".zig-cache/smoke/output.json")); assert value["exit_status"] == 0'
+          jq --exit-status '.exit_status == 0' .zig-cache/smoke/output.json
