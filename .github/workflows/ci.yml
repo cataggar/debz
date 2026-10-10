@@ -1823,13 +1823,16 @@ jobs:
         timeout-minutes: 5
         working-directory: ${{ env.PROTECTED }}/checkout
         run: |
+          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
+            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
+            zig build build-signed-proc-compare test-signed-proc-compare \
+              -Doptimize="$OPTIMIZE" -j2 --summary all
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8 \
-            PYTHONDONTWRITEBYTECODE=1 bash -euo pipefail -c '
+            bash -euo pipefail -c '
               ws=$1/.real-snapshot/ws
-              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py
               install -d -o root -g root -m 0700 "$ws/compare"
               for target in systemd udev sudo; do
-                python3 tools/real-snapshot-signed-proc-compare.py "$target" \
+                PATH=/no-host-interpreters "$1/zig-out/bin/debz-signed-proc-compare" "$target" \
                   "$ws/native/$target" "$ws/proofs/$target" "$ws/compare/$target.json"
               done
             ' bash "$PWD"

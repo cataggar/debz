@@ -1308,9 +1308,21 @@ pub fn build(b: *std.Build) void {
     const dpkg_oracle_evidence_tests = b.addRunArtifact(dpkg_oracle_evidence_unit);
     b.step("test-dpkg-oracle-evidence", "Test native bounded oracle evidence and refusal boundaries").dependOn(&dpkg_oracle_evidence_tests.step);
     workload_native.dependOn(&dpkg_oracle_evidence_tests.step);
-    const signed_proc_compare_tests = b.addSystemCommand(
-        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_real_snapshot_signed_proc_compare.py" },
-    );
+    const signed_proc_compare_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-signed-proc-compare.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    signed_proc_compare_module.addImport("debz", debz);
+    const signed_proc_compare = b.addExecutable(.{
+        .name = "debz-signed-proc-compare",
+        .root_module = signed_proc_compare_module,
+    });
+    const install_signed_proc_compare = b.addInstallArtifact(signed_proc_compare, .{});
+    b.step("build-signed-proc-compare", "Build the native signed replay comparison CLI").dependOn(&install_signed_proc_compare.step);
+    const signed_proc_compare_unit = b.addTest(.{ .root_module = signed_proc_compare_module });
+    const signed_proc_compare_tests = b.addRunArtifact(signed_proc_compare_unit);
+    b.step("test-signed-proc-compare", "Test exact signed replay differences and rooted comparison refusals").dependOn(&signed_proc_compare_tests.step);
     workload_native.dependOn(&signed_proc_compare_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{

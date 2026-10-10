@@ -3760,9 +3760,12 @@ SIGNED_PROC_CI_STEPS = {
     ),
     "Compare native replays with pinned dpkg proofs": (
         "        working-directory: ${{ env.PROTECTED }}/checkout",
-        "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py",
+        '          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \\',
+        '            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \\',
+        '            zig build build-signed-proc-compare test-signed-proc-compare \\',
+        '              -Doptimize="$OPTIMIZE" -j2 --summary all',
         "              for target in systemd udev sudo; do",
-        '                python3 tools/real-snapshot-signed-proc-compare.py "$target" \\',
+        '                PATH=/no-host-interpreters "$1/zig-out/bin/debz-signed-proc-compare" "$target" \\',
         '                  "$ws/native/$target" "$ws/proofs/$target" "$ws/compare/$target.json"',
     ),
     "Execute signed binding refusal fixtures": (
