@@ -133,6 +133,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(workload_release);
     workload_core.dependOn(&run_tests.step);
 
+    const native_outcome_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-native-outcome.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_outcome_module.addImport("debz", debz);
+    const native_outcome = b.addExecutable(.{
+        .name = "debz-native-outcome",
+        .root_module = native_outcome_module,
+    });
+    const install_native_outcome = b.addInstallArtifact(native_outcome, .{});
+    b.step("build-native-outcome", "Build the bounded native acceptance outcome collector").dependOn(&install_native_outcome.step);
+    const native_outcome_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_outcome_module }));
+    b.step("test-native-outcome", "Test actual native outcome evidence and failure distinctions").dependOn(&native_outcome_tests.step);
+    workload_native.dependOn(&native_outcome_tests.step);
+
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);
@@ -472,6 +488,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_snapshot_policy_tests = b.addRunArtifact(snapshot_policy_tests);
+    const snapshot_policy_options = b.addOptions();
+    snapshot_policy_options.addOptionPath("native_outcome", native_outcome.getEmittedBin());
+    snapshot_policy_tests.root_module.addOptions("snapshot_policy_options", snapshot_policy_options);
     run_snapshot_policy_tests.setCwd(b.path("."));
     audit_step.dependOn(&run_snapshot_policy_tests.step);
     const snapshot_repin_options = b.addOptions();

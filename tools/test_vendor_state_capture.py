@@ -1406,7 +1406,7 @@ class VendorStateCaptureTests(unittest.TestCase):
         self.assertIn('capture_status == 0 && differential_status == 0', collector)
         self.assertIn('NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}', job)
         self.assertIn('NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME"', job)
-        self.assertIn('tools/real_snapshot_outcome.py "$evidence"', collector)
+        self.assertIn('zig-out/bin/debz-native-outcome "$evidence"', collector)
         self.assertIn('outcome_status == 0', collector)
         self.assertNotIn('"$evidence/refresh.json"', collector)
         self.assertIn('cleanup_status=%s', job)
