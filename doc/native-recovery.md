@@ -1911,9 +1911,8 @@ There were 56 Python methods: all have Zig assertions for the portable behavior,
 targets instead invoke `tools/generate-integration-repository.py`, which
 imports `generate-openpgp-fixtures.py` and `cryptography`, not the recovery
 acceptance module or `jsonschema`. Remaining required Python schema checks
-(`dpkg-oracle-evidence.py`, `test_vendor_state_capture.py`,
-`test_dpkg_config_reference.py`, `test_dpkg_alternatives_reference.py`,
-`test_dpkg_oracle_evidence.py`) call `jsonschema.Draft202012Validator`
+(`test_vendor_state_capture.py`, `test_dpkg_config_reference.py`,
+`test_dpkg_alternatives_reference.py`) call `jsonschema.Draft202012Validator`
 directly on self-contained schemas; none imports the recovery fallback or
 resolves an external `$ref`. With both Python
 recovery entry points retired on this branch, no remaining Python consumer needs this
@@ -1921,6 +1920,23 @@ fallback. Replacing a removed Python interpreter import branch with Zig would
 be a fixture-only substitute, not executed behavior; the actual cross-file
 v1/v2/v3 request refusal remains in the Zig unit target. The table records
 *coverage*, not approval of gate retirement without both CI matrices.
+
+The ARM oracle evidence `create` and `verify` consumers now use the compiled
+`debz-dpkg-oracle-evidence` tool, built by `build-dpkg-oracle-evidence` and
+tested by `test-dpkg-oracle-evidence`. Its closed typed v1 contract preserves
+the published ARM-only schema, original three-binary pinned receipt checks,
+canonical sorted ASCII JSON, both raw observation hashes, privacy and byte
+bounds, and RFC3339 calendar validation without an optional Python format
+plugin. It uses descriptor-rooted no-follow, single-link stable reads and
+exclusive mode-0600 output creation; aliases, hardlinks and reused output
+files refuse without truncation. JSON nesting is bounded to 64 levels.
+The CI evidence commands run with no interpreter directory in `PATH`.
+The tool does not execute or invent an oracle:
+the existing independently run pinned-dpkg config/alternatives drivers remain
+separate, and fixture-shaped constructor tests are not hosted execution
+evidence. This retires only the evidence driver, not those other Python
+drivers or the whole repository Python dependency.
+
 Former methods #44 and #45 tested a different Python-tool reader:
 `tools/test-native-recovery.py::provenance` passed a report-supplied path to
 `namespace_path`, which rejected escapes and arbitrary symlinks before
