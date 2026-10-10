@@ -732,7 +732,7 @@ elif [[ $architecture == arm64 ]]; then
   fi
   rm -rf --one-file-system -- "$less_workspace"
   bash_workspace=$checkout/.real-snapshot/bash-arm64
-  step arm64-bash-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
+  step arm64-bash-stage 0 "nine replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
     "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
     bash tools/real-snapshot-bash-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$bash_workspace"
   step arm64-bash-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m \
@@ -745,6 +745,7 @@ elif [[ $architecture == arm64 ]]; then
     "-Darm64-bash-postinst-bad-tool=$bash_workspace/bad-tool" \
     "-Darm64-bash-postinst-bad-alias=$bash_workspace/bad-alias" \
     "-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate" \
+    "-Darm64-bash-postinst-bad-cache=$bash_workspace/bad-cache" \
     "-Darm64-bash-postinst-proof=$bash_workspace/evidence/bash-postinst-proof.txt" \
     -Doptimize=ReleaseSafe -j2 --summary all
   grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips" "$bash_workspace/evidence/bash-postinst-proof.txt"

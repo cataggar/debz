@@ -200,7 +200,7 @@ authenticated_lock "$lock"
 if [[ $purpose == arm64-less || $purpose == arm64-bash ]]; then
   # Each CLI request accepts one root. Keep its authenticated lock intact.
   packages=(less dash util-linux)
-  if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux); fi
+  if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux libc-bin); fi
   for package in "${packages[@]}"; do
     package_lock=$evidence/$package.lock.json
     debz_step "$package-plan" plan "$snapshot/root" --transaction-backend native --lock-output "$package_lock" "$package"
