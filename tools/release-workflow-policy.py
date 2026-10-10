@@ -48,6 +48,7 @@ CI_GHR_ZIG_JOBS = (
     "native-recovery-zig-family",
     "native-recovery-zig-scenarios",
     "native-recovery-zig-diversions",
+    "arm64-dpkg-oracles",
     "signed-proc-protected-replay",
     "security-audit",
     "release-dry-run",

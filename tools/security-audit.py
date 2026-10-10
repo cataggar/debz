@@ -5011,7 +5011,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 21, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -5968,7 +5968,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 20)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":

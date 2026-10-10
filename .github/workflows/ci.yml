@@ -1504,8 +1504,24 @@ jobs:
           test "$RUNNER_ARCH" = ARM64
           test "$(uname -m)" = aarch64
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$GITHUB_REF_NAME" = issue-86-arm64-oracles
+          test "$GITHUB_REPOSITORY" = cataggar/debz
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = "refs/heads/$GITHUB_REF_NAME"
           test "$EXPECTED_INVOCATION_CLOCK" = "2026-09-20T16:29:21.965+00:00"
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Build and test native oracle evidence tooling
+        run: |
+          zig build build-dpkg-oracle-evidence test-dpkg-oracle-evidence -Doptimize=ReleaseSafe -j2 --summary all
       - name: Prepare digest-verified private ARM64 tools
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture arm64)"
@@ -1569,7 +1585,7 @@ jobs:
         run: |
           output="$PWD/.tmp/arm64-dpkg-oracles"
           reference="$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin"
-          python3 tools/dpkg-oracle-evidence.py create \
+          PATH=/no-host-interpreters zig-out/bin/debz-dpkg-oracle-evidence create \
             --architecture arm64 \
             --source-commit "$GITHUB_SHA" \
             --invocation-clock "$INVOCATION_CLOCK" \
@@ -1594,13 +1610,12 @@ jobs:
             --alternatives-stdout "$output/alternatives.stdout" \
             --alternatives-stderr "$output/alternatives.stderr" \
             --output "$output/dpkg-oracle-execution-evidence-arm64-v1.json"
-          python3 tools/dpkg-oracle-evidence.py verify \
+          PATH=/no-host-interpreters zig-out/bin/debz-dpkg-oracle-evidence verify \
             --evidence "$output/dpkg-oracle-execution-evidence-arm64-v1.json" \
             --artifact-root "$output"
           python3 -m unittest \
             tools/test_dpkg_config_reference.py \
-            tools/test_dpkg_alternatives_reference.py \
-            tools/test_dpkg_oracle_evidence.py
+            tools/test_dpkg_alternatives_reference.py
       - name: Upload canonical ARM64 oracle evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
