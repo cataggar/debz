@@ -96,4 +96,4 @@ timeout --signal=TERM --kill-after=5s 120s \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 8 * 1024 * 1024 * 1024 ))
-echo "signed arm64 bash source and eight fresh replay roots staged; required native receipt remains"
+echo "signed arm64 bash source and eight replay roots staged; required native receipt remains"

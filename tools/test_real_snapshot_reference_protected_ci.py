@@ -1286,6 +1286,29 @@ class SignedBashStagingTests(unittest.TestCase):
         (self.info / "bash.postinst").chmod(mode)
         self.stage = load("debz_bash_seal", "real_snapshot_less_stage.py")
 
+    def test_successful_stage_receipt_is_accepted_only_with_zero_exit_status(self) -> None:
+        stage = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
+        receipt = stage.strip().splitlines()[-1]
+        ci = (TOOLS / "real-snapshot-reference-protected-ci.sh").read_text()
+        helper = re.search(r"^step\(\) \{\n.*?^\}$", ci, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(helper)
+        activation = next(line for line in ci.splitlines()
+                          if line.startswith("  step arm64-bash-stage "))
+        arguments = shlex.split(activation.removesuffix("\\"))[:4]
+        with tempfile.TemporaryDirectory(dir=TOOLS.parent / ".zig-cache") as temporary:
+            environment = {**os.environ, "evidence": temporary,
+                           "codes": str(Path(temporary) / "exit-codes.tsv")}
+            for command, accepted in ((receipt, True), (receipt + "\nexit 1", False),
+                                      ('echo "stage exited without its receipt"', False)):
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c",
+                         helper.group(0) + '\nstep "$1" "$2" "$3" bash -c "$4"\n',
+                         arguments[0], *arguments[1:], command],
+                        env=environment, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_fresh_replays_preserve_existing_pinned_dpkg_directory_and_refuse_reuse(self) -> None:
         script = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
         copies = re.search(r"^for name in [^\n]+; do\n.*?^done$", script, re.MULTILINE | re.DOTALL)
