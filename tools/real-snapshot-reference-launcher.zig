@@ -72,8 +72,8 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
     null,
 };
 
-const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle };
+const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle, kbd_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle, break_kbd_cycle };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -92,6 +92,7 @@ const dpkg_digests = [_][]const u8{
 const CycleBinding = struct {
     name: []const u8,
     version: []const u8,
+    architecture: []const u8 = "amd64",
     depends: []const u8,
     archive_size: usize,
     archive_sha512: []const u8,
@@ -109,7 +110,14 @@ const openssl_cycle = [_]CycleBinding{
     .{ .name = "libzstd1", .version = "1.5.7+dfsg-3", .depends = "libc6 (>= 2.34)", .archive_size = 308174, .archive_sha512 = "284a44950a9caae10a6b7a06baead5db2d6dd2989fc01107c78c76ef5468cb489fc1a8e92d6cb84d44b5a371f8b1156bd2f5c232e79f1631dcf000a601e52183" },
     .{ .name = "zlib1g", .version = "1:1.3.dfsg+really1.3.1-1ubuntu3.1", .depends = "libc6 (>= 2.14)", .archive_size = 61612, .archive_sha512 = "a0ad94daadd3099ee40766a62a42d3fa7f431c6d805e9108d1dde07d64bfe3e7da66a41a2294598917e5ef5435df7a239d011711dd6d18037bc9b61b530ed3d4" },
 };
-const CycleKind = enum { base, openssl };
+const kbd_cycle = [_]CycleBinding{
+    .{ .name = "kbd", .version = "2.7.1-2ubuntu2", .depends = "libc6 (>= 2.38), console-setup | console-setup-mini", .archive_size = 238014, .archive_sha512 = "5a1fcb79b59441d380b4f6f38198ab4e7b04e50a759580302643ab1f138d88c900145612dfe0861eab37c5f9ebbb6218bc3a5585366be04d4cd00f85efa16050" },
+    .{ .name = "console-setup-linux", .version = "1.237ubuntu3.1", .architecture = "all", .depends = "kbd (>= 0.99-12) | console-tools (>= 1:0.2.3-16), keyboard-configuration (= 1.237ubuntu3.1), init-system-helpers (>= 1.29~) | initscripts", .archive_size = 6206020, .archive_sha512 = "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b" },
+    .{ .name = "console-setup", .version = "1.237ubuntu3.1", .architecture = "all", .depends = "console-setup-linux | hurd, xkb-data (>= 0.9), keyboard-configuration (= 1.237ubuntu3.1), debconf (>= 0.5) | debconf-2.0", .archive_size = 102654, .archive_sha512 = "776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832" },
+    base_cycle[0],
+};
+const kbd_triggers = "# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n";
+const CycleKind = enum { base, openssl, kbd };
 const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
 const cycle_graph_keys = [_][]const u8{
     "Depends",    "Pre-Depends", "Breaks",    "Conflicts",        "Provides",         "Replaces",
@@ -160,10 +168,34 @@ fn opensslGraphField(index: usize, key: []const u8) []const u8 {
     return "";
 }
 
+fn kbdGraphField(index: usize, key: []const u8) []const u8 {
+    if (index == 3) return cycleGraphField(0, key);
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return kbd_cycle[index].depends;
+    if (std.ascii.eqlIgnoreCase(key, "Pre-Depends")) return if (index == 2) "debconf | debconf-2.0" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        1 => "console-cyrillic (<= 0.9-11), console-setup (<< 1.71), console-terminus",
+        2 => "lsb (<< 2.0-6), lsb-base (<< 3.0-6), lsb-core (<< 2.0-6)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Conflicts")) return switch (index) {
+        0 => "console-utilities",
+        2 => "console-setup-mini",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return switch (index) {
+        0 => "console-utilities",
+        1 => "console-terminus",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return if (index == 1) "console-setup (<< 1.71), console-terminus" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index == 1 or index == 2) "foreign" else "";
+    return "";
+}
+
 fn scriptBinding(profile: Profile) ?ScriptBinding {
     return switch (profile) {
         .systemd, .udev, .sudo => script_bindings[@intFromEnum(profile) - 1],
-        .none, .libgcc_cycle, .openssl_cycle => null,
+        .none, .libgcc_cycle, .openssl_cycle, .kbd_cycle => null,
     };
 }
 
@@ -181,6 +213,7 @@ const Options = struct {
     archive_size: ?usize = null,
     cycle_archives: ?[base_cycle.len][:0]const u8 = null,
     openssl_archives: ?[openssl_cycle.len][:0]const u8 = null,
+    kbd_archives: ?[kbd_cycle.len][:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -208,6 +241,7 @@ pub fn main(init: std.process.Init) !void {
     const runtime_path = args.next() orelse return error.InvalidArguments;
     var cycle_archives: ?[base_cycle.len][:0]const u8 = null;
     var openssl_archives: ?[openssl_cycle.len][:0]const u8 = null;
+    var kbd_archives: ?[kbd_cycle.len][:0]const u8 = null;
     if (verb == .break_base_cycle) {
         var paths: [base_cycle.len][:0]const u8 = undefined;
         for (&paths) |*path| {
@@ -222,7 +256,14 @@ pub fn main(init: std.process.Init) !void {
         }
         openssl_archives = paths;
     }
-    const normal = cycle_archives == null and openssl_archives == null;
+    if (verb == .break_kbd_cycle) {
+        var paths: [kbd_cycle.len][:0]const u8 = undefined;
+        for (&paths) |*path| {
+            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+        }
+        kbd_archives = paths;
+    }
+    const normal = cycle_archives == null and openssl_archives == null and kbd_archives == null;
     const archive = if (normal) args.next() else null;
     const digest = if (normal) args.next() else null;
     const size_text = if (normal) args.next() else null;
@@ -240,6 +281,7 @@ pub fn main(init: std.process.Init) !void {
         .archive_size = if (size_text) |value| try std.fmt.parseInt(usize, value, 10) else null,
         .cycle_archives = cycle_archives,
         .openssl_archives = openssl_archives,
+        .kbd_archives = kbd_archives,
     };
     try validateOptions(options);
     const status = try run(init.arena.allocator(), options);
@@ -267,7 +309,7 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle;
+    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle or options.verb == .break_kbd_cycle;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
@@ -277,6 +319,16 @@ fn validateOptions(options: Options) !void {
         return error.InvalidArguments;
     if ((options.verb == .configure_openssl_cycle) != (options.openssl_archives != null))
         return error.InvalidArguments;
+    if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))
+        return error.InvalidArguments;
+    if (options.kbd_archives) |paths| {
+        for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
+        if (options.profile != .kbd_cycle or architecture_index != 0 or
+            !std.mem.eql(u8, options.selector.?, "kbd:amd64"))
+            return error.InvalidCycleProfile;
+    } else if (options.profile == .kbd_cycle) {
+        return error.InvalidCycleProfile;
+    }
     if (options.openssl_archives) |paths| {
         for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
         if (options.profile != .openssl_cycle or architecture_index != 0 or
@@ -576,8 +628,16 @@ fn cycleStatusMatches(status: []const u8) bool {
 }
 
 fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
-    const bindings = if (kind == .base) base_cycle else openssl_cycle;
-    const graphField = if (kind == .base) cycleGraphField else opensslGraphField;
+    const bindings = switch (kind) {
+        .base => base_cycle,
+        .openssl => openssl_cycle,
+        .kbd => kbd_cycle,
+    };
+    const graphField = switch (kind) {
+        .base => cycleGraphField,
+        .openssl => opensslGraphField,
+        .kbd => kbdGraphField,
+    };
     var matched = [_]bool{false} ** bindings.len;
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
@@ -633,8 +693,8 @@ fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
             for (cycle_graph_keys, graph_seen) |key, seen| {
                 if (!seen and graphField(index, key).len != 0) return false;
             }
-            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, binding.version) or
-                !std.mem.eql(u8, depends, binding.depends) or !std.mem.eql(u8, state, if (index < 2)
+            if (!std.mem.eql(u8, architecture, binding.architecture) or !std.mem.eql(u8, version, binding.version) or
+                !std.mem.eql(u8, depends, binding.depends) or !std.mem.eql(u8, state, if (index < (if (kind == .kbd) @as(usize, 3) else 2))
                 "install ok unpacked"
             else
                 "install ok installed")) return false;
@@ -657,12 +717,24 @@ fn verifyCycle(comptime kind: CycleKind) !void {
         const pending = readInstalledFile(unincorp_path, 0) catch return error.CycleCallbackChanged;
         std.heap.page_allocator.free(pending);
     } else if (linux.errno(unincorp) != .NOENT) return error.CycleCallbackChanged;
-    const activation_name = if (kind == .base) "libgcc-s1" else "libssl3t64";
-    const triggers = readInstalledFile("/var/lib/dpkg/info/" ++ activation_name ++ ":amd64.triggers", 1024) catch return error.CycleCallbackChanged;
+    const activation_name = switch (kind) {
+        .base => "libgcc-s1",
+        .openssl => "libssl3t64",
+        .kbd => "kbd",
+    };
+    const activation_path = if (kind == .kbd)
+        "/var/lib/dpkg/info/kbd.triggers"
+    else
+        "/var/lib/dpkg/info/" ++ activation_name ++ ":amd64.triggers";
+    const triggers = readInstalledFile(activation_path, 1024) catch return error.CycleCallbackChanged;
     defer std.heap.page_allocator.free(triggers);
-    if (!std.mem.eql(u8, triggers, "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"))
+    if (!std.mem.eql(u8, triggers, if (kind == .kbd) kbd_triggers else "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"))
         return error.CycleCallbackChanged;
-    const unqualified = linux.open("/var/lib/dpkg/info/" ++ activation_name ++ ".triggers", .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    const other_path = if (kind == .kbd)
+        "/var/lib/dpkg/info/kbd:amd64.triggers"
+    else
+        "/var/lib/dpkg/info/" ++ activation_name ++ ".triggers";
+    const unqualified = linux.open(other_path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     if (linux.errno(unqualified) == .SUCCESS) {
         _ = linux.close(@intCast(unqualified));
         return error.CycleCallbackChanged;
@@ -672,10 +744,11 @@ fn verifyCycle(comptime kind: CycleKind) !void {
         try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy.triggers");
         try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy:amd64.triggers");
     }
-    const names = if (kind == .base)
-        .{ "libgcc-s1", "libgcc-s1:amd64" }
-    else
-        .{ "libssl3t64", "libssl3t64:amd64", "openssl-provider-legacy", "openssl-provider-legacy:amd64" };
+    const names = switch (kind) {
+        .base => .{ "libgcc-s1", "libgcc-s1:amd64" },
+        .openssl => .{ "libssl3t64", "libssl3t64:amd64", "openssl-provider-legacy", "openssl-provider-legacy:amd64" },
+        .kbd => .{ "kbd", "kbd:amd64" },
+    };
     inline for (names) |name| {
         inline for (.{ "preinst", "postinst", "prerm", "postrm", "config" }) |script| {
             const path = "/var/lib/dpkg/info/" ++ name ++ "." ++ script;
@@ -970,7 +1043,7 @@ fn mountArchive(child: Child) linux.E {
 }
 
 fn mountProc(child: Child) linux.E {
-    if (child.options.profile == .none or child.options.profile == .libgcc_cycle or child.options.profile == .openssl_cycle) return .SUCCESS;
+    if (child.options.profile == .none or child.options.profile == .libgcc_cycle or child.options.profile == .openssl_cycle or child.options.profile == .kbd_cycle) return .SUCCESS;
     const proc = openPinned("/proc", true) catch return .STALE;
     defer _ = linux.close(proc.fd);
     if (!same(proc.metadata, child.proc_mountpoint.metadata)) return .STALE;
@@ -1336,6 +1409,11 @@ fn childMain(input: Child) noreturn {
             std.log.err("reference OpenSSL operation refused: {s}", .{@errorName(err)});
             fail(status, 11, .STALE);
         };
+    if (child.options.verb == .break_kbd_cycle)
+        verifyCycle(.kbd) catch |err| {
+            std.log.err("reference kbd cycle operation refused: {s}", .{@errorName(err)});
+            fail(status, 11, .STALE);
+        };
     const archive_setup = mountArchive(child);
     if (archive_setup != .SUCCESS) fail(status, 5, archive_setup);
     const proc_setup = mountProc(child);
@@ -1356,6 +1434,7 @@ fn childMain(input: Child) noreturn {
         .configure, .continue_prestate => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
         .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
+        .break_kbd_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", "kbd:amd64", null },
     };
     const loader_name = std.fmt.allocPrintSentinel(
         allocator,
@@ -1506,6 +1585,18 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
             _ = linux.close(source.fd);
         }
     }
+    if (options.kbd_archives) |paths| {
+        for (paths, kbd_cycle) |path, binding| {
+            const source = openVerified(
+                path,
+                std.crypto.hash.sha2.Sha512,
+                binding.archive_sha512,
+                binding.archive_size,
+                binding.archive_size,
+            ) catch return error.CycleIdentityChanged;
+            _ = linux.close(source.fd);
+        }
+    }
     const root_proc = try std.fmt.allocPrintSentinel(allocator, "{s}/proc", .{options.root}, 0);
     const proc = try openPinned(root_proc, true);
     defer _ = linux.close(proc.fd);
@@ -1613,10 +1704,11 @@ fn cycleStatusFixture(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn cycleStatusFixtureFor(allocator: std.mem.Allocator, comptime kind: CycleKind) ![]u8 {
-    const source = if (kind == .base)
-        @embedFile("fixtures/real-snapshot/base-cycle-controls-v1.json")
-    else
-        @embedFile("fixtures/real-snapshot/openssl-cycle-controls-v1.json");
+    const source = switch (kind) {
+        .base => @embedFile("fixtures/real-snapshot/base-cycle-controls-v1.json"),
+        .openssl => @embedFile("fixtures/real-snapshot/openssl-cycle-controls-v1.json"),
+        .kbd => @embedFile("fixtures/real-snapshot/kbd-cycle-controls-v1.json"),
+    };
     const fixture = try std.json.parseFromSlice(struct {
         packages: []const struct { control: []const u8, status: []const u8 },
     }, allocator, source, .{ .ignore_unknown_fields = true });
@@ -1656,6 +1748,55 @@ test "reference OpenSSL pair refuses changed signed graph, pending triggers and 
     }
     const missing = std.mem.indexOf(u8, status, "Package: zlib1g").?;
     try std.testing.expect(!cycleStatusMatchesFor(status[0..missing], .openssl));
+}
+
+test "reference kbd cycle binds original all-architecture peers and installed outside libc" {
+    const allocator = std.testing.allocator;
+    const status = try cycleStatusFixtureFor(allocator, .kbd);
+    defer allocator.free(status);
+    try std.testing.expect(cycleStatusMatchesFor(status, .kbd));
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "Architecture: all", .after = "Architecture: amd64" },
+        .{ .before = "Depends: libc6 (>= 2.38), console-setup", .after = "Depends: libc6 (>= 2.38), other" },
+        .{ .before = "Pre-Depends: debconf | debconf-2.0", .after = "Pre-Depends: other" },
+        .{ .before = "Status: install ok installed", .after = "Status: install ok unpacked" },
+        .{ .before = "Status: install ok unpacked", .after = "Status: install ok triggers-pending" },
+        .{ .before = "Provides: console-utilities", .after = "Provides: console-utilities\nTriggers-Pending: update-initramfs" },
+        .{ .before = "Version: 2.7.1-2ubuntu2", .after = "Version: 2.7.1-2ubuntu3" },
+    }) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, allocator, status, mutation.before, mutation.after);
+        defer allocator.free(changed);
+        try std.testing.expect(!cycleStatusMatchesFor(changed, .kbd));
+    }
+}
+
+test "reference kbd cycle operation never authorizes a console callback or another architecture" {
+    const options: Options = .{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
+        .architecture = "amd64",
+        .profile = .kbd_cycle,
+        .verb = .break_kbd_cycle,
+        .selector = "kbd:amd64",
+        .kbd_archives = .{ "/protected/kbd", "/protected/linux", "/protected/console", "/protected/libc" },
+    };
+    try validateOptions(options);
+    var changed = options;
+    changed.selector = "console-setup-linux";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.architecture = "arm64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.profile = .none;
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.verb = .configure;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.kbd_archives = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
 }
 
 test "reference OpenSSL operation cannot become a generic batch or proc profile" {

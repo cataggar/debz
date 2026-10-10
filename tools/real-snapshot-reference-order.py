@@ -61,6 +61,20 @@ OPENSSL_CYCLE = (
      "libc6 (>= 2.14)"),
 )
 OPENSSL_CYCLE_PROFILE = "openssl_cycle"
+KBD_CYCLE = (
+    ("kbd", "2.7.1-2ubuntu2", "amd64", 238014,
+     "5a1fcb79b59441d380b4f6f38198ab4e7b04e50a759580302643ab1f138d88c900145612dfe0861eab37c5f9ebbb6218bc3a5585366be04d4cd00f85efa16050",
+     "libc6 (>= 2.38), console-setup | console-setup-mini"),
+    ("console-setup-linux", "1.237ubuntu3.1", "all", 6206020,
+     "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
+     "kbd (>= 0.99-12) | console-tools (>= 1:0.2.3-16), keyboard-configuration (= 1.237ubuntu3.1), init-system-helpers (>= 1.29~) | initscripts"),
+    ("console-setup", "1.237ubuntu3.1", "all", 102654,
+     "776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832",
+     "console-setup-linux | hurd, xkb-data (>= 0.9), keyboard-configuration (= 1.237ubuntu3.1), debconf (>= 0.5) | debconf-2.0"),
+    (BASE_CYCLE[0][0], BASE_CYCLE[0][1], "amd64", *BASE_CYCLE[0][2:]),
+)
+KBD_CYCLE_PROFILE = "kbd_cycle"
+KBD_TRIGGERS = b"# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n"
 SUDO_PRESTATE_COMPANION = ("sudo-rs", "0.2.13-0ubuntu1.2", "amd64")
 MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm", "config")
 LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"
@@ -154,6 +168,15 @@ def dpkg_command(
     launcher: Launcher, dpkg: Path, root: Path, architecture: str, profile: str,
     verb: str, package: Package | None = None, cycle: tuple[Package, ...] = (),
 ) -> list[str]:
+    if verb == "break_kbd_cycle":
+        if (architecture != "amd64" or profile != KBD_CYCLE_PROFILE
+            or len(cycle) != len(KBD_CYCLE) or package != cycle[0]
+            or any((p.name, p.version, p.architecture, p.size, p.digest) !=
+                   (name, version, arch, size, digest)
+                   for p, (name, version, arch, size, digest, _) in zip(cycle, KBD_CYCLE))):
+            raise CycleRefusal("CycleIdentityChanged: unauthorized kbd cycle operation")
+        return [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, str(launcher.runtime), *(str(p.archive) for p in cycle)]
     if verb == "configure_openssl_cycle":
         if (architecture != "amd64" or profile != OPENSSL_CYCLE_PROFILE
             or len(cycle) != len(OPENSSL_CYCLE) or package != cycle[0]
@@ -565,6 +588,112 @@ def configure_openssl_cycle(
     }, sort_keys=True) + "\n")
     return cycle[:2]
 
+def kbd_cycle_packages(packages: list[Package], architecture: str) -> tuple[Package, ...]:
+    if architecture != "amd64":
+        raise CycleRefusal("UnknownCycle: no reviewed kbd cycle for this architecture")
+    cycle = []
+    for name, version, arch, size, digest, _ in KBD_CYCLE:
+        matches = [package for package in packages if package.name == name]
+        if (len(matches) != 1 or
+            (matches[0].version, matches[0].architecture, matches[0].size, matches[0].digest)
+                != (version, arch, size, digest)):
+            raise CycleRefusal(f"CycleIdentityChanged: {name}")
+        cycle.append(matches[0])
+    return tuple(cycle)
+
+
+def verify_kbd_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
+    records = database_fields(root)
+    triggers_before = trigger_database(root)
+    graph = {}
+    for index, (package, binding) in enumerate(zip(cycle, KBD_CYCLE)):
+        verify_archive(package)
+        result = subprocess.run(
+            ["dpkg-deb", "--ctrl-tarfile", str(package.archive)],
+            env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            check=True, timeout=30,
+        )
+        if len(result.stdout) > MAXIMUM_CONTROL_BYTES or result.stderr:
+            raise CycleRefusal("CycleControlChanged: oversized kbd control archive")
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            control = archive.extractfile("./control")
+            if control is None:
+                raise CycleRefusal("CycleControlChanged: missing kbd cycle control")
+            fields, = control_fields(control.read(MAXIMUM_PROBE_OUTPUT + 1))
+            if index == 0:
+                if {member.name for member in archive.getmembers()} != {
+                    ".", "./control", "./md5sums", "./triggers",
+                }:
+                    raise CycleRefusal("CycleCallbackChanged: kbd must have no maintainer scripts")
+                activation = archive.extractfile("./triggers")
+                if activation is None or activation.read(1025) != KBD_TRIGGERS:
+                    raise CycleRefusal("CycleCallbackChanged: signed kbd activation changed")
+        if (fields.get("package") != package.name or fields.get("version") != package.version
+            or fields.get("architecture") != package.architecture
+            or fields.get("depends", "") != binding[5]
+            or fields.get("pre-depends", "") != ("debconf | debconf-2.0" if index == 2 else "")):
+            raise CycleRefusal(f"CycleControlChanged: signed kbd graph: {package.name}")
+        installed = records.get((package.name, package.architecture))
+        expected = "install ok unpacked" if index < 3 else "install ok installed"
+        if installed is None or installed.get("version") != package.version:
+            raise CycleRefusal(f"CycleStateChanged: {package.name}")
+        if installed.get("status") != expected:
+            raise CycleRefusal(f"CycleStateChanged: {package.name}")
+        for field in ("depends", "pre-depends", "provides", "conflicts", "breaks", "replaces",
+                      "multi-arch", "protected", "essential"):
+            if installed.get(field, "") != fields.get(field, ""):
+                raise CycleRefusal(f"CycleControlChanged: installed {package.name} {field}")
+        if any(installed.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version")):
+            raise CycleRefusal(f"CycleCallbackChanged: {package.name} trigger state")
+        graph[package.name] = {"version": package.version, "architecture": package.architecture,
+                              "archive_sha512": package.digest, "depends": binding[5], "status": expected}
+    if read_root_file(root, "var/lib/dpkg/info/kbd.triggers", 1024) != KBD_TRIGGERS:
+        raise CycleRefusal("CycleCallbackChanged: installed kbd trigger activation changed")
+    info = root / "var/lib/dpkg/info"
+    forbidden = ["kbd:amd64.triggers"]
+    forbidden.extend(f"{name}.{script}" for name in ("kbd", "kbd:amd64") for script in MAINTAINER_SCRIPTS)
+    for name in forbidden:
+        path = info / name
+        if path.exists() or path.is_symlink():
+            raise CycleRefusal(f"CycleCallbackChanged: unexpected {name}")
+    return {"graph": graph, "records": records, "callbacks": [],
+            "trigger_database": triggers_before, "profile": KBD_CYCLE_PROFILE,
+            "force": ["--force-depends"]}
+
+
+def break_kbd_cycle(
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+) -> Package:
+    cycle = kbd_cycle_packages(packages, architecture)
+    before = verify_kbd_cycle(root, cycle)
+    command = dpkg_command(launcher, dpkg, root, architecture, "none", "probe_configure", cycle[0])
+    status, output = probe(command, environment, evidence)
+    (evidence / "kbd-cycle-refusal.json").write_text(json.dumps({
+        "argv": command[3:], "exit_status": status,
+        "output": output.decode("utf-8", errors="replace"),
+    }, sort_keys=True) + "\n")
+    if (not status or b"dependency problems" not in output
+        or b"Package console-setup is not configured yet." not in output):
+        raise CycleRefusal("CycleProbeChanged: kbd did not refuse its exact console-setup peer")
+    (evidence / "kbd-cycle-before.json").write_text(json.dumps(
+        {**before, "records": list(before["records"].values())}, sort_keys=True,
+    ) + "\n")
+    command = dpkg_command(launcher, dpkg, root, architecture, KBD_CYCLE_PROFILE,
+                           "break_kbd_cycle", cycle[0], cycle)
+    apply(command, environment, stdout, stderr)
+    after = database_fields(root)
+    triggers_after = trigger_database(root)
+    expected = {key: dict(value) for key, value in before["records"].items()}
+    expected[("kbd", "amd64")]["status"] = "install ok installed"
+    if after != expected or triggers_after != before["trigger_database"]:
+        raise CycleRefusal("CycleNoProgress: database changed beyond the one reviewed kbd transition")
+    (evidence / "kbd-cycle-after.json").write_text(json.dumps({
+        "operation": command[3:], "callbacks": [], "force": ["--force-depends"],
+        "trigger_database": triggers_after, "records": list(after.values()),
+    }, sort_keys=True) + "\n")
+    return cycle[0]
+
 
 def stage_pending_runtime(baseline: Path, setpriv: Path) -> dict:
     """Stage setpriv's signed library only in the unregistered pending oracle."""
@@ -909,6 +1038,7 @@ def install(
     probes = 0
     cycle_broken = False
     openssl_configured = False
+    kbd_configured = False
     while pending or unpacked:
         progressed = False
         deferred: list[str] = []
@@ -991,6 +1121,7 @@ def install(
         if not progressed:
             (evidence / "reference-no-progress.json").write_text(json.dumps({
                 "base_cycle_applied": cycle_broken, "openssl_cycle_applied": openssl_configured,
+                "kbd_cycle_applied": kbd_configured,
                 "deferred": deferred, "refusals": refusals[:128],
                 "refusals_truncated": len(refusals) > 128,
             }, sort_keys=True) + "\n")
@@ -1018,6 +1149,19 @@ def install(
                     unpacked.remove(package)
                     configured.add((package.name, package.architecture))
                 openssl_configured = True
+                continue
+            if (not kbd_configured and
+                {"kbd", "console-setup-linux", "console-setup"} <= {p.name for p in unpacked}):
+                probes += 1
+                if probes > MAXIMUM_PROBES:
+                    raise ValueError("reference dpkg dependency probe limit exceeded")
+                selected = break_kbd_cycle(
+                    launcher, dpkg, root, evidence, architecture, packages,
+                    environment, stdout, stderr,
+                )
+                unpacked.remove(selected)
+                configured.add((selected.name, selected.architecture))
+                kbd_configured = True
                 continue
             raise CycleRefusal(
                 "CycleNoProgress: reference dependency ordering stalled; ambiguous --configure --pending "
