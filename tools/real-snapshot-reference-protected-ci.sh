@@ -555,6 +555,7 @@ step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree
 
 stage_native_inputs() {
   step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
+  step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2
   python3 -I - "$checkout/tools" "$architecture" "$tree/reference-dpkg" <<'PY'
 import importlib.util
 from pathlib import Path
