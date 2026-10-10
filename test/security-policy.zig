@@ -684,6 +684,11 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         .{ .before = "          test ! -s .tmp/protected-writable.txt\n", .after = "" },
         .{ .before = "for path in / /srv /srv/debz-protected \"$PROTECTED\"; do", .after = "for path in \"$PROTECTED\"; do" },
         .{ .before = "            tools/real-snapshot-signed-proc-prestates.sh \\", .after = "            true \\" },
+        .{ .before = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 12\n", .after = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 25\n" },
+        .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 25\n" },
+        .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n        timeout-minutes: 25\n" },
+        .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        if: false\n        timeout-minutes: 12\n" },
+        .{ .before = "            DEBZ_ZIG=\"$PROTECTED/zig/zig\" \\\n", .after = "" },
         .{ .before = "          sudo -n test -s \"$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json\"\n", .after = "" },
         .{ .before = "          sudo -n test -s \"$PWD/.real-snapshot/ws/prestate-build/evidence/openssl-cycle-after.json\"\n", .after = "" },
         .{ .before = "                snapshot/evidence/refresh.json snapshot/evidence/refresh.stderr \\\n", .after = "" },
@@ -2436,6 +2441,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-bash-protected-stage.sh", &.{
         "      /var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu\n",
+        "\"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-util-linux-source-protected \\\n",
+        "  \"-Darm64-util-linux-source-root=$source\" \\\n",
+        "grep -Fx \"signed arm64 util-linux original archive source validated without callback admission or skips\" \"$workspace/evidence/util-linux-source-proof.txt\"\n",
+        "cmp \"$workspace/evidence/util-linux-original-native.postinst\" \"$workspace/evidence/util-linux-original-dpkg.postinst\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
         "        --force-depends --no-triggers --configure less\n",
@@ -2448,6 +2457,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
         "        for package in SOURCE_ARTIFACTS:\n            archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
         "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
+        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.deb\", util_linux, 0o644)\n",
+        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.lock.json\", util_linux_lock, 0o644)\n",
     });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
         "      run_protected_reference:\n",
