@@ -325,6 +325,17 @@ the already-retained arm64 lock and original signed Packages index; the
 original report, locks, InRelease and indexes remain unchanged. This adds
 the missing source bytes, not a new probe or a protected less replay claim.
 
+The current bundle also retains both original `bash 5.3-2ubuntu1` archives
+for the shared postinst identity. Their SHA-512, size, version and architecture
+are independently rederived from the retained locks and signed Packages
+indices; their postinst bytes, size (491) and mode (0755) agree with the
+existing fixture. The previous archives, locks, InRelease and index bytes
+remain unchanged. Only the source index and report's `artifact_sources`
+registrations are supplemented; probe clocks, freshness and admission
+deadline are not renewed. This is source authentication only: native ARM
+bash postinst execution still refuses until its runtime authority and
+protected reference comparison are separately qualified.
+
 Ownership-list pins bind the original data-tar member order, not a sorted
 path set. Less sealing and Python empty-fixture preparation validate those
 exact archive-derived bytes without rewriting the `.list` files. Reordering
