@@ -25,6 +25,11 @@ SOURCE_ARTIFACTS = {
     "dpkg": ("1.23.7ubuntu1", 1260980, "824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"),
     "libc6": ("2.43-2ubuntu2.4", 1642036, "865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7"),
 }
+BASH_ARTIFACTS = {
+    "bash": ("5.3-2ubuntu1", 829052, "7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"),
+    "libtinfo6": ("6.6+20251231-1", 107766, "301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"),
+}
+ARCHIVE_ARTIFACTS = {**SOURCE_ARTIFACTS, **BASH_ARTIFACTS}
 
 
 def directory(root: Path, relative: str, mode: int = 0o755) -> None:
@@ -79,8 +84,8 @@ def archive(lock: dict, cache: Path, package: str) -> Path:
     if (entry["origin"]["type"] != "authenticated_repository" or
             identity["primary"] != "sha512" or len(digests) != 1):
         raise ValueError("unauthenticated source archive")
-    if package in SOURCE_ARTIFACTS and (
-            entry["version"], entry["declared_size"], digests[0]) != SOURCE_ARTIFACTS[package]:
+    if package in ARCHIVE_ARTIFACTS and (
+            entry["version"], entry["declared_size"], digests[0]) != ARCHIVE_ARTIFACTS[package]:
         raise ValueError("source archive differs from exact production authority")
     path = cache / f"sha512-{digests[0]}"
     protected(path)
@@ -138,13 +143,16 @@ def limit_capture() -> None:
 
 
 def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
-            *additional_locks: Path) -> None:
+            *additional_locks: Path, package: str = "less") -> None:
+    if package not in ("less", "bash"):
+        raise ValueError("unsupported signed alternatives source")
+    selected_package = package
     if len(additional_locks) not in (0, 3):
         raise ValueError("separate less, dash and util-linux locks must be provided together")
     for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):
         protected(path)
     protected(root, directory=True)
-    goals = ("dpkg", "less", "dash", "util-linux")
+    goals = ("dpkg", selected_package, "dash", "util-linux")
     paths = (lock_path, *additional_locks) if additional_locks else (lock_path,) * len(goals)
     locks = {}
     for goal, path in zip(goals, paths):
@@ -152,8 +160,13 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
         if lock["target_architecture"] != "arm64":
             raise ValueError(f"source target must be arm64: {path}")
         locks[goal] = lock
-    for package in SOURCE_ARTIFACTS:
-        archive(locks["dpkg" if package == "libc6" else package], cache, package)
+    if selected_package == "less":
+        for package in SOURCE_ARTIFACTS:
+            archive(locks["dpkg" if package == "libc6" else package], cache, package)
+    else:
+        for name in ("bash", "libtinfo6", "dash", "dpkg", "libc6"):
+            source_lock = locks["bash" if name == "libtinfo6" else "dpkg" if name == "libc6" else name]
+            archive(source_lock, cache, name)
     remove_lib64(root)
     for path in ("etc", "etc/alternatives", "var/lib/dpkg/alternatives",
                  "var/lib/debz-lifecycle-scripts"):
@@ -168,9 +181,12 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
         create_exclusive(root, path, member(archive(lock, cache, package), path), mode)
     alias(root, "usr/bin/sh", "dash")
     alias(root, "usr/lib/aarch64-linux-gnu/libcap-ng.so.0", "libcap-ng.so.0.0.0")
+    if selected_package == "bash":
+        tinfo = archive(locks["bash"], cache, "libtinfo6")
+        create_exclusive(root, "var/lib/dpkg/producer-libtinfo6.deb", tinfo.read_bytes(), 0o644)
     create_exclusive(root, "var/lib/dpkg/producer-dpkg", pinned.read_bytes(), 0o755)
-    less = archive(locks["less"], cache, "less")
-    create_exclusive(root, "var/lib/dpkg/producer-less.deb", less.read_bytes(), 0o644)
+    original = archive(locks[selected_package], cache, selected_package)
+    create_exclusive(root, f"var/lib/dpkg/producer-{selected_package}.deb", original.read_bytes(), 0o644)
 
 
 def seal(root: Path) -> None:
@@ -192,13 +208,30 @@ def seal(root: Path) -> None:
     create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", preinst, 0o755)
     create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755)
 
+def seal_bash(root: Path) -> None:
+    with regular_descriptor(root, "var/lib/dpkg/info/bash.list") as descriptor:
+        listing = os.read(descriptor, 2048)
+    if (len(listing) != 1068 or hashlib.sha256(listing).hexdigest() !=
+            "f258025bf7b7200aaef0a62c5793535fab6500c7de9d7fbffc069eb78444505c"):
+        raise ValueError("signed bash ownership path set changed")
+    with regular_descriptor(root, "var/lib/dpkg/info/bash.postinst") as descriptor:
+        script = os.read(descriptor, 1024)
+    if (len(script) != 491 or hashlib.sha256(script).hexdigest() !=
+            "72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d"):
+        raise ValueError("signed bash postinst changed")
+    create_exclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755)
+
 
 if __name__ == "__main__":
     if os.geteuid() != 0 or os.getegid() != 0:
         raise SystemExit("protected less source setup requires root")
     if sys.argv[1] == "prepare":
         prepare(*(Path(argument) for argument in sys.argv[2:]))
+    elif sys.argv[1] == "prepare-bash":
+        prepare(*(Path(argument) for argument in sys.argv[2:]), package="bash")
     elif sys.argv[1] == "seal":
         seal(Path(sys.argv[2]))
+    elif sys.argv[1] == "seal-bash":
+        seal_bash(Path(sys.argv[2]))
     else:
         raise SystemExit("unknown source setup stage")

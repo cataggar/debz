@@ -127,6 +127,12 @@ collect() {
     find "$checkout/.real-snapshot/less-arm64/evidence" -maxdepth 1 -type f \
       -size -16777217c -exec install -m 0644 -t "$upload/arm64-less" {} +
   fi
+  if [[ -d $checkout/.real-snapshot/bash-arm64/evidence &&
+        ! -L $checkout/.real-snapshot/bash-arm64/evidence ]]; then
+    install -d -o root -g root -m 0755 "$upload/arm64-bash"
+    find "$checkout/.real-snapshot/bash-arm64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/arm64-bash" {} +
+  fi
   for source in snapshot/evidence prestate-build/evidence; do
     local python3_evidence=$checkout/.real-snapshot/python3-amd64/$source
     [[ -d $python3_evidence && ! -L $python3_evidence ]] || continue
@@ -724,6 +730,30 @@ elif [[ $architecture == arm64 ]]; then
     exit 1
   fi
   rm -rf --one-file-system -- "$less_workspace"
+  bash_workspace=$checkout/.real-snapshot/bash-arm64
+  step arm64-bash-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-bash-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$bash_workspace"
+  step arm64-bash-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-arm64-bash-postinst-protected \
+    "-Darm64-bash-postinst-root=$bash_workspace/source" \
+    "-Darm64-bash-postinst-native-root=$bash_workspace/native" \
+    "-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg" \
+    "-Darm64-bash-postinst-bad-script=$bash_workspace/bad-script" \
+    "-Darm64-bash-postinst-bad-mode=$bash_workspace/bad-mode" \
+    "-Darm64-bash-postinst-bad-tool=$bash_workspace/bad-tool" \
+    "-Darm64-bash-postinst-bad-alias=$bash_workspace/bad-alias" \
+    "-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate" \
+    "-Darm64-bash-postinst-proof=$bash_workspace/evidence/bash-postinst-proof.txt" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips" "$bash_workspace/evidence/bash-postinst-proof.txt"
+  find "$bash_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  if grep -F " $bash_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the ARM bash replay workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$bash_workspace"
 fi
 
 # The protected proof on the staged new empty workspace, bounded by a timeout
