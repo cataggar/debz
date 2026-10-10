@@ -726,6 +726,16 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; [0-9]+ skipped; 0 failed" },
         .{ .before = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed", .after = "grep -Eq '^[1-9][0-9]* passed; 3 skipped; [0-9]+ failed" },
         .{ .before = "        if: ${{ always() }}\n        run: |", .after = "        run: |" },
+        .{ .before = "      - name: Exercise named cleanup with a live bounded cache writer\n", .after = "      - name: Skip live cleanup regression\n" },
+        .{ .before = "              timeout --signal=TERM --kill-after=5s 60s bash -c '\"'\"'\n", .after = "" },
+        .{ .before = "              kill -0 \"$pid\"\n", .after = "" },
+        .{ .before = "              [[ \"$tree\" == /srv/debz-protected/signed-proc ]]\n", .after = "" },
+        .{ .before = "                for process in /proc/[0-9]*; do\n", .after = "" },
+        .{ .before = "                  cwd=$(readlink \"$process/cwd\" 2>/dev/null) || cwd=\n", .after = "" },
+        .{ .before = "                if (( attempt == 6 )); then\n", .after = "" },
+        .{ .before = "                kill -KILL \"${signed_victims[@]}\" 2>/dev/null || true\n", .after = "" },
+        .{ .before = "          test \"${stop_status:-0}\" -eq 0\n", .after = "" },
+        .{ .before = "            grep -Eq \"(^| )$writer_pid( |$)\" .tmp/signed-proc-stop.log\n", .after = "" },
         .{ .before = "sudo -n rm -rf --one-file-system -- \"$PROTECTED\"", .after = "true" },
     }) |mutation| {
         const changed_job = try f.replace(signed, mutation.before, mutation.after);
@@ -735,6 +745,15 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         if (rejected.code == 0) std.debug.print("signed proc CI mutation missed: {s}\n", .{mutation.before});
         try rejected.failsWith("ci.yml: signed proc replay");
     }
+    const stop_line = "            ' signed-cleanup \"$PROTECTED\" >.tmp/signed-proc-stop.log 2>&1 || stop_status=$?\n";
+    const delayed_stop = try f.replace(
+        try f.replace(signed, stop_line, ""),
+        "          sudo -n rm -rf --one-file-system -- \"$PROTECTED\"\n",
+        try std.fmt.allocPrint(f.arena.allocator(), "          sudo -n rm -rf --one-file-system -- \"$PROTECTED\"\n{s}", .{stop_line}),
+    );
+    const reordered_cleanup = try f.check("ci-signed-proc", try f.replace(workflow, signed, delayed_stop));
+    defer reordered_cleanup.deinit();
+    try reordered_cleanup.failsWith("must stop protected writers before evidence copy and named-tree removal");
 }
 
 test "security: every split build workload job, mode and step fails closed under mutation" {

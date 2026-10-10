@@ -3784,12 +3784,36 @@ SIGNED_PROC_CI_STEPS = {
         "          grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\\.$' "
         '"$GITHUB_WORKSPACE/.tmp/signed-bindings.log"',
     ),
+    "Exercise named cleanup with a live bounded cache writer": (
+        "          set -euo pipefail",
+        '              [[ "$tree" == /srv/debz-protected/signed-proc && -d "$tree" && ! -L "$tree" ]]',
+        "              timeout --signal=TERM --kill-after=5s 60s bash -c '\"'\"'",
+        "                while :; do printf . >> cleanup-cache-writer; sleep 0.01; done",
+        '              kill -0 "$pid"',
+        '          [[ "$writer_pid" =~ ^[1-9][0-9]*$ ]]',
+    ),
     "Copy bounded evidence and remove named protected roots": (
         "        if: ${{ always() }}",
         "          set -euo pipefail",
+        "            timeout --signal=TERM --kill-after=5s 30s bash -euo pipefail -c '",
+        '              [[ "$tree" == /srv/debz-protected/signed-proc ]]',
+        '              [[ -d "$tree" && ! -L "$tree" && $(stat -c %u:%g "$tree") == 0:0 ]]',
+        "              for attempt in 1 2 3 4 5 6; do",
+        "                for process in /proc/[0-9]*; do",
+        '                  root=$(readlink "$process/root" 2>/dev/null) || continue',
+        '                  cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=',
+        '                    *"$tree/"*) signed_victims+=("${process#/proc/}") ;;',
+        "                if (( attempt == 6 )); then",
+        '                  echo "protected descendants survived bounded shutdown: ${signed_victims[*]}" >&2',
+        '                kill -KILL "${signed_victims[@]}" 2>/dev/null || true',
+        "                sleep 1",
+        '            \' signed-cleanup "$PROTECTED" >.tmp/signed-proc-stop.log 2>&1 || stop_status=$?',
+        '          test "${stop_status:-0}" -eq 0',
         '          if grep -F "$PROTECTED" .tmp/signed-proc-mounts.txt; then',
         '          sudo -n rm -rf --one-file-system -- "$PROTECTED"',
         '          test ! -e "$PROTECTED"',
+        '            grep -Eq "(^| )$writer_pid( |$)" .tmp/signed-proc-stop.log',
+        '              >"$evidence/signed-cleanup-writer-proof.txt"',
         "                snapshot/evidence/refresh.json snapshot/evidence/refresh.stderr \\",
         "                snapshot/evidence/plan.json snapshot/evidence/plan.stderr \\",
         "                snapshot/evidence/download.json snapshot/evidence/download.stderr \\",
@@ -3842,6 +3866,17 @@ def signed_proc_ci_failures(text: str) -> list[str]:
     steps = re.findall(r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body)
     if [name for name, _ in steps] != list(SIGNED_PROC_CI_STEPS):
         failures.append("ci.yml: signed proc replay steps changed from the reviewed sequence")
+    cleanup = dict(steps).get("Copy bounded evidence and remove named protected roots", "")
+    cleanup_order = (
+        '\' signed-cleanup "$PROTECTED" >.tmp/signed-proc-stop.log',
+        'test "${stop_status:-0}" -eq 0',
+        'cp .tmp/*.log "$evidence/"',
+        'sudo -n rm -rf --one-file-system -- "$PROTECTED"',
+        'test ! -e "$PROTECTED"',
+    )
+    positions = [cleanup.find(token) for token in cleanup_order]
+    if any(position < 0 for position in positions) or positions != sorted(set(positions)):
+        failures.append("ci.yml: signed proc replay must stop protected writers before evidence copy and named-tree removal")
     for name, step_body in steps:
         required = SIGNED_PROC_CI_STEPS.get(name, ())
         step_lines = step_body.splitlines()

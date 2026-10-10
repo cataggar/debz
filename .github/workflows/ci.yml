@@ -1828,12 +1828,61 @@ jobs:
           cat "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
           test "${status:-0}" -eq 0
           grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\.$' "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
+      - name: Exercise named cleanup with a live bounded cache writer
+        run: |
+          set -euo pipefail
+          writer_pid=$(sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            bash -euo pipefail -c '
+              tree=$1
+              [[ "$tree" == /srv/debz-protected/signed-proc && -d "$tree" && ! -L "$tree" ]]
+              cd "$tree"
+              timeout --signal=TERM --kill-after=5s 60s bash -c '"'"'
+                while :; do printf . >> cleanup-cache-writer; sleep 0.01; done
+              '"'"' </dev/null >/dev/null 2>&1 &
+              pid=$!
+              for attempt in 1 2 3 4 5; do
+                [[ -s cleanup-cache-writer ]] && break
+                sleep 0.1
+              done
+              test -s cleanup-cache-writer
+              kill -0 "$pid"
+              printf "%s\n" "$pid"
+            ' cleanup-writer "$PROTECTED")
+          [[ "$writer_pid" =~ ^[1-9][0-9]*$ ]]
+          printf '%s\n' "$writer_pid" >.tmp/signed-cleanup-writer.pid
       - name: Copy bounded evidence and remove named protected roots
         if: ${{ always() }}
         run: |
           set -euo pipefail
           evidence="$PWD/.tmp/signed-proc-evidence"
           mkdir -p "$evidence"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            timeout --signal=TERM --kill-after=5s 30s bash -euo pipefail -c '
+              tree=$1
+              [[ "$tree" == /srv/debz-protected/signed-proc ]]
+              [[ -e "$tree" || -L "$tree" ]] || exit 0
+              [[ -d "$tree" && ! -L "$tree" && $(stat -c %u:%g "$tree") == 0:0 ]]
+              for attempt in 1 2 3 4 5 6; do
+                signed_victims=()
+                for process in /proc/[0-9]*; do
+                  root=$(readlink "$process/root" 2>/dev/null) || continue
+                  cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=
+                  case "$root/ $cwd/" in
+                    *"$tree/"*) signed_victims+=("${process#/proc/}") ;;
+                  esac
+                done
+                (( ${#signed_victims[@]} )) || break
+                if (( attempt == 6 )); then
+                  echo "protected descendants survived bounded shutdown: ${signed_victims[*]}" >&2
+                  exit 1
+                fi
+                echo "killing protected descendants: ${signed_victims[*]}"
+                kill -KILL "${signed_victims[@]}" 2>/dev/null || true
+                sleep 1
+              done
+            ' signed-cleanup "$PROTECTED" >.tmp/signed-proc-stop.log 2>&1 || stop_status=$?
+          cat .tmp/signed-proc-stop.log
+          test "${stop_status:-0}" -eq 0
           cp .tmp/*.log "$evidence/" 2>/dev/null || true
           for target in systemd udev; do
             if [[ -f ".tmp/signed-network-$target.proof" ]]; then
@@ -1903,6 +1952,14 @@ jobs:
           fi
           sudo -n rm -rf --one-file-system -- "$PROTECTED"
           test ! -e "$PROTECTED"
+          if [[ -f .tmp/signed-cleanup-writer.pid ]]; then
+            writer_pid=$(<.tmp/signed-cleanup-writer.pid)
+            [[ "$writer_pid" =~ ^[1-9][0-9]*$ ]]
+            grep -Eq "(^| )$writer_pid( |$)" .tmp/signed-proc-stop.log
+            printf 'live bounded cache writer was stopped before named-tree removal\n' \
+              >"$evidence/signed-cleanup-writer-proof.txt"
+            cat "$evidence/signed-cleanup-writer-proof.txt"
+          fi
       - name: Upload bounded signed replay evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
