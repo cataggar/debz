@@ -2480,6 +2480,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "                 \"tools/real_snapshot_outcome.py\",\n",
         "python3 -I tools/real_snapshot_outcome.py \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
         "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
+        "        source_fd = open_beneath(root_fd, \"var/lib/debz\", directory=True)\n",
+        "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=source_fd)\n",
+        "            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 128 * 1024 * 1024:\n",
+        "    inventory[\"capture_complete\"] = True\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
         "    --check-keyring \"$keyring\" >/dev/null\n",

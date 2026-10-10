@@ -70,7 +70,7 @@ case "$operation" in
 esac
 
 install -d -o root -g root -m 0700 "$evidence" "$upload"
-capture_status=0 differential_status=0 forbidden_exec_status=0 outcome_status=0 copy_status=0
+capture_status=0 differential_status=0 forbidden_exec_status=0 outcome_status=0 copy_status=0 coordination_status=0
 if [[ -d "$work/root/var/lib/dpkg/info" ]]; then
   timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py \
     --reference-root "$work/root" --architecture "$architecture" \
@@ -139,10 +139,99 @@ copy_optional "$tree/reference-dpkg/usr/bin/dpkg-deb" "$evidence/reference-dpkg-
 copy_optional "$tree/reference-dpkg/reference-receipt-v1.json" "$evidence/reference-receipt-v1.json"
 copy_optional "$tree/evidence" "$evidence/staging"
 copy_optional "$tree/native-inputs.args" "$evidence/native-inputs.args"
+python3 -I - "$checkout/tools" "$work/root" "$evidence" >"$evidence/native-coordination-capture.log" 2>&1 <<'PY' || coordination_status=$?
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import open_absolute, open_beneath
+
+root, evidence = map(Path, sys.argv[2:])
+names = (
+    "root-operation-v1.json",
+    "native-execution-intent-v1.json",
+    "native-execution-progress-v1.log",
+    "native-managed-state-v1.json",
+    "native-lifecycle-script-v1.json",
+    "native-trigger-events-v1.json",
+    "native-transaction-authorization-v1.json",
+    "native-transaction-authorization-v2.json",
+    "native-transaction-authorization-v3.json",
+    "native-transaction-program-v1.json",
+    "native-transaction-program-v2.json",
+    "native-transaction-program-v3.json",
+    "root-mutation-v1.json",
+    "root-mutation-v2.log",
+)
+inventory = {"version": 1, "capture_complete": False, "files": []}
+root_fd = source_fd = evidence_fd = output_fd = -1
+try:
+    evidence_fd = open_absolute(evidence, directory=True)
+    try:
+        root_fd = open_absolute(root, directory=True)
+        source_fd = open_beneath(root_fd, "var/lib/debz", directory=True)
+    except FileNotFoundError:
+        source_fd = -1
+    os.mkdir("native-coordination", mode=0o700, dir_fd=evidence_fd)
+    output_fd = open_beneath(evidence_fd, "native-coordination", directory=True)
+    coordination_bytes = 0
+    for name in names:
+        row = {"source": f"var/lib/debz/{name}", "status": "unread"}
+        inventory["files"].append(row)
+        try:
+            if source_fd == -1:
+                row["status"] = "absent"
+                continue
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=source_fd)
+        except FileNotFoundError:
+            row["status"] = "absent"
+            continue
+        with os.fdopen(fd, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 128 * 1024 * 1024:
+                raise ValueError(f"unsafe or oversized native coordination member: {name}")
+            data = source.read(128 * 1024 * 1024 + 1)
+            after = os.fstat(source.fileno())
+            if (len(data) != before.st_size or
+                (before.st_mode, before.st_nlink, before.st_size, before.st_mtime_ns, before.st_ctime_ns) !=
+                (after.st_mode, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ValueError(f"native coordination member changed while reading: {name}")
+        coordination_bytes += len(data)
+        if coordination_bytes > 512 * 1024 * 1024:
+            raise ValueError("native coordination evidence exceeds 512 MiB")
+        destination_fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=output_fd,
+        )
+        with os.fdopen(destination_fd, "wb") as destination:
+            destination.write(data)
+        row.update(status="present", file=f"native-coordination/{name}", size=len(data),
+                   sha256=hashlib.sha256(data).hexdigest())
+    inventory["capture_complete"] = True
+finally:
+    try:
+        if evidence_fd != -1:
+            inventory_fd = os.open(
+                "native-coordination-inventory-v1.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=evidence_fd,
+            )
+            with os.fdopen(inventory_fd, "w") as output:
+                json.dump(inventory, output, indent=2)
+                output.write("\n")
+    finally:
+        for fd in (root_fd, source_fd, evidence_fd, output_fd):
+            if fd != -1:
+                os.close(fd)
+PY
 du -sh "$work" >"$evidence/disk-usage-final.txt" || copy_status=$?
-printf 'commit=%s\narchitecture=%s\ncapture_status=%s\ndifferential_status=%s\nexec_audit_status=%s\noutcome_status=%s\ncopy_status=%s\n' \
+printf 'commit=%s\narchitecture=%s\ncapture_status=%s\ndifferential_status=%s\nexec_audit_status=%s\noutcome_status=%s\ncopy_status=%s\ncoordination_status=%s\n' \
   "$commit" "$architecture" "$capture_status" "$differential_status" \
-  "$forbidden_exec_status" "$outcome_status" "$copy_status" >"$evidence/collection-result.txt"
+  "$forbidden_exec_status" "$outcome_status" "$copy_status" "$coordination_status" >"$evidence/collection-result.txt"
 
 # Export only bounded regular evidence, never transfer ownership of the
 # protected checkout, tools or live roots to the runner.
@@ -187,4 +276,4 @@ finally:
             lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(target)}")
     (target / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 PY
-(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 ))
+(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 && coordination_status == 0 ))
