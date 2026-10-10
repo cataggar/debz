@@ -481,22 +481,34 @@ The prestates are disposable fixtures, not native installation results.
 The build tree is removed; `WORKSPACE/prestate-build/evidence` keeps the
 reference order logs.
 
-`tools/real-snapshot-signed-proc-compare.py TARGET NATIVE PROOF REPORT`
+`zig build build-signed-proc-compare test-signed-proc-compare` builds and tests
+`zig-out/bin/debz-signed-proc-compare TARGET NATIVE PROOF REPORT`. This native
+CLI replaces the Python comparator and its live unittest consumer. CI
+executes it with `PATH=/no-host-interpreters` in both signed replay modes. It
 inventories a replayed native root and its pinned-dpkg proof. It records
 type, owner, mode, size, link count, link target, device number and SHA-256
 for every entry, requires `proc` to be empty and refuses mount crossings.
+Root and parent components are opened without following symlinks; regular
+files and symlink targets are descriptor-pinned and checked before/after
+observation. Files are streamed up to 512 MiB, classification reads are
+bounded to 4 MiB, and each inventory admits at most 200,000 entries within
+the native rooted-path grammar. Reports are exclusive 0600 files, retaining
+sorted ASCII JSON and every unexpected difference; `--report-only` is a
+diagnostic option forbidden in acceptance CI. Malformed or changed
+classification inputs retain typed errors and remain unexpected.
 The native test runs only the signed postinst, while the proof runs
 `dpkg --configure`, so a few differences are expected. Each is accepted
 only by an exact rule, derived from the first hosted amd64 reports and
-covered by `tools/test_real_snapshot_signed_proc_compare.py`:
+covered by native tests in `tools/real-snapshot-signed-proc-compare.zig`:
 
 - **proof harness files:** `usr/bin/setpriv` (only in the proof, SHA-256
-  `9e0d70d2…`) and pinned dpkg (`0a20f601…`). For udev and sudo that is
+  `86965a01…`) and pinned dpkg (`0a20f601…`). For udev and sudo that is
   proof-only `usr/local/sbin/dpkg`; for systemd it replaces the snapshot
-  `usr/bin/dpkg` (`6587ef9e…`). Also `run/mount`, the empty root-owned
+  `usr/bin/dpkg` (`972003a1…`). Also `run/mount`, the empty root-owned
   0700 directory that the chrooted `mount -t proc` (libmount) creates;
-- **dpkg bookkeeping:** `var/log/dpkg.log` exists only in the proof and
-  may record only its configure of the target. In `status` only the
+- **dpkg bookkeeping:** `var/log/dpkg.log` preserves every byte of any
+  native history and appends only the proof's configure of the target.
+  In `status` only the
   target stanza may change: `unpacked` or `half-configured` becomes
   `installed`, `Config-Version` may equal only `Version`, and each
   `newconffile` hash becomes the MD5 of the proof's installed conffile.
