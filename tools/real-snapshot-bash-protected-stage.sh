@@ -71,6 +71,16 @@ zenv=(env "TMPDIR=$checkout/.zig-cache/data")
   "-Darm64-bash-source-proof=$workspace/evidence/bash-source-proof.txt" \
   -Doptimize=ReleaseSafe -j2 --summary all
 grep -Fx "signed arm64 bash source guard executed without skips" "$workspace/evidence/bash-source-proof.txt"
+"${zenv[@]}" "$zig" build test-real-snapshot-arm64-util-linux-source-protected \
+  "-Darm64-util-linux-source-root=$source" \
+  "-Darm64-util-linux-source-postinst=$workspace/evidence/util-linux-original-native.postinst" \
+  "-Darm64-util-linux-source-proof=$workspace/evidence/util-linux-source-proof.txt" \
+  -Doptimize=ReleaseSafe -j2 --summary all
+grep -Fx "signed arm64 util-linux original archive source validated without callback admission or skips" "$workspace/evidence/util-linux-source-proof.txt"
+timeout --signal=TERM --kill-after=5s 60s \
+  /usr/bin/dpkg-deb --ctrl-tarfile "$source/var/lib/dpkg/producer-util-linux.deb" |
+  /usr/bin/tar -xOf - ./postinst >"$workspace/evidence/util-linux-original-dpkg.postinst"
+cmp "$workspace/evidence/util-linux-original-native.postinst" "$workspace/evidence/util-linux-original-dpkg.postinst"
 for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate bad-cache; do
   destination=$workspace/$name
   [[ ! -e "$destination" && ! -L "$destination" ]]
