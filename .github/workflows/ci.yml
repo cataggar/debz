@@ -1723,7 +1723,7 @@ jobs:
           sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
             ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
             zig build -Doptimize=Debug -j2 --summary all
-      - name: Authenticate the snapshot closure and generate fresh signed prestates
+      - name: Authenticate the snapshot closure and stage signed bindings
         timeout-minutes: 12
         working-directory: ${{ env.PROTECTED }}/checkout
         run: |
@@ -1731,6 +1731,10 @@ jobs:
             DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \
             tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \
             "$PWD/.real-snapshot/ws"
+      - name: Generate fresh signed pinned-dpkg prestates
+        timeout-minutes: 12
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
             DEBZ_ZIG="$PROTECTED/zig/zig" \
             tools/real-snapshot-signed-proc-prestates.sh \

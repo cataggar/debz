@@ -3721,10 +3721,17 @@ SIGNED_PROC_CI_STEPS = {
         "        working-directory: ${{ env.PROTECTED }}/checkout",
         "            zig build -Doptimize=Debug -j2 --summary all",
     ),
-    "Authenticate the snapshot closure and generate fresh signed prestates": (
+    "Authenticate the snapshot closure and stage signed bindings": (
+        "        timeout-minutes: 12",
         "        working-directory: ${{ env.PROTECTED }}/checkout",
         '            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \\',
         '            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \\',
+        '            "$PWD/.real-snapshot/ws"',
+    ),
+    "Generate fresh signed pinned-dpkg prestates": (
+        "        timeout-minutes: 12",
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        '            DEBZ_ZIG="$PROTECTED/zig/zig" \\',
         "            tools/real-snapshot-signed-proc-prestates.sh \\",
         '            "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"',
         '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json"',
@@ -3849,13 +3856,18 @@ def signed_proc_ci_failures(text: str) -> list[str]:
         required = SIGNED_PROC_CI_STEPS.get(name, ())
         step_lines = step_body.splitlines()
         conditions = [line for line in step_lines if re.match(r"^        if:", line)]
+        timeout_minutes = re.findall(r"(?m)^        timeout-minutes: ([0-9]+)$", step_body)
         if (
             any(line not in step_lines for line in required)
             or conditions not in ([], ["        if: ${{ always() }}"])
             or (conditions and "        if: ${{ always() }}" not in required)
-            or any(
-                not 1 <= int(minutes) <= 25
-                for minutes in re.findall(r"(?m)^        timeout-minutes: ([0-9]+)$", step_body)
+            or any(not 1 <= int(minutes) <= 25 for minutes in timeout_minutes)
+            or (
+                name in (
+                    "Authenticate the snapshot closure and stage signed bindings",
+                    "Generate fresh signed pinned-dpkg prestates",
+                )
+                and timeout_minutes != ["12"]
             )
         ):
             failures.append(f"ci.yml: signed proc replay step changed: {name}")
