@@ -28,6 +28,7 @@ SOURCE_ARTIFACTS = {
 BASH_ARTIFACTS = {
     "bash": ("5.3-2ubuntu1", 829052, "7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"),
     "libtinfo6": ("6.6+20251231-1", 107766, "301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"),
+    "libc-bin": ("2.43-2ubuntu2.4", 597592, "e964f5753787fa44c95c7144507b178b970359b1ea90a732b2f2b6a1831d67ef3bf5b900d57ae682d3481676f8080b6382a130c6e13112a40fb698435ee124cc"),
 }
 ARCHIVE_ARTIFACTS = {**SOURCE_ARTIFACTS, **BASH_ARTIFACTS}
 
@@ -147,12 +148,14 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
     if package not in ("less", "bash"):
         raise ValueError("unsupported signed alternatives source")
     selected_package = package
-    if len(additional_locks) not in (0, 3):
-        raise ValueError("separate less, dash and util-linux locks must be provided together")
+    if len(additional_locks) not in ((0, 3, 4) if package == "bash" else (0, 3)):
+        raise ValueError("separate package, dash, util-linux and optional bash cache-producer locks must be provided together")
     for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):
         protected(path)
     protected(root, directory=True)
     goals = ("dpkg", selected_package, "dash", "util-linux")
+    if len(additional_locks) == 4:
+        goals += ("libc-bin",)
     paths = (lock_path, *additional_locks) if additional_locks else (lock_path,) * len(goals)
     locks = {}
     for goal, path in zip(goals, paths):
@@ -184,6 +187,12 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
     if selected_package == "bash":
         tinfo = archive(locks["bash"], cache, "libtinfo6")
         create_exclusive(root, "var/lib/dpkg/producer-libtinfo6.deb", tinfo.read_bytes(), 0o644)
+        if "libc-bin" in locks:
+            producer = member(archive(locks["libc-bin"], cache, "libc-bin"), "usr/sbin/ldconfig")
+            if (len(producer) != 865848 or hashlib.sha256(producer).hexdigest() !=
+                    "b78066d6243748c6565675a63eec5f0d41b6adb3b4635adea6906326db41f9fa"):
+                raise ValueError("signed ldconfig cache producer changed")
+            create_exclusive(root, "var/lib/dpkg/producer-ldconfig", producer, 0o755)
     create_exclusive(root, "var/lib/dpkg/producer-dpkg", pinned.read_bytes(), 0o755)
     original = archive(locks[selected_package], cache, selected_package)
     create_exclusive(root, f"var/lib/dpkg/producer-{selected_package}.deb", original.read_bytes(), 0o644)

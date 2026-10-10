@@ -33,7 +33,8 @@ lock=$workspace/evidence/runtime.lock.json
 cache=$workspace/snapshot/cache/packages-v2/objects
 pinned=$workspace/dpkg/usr/bin/dpkg
 python3 -B -I tools/real_snapshot_less_stage.py prepare-bash "$source" "$lock" "$cache" "$pinned" \
-  "$workspace/evidence/bash.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json"
+  "$workspace/evidence/bash.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json" \
+  "$workspace/evidence/libc-bin.lock.json"
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
@@ -46,6 +47,20 @@ timeout --signal=TERM --kill-after=5s 120s \
       --force-depends --no-triggers --unpack /var/lib/dpkg/producer-libtinfo6.deb /var/lib/dpkg/producer-bash.deb
   '
 python3 -B -I tools/real_snapshot_less_stage.py seal-bash "$source"
+[[ ! -e "$source/etc/ld.so.cache" && ! -L "$source/etc/ld.so.cache" ]]
+{
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$source" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      /var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu
+  '
+} >"$workspace/evidence/bash-cache-producer.stdout" 2>"$workspace/evidence/bash-cache-producer.stderr"
+install -m 0644 "$source/etc/ld.so.cache" "$workspace/evidence/bash-source-ld.so.cache"
 [[ $(dpkg-query --admindir="$source/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
 read -r bytes _ < <(du -sb "$source")
@@ -56,7 +71,7 @@ zenv=(env "TMPDIR=$checkout/.zig-cache/data")
   "-Darm64-bash-source-proof=$workspace/evidence/bash-source-proof.txt" \
   -Doptimize=ReleaseSafe -j2 --summary all
 grep -Fx "signed arm64 bash source guard executed without skips" "$workspace/evidence/bash-source-proof.txt"
-for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate; do
+for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate bad-cache; do
   destination=$workspace/$name
   [[ ! -e "$destination" && ! -L "$destination" ]]
   cp -a --reflink=auto --one-file-system -- "$source" "$destination"
@@ -76,6 +91,11 @@ chmod_regular(root / "bad-mode", relative, 0o644)
 overwrite_regular(root / "bad-tool", "usr/bin/update-alternatives", b"foreign alternatives tool\n")
 replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo")
 create_exclusive(root / "bad-prestate", "usr/bin/update-menus", b"#!/bin/sh\nexit 0\n", 0o755)
+cache = read_regular(root / "bad-cache", "etc/ld.so.cache", 1024 * 1024)
+if b"/lib/aarch64-linux-gnu/libc.so.6" not in cache:
+    raise ValueError("original ldconfig cache omitted the libc provider")
+overwrite_regular(root / "bad-cache", "etc/ld.so.cache",
+                  cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6"))
 PY
 {
 timeout --signal=TERM --kill-after=5s 120s \
@@ -96,4 +116,4 @@ timeout --signal=TERM --kill-after=5s 120s \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 8 * 1024 * 1024 * 1024 ))
-echo "signed arm64 bash source and eight replay roots staged; required native receipt remains"
+echo "signed arm64 bash cached source and nine replay roots staged; required native receipt remains"
