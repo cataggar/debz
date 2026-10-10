@@ -359,30 +359,10 @@ jobs:
             --lock-output "$workspace/base.native.lock.json" base-dep >/dev/null
           zig-out/bin/debz plan "${native_common[@]}" --transaction-backend native \
             --lock-output "$workspace/scenario.native.lock.json" scenario-main >/dev/null
-          python3 - "$workspace/base.native.lock.json" "$workspace/empty.native.lock.json" <<'PY'
-          from hashlib import sha256
-          import json
-          from pathlib import Path
-          import sys
-
-          value = json.loads(Path(sys.argv[1]).read_bytes())
-          assert value["schema"] == "https://debz.dev/schema/exact-closure-lock-v3"
-          assert value["version"] == 3
-          assert list(value) == [
-              "schema", "version", "target_architecture", "request_sha256",
-              "policy_sha256", "repositories", "local_artifacts", "packages",
-              "digest_sha256",
-          ]
-          canonical = lambda document: json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode()
-          digest = value.pop("digest_sha256")
-          assert digest == sha256(canonical(value)).hexdigest()
-          value["request_sha256"] = sha256(b"native-action-empty-cache").hexdigest()
-          value["repositories"] = []
-          value["local_artifacts"] = []
-          value["packages"] = []
-          value["digest_sha256"] = sha256(canonical(value)).hexdigest()
-          Path(sys.argv[2]).write_bytes(canonical(value))
-          PY
+          zig build build-native-action-empty-lock test-native-action-empty-lock \
+            -Doptimize=ReleaseSafe -j2 --summary all
+          PATH=/no-host-interpreters zig-out/bin/debz-native-action-empty-lock \
+            "$workspace/base.native.lock.json" "$workspace/empty.native.lock.json"
           printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\n' \
             "$workspace" "$workspace/fixture.sources" \
             "$workspace/repository/fixture-keyring.gpg" \
