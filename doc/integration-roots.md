@@ -752,6 +752,26 @@ systemd/udev half-configured and sudo unpacked capture semantics. That authority
 is never reused; neither bootstrap status registration nor trigger clearing is
 performed.
 
+The **amd64 console-cycle prerequisite** is a separate `break_kbd_cycle`
+operation with the `kbd_cycle` profile. The original failed reference root
+shows `console-setup-linux -> kbd -> console-setup -> console-setup-linux`;
+`ubuntu-minimal` is downstream. The exact `kbd 2.7.1-2ubuntu2` archive has
+no maintainer scripts, only its original `activate-noawait update-initramfs`
+declaration. At genuine no-progress, the driver and launcher independently
+bind that archive, both original `Architecture: all` console peers at
+`1.237ubuntu3.1`, and the already-installed `libc6 2.43-2ubuntu2.4` outside
+dependency. Changed graphs, architecture, versions, installed callbacks,
+pending trigger state, unincorporated activations or database updates refuse.
+
+Only `--no-triggers --force-depends --configure kbd:amd64` is authorized.
+Neither console peer's callback is selected, no pending batch is run, and
+no bootstrap status or trigger metadata is synthesized or cleared. Original
+probe refusal and before/after records are retained. Only the actual kbd
+unpacked-to-installed transition with every other database field and every
+trigger-database byte unchanged permits normal unforced scheduling to resume.
+This prerequisite is not a selected-trigger grant or whole-root parity;
+the existing final trigger-closure refusal remains mandatory.
+
 When several prestates are requested, the producer's intentional interrupted
 systemd/udev postinst leaves the working package half-configured after its
 independent copy is captured. Only the separate `continue_prestate` verb may
