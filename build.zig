@@ -374,11 +374,27 @@ pub fn build(b: *std.Build) void {
         .name = "repository-add-integration",
         .root_module = repository_add_module,
     });
+    const http_fixture_module = b.createModule(.{
+        .root_source_file = b.path("tools/http-fixture-server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http_fixture_module.addImport("debz", debz);
+    const http_fixture_server = b.addExecutable(.{
+        .name = "http-fixture-server",
+        .root_module = http_fixture_module,
+    });
+    const http_fixture_tests = b.addTest(.{ .root_module = http_fixture_module });
+    const run_http_fixture_tests = b.addRunArtifact(http_fixture_tests);
+    const http_fixture_step = b.step("test-http-fixture-server", "Check native hermetic HTTP serving and path redaction");
+    http_fixture_step.dependOn(&run_http_fixture_tests.step);
+    workload_core.dependOn(&run_http_fixture_tests.step);
     const repository_add_tests = b.addSystemCommand(
         &.{ "sh", "tools/test-repository-add.sh" },
     );
     repository_add_tests.addArtifactArg(cli);
     repository_add_tests.addArtifactArg(repository_add_harness);
+    repository_add_tests.addArtifactArg(http_fixture_server);
     const repository_add_step = b.step(
         "test-repository-add",
         "Run the hermetic Microsoft-shaped repository add integration",
@@ -1754,6 +1770,7 @@ pub fn build(b: *std.Build) void {
         .name = "native-recovery-zig-repository",
         .root_module = repository_recovery_module,
     });
+    http_fixture_step.dependOn(&repository_recovery_executable.step);
     const repository_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
@@ -1761,6 +1778,7 @@ pub fn build(b: *std.Build) void {
     repository_recovery.addArtifactArg(repository_recovery_executable);
     repository_recovery.addArtifactArg(native_lifecycle_tests);
     repository_recovery.addArtifactArg(cli);
+    repository_recovery.addArtifactArg(http_fixture_server);
     if (b.option([]const u8, "native-repository-fixture-python", "Python with signed-repository fixture generator dependencies")) |python|
         repository_recovery.addArgs(&.{ "--fixture-python", python });
     const repository_case = b.option([]const u8, "native-zig-repository-case", "Run one Zig repository CLI scenario");
