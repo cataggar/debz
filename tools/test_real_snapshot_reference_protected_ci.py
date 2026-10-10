@@ -564,7 +564,7 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                 )
                 rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
                 goals = (("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else
-                         ("dpkg", "bash", "dash", "util-linux") if purpose == "arm64-bash" else ("dpkg",))
+                         ("dpkg", "bash", "dash", "util-linux", "libc-bin") if purpose == "arm64-bash" else ("dpkg",))
                 self.assertEqual(len(rows), 2 * len(goals))
                 for index, package in enumerate(goals):
                     for offset, command in enumerate(("plan", "download")):
@@ -819,8 +819,9 @@ timeout() {
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, token in (
-            ("src/native_unpack.zig", 'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);'),
-            ("src/native_unpack.zig", 'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n            verifySnapshotBashArm64Inputs('),
+            ("src/native_unpack.zig", 'bash_cache_fact = try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);'),
+            ("src/native_unpack.zig", 'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n            _ = verifySnapshotBashArm64Inputs('),
+            ("src/native_unpack.zig", 'if (!std.meta.eql(observed, expected_cache)) return error.AlternativesInputChanged;'),
             ("src/native_unpack.zig", 'try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");'),
             ("src/native_unpack.zig", 'try testing.expectEqualStrings("/usr/share/man/man7/bash-builtins.7.gz", actual.selected);'),
             ("tools/real-snapshot-bash-protected-stage.sh", '"$zig" build test-real-snapshot-arm64-bash-source-protected'),
@@ -1327,11 +1328,11 @@ class SignedBashStagingTests(unittest.TestCase):
             command = ["bash", "-euo", "pipefail", "-c", copies.group(0)]
             subprocess.run(command, env=environment, capture_output=True, check=True, timeout=10)
             replays = [path for path in workspace.iterdir() if path.name not in ("source", "dpkg")]
-            self.assertEqual(len(replays), 7)
+            self.assertEqual(len(replays), 8)
             for replay in replays:
                 self.assertEqual((replay / "bash.postinst").read_bytes(), original)
             self.assertEqual(len({(path / "bash.postinst").stat().st_ino
-                                  for path in (source, *replays)}), 8)
+                                  for path in (source, *replays)}), 9)
             self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
             result = subprocess.run(command, env=environment, capture_output=True,
                                     check=False, timeout=10)

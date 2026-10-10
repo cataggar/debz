@@ -1061,6 +1061,7 @@ pub fn build(b: *std.Build) void {
         .{ .option = "bad-tool", .environment = "BAD_TOOL_ROOT" },
         .{ .option = "bad-alias", .environment = "BAD_ALIAS_ROOT" },
         .{ .option = "bad-prestate", .environment = "BAD_PRESTATE_ROOT" },
+        .{ .option = "bad-cache", .environment = "BAD_CACHE_ROOT" },
         .{ .option = "proof", .environment = "PROOF" },
     }) |coordinate| {
         const value = b.option([]const u8, b.fmt("arm64-bash-postinst-{s}", .{coordinate.option}), "Required protected ARM bash configure proof coordinate") orelse "";

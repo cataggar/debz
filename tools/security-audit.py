@@ -1693,7 +1693,8 @@ def audit_production_sources() -> None:
         "try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture, kind);",
         "try bindSnapshotLessArm64ImmutableInputs(&script, kind);",
         'stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)',
-        '"etc/ld.so.preload",\n    "etc/ld.so.cache",',
+        '"etc/ld.so.preload",',
+        'const snapshot_less_arm64_absent = snapshot_loader_arm64_absent ++ [_][]const u8{"etc/ld.so.cache"};',
         "var contents = try proc.observeAlloc(allocator, 0, 0);",
         "entry.mode != 0o777 or entry.uid != 0 or entry.gid != 0 or",
         "try attempt.requireRecovery(allocator, .script);",
@@ -1702,9 +1703,9 @@ def audit_production_sources() -> None:
             fail(f"reviewed exact arm64 less callback boundary changed: {required}")
     for required in (
         'if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {',
-        'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
+        'bash_cache_fact = try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
         'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n'
-        '            verifySnapshotBashArm64Inputs(',
+        '            _ = verifySnapshotBashArm64Inputs(',
         'const snapshot_bash_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{',
         'const snapshot_bash_arm64_controls = [_]SignedDebconfControlFile{',
         '.path = "var/lib/dpkg/info/libtinfo6:arm64.list"',
@@ -2813,6 +2814,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'grep -Fx "signed arm64 bash source guard executed without skips"',
         'replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo")',
         'create_exclusive(root / "bad-prestate", "usr/bin/update-menus"',
+        '/var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu',
+        'cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6")',
         'bytes <= 8 * 1024 * 1024 * 1024',
     ),
     "tools/prepare-native-dpkg.py": (
@@ -2855,6 +2858,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'raise ValueError("signed bash ownership path set changed")',
         'raise ValueError("signed bash postinst changed")',
         'create_exclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755)',
+        'member(archive(locks["libc-bin"], cache, "libc-bin"), "usr/sbin/ldconfig")',
+        'raise ValueError("signed ldconfig cache producer changed")',
         'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
     ),
     "tools/real-snapshot-less-reference.sh": (
@@ -3071,7 +3076,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     ),
     "tools/real-snapshot-reference-protected-stage.sh": (
         '  packages=(less dash util-linux)',
-        'if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux); fi',
+        'if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux libc-bin); fi',
         '  for package in "${packages[@]}"; do',
         '    authenticated_lock "$package_lock"',
         'module.receipt_from_extracted_archive(\n    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])',
@@ -3146,7 +3151,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     for path, count in (
         ("tools/real-snapshot-less-protected-stage.sh", 1),
         ("tools/real-snapshot-less-reference.sh", 3),
-        ("tools/real-snapshot-bash-protected-stage.sh", 2),
+        ("tools/real-snapshot-bash-protected-stage.sh", 3),
     ):
         commands = re.findall(
             r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
@@ -3179,11 +3184,12 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         'grep -F " $less_workspace" /proc/self/mountinfo',
         'rm -rf --one-file-system -- "$less_workspace"',
         '$checkout/.real-snapshot/bash-arm64',
-        'step arm64-bash-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
+        'step arm64-bash-stage 0 "nine replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
         'step arm64-bash-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m',
         '"$zig" build test-real-snapshot-arm64-bash-postinst-protected',
         '"-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg-after"',
         '"-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate"',
+        '"-Darm64-bash-postinst-bad-cache=$bash_workspace/bad-cache"',
         'grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips"',
         'grep -F " $bash_workspace" /proc/self/mountinfo',
         'rm -rf --one-file-system -- "$bash_workspace"',
@@ -3261,6 +3267,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             'try expectAlternativesReplayFactEqual(actual.record_fact, expected.record_fact);',
             'try expectAlternativesReplayFactEqual(left, right);',
             'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_PRESTATE_ROOT',
+            'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_CACHE_ROOT',
             'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_PROOF',
         )),
     ):
@@ -3273,9 +3280,12 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     unpack = texts.get("src/native_unpack.zig", "")
     for token in (
         'if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {',
-        'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
+        'bash_cache_fact = try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
         'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n'
-        '            verifySnapshotBashArm64Inputs(',
+        '            _ = verifySnapshotBashArm64Inputs(',
+        'try verifySnapshotBashArm64CacheInput(allocator, root);',
+        'targets[script.immutable_targets.len] = "/etc/ld.so.cache";',
+        'if (!std.meta.eql(observed, expected_cache)) return error.AlternativesInputChanged;',
     ):
         if token not in unpack:
             failures.append(f"protected arm64 bash production input revalidation lost {token}")
