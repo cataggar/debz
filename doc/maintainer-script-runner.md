@@ -685,6 +685,32 @@ script/pinned-dpkg replay and strict negative fixtures. It must be invoked
 explicitly from a root-owned protected checkout; no workflow dispatch or
 automatic CI proof is implied. Full #393/#262 closure remains separate.
 
+## ARM bash with a populated loader cache
+
+The exact ARM bash `postinst configure ""` profile retains its original
+five-archive, script, tool, provider, alias, and optional-helper bindings.
+Unlike the less profile, it permits an absent cache or a bounded, root-owned
+single-link `0644` cache. Present caches must use the little-endian glibc
+`1.1` format, with at most 4,096 entries and 1 MiB of bytes. Every entry's
+string offsets, architecture flags and reserved fields are checked; hwcaps,
+legacy formats, ambiguous numeric SONAME spellings, malformed extensions
+and unbounded strings are refused. Every `libc.so.6` and `libtinfo.so.6`
+candidate, including duplicates, must route through the already bound
+original providers and aliases. Other entries grant no execution authority.
+Only an informational generator extension is permitted.
+
+The cache itself joins the descriptor-rooted immutable input snapshot,
+including bytes, ownership, mode, link count and inode/timestamps. Pre-launch
+validation and post-return validation/recovery remain mandatory; no cache
+is removed, rewritten, ignored or accepted solely by its existence.
+Protected staging authenticates a separate exact libc-bin lock and archive,
+then runs its original static ldconfig in the existing private mount,
+network and PID namespace with no-new-privileges and no mount capability.
+Its raw cache and producer logs are retained. The nine-root proof requires
+actual cached native/pinned-dpkg replay and the original five negative roots
+plus an altered cache-provider refusal. Full ARM installation and trigger
+closure remain separate acceptance gates.
+
 ## Exact signed python3 preinst inert alternatives call
 
 The separate new-package `python3:amd64` `3.14.3-0ubuntu2`
