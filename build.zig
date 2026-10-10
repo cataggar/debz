@@ -1273,9 +1273,21 @@ pub fn build(b: *std.Build) void {
         "test-dpkg-alternatives-reference",
         "Verify pinned dpkg/update-alternatives records, links, lifecycle and recovery",
     ).dependOn(&dpkg_alternatives_reference.step);
-    const dpkg_oracle_evidence_tests = b.addSystemCommand(
-        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },
-    );
+    const dpkg_oracle_evidence_module = b.createModule(.{
+        .root_source_file = b.path("tools/dpkg-oracle-evidence.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dpkg_oracle_evidence_module.addImport("debz", debz);
+    const dpkg_oracle_evidence = b.addExecutable(.{
+        .name = "debz-dpkg-oracle-evidence",
+        .root_module = dpkg_oracle_evidence_module,
+    });
+    const install_dpkg_oracle_evidence = b.addInstallArtifact(dpkg_oracle_evidence, .{});
+    b.step("build-dpkg-oracle-evidence", "Build the native pinned-dpkg oracle evidence CLI").dependOn(&install_dpkg_oracle_evidence.step);
+    const dpkg_oracle_evidence_unit = b.addTest(.{ .root_module = dpkg_oracle_evidence_module });
+    const dpkg_oracle_evidence_tests = b.addRunArtifact(dpkg_oracle_evidence_unit);
+    b.step("test-dpkg-oracle-evidence", "Test native bounded oracle evidence and refusal boundaries").dependOn(&dpkg_oracle_evidence_tests.step);
     workload_native.dependOn(&dpkg_oracle_evidence_tests.step);
     const signed_proc_compare_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_real_snapshot_signed_proc_compare.py" },
