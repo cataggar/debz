@@ -3163,6 +3163,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         'step arm64-bash-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
         'step arm64-bash-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m',
         '"$zig" build test-real-snapshot-arm64-bash-postinst-protected',
+        '"-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg-after"',
         '"-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate"',
         'grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips"',
         'grep -F " $bash_workspace" /proc/self/mountinfo',
@@ -3260,7 +3261,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         if token not in unpack:
             failures.append(f"protected arm64 bash production input revalidation lost {token}")
     source_guard = bash_stage.find('"$zig" build test-real-snapshot-arm64-bash-source-protected')
-    copies = bash_stage.find('for name in native dpkg bad-script')
+    copies = bash_stage.find('for name in native dpkg-after bad-script')
     if source_guard < 0 or copies < 0 or source_guard > copies:
         failures.append("protected bash source guard must execute before copies/mutations")
     for token in (

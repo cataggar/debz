@@ -1286,6 +1286,35 @@ class SignedBashStagingTests(unittest.TestCase):
         (self.info / "bash.postinst").chmod(mode)
         self.stage = load("debz_bash_seal", "real_snapshot_less_stage.py")
 
+    def test_fresh_replays_preserve_existing_pinned_dpkg_directory_and_refuse_reuse(self) -> None:
+        script = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
+        copies = re.search(r"^for name in [^\n]+; do\n.*?^done$", script, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(copies)
+        with tempfile.TemporaryDirectory(dir=TOOLS.parent / ".zig-cache") as temporary:
+            workspace = Path(temporary)
+            source = workspace / "source"
+            source.mkdir()
+            original = (self.info / "bash.postinst").read_bytes()
+            (source / "bash.postinst").write_bytes(original)
+            pinned = workspace / "dpkg/usr/bin/dpkg"
+            pinned.parent.mkdir(parents=True)
+            pinned.write_bytes(b"retained pinned dpkg artifact\n")
+            before = (pinned.read_bytes(), pinned.stat())
+            environment = {**os.environ, "workspace": str(workspace), "source": str(source)}
+            command = ["bash", "-euo", "pipefail", "-c", copies.group(0)]
+            subprocess.run(command, env=environment, capture_output=True, check=True, timeout=10)
+            replays = [path for path in workspace.iterdir() if path.name not in ("source", "dpkg")]
+            self.assertEqual(len(replays), 7)
+            for replay in replays:
+                self.assertEqual((replay / "bash.postinst").read_bytes(), original)
+            self.assertEqual(len({(path / "bash.postinst").stat().st_ino
+                                  for path in (source, *replays)}), 8)
+            self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
+            result = subprocess.run(command, env=environment, capture_output=True,
+                                    check=False, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
+
     def test_seal_preserves_original_controls_and_refuses_overwriting_staged_callback(self) -> None:
         before = {path.name: (path.read_bytes(), path.stat().st_ino, path.stat().st_mode)
                   for path in self.info.iterdir()}

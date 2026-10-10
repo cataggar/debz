@@ -738,7 +738,7 @@ elif [[ $architecture == arm64 ]]; then
     "${zenv[@]}" "$zig" build test-real-snapshot-arm64-bash-postinst-protected \
     "-Darm64-bash-postinst-root=$bash_workspace/source" \
     "-Darm64-bash-postinst-native-root=$bash_workspace/native" \
-    "-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg" \
+    "-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg-after" \
     "-Darm64-bash-postinst-bad-script=$bash_workspace/bad-script" \
     "-Darm64-bash-postinst-bad-mode=$bash_workspace/bad-mode" \
     "-Darm64-bash-postinst-bad-tool=$bash_workspace/bad-tool" \

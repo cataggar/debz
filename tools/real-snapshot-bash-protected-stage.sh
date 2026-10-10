@@ -56,7 +56,7 @@ zenv=(env "TMPDIR=$checkout/.zig-cache/data")
   "-Darm64-bash-source-proof=$workspace/evidence/bash-source-proof.txt" \
   -Doptimize=ReleaseSafe -j2 --summary all
 grep -Fx "signed arm64 bash source guard executed without skips" "$workspace/evidence/bash-source-proof.txt"
-for name in native dpkg bad-script bad-mode bad-tool bad-alias bad-prestate; do
+for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate; do
   destination=$workspace/$name
   [[ ! -e "$destination" && ! -L "$destination" ]]
   cp -a --reflink=auto --one-file-system -- "$source" "$destination"
@@ -82,7 +82,7 @@ timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
       DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
-      chroot "$workspace/dpkg" /bin/sh -c '
+      chroot "$workspace/dpkg-after" /bin/sh -c '
     set -eu
     test "$$" -eq 1
     exec setpriv --bounding-set=-sys_admin --no-new-privs \
@@ -90,7 +90,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       --force-depends --no-triggers --configure bash
   '
 } >"$workspace/evidence/bash-reference.stdout" 2>"$workspace/evidence/bash-reference.stderr"
-[[ $(dpkg-query --admindir="$workspace/dpkg/var/lib/dpkg" -W \
+[[ $(dpkg-query --admindir="$workspace/dpkg-after/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok installed' ]]
 [[ $(dpkg-query --admindir="$source/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
