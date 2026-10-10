@@ -4783,6 +4783,42 @@ def ghr_zig_workflow_failures(
     return failures
 
 
+CLI_SMOKE_PATHS = ("build.zig", "test/cli-smoke.zig", "tools/test-cli.sh")
+
+
+def native_cli_smoke_failures(texts: dict[str, str]) -> list[str]:
+    failures = []
+    required = {
+        "build.zig": (
+            'cli_smoke_options.addOptionPath("debz", cli.getEmittedBin());',
+            'cli_smoke_options.addOption([]const u8, "version", version);',
+            'b.path("test/cli-smoke.zig")',
+            "const cli_tests = b.addRunArtifact(b.addTest(",
+            'cli_tests.setCwd(b.path("."));',
+            "workload_core.dependOn(&cli_tests.step);",
+        ),
+        "test/cli-smoke.zig": (
+            'try environment.put("PATH", "/no-host-interpreters");',
+            ".environ_map = &self.environment,",
+            "options.debz",
+            "options.version",
+            "case.argv.len + 8000",
+            "try f.run(argv, 5);",
+            'try absent(result.stdout, dangerous);',
+            'try booleanField(value, "invokes_dpkg", false);',
+            'try booleanField(install_value, "receipt_binding", true);',
+            'try booleanField(install_value, "unchanged_without_receipt", true);',
+            '"root/var/lib/debz/root-operation-v1.json"',
+        ),
+    }
+    for path, tokens in required.items():
+        if any(token not in texts.get(path, "") for token in tokens):
+            failures.append(f"{path}: native CLI-smoke authority, privacy or execution contract is missing")
+    if "tools/test-cli.sh" in texts or "tools/test-cli.sh" in texts.get("build.zig", ""):
+        failures.append("tools/test-cli.sh: retired shell/Python CLI-smoke driver was restored")
+    return failures
+
+
 def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
     failures: list[str] = []
     for entrypoint in (
@@ -4899,6 +4935,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_cli_smoke_failures({
+        path: (ROOT / path).read_text() for path in CLI_SMOKE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_exercise_final_wiring_failures(
         (ROOT / "test/native_recovery_helper.zig").read_text(),
         (ROOT / "test/native_lifecycle_support.zig").read_text(),
@@ -5990,7 +6030,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference",
+        "reference-root", "protected-reference", "native-cli-smoke",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6012,6 +6052,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             ),
             "reference-root": REFERENCE_ROOT_PATHS,
             "protected-reference": PROTECTED_REFERENCE_PATHS,
+            "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -6068,6 +6109,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = reference_launcher_root_wiring_failures(*(texts.get(path, "") for path in paths))
         elif kind == "protected-reference":
             failures = protected_reference_ci_failures(texts)
+        elif kind == "native-cli-smoke":
+            failures = native_cli_smoke_failures(texts)
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

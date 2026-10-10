@@ -153,9 +153,18 @@ pub fn build(b: *std.Build) void {
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);
 
-    const cli_tests = b.addSystemCommand(&.{ "sh", "tools/test-cli.sh" });
-    cli_tests.addArtifactArg(cli);
-    cli_tests.addArg(version);
+    const cli_smoke_options = b.addOptions();
+    cli_smoke_options.addOptionPath("debz", cli.getEmittedBin());
+    cli_smoke_options.addOption([]const u8, "version", version);
+    const cli_smoke_module = b.createModule(.{
+        .root_source_file = b.path("test/cli-smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_smoke_module.addOptions("cli_smoke_options", cli_smoke_options);
+    const cli_tests = b.addRunArtifact(b.addTest(.{ .root_module = cli_smoke_module }));
+    cli_tests.setCwd(b.path("."));
+    b.step("test-cli-smoke", "Run the native CLI smoke suite without host interpreters").dependOn(&cli_tests.step);
     workload_core.dependOn(&cli_tests.step);
 
     const help_cases = [_]struct {
