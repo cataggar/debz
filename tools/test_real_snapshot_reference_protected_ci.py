@@ -935,6 +935,12 @@ class NativeEvidenceExportTests(unittest.TestCase):
         self.exporter = wrapper.split(
             'python3 -I - "$evidence" "$upload" <<\'PY\'\n', 1
         )[1].split("\nPY\n", 1)[0]
+        self.candidate = self.root / "candidate"
+        self.namespace = self.candidate / "var/lib/debz"
+        self.namespace.mkdir(parents=True)
+        self.collector = wrapper.split(
+            '<<\'PY\' || coordination_status=$?\n', 1
+        )[1].split("\nPY\n", 1)[0]
 
     def export(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -1001,6 +1007,107 @@ class NativeEvidenceExportTests(unittest.TestCase):
         self.assertFalse((self.target / "oversized").exists())
         self.assertTrue((self.target / "export-failure.txt").is_file())
         self.verify_index()
+
+
+    def capture(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-I", "-", str(TOOLS), str(self.candidate), str(self.source)],
+            input=self.collector, capture_output=True, text=True, timeout=30,
+        )
+
+    def inventory(self) -> dict:
+        return json.loads((self.source / "native-coordination-inventory-v1.json").read_bytes())
+
+    def test_failed_attempt_original_coordinates_survive_export_without_blobs(self) -> None:
+        files = {
+            "root-operation-v1.json": b'{"phase":"script","disposition":"recovery_required"}\n',
+            "native-execution-progress-v1.log": b'{"records":[{"action":{"program_step":123},"stage":"prepared"}]}\n',
+            "native-transaction-program-v3.json": b'{"steps":[{"package":"original-package","kind":"preinst"}]}\n',
+            "native-lifecycle-script-v1.json": b"original unresolved callback\x00\xff\n",
+        }
+        for name, payload in files.items():
+            (self.namespace / name).write_bytes(payload)
+        (self.namespace / "native-recovery-v1-blob-unselected").write_bytes(b"not a coordination document")
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = self.inventory()
+        self.assertTrue(inventory["capture_complete"])
+        self.assertEqual({row["source"].split("/")[-1] for row in inventory["files"] if row["status"] == "present"}, set(files))
+        result = self.export()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, payload in files.items():
+            self.assertEqual((self.target / "native-coordination" / name).read_bytes(), payload)
+        self.assertFalse((self.target / "native-coordination/native-recovery-v1-blob-unselected").exists())
+        self.verify_index()
+
+    def test_absent_early_prestate_is_explicit_not_reconstructed(self) -> None:
+        self.namespace.rmdir()
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inventory = self.inventory()
+        self.assertTrue(inventory["capture_complete"])
+        self.assertTrue(inventory["files"])
+        self.assertTrue(all(row["status"] == "absent" for row in inventory["files"]))
+        self.assertEqual(list((self.source / "native-coordination").iterdir()), [])
+
+    def test_capture_never_follows_output_alias_or_overwrites_previous_inventory(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        original = self.source
+        self.source = self.root / "output-alias"
+        self.source.symlink_to(outside, target_is_directory=True)
+        result = self.capture()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.source = original
+        self.assertEqual(self.capture().returncode, 0)
+        inventory = (self.source / "native-coordination-inventory-v1.json").read_bytes()
+        result = self.capture()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.source / "native-coordination-inventory-v1.json").read_bytes(), inventory)
+
+    def test_symlinked_ancestor_or_leaf_refuses_without_exporting_external_bytes(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "native-execution-progress-v1.log").write_bytes(b"external bytes")
+        for ancestor in (False, True):
+            with self.subTest(ancestor=ancestor), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                self.source = Path(temporary)
+                if ancestor:
+                    self.namespace.rmdir()
+                    self.namespace.symlink_to(outside, target_is_directory=True)
+                else:
+                    (self.namespace / "native-execution-progress-v1.log").symlink_to(outside / "native-execution-progress-v1.log")
+                result = self.capture()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.inventory()["capture_complete"])
+                self.assertFalse((self.source / "native-coordination/native-execution-progress-v1.log").exists())
+                if ancestor:
+                    self.namespace.unlink()
+                    self.namespace.mkdir()
+                else:
+                    (self.namespace / "native-execution-progress-v1.log").unlink()
+
+    def test_nonregular_hardlinked_and_oversized_members_refuse_without_blocking(self) -> None:
+        for kind in ("fifo", "hardlink", "oversized"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                self.source = Path(temporary)
+                member = self.namespace / "native-execution-progress-v1.log"
+                if kind == "fifo":
+                    os.mkfifo(member)
+                elif kind == "hardlink":
+                    outside = self.root / "external"
+                    outside.write_bytes(b"external bytes")
+                    os.link(outside, member)
+                else:
+                    with member.open("wb") as payload:
+                        payload.truncate(128 * 1024 * 1024 + 1)
+                result = self.capture()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsafe or oversized native coordination member", result.stderr)
+                self.assertFalse(self.inventory()["capture_complete"])
+                self.assertFalse((self.source / "native-coordination/native-execution-progress-v1.log").exists())
+                member.unlink()
 
 
 class ProtectedInputTests(unittest.TestCase):
