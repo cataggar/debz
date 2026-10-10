@@ -1366,5 +1366,51 @@ class SignedBashStagingTests(unittest.TestCase):
         self.assertEqual(list(self.lifecycle.iterdir()), [])
 
 
+class SignedUtilLinuxSourceTests(unittest.TestCase):
+    def test_binary_sources_preserve_text_byte_bounds_and_newline_normalization(self) -> None:
+        audit = load("debz_util_linux_source_text_bounds", "security-audit.py")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "src").mkdir()
+            source = root / "src" / "bounded.zig"
+            with mock.patch.object(audit, "ROOT", root), \
+                    mock.patch.object(audit, "untracked_files", return_value=[]):
+                source.write_bytes(b"a\r\n")
+                self.assertEqual(audit.tracked_digest_texts([source], 3),
+                                 {"src/bounded.zig": "a\n"})
+                source.write_bytes(b"\x80" * 8)
+                self.assertEqual(audit.tracked_digest_texts([source], 3), {})
+                for data in (b"xxxx", b"\xc3\xa9" * 2):
+                    with self.subTest(data=data):
+                        source.write_bytes(data)
+                        with self.assertRaises(OverflowError):
+                            audit.tracked_digest_texts([source], 3)
+
+    def test_source_archive_coordinates_refuse_changes_before_reading_any_cache_bytes(self) -> None:
+        stage = load("debz_util_linux_source_lock_pins", "real_snapshot_less_stage.py")
+        version, size, digest = stage.UTIL_LINUX_ARTIFACTS["util-linux"]
+        original = {
+            "name": "util-linux", "version": version, "architecture": "arm64",
+            "declared_size": size, "origin": {"type": "authenticated_repository"},
+            "archive_identity": {"primary": "sha512", "digests": [
+                {"algorithm": "sha512", "digest": digest}]},
+        }
+        for field, changed in (
+            ("version", version + "-unreviewed"),
+            ("declared_size", size + 1),
+            ("origin", {"type": "local_artifact"}),
+            ("archive_identity", {"primary": "sha512", "digests": [
+                {"algorithm": "sha512", "digest": "0" * 128}]}),
+            ("archive_identity", {"primary": "sha256", "digests": [
+                {"algorithm": "sha256", "digest": "0" * 64}]}),
+        ):
+            with self.subTest(field=field, changed=changed):
+                with mock.patch.object(stage, "protected") as protected:
+                    with self.assertRaises(ValueError):
+                        stage.archive({"packages": [dict(original, **{field: changed})]},
+                                      Path("/unused-cache"), "util-linux")
+                    protected.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
