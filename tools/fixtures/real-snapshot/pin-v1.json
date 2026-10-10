@@ -668,6 +668,14 @@
         {
           "form": "fixture",
           "path": "src/fixtures/ubuntu-resolute-bash.postinst"
+        },
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
         }
       ],
       "digest": "sha256:72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
@@ -3358,6 +3366,198 @@
       },
       "review": "#393",
       "size": 28936,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701",
+      "id": "archive:bash@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "bash",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"
+        },
+        "version": "5.3-2ubuntu1"
+      },
+      "review": "#393",
+      "size": 829052,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha512:301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af",
+      "id": "archive:libtinfo6@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "libtinfo6",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"
+        },
+        "version": "6.6+20251231-1"
+      },
+      "review": "#393",
+      "size": 107766,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "derived_from": [
+        {
+          "package": "bash",
+          "version": "5.3-2ubuntu1"
+        }
+      ],
+      "digest": "sha256:f258025bf7b7200aaef0a62c5793535fab6500c7de9d7fbffc069eb78444505c",
+      "id": "prestate:bash/list",
+      "kind": "prestate",
+      "mode": "0644",
+      "package": "bash",
+      "path": "var/lib/dpkg/info/bash.list",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"
+        },
+        "version": "5.3-2ubuntu1"
+      },
+      "review": "#393",
+      "size": 1068,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:5bb2b95c8ef8a6880de1caf392086098e96a09323cf5b1600c80f051605c5edd",
+      "id": "file:libtinfo6/usr/lib/aarch64-linux-gnu/libtinfo.so.6.6@arm64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "libtinfo6",
+      "path": "usr/lib/aarch64-linux-gnu/libtinfo.so.6.6",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"
+        },
+        "version": "6.6+20251231-1"
+      },
+      "review": "#393",
+      "size": 265584,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:01c006568543d6b6ab9f0a57dd44b9d779d1edc437a5f5d2db0215887c19dbeb",
+      "id": "file:bash/usr/bin/bash@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "bash",
+      "path": "usr/bin/bash",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"
+        },
+        "version": "5.3-2ubuntu1"
+      },
+      "review": "#393",
+      "size": 1609176,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:dacf8379c9a1d56a7f8f4ddb330c60ca0444d82a63eea55755db7cc29312b0a3",
+      "id": "file:bash/usr/share/man/man7/bash-builtins.7.gz@arm64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "bash",
+      "path": "usr/share/man/man7/bash-builtins.7.gz",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:7cdebc65396efe02fa527b6314b733266cec1026313b57e5a14d29225679bf6c402763fc4ea8b50387f4135623fd3372bfc033c6e7f7cb23573d83308bc20701"
+        },
+        "version": "5.3-2ubuntu1"
+      },
+      "review": "#393",
+      "size": 508,
+      "version_bound": false
+    },
+    {
+      "architectures": ["arm64"],
+      "consumers": [{"form": "hex", "path": "src/native_unpack.zig"}],
+      "derived_from": [{"package": "libtinfo6", "version": "6.6+20251231-1"}],
+      "digest": "sha256:db5239cbc950b3d9616cc5a62d1c82d6bebf5aa1a99782921012645acd7bf190",
+      "id": "prestate:libtinfo6/list@arm64",
+      "kind": "prestate",
+      "mode": "0644",
+      "package": "libtinfo6",
+      "path": "var/lib/dpkg/info/libtinfo6:arm64.list",
+      "provenance": {
+        "archives": {"arm64": "sha512:301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"},
+        "version": "6.6+20251231-1"
+      },
+      "review": "#393",
+      "size": 339,
       "version_bound": false
     }
   ],

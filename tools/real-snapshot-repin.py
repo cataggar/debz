@@ -505,7 +505,10 @@ def dpkg_ownership_list(deb: bytes) -> bytes:
 def prestate_derivation(identity: dict, arch: str) -> str | None:
     if identity["kind"] != "prestate":
         return None
-    if identity["path"] == f"var/lib/dpkg/info/{identity['package']}.list":
+    if identity["path"] in (
+        f"var/lib/dpkg/info/{identity['package']}.list",
+        f"var/lib/dpkg/info/{identity['package']}:{arch}.list",
+    ):
         return "dpkg-list"
     if identity["path"] in (
         f"var/lib/dpkg/info/{identity['package']}.triggers",

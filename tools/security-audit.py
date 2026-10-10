@@ -1684,7 +1684,8 @@ def audit_production_sources() -> None:
         'const arm64 = std.mem.eql(u8, architecture, "arm64") and\n'
         '        std.mem.eql(u8, package.architecture, "arm64");',
         "if ((!amd64 and !arm64) or",
-        "const snapshot_less_arm64_artifacts = [_]struct {",
+        "const SnapshotAlternativesArm64Artifact = struct {",
+        "const snapshot_less_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{",
         "const snapshot_less_arm64_controls = [_]SignedDebconfControlFile{",
         "const snapshot_less_arm64_postinst_controls = [_]SignedDebconfControlFile{",
         "if ((less_inert or snapshot_postinst) and std.mem.eql(u8, architecture, \"arm64\")) {",
@@ -1699,6 +1700,18 @@ def audit_production_sources() -> None:
     ):
         if required not in unpack:
             fail(f"reviewed exact arm64 less callback boundary changed: {required}")
+    for required in (
+        'if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {',
+        'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
+        'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n'
+        '            verifySnapshotBashArm64Inputs(',
+        'const snapshot_bash_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{',
+        'const snapshot_bash_arm64_controls = [_]SignedDebconfControlFile{',
+        '.path = "var/lib/dpkg/info/libtinfo6:arm64.list"',
+        '"usr/bin/update-menus",\n    "usr/sbin/update-menus",',
+    ):
+        if required not in unpack:
+            fail(f"reviewed exact arm64 bash callback boundary changed: {required}")
     less_reference = (ROOT / "tools/real-snapshot-less-reference.sh").read_text(errors="strict")
     for required in (
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT="$source_root"',
@@ -2592,6 +2605,7 @@ PROTECTED_REFERENCE_PATHS = (
     "src/native_unpack.zig",
     "src/native_alternatives.zig",
     "tools/real-snapshot-less-protected-stage.sh",
+    "tools/real-snapshot-bash-protected-stage.sh",
     "tools/real-snapshot-less-reference.sh",
     "tools/real_snapshot_less_stage.py",
     "tools/real_snapshot_less_fixtures.py",
@@ -2783,6 +2797,23 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "[[ ${#proof_arguments[@]} == 15 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "tools/real-snapshot-bash-protected-stage.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
+        '"$workspace" == "$checkout/.real-snapshot/bash-arm64"',
+        'toolchain(Path(sys.argv[3]))',
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-reference-protected-stage.sh --arm64-bash-source',
+        'python3 -B -I tools/real_snapshot_less_stage.py prepare-bash',
+        'python3 -B -I tools/real_snapshot_less_stage.py seal-bash',
+        '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-libtinfo6.deb /var/lib/dpkg/producer-bash.deb',
+        '--force-depends --no-triggers --configure bash',
+        "'5.3-2ubuntu1 arm64 install ok installed'",
+        '"$zig" build test-real-snapshot-arm64-bash-source-protected',
+        'grep -Fx "signed arm64 bash source guard executed without skips"',
+        'replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo")',
+        'create_exclusive(root / "bad-prestate", "usr/bin/update-menus"',
+        'bytes <= 8 * 1024 * 1024 * 1024',
+    ),
     "tools/prepare-native-dpkg.py": (
         'with path.open("x", encoding="utf-8") as output:',
     ),
@@ -2805,7 +2836,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'entry["origin"]["type"] != "authenticated_repository"',
         'raise ValueError("source archive differs from exact production authority")',
         'for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):',
-        'for package in SOURCE_ARTIFACTS:\n        archive(locks["dpkg" if package == "libc6" else package], cache, package)',
+        'for package in SOURCE_ARTIFACTS:\n            archive(locks["dpkg" if package == "libc6" else package], cache, package)',
         'f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8',
         'c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e',
         '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
@@ -2818,6 +2849,11 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755)',
         'regular_descriptor(root, "var/lib/dpkg/info/less.postinst")',
         'raise ValueError("signed less postinst changed")',
+        'if selected_package == "bash":',
+        'archive(source_lock, cache, name)',
+        'raise ValueError("signed bash ownership path set changed")',
+        'raise ValueError("signed bash postinst changed")',
+        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755)',
         'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
     ),
     "tools/real-snapshot-less-reference.sh": (
@@ -3015,7 +3051,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'b.step("test-real-snapshot-reference-protected", ',
     ),
     "tools/real-snapshot-reference-protected-stage.sh": (
-        '  for package in less dash util-linux; do',
+        '  packages=(less dash util-linux)',
+        'if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux); fi',
+        '  for package in "${packages[@]}"; do',
         '    authenticated_lock "$package_lock"',
         'module.receipt_from_extracted_archive(\n    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])',
         '--architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"',
@@ -3089,6 +3127,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     for path, count in (
         ("tools/real-snapshot-less-protected-stage.sh", 1),
         ("tools/real-snapshot-less-reference.sh", 3),
+        ("tools/real-snapshot-bash-protected-stage.sh", 2),
     ):
         commands = re.findall(
             r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
@@ -3120,6 +3159,15 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         'grep -Fx "signed arm64 less native postinst and independent pinned dpkg agree without skips"',
         'grep -F " $less_workspace" /proc/self/mountinfo',
         'rm -rf --one-file-system -- "$less_workspace"',
+        '$checkout/.real-snapshot/bash-arm64',
+        'step arm64-bash-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
+        'step arm64-bash-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-arm64-bash-postinst-protected',
+        '"-Darm64-bash-postinst-dpkg-root=$bash_workspace/dpkg-after"',
+        '"-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate"',
+        'grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips"',
+        'grep -F " $bash_workspace" /proc/self/mountinfo',
+        'rm -rf --one-file-system -- "$bash_workspace"',
     ):
         if token not in arm_body:
             failures.append(f"protected arm64 less activation lost {token}")
@@ -3134,6 +3182,11 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         'b.step("test-real-snapshot-arm64-less-postinst-protected",',
         'run_arm64_less_postinst_tests.has_side_effects = true;',
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_POSTINST_{s}',
+        'b.step("test-real-snapshot-arm64-bash-source-protected",',
+        'run_arm64_bash_source_tests.has_side_effects = true;',
+        'b.step("test-real-snapshot-arm64-bash-postinst-protected",',
+        'run_arm64_bash_postinst_tests.has_side_effects = true;',
+        'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_{s}',
     ):
         if token not in arm_build:
             failures.append(f"protected arm64 less build lost {token}")
@@ -3169,6 +3222,48 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             if token not in body:
                 failures.append(f"protected arm64 less test body lost {token}")
     less_reference = texts.get("tools/real-snapshot-less-reference.sh", "")
+    for name, calls in (
+        ("source is validated before fixture mutation", (
+            'try verifySnapshotBashArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");',
+            'DEBZ_REQUIRE_SIGNED_ARM64_BASH_SOURCE_PROOF',
+        )),
+        ("postinst runs natively and matches pinned dpkg", (
+            'maintainer_script.SystemLauncher',
+            'maintainer_script.run(testing.allocator,',
+            'try testing.expect(report.succeeded());',
+            '.policy = lifecycleInvocationPolicy(false, false, false)',
+            'try verifySnapshotBashArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");',
+            'native_alternatives.validateScriptInputs(',
+            'native_alternatives.validateScriptTransition(',
+            'try testing.expectEqualDeep(actual.record, expected.record);',
+            'try testing.expectEqualStrings("/usr/share/man/man7/bash-builtins.7.gz", actual.selected);',
+            'try testing.expectEqualDeep(actual.links, expected.links);',
+            'try testing.expectEqualDeep(actual.missing_master_targets, expected.missing_master_targets);',
+            'try expectAlternativesReplayFactEqual(actual.record_fact, expected.record_fact);',
+            'try expectAlternativesReplayFactEqual(left, right);',
+            'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_BAD_PRESTATE_ROOT',
+            'DEBZ_REQUIRE_SIGNED_ARM64_BASH_POSTINST_PROOF',
+        )),
+    ):
+        text = texts.get("src/native_unpack.zig", "")
+        body = text.partition(f'test "native_unpack.test.protected signed arm64 bash {name}" {{')[2].partition('\n}\n')[0]
+        for token in (*calls, '.exclusive = true', 'try proof.writeStreamingAll('):
+            if token not in body:
+                failures.append(f"protected arm64 bash test body lost {token}")
+    bash_stage = texts.get("tools/real-snapshot-bash-protected-stage.sh", "")
+    unpack = texts.get("src/native_unpack.zig", "")
+    for token in (
+        'if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {',
+        'try verifySnapshotBashArm64Inputs(allocator, root, program.artifacts, program.target_architecture);',
+        'native_alternatives.matchesSnapshotBashPostinst(script_bytes))\n'
+        '            verifySnapshotBashArm64Inputs(',
+    ):
+        if token not in unpack:
+            failures.append(f"protected arm64 bash production input revalidation lost {token}")
+    source_guard = bash_stage.find('"$zig" build test-real-snapshot-arm64-bash-source-protected')
+    copies = bash_stage.find('for name in native dpkg-after bad-script')
+    if source_guard < 0 or copies < 0 or source_guard > copies:
+        failures.append("protected bash source guard must execute before copies/mutations")
     for token in (
         'mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")',
         '--force-depends --no-triggers --configure less',

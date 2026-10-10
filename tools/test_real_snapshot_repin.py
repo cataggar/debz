@@ -1455,7 +1455,7 @@ class SourceEvidenceTests(unittest.TestCase):
             self.assertEqual(repin.check_prestate_evidence(committed, data), [])
         with zipfile.ZipFile(io.BytesIO(data)) as original:
             sources = json.loads(original.read("evidence.json"))["sources"]
-            for package in ("python3", "python3-minimal", "bash"):
+            for package in ("python3", "python3-minimal", "bash", "libtinfo6"):
                 source = next(item for item in sources
                               if item["architecture"] == "arm64" and item["package"] == package)
                 output = io.BytesIO()
@@ -1468,6 +1468,25 @@ class SourceEvidenceTests(unittest.TestCase):
                 with self.subTest(package=package), self.assertRaisesRegex(
                         repin.RepinError, f"source archive for {package} disagrees"):
                     repin.check_prestate_evidence(committed, output.getvalue())
+
+    def test_original_multiarch_list_is_derived_for_only_its_bound_architecture(self) -> None:
+        manifest = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        identity = next(item for item in manifest["identities"] if item["id"] == "prestate:libtinfo6/list@arm64")
+        with zipfile.ZipFile(ROOT / manifest["prestate_evidence"]) as archive:
+            sources = json.loads(archive.read("evidence.json"))["sources"]
+            source = next(item for item in sources
+                          if item["architecture"] == "arm64" and item["package"] == "libtinfo6")
+            original = archive.read(source["archive_file"])
+        derived = repin.derive_prestate(identity, "arm64", original)
+        self.assertIsNotNone(derived)
+        self.assertEqual((sha256(derived[0]), len(derived[0]), derived[1]),
+                         (identity["digest"], identity["size"], 0o644))
+        self.assertIsNone(repin.derive_prestate(identity, "amd64", original))
+        changed = copy.deepcopy(manifest)
+        target = next(item for item in changed["identities"] if item["id"] == identity["id"])
+        target["digest"] = sha256(derived[0][:-1])
+        failures = repin.prestate_evidence_failures(changed, ROOT)
+        self.assertTrue(any(identity["id"] in failure and "derived bytes disagree" in failure for failure in failures))
 
 
 if __name__ == "__main__":
