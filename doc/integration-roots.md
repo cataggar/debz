@@ -211,6 +211,19 @@ final verdict, exit status and longest progress gap. A stop also writes
 `create-watchdog.txt` with host load and the install process group's state,
 CPU time and wait channel.
 
+Protected native diagnostics retain a fixed allowlist of the selected root's
+original `var/lib/debz` coordination documents: operation, intent, program,
+authorization, native progress, managed state, active script, trigger events,
+and root-mutation journal/progress. `native-coordination-inventory-v1.json`
+records each present or absent member and hashes the original copied bytes.
+These are raw failure diagnostics, not reconstructed state or replay authority.
+Recovery blobs, binaries, backups and lock files are not copied. Reads are
+descriptor-rooted and no-follow; nonregular, hardlinked, changed or oversized
+members fail collection explicitly while retaining its log and incomplete
+inventory. The existing 128 MiB member and 512 MiB total export bounds remain.
+This preserves a prepared but unspawned callback's exact program/progress
+coordinates, which cannot be inferred from the last successful exec alone.
+
 Traced candidate commands run under `strace -f --seccomp-bpf -qq -yy -s 4096
 --pidns-translation -e signal=none` with only `execve`, `execveat`, `fork`,
 `vfork`, `clone` and `clone3` selected. A seccomp filter stops the tracee only
