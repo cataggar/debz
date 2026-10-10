@@ -28,6 +28,13 @@ GHR_ZIG_INSTALL = """\
       - name: Validate Zig version
         run: test "$(zig version)" = 0.16.0
 """
+GHR_STANDALONE_SETUP = """\
+      - name: Install verified standalone ghr
+        id: ghr
+        uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        with:
+          ghr-version: v0.8.1
+"""
 CI_CONCURRENCY = """\
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
@@ -112,6 +119,48 @@ def audit_ci_concurrency(ci: str) -> None:
         ci,
     ):
         FAILURES.append("ci.yml: workflow concurrency must be a top-level policy before permissions")
+
+
+def audit_ghr_smoke(ci: str, release: str) -> None:
+    for label, text, job_name in (
+        ("ci.yml", ci, "release-dry-run"),
+        ("release.yml", release, "smoke"),
+    ):
+        match = re.search(
+            rf"(?ms)^  {job_name}:\n(.*?)(?=^  \S|\Z)", text
+        )
+        body = match.group(1) if match else ""
+        setup = re.search(
+            r"(?ms)^      - name: Install verified standalone ghr\n.*?(?=^      - name:|\Z)",
+            body,
+        )
+        if (text.count(GHR_STANDALONE_SETUP) != 1 or
+                body.count(GHR_STANDALONE_SETUP) != 1 or
+                text.count("uses: cataggar/ghr/actions/setup@") != 1 or
+                setup is None or setup.group().rstrip() != GHR_STANDALONE_SETUP.rstrip()):
+            FAILURES.append(f"{label}: exact verified standalone ghr setup must remain in {job_name}")
+        for token in (
+            "GHR_PATH: ${{ steps.ghr.outputs.ghr-path }}",
+            "GHR_VERSION: ${{ steps.ghr.outputs.ghr-version }}",
+            "GHR_TOOL_DIR: ${{ runner.temp }}/debz-release-ghr-tools",
+            "GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin",
+            "GHR_CACHE_DIR: ${{ runner.temp }}/debz-release-ghr-cache",
+            'test -x "$GHR_PATH"',
+            'test "$GHR_VERSION" = v0.8.1',
+            'test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.8.1',
+            'PATH=/no-host-interpreters "$GHR_PATH" install "cataggar/debz@v$VERSION"',
+            'bin_dir=$(PATH=/no-host-interpreters "$GHR_PATH" path bin)',
+            'test "$bin_dir" = "$GHR_BIN_DIR"',
+            'test -x "$bin_dir/debz"',
+            'test "$(PATH=/no-host-interpreters "$bin_dir/debz" version)" = "$VERSION"',
+            'PATH=/no-host-interpreters "$bin_dir/debz" --help',
+            'PATH=/no-host-interpreters "$bin_dir/debz" list-installed',
+            "jq --exit-status '.exit_status == 0'",
+        ):
+            if token not in body:
+                FAILURES.append(f"{label}: standalone ghr release smoke lost {token}")
+        if re.search(r"\bpython3?\s+-m\s+(?:pip|venv)\b|\bpython3-(?:pip|venv)\b|(?<![\w-])ghr-bin(?![\w-])", text):
+            FAILURES.append(f"{label}: retired Python ghr bootstrap was restored")
 
 
 def audit_setup_action(ci: str, release: str) -> None:
@@ -413,6 +462,7 @@ def main() -> None:
     audit_actions(ci, CI)
     audit_ci_concurrency(ci)
     audit_zig_installation(ci, release)
+    audit_ghr_smoke(ci, release)
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
     audit_install_action(ci, release)
@@ -435,7 +485,6 @@ def main() -> None:
         "subject-path: release-assets/*.tar.xz",
         "release-assets-${{ matrix.platform }}",
         "merge-multiple: true",
-        "ghr-bin==0.7.0",
         "ghr install cataggar/debz@v$VERSION",
         "'```sh'",
         "--generate-notes",

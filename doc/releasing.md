@@ -29,7 +29,7 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
    recovery guidance.
 6. Create one annotated tag without changing the commit: `git tag -a v0.3.0 -m "debz 0.3.0"`.
 7. Push only that tag: `git push origin refs/tags/v0.3.0`.
-8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus `ghr-bin==0.7.0` smoke jobs.
+8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus verified standalone `ghr` v0.8.1 smoke jobs.
 9. Confirm the release is named `debz 0.3.0`, its prerelease flag matches parsed SemVer, only the four Linux x64/arm64 gzip/xz binary archives are present, the generated notes summarize changes since the previous release, and `cataggar/debz/actions/setup@v0.3.0`, `cataggar/debz/actions/download@v0.3.0`, `cataggar/debz/actions/install@v0.3.0`, and `ghr install cataggar/debz@v0.3.0` succeed on native x64 and arm64. The install smoke must show a cold alternate-root transaction followed by an exact package-cache hit into a different fresh root with zero package downloads and a separately verified transaction result.
 10. Verify both archive formats with `gh attestation verify debz-0.3.0-linux-x64.tar.gz --repo cataggar/debz` and `gh attestation verify debz-0.3.0-linux-x64.tar.xz --repo cataggar/debz` after downloading the assets.
 
@@ -42,3 +42,17 @@ If any job fails before publication, leave the failed tag unchanged, fix the pro
 If publication succeeds but a smoke job or later investigation finds a defect, do not replace assets, edit provenance, or move the tag. Mark the release as affected in its notes, open a tracking issue, and publish a corrected next patch or prerelease tag after all gates pass. If an artifact must be withdrawn, remove the GitHub Release assets or release entry only as an explicit incident response while preserving the tag and audit record; users must be directed to a new version.
 
 The workflow uses no repository secrets and cannot run on pull requests. A rerun is safe only when no GitHub Release exists for the tag; after publication, diagnose the existing immutable release instead of rerunning publication.
+
+The ghr smoke bootstrap uses the same fully pinned native setup action and exact
+v0.8.1 CLI as the verified Zig installer, with GitHub release provenance
+verification and exact-cache rehashing. It no longer installs `ghr-bin` through
+pip or creates a Python virtual environment. Both required release dry-run
+architectures exercise the standalone bootstrap against the existing immutable
+v0.3.0 release without publishing or rewriting a release. The post-release
+smoke still installs its newly published exact tag, verifies the executable
+version, and exercises `list-installed` in a separate disposable workspace.
+The standalone ghr and installed debz commands run with
+`PATH=/no-host-interpreters`, and the returned bin directory must match the
+explicit runner-temporary directory rather than a preexisting host installation.
+Release packaging and signed fixture generation still use Python; this is
+only the ghr bootstrap portion of the tooling cutover.

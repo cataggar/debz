@@ -2072,6 +2072,42 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Install verified standalone ghr
+        id: ghr
+        uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        with:
+          ghr-version: v0.8.1
+      - name: Prove standalone ghr published-release smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GHR_PATH: ${{ steps.ghr.outputs.ghr-path }}
+          GHR_VERSION: ${{ steps.ghr.outputs.ghr-version }}
+          GHR_TOOL_DIR: ${{ runner.temp }}/debz-release-ghr-tools
+          GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin
+          GHR_CACHE_DIR: ${{ runner.temp }}/debz-release-ghr-cache
+          ARCHITECTURE: ${{ matrix.platform == 'linux-arm64' && 'arm64' || 'amd64' }}
+          VERSION: 0.3.0
+        run: |
+          test -x "$GHR_PATH"
+          test "$GHR_VERSION" = v0.8.1
+          test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.8.1
+          PATH=/no-host-interpreters "$GHR_PATH" install "cataggar/debz@v$VERSION"
+          bin_dir=$(PATH=/no-host-interpreters "$GHR_PATH" path bin)
+          test "$bin_dir" = "$GHR_BIN_DIR"
+          test -x "$bin_dir/debz"
+          test "$(PATH=/no-host-interpreters "$bin_dir/debz" version)" = "$VERSION"
+          PATH=/no-host-interpreters "$bin_dir/debz" --help
+          workspace="$PWD/.zig-cache/ghr-release-smoke"
+          mkdir -p "$workspace/root" "$workspace/cache" "$workspace/state"
+          PATH=/no-host-interpreters "$bin_dir/debz" list-installed \
+            --install-root "$workspace/root" \
+            --cache-path "$workspace/cache" \
+            --state-path "$workspace/state" \
+            --status-path "$PWD/src/fixtures/dpkg-status/installed.status" \
+            --architecture "$ARCHITECTURE" --json >"$workspace/output.json"
+          jq --exit-status '.exit_status == 0' "$workspace/output.json"
+
   release-dry-run-verify:
     name: Required release dry-run exact verification
     needs: release-dry-run
