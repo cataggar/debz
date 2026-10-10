@@ -911,7 +911,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 50), members);
+    try testing.expectEqual(@as(usize, 51), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1566,6 +1566,25 @@ test "security: download action consumes opaque CLI-owned archive and pinned blo
     try support.contains(cache, "downloadToFile(");
     try testing.expect(std.mem.indexOf(u8, cache, "restoreCache(") == null);
     try support.contains(try f.source("src/package_cache_archive.zig"), "pub const format_id = \"debz-package-cache-archive-v1\"");
+}
+
+test "security: action empty-lock fixture uses the native canonical codec without Python" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-action-empty-lock", ".github/workflows/ci.yml", &.{
+        "zig build build-native-action-empty-lock test-native-action-empty-lock",
+        "PATH=/no-host-interpreters zig-out/bin/debz-native-action-empty-lock",
+        "\"$workspace/base.native.lock.json\" \"$workspace/empty.native.lock.json\"",
+    });
+    try nativeMutations(&f, "native-action-empty-lock", "build.zig", &.{
+        "workload_core.dependOn(&native_action_empty_lock_tests.step);",
+    });
+    try nativeMutations(&f, "native-action-empty-lock", "tools/native-action-empty-lock.zig", &.{
+        "try locks.decode(allocator, source, locks.maximum_document_bytes)",
+        ".policy_sha256 = original.lock.policy_sha256",
+        "try file.observeStableAlloc(allocator, locks.maximum_document_bytes)",
+        ".overwrite = .fail_if_exists,",
+    });
 }
 
 test "security: install action uses pinned bundles and validates before emitting result" {
