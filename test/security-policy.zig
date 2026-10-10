@@ -911,7 +911,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 49), members);
+    try testing.expectEqual(@as(usize, 50), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2383,6 +2383,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
+        "  step native-outcome-build 0 \"\" \"${zenv[@]}\" \"$zig\" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
         "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-postinst-protected \\\n",
@@ -2480,8 +2481,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
         "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
         "            if total > 512 * 1024 * 1024:\n",
-        "                 \"tools/real_snapshot_outcome.py\",\n",
-        "python3 -I tools/real_snapshot_outcome.py \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
+        "                 \"zig-out/bin/debz-native-outcome\",\n",
+        "PATH=/no-host-interpreters zig-out/bin/debz-native-outcome \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
         "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
         "        source_fd = open_beneath(root_fd, \"var/lib/debz\", directory=True)\n",
         "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=source_fd)\n",
@@ -2495,11 +2496,13 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "  printf '{\"stage\":\"%s\",\"command_exit_status\":null}\\n' \"$name\" >\"$evidence/native-stage-v1.json\"\n",
         "  printf '{\"stage\":\"%s\",\"command_exit_status\":%s}\\n' \"$name\" \"$status\" >\"$evidence/native-stage-v1.json\"\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_outcome.py", &.{
-        "        marker = json.loads(read_root_file(evidence, \"native-stage-v1.json\", 4096))\n",
-        "        result = json.loads(read_root_file(evidence, f\"{stage}.json\", 128 * 1024 * 1024))\n",
-        "            if wrapper_status != 0 or not expected_refusal:\n",
-        "        if command_status is None:\n",
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-native-outcome.zig", &.{
+        "                if (depth > maximum_document_depth) return error.OutcomeDepthExceeded;\n",
+        "    const marker = try document(root, allocator, \"native-stage-v1.json\", 4096);\n",
+        "    const result = try document(root, allocator, result_path, maximum_result_bytes);\n",
+        "        if (outcome.wrapper_exit_status != 0 or !expected_refusal) return error.IncompleteSuccessfulWorkflow;\n",
+        "    const command_status = outcome.command_exit_status orelse return error.UnrecordedCommandExit;\n",
+        "    var pin = try root.root.pinRegularFile(try fs.Path.init(path));\n",
     });
     try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  ubuntu-real-snapshot:", "  protected-reference:", &.{
         "        id: native\n",
