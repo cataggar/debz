@@ -2460,6 +2460,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-bash-protected-stage.sh", &.{
         "      /var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu\n",
+        "\"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-util-linux-source-protected \\\n",
+        "  \"-Darm64-util-linux-source-root=$source\" \\\n",
+        "grep -Fx \"signed arm64 util-linux original archive source validated without callback admission or skips\" \"$workspace/evidence/util-linux-source-proof.txt\"\n",
+        "cmp \"$workspace/evidence/util-linux-original-native.postinst\" \"$workspace/evidence/util-linux-original-dpkg.postinst\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
         "        --force-depends --no-triggers --configure less\n",
@@ -2472,6 +2476,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
         "        for package in SOURCE_ARTIFACTS:\n            archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
         "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
+        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.deb\", util_linux, 0o644)\n",
+        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.lock.json\", util_linux_lock, 0o644)\n",
     });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
         "      run_protected_reference:\n",

@@ -22857,6 +22857,84 @@ fn snapshotUtilLinuxPostinstIsBound(
     return true;
 }
 
+fn snapshotUtilLinuxArm64SourcePackage(lock: exact_lock_v3.Lock) !exact_lock_v3.Package {
+    if (!std.mem.eql(u8, lock.target_architecture, "arm64"))
+        return error.InvalidSnapshotUtilLinuxSource;
+    const package = lock.findIdentity("util-linux", "arm64") orelse
+        return error.InvalidSnapshotUtilLinuxSource;
+    const origin = switch (package.origin) {
+        .authenticated_repository => |value| value,
+        .local_artifact => return error.InvalidSnapshotUtilLinuxSource,
+    };
+    const repository = lock.findRepository(origin.repository_id) orelse
+        return error.InvalidSnapshotUtilLinuxSource;
+    if (!std.crypto.timing_safe.eql([32]u8, repository.snapshot_sha256, origin.repository_snapshot_sha256))
+        return error.InvalidSnapshotUtilLinuxSource;
+    if (!std.mem.eql(u8, package.version, "2.41.3-3ubuntu2.2") or
+        package.declared_size != 1055344 or
+        lock.archiveAuthentication(package) != .signed_sha512 or
+        package.archive_identity.primary != .sha512 or
+        package.archive_identity.digests.sha512 == null or
+        !std.mem.eql(u8, &package.archive_identity.digests.sha512.?, &(try content_digest.Value.parse(
+            .sha512,
+            "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad",
+        )).sha512))
+        return error.InvalidSnapshotUtilLinuxSource;
+    return package;
+}
+
+fn snapshotUtilLinuxArm64SourceModel(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v3.Lock,
+    bytes: []const u8,
+) !archive_application.Model {
+    const package = try snapshotUtilLinuxArm64SourcePackage(lock);
+    const origin = package.origin.authenticated_repository;
+    var model = switch (archive_application.prepare(allocator, bytes, .{ .repository = .{
+        .repository = &origin.repository_id,
+        .package = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .requested_package = package.name,
+        .requested_version = package.version,
+        .requested_architecture = package.architecture,
+        .filename = "util-linux_2.41.3-3ubuntu2.2_arm64.deb",
+        .size = package.declared_size,
+        .archive_identity = package.archive_identity,
+    } }, .{ .payload = .{
+        .max_control_compressed_bytes = 1024 * 1024,
+        .max_control_decompressed_bytes = 1024 * 1024,
+        .max_data_compressed_bytes = 2 * 1024 * 1024,
+        .max_data_decompressed_bytes = 64 * 1024 * 1024,
+        .max_entries_per_tar = 4096,
+    } })) {
+        .model => |value| value,
+        .diagnostic => |diagnostic| {
+            std.debug.print("original ARM util-linux source refused: {s}\n", .{diagnostic.message()});
+            return error.InvalidSnapshotUtilLinuxSource;
+        },
+    };
+    errdefer model.deinit();
+    const script = model.script(.postinst) orelse return error.InvalidSnapshotUtilLinuxSource;
+    if (script.mode != 0o755 or script.uid != 0 or script.gid != 0 or script.size != 2112 or
+        !std.mem.eql(u8, model.scriptBytes(script.*), @embedFile("fixtures/ubuntu-resolute-util-linux.postinst")))
+        return error.InvalidSnapshotUtilLinuxSource;
+    for ([_]SignedDebconfControlFile{
+        .{ .path = "usr/bin/more", .size = 68024, .mode = 0o755, .sha256 = "d06d24e93d2fa8d550a2f9977a4aefd34e0ed91fd1f792481d7e475768313501" },
+        .{ .path = "usr/share/man/man1/more.1.gz", .size = 2650, .mode = 0o644, .sha256 = "91dc8c4d835aaf3765915af09af73b533ac3a12ac13fe754b3e02c230c1f2d5d" },
+        .{ .path = "usr/lib/systemd/system/fstrim.service", .size = 477, .mode = 0o644, .sha256 = "9d5ab55ca0f12257edd33d154e5dc523ddea4d5f2525557cbf96e30b97deab56" },
+        .{ .path = "usr/lib/systemd/system/fstrim.timer", .size = 283, .mode = 0o644, .sha256 = "699161252ffaa35a0272aae055e51332df694ff4d28c39f8b666d47ecced3397" },
+    }) |binding| {
+        const file = model.findFile(binding.path) orelse return error.InvalidSnapshotUtilLinuxSource;
+        const expected = (try content_digest.Value.parse(.sha256, binding.sha256)).sha256;
+        if (file.kind != .regular or file.mode != binding.mode or file.uid != 0 or file.gid != 0 or
+            file.size != binding.size or file.sha256 == null or
+            !std.crypto.timing_safe.eql([32]u8, file.sha256.?, expected))
+            return error.InvalidSnapshotUtilLinuxSource;
+    }
+    return model;
+}
+
 fn snapshotConsoleSetupLinuxPostinstIsBound(
     bytes: []const u8,
     architecture: []const u8,
@@ -25727,6 +25805,104 @@ test "native_unpack.test.signed arm64 bash cache retains absence but refuses a s
     _ = try verifySnapshotBashArm64CacheInput(testing.allocator, root);
     try temporary.dir.symLink(testing.io, "/etc/ld.so.cache", "etc/ld.so.cache", .{});
     try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotBashArm64CacheInput(testing.allocator, root));
+}
+
+test "native_unpack.test.signed arm64 util-linux source refuses borrowed or unauthenticated archive coordinates" {
+    var package: exact_lock_v3.Package = .{
+        .name = "util-linux",
+        .version = "2.41.3-3ubuntu2.2",
+        .architecture = "arm64",
+        .origin = .{ .authenticated_repository = .{ .repository_id = @splat('1'), .repository_snapshot_sha256 = @splat(2) } },
+        .archive_identity = try content_digest.Identity.init(.{ .sha512 = (try content_digest.Value.parse(
+            .sha512,
+            "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad",
+        )).sha512 }, .sha512),
+        .declared_size = 1055344,
+        .retention = .dependency,
+        .dpkg_selection_hold = false,
+    };
+    var lock: exact_lock_v3.Lock = .{
+        .target_architecture = "arm64",
+        .request_sha256 = @splat(0),
+        .policy_sha256 = @splat(0),
+        .repositories = &.{.{
+            .id = @splat('1'),
+            .snapshot_sha256 = @splat(2),
+            .release_sha256 = @splat(3),
+            .index_identity = try content_digest.Identity.init(.{ .sha256 = @splat(4) }, .sha256),
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{package},
+        .digest_sha256 = @splat(0),
+    };
+    _ = try snapshotUtilLinuxArm64SourcePackage(lock);
+    const original = package;
+    for (0..8) |change| {
+        package = original;
+        lock.target_architecture = "arm64";
+        switch (change) {
+            0 => package.version = "2.41.3-3ubuntu2",
+            1 => package.architecture = "amd64",
+            2 => package.declared_size += 1,
+            3 => package.archive_identity.digests.sha512.?[0] ^= 1,
+            4 => package.name = "borrowed-source",
+            5 => lock.target_architecture = "amd64",
+            6 => package.archive_identity = try content_digest.Identity.init(.{ .sha256 = @splat(0) }, .sha256),
+            7 => package.origin.authenticated_repository.repository_snapshot_sha256[0] ^= 1,
+            else => unreachable,
+        }
+        lock.packages = &.{package};
+        try testing.expectError(error.InvalidSnapshotUtilLinuxSource, snapshotUtilLinuxArm64SourcePackage(lock));
+    }
+    package = original;
+    lock.target_architecture = "arm64";
+    lock.packages = &.{package};
+    lock.repositories = &.{};
+    try testing.expectError(error.InvalidSnapshotUtilLinuxSource, snapshotUtilLinuxArm64SourcePackage(lock));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        @embedFile("fixtures/ubuntu-resolute-util-linux.postinst"),
+        "arm64",
+        .{ .name = "util-linux", .version = "2.41.3-3ubuntu2.2", .architecture = "arm64" },
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+}
+
+test "native_unpack.test.protected signed arm64 util-linux archive source is validated without callback admission" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_ROOT") orelse return;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    var lock_file = try root.root.pinRegularFile(try root_fs.Path.init("var/lib/dpkg/producer-util-linux.lock.json"));
+    defer lock_file.close();
+    const lock_observation = try lock_file.observeStableAlloc(testing.allocator, exact_lock_v3.maximum_document_bytes);
+    defer testing.allocator.free(lock_observation.bytes);
+    try testing.expect(lock_observation.entry.uid == 0 and lock_observation.entry.gid == 0 and
+        lock_observation.entry.mode == 0o644 and lock_observation.entry.link_count == 1);
+    var lock = try exact_lock_v3.decode(testing.allocator, lock_observation.bytes, exact_lock_v3.maximum_document_bytes);
+    defer lock.deinit();
+    var archive = try root.root.pinRegularFile(try root_fs.Path.init("var/lib/dpkg/producer-util-linux.deb"));
+    defer archive.close();
+    const observation = try archive.observeStableAlloc(testing.allocator, 1055344);
+    defer testing.allocator.free(observation.bytes);
+    try testing.expect(observation.entry.uid == 0 and observation.entry.gid == 0 and
+        observation.entry.mode == 0o644 and observation.entry.link_count == 1);
+    var model = try snapshotUtilLinuxArm64SourceModel(testing.allocator, lock.lock, observation.bytes);
+    defer model.deinit();
+    const altered = try testing.allocator.dupe(u8, observation.bytes);
+    defer testing.allocator.free(altered);
+    altered[altered.len - 1] ^= 1;
+    try testing.expectError(error.InvalidSnapshotUtilLinuxSource, snapshotUtilLinuxArm64SourceModel(testing.allocator, lock.lock, altered));
+    try testing.expectError(error.InvalidSnapshotUtilLinuxSource, snapshotUtilLinuxArm64SourceModel(testing.allocator, lock.lock, observation.bytes[0 .. observation.bytes.len - 1]));
+    const postinst_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_POSTINST") orelse return error.TestUnexpectedResult;
+    var postinst = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(postinst_path), .{ .exclusive = true });
+    defer postinst.close(testing.io);
+    try postinst.writeStreamingAll(testing.io, model.scriptBytes(model.script(.postinst).?.*));
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed arm64 util-linux original archive source validated without callback admission or skips\n");
 }
 
 test "native_unpack.test.protected signed arm64 bash source is validated before fixture mutation" {

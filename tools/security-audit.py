@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import codecs
 import re
 import hashlib
 import json
@@ -218,14 +219,26 @@ def digest_relevant_path(relative: str) -> bool:
     return path.suffix not in {".pyc", ".pyo"}
 
 
-def tracked_digest_texts(files: list[pathlib.Path]) -> dict[str, str]:
+def tracked_digest_texts(
+    files: list[pathlib.Path], maximum_text_bytes: int | None = None,
+) -> dict[str, str]:
     texts: dict[str, str] = {}
     for path in repository_digest_files(files):
         relative = path.relative_to(ROOT).as_posix()
         if not digest_relevant_path(relative):
             continue
         try:
-            texts[relative] = path.read_text(errors="strict")
+            if maximum_text_bytes is None:
+                texts[relative] = path.read_text(errors="strict")
+            else:
+                with path.open("rb") as stream:
+                    data = stream.read(maximum_text_bytes + 1)
+                text = codecs.getincrementaldecoder("utf-8")().decode(
+                    data, final=len(data) <= maximum_text_bytes,
+                )
+                if len(data) > maximum_text_bytes:
+                    raise OverflowError("digest text exceeds its byte bound")
+                texts[relative] = text.replace("\r\n", "\n").replace("\r", "\n")
         except FileNotFoundError:
             continue  # A tracked file may be deleted in the working tree before commit.
         except UnicodeDecodeError:
@@ -3298,6 +3311,40 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     copies = bash_stage.find('for name in native dpkg-after bad-script')
     if source_guard < 0 or copies < 0 or source_guard > copies:
         failures.append("protected bash source guard must execute before copies/mutations")
+    util_source_guard = bash_stage.find('"$zig" build test-real-snapshot-arm64-util-linux-source-protected')
+    if util_source_guard < 0 or copies < 0 or util_source_guard > copies:
+        failures.append("protected ARM util-linux original source guard must execute before copies/mutations")
+    for path, required in (
+        ("tools/real_snapshot_less_stage.py", (
+            '"util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad")',
+            'copy_exclusive(root, "var/lib/dpkg/producer-util-linux.deb", util_linux, 0o644)',
+            'copy_exclusive(root, "var/lib/dpkg/producer-util-linux.lock.json", util_linux_lock, 0o644)',
+        )),
+        ("tools/real-snapshot-bash-protected-stage.sh", (
+            '"-Darm64-util-linux-source-root=$source"',
+            '"-Darm64-util-linux-source-postinst=$workspace/evidence/util-linux-original-native.postinst"',
+            '"-Darm64-util-linux-source-proof=$workspace/evidence/util-linux-source-proof.txt"',
+            'grep -Fx "signed arm64 util-linux original archive source validated without callback admission or skips"',
+            '/usr/bin/dpkg-deb --ctrl-tarfile "$source/var/lib/dpkg/producer-util-linux.deb"',
+            'cmp "$workspace/evidence/util-linux-original-native.postinst" "$workspace/evidence/util-linux-original-dpkg.postinst"',
+        )),
+        ("build.zig", (
+            'b.step("test-real-snapshot-arm64-util-linux-source-protected",',
+            'run_arm64_util_linux_source_tests.has_side_effects = true;',
+            'DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_{s}',
+        )),
+        ("src/native_unpack.zig", (
+            'lock.archiveAuthentication(package) != .signed_sha512',
+            'lock.findRepository(origin.repository_id) orelse',
+            'var model = try snapshotUtilLinuxArm64SourceModel(testing.allocator, lock.lock, observation.bytes);',
+            'try exact_lock_v3.decode(testing.allocator, lock_observation.bytes, exact_lock_v3.maximum_document_bytes)',
+            'try postinst.writeStreamingAll(testing.io, model.scriptBytes(model.script(.postinst).?.*));',
+            'DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_SOURCE_PROOF',
+        )),
+    ):
+        for token in required:
+            if token not in texts.get(path, ""):
+                failures.append(f"protected ARM util-linux original source binding lost {token}")
     for token in (
         'mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")',
         '--force-depends --no-triggers --configure less',
@@ -6241,10 +6288,15 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         policy = json.loads((ROOT / DIGEST_POLICY_PATH).read_text())
         files = repository_digest_files(tracked_files())
-        if len(files) > 1024 or any(path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024 for path in files):
+        maximum_text_bytes = 16 * 1024 * 1024
+        if len(files) > 1024 or any(path.is_symlink() for path in files):
             print("security-audit: digest check input exceeds repository bounds", file=sys.stderr)
             return 2
-        texts = tracked_digest_texts(tracked_files())
+        try:
+            texts = tracked_digest_texts(files, maximum_text_bytes)
+        except OverflowError:
+            print("security-audit: digest check input exceeds repository bounds", file=sys.stderr)
+            return 2
         texts[fixture["path"]] = fixture["text"]
         candidates = digest_semantic_candidates(texts)
         failures = semantic_allowlist_failures(

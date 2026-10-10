@@ -15,7 +15,7 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).parent))
 from real_snapshot_less_fixtures import (
-    create_exclusive, parent_descriptor, regular_descriptor,
+    copy_exclusive, create_exclusive, parent_descriptor, regular_descriptor,
 )
 from real_snapshot_reference_paths import open_absolute, protected
 
@@ -30,7 +30,10 @@ BASH_ARTIFACTS = {
     "libtinfo6": ("6.6+20251231-1", 107766, "301fe9df359848c63f76e5c626aaf40beb954ce95ffa96526532d7e6b86e4539099df41348aecdc9af45fd96a247d5c3f84d0393dc1408202027b545556193af"),
     "libc-bin": ("2.43-2ubuntu2.4", 597592, "e964f5753787fa44c95c7144507b178b970359b1ea90a732b2f2b6a1831d67ef3bf5b900d57ae682d3481676f8080b6382a130c6e13112a40fb698435ee124cc"),
 }
-ARCHIVE_ARTIFACTS = {**SOURCE_ARTIFACTS, **BASH_ARTIFACTS}
+UTIL_LINUX_ARTIFACTS = {
+    "util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad"),
+}
+ARCHIVE_ARTIFACTS = {**SOURCE_ARTIFACTS, **BASH_ARTIFACTS, **UTIL_LINUX_ARTIFACTS}
 
 
 def directory(root: Path, relative: str, mode: int = 0o755) -> None:
@@ -185,6 +188,10 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
     alias(root, "usr/bin/sh", "dash")
     alias(root, "usr/lib/aarch64-linux-gnu/libcap-ng.so.0", "libcap-ng.so.0.0.0")
     if selected_package == "bash":
+        util_linux = archive(locks["util-linux"], cache, "util-linux")
+        copy_exclusive(root, "var/lib/dpkg/producer-util-linux.deb", util_linux, 0o644)
+        util_linux_lock = paths[goals.index("util-linux")]
+        copy_exclusive(root, "var/lib/dpkg/producer-util-linux.lock.json", util_linux_lock, 0o644)
         tinfo = archive(locks["bash"], cache, "libtinfo6")
         create_exclusive(root, "var/lib/dpkg/producer-libtinfo6.deb", tinfo.read_bytes(), 0o644)
         if "libc-bin" in locks:
