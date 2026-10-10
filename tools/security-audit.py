@@ -2073,6 +2073,7 @@ WORKLOAD_PARTITIONS = {
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
+        "run_http_fixture_tests",
         "run_debian_closure_inventory_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),

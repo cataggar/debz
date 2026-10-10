@@ -5,6 +5,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 debz=$1
 harness=$2
+http_server=$3
 workspace="$PWD/.zig-cache/repository-add-integration"
 http_root="$workspace/http"
 repository="$http_root/repository"
@@ -21,9 +22,8 @@ esac
 test ! -L "$workspace"
 rm -rf "$workspace"
 mkdir -p "$http_root"
-: >"$request_log"
 
-python3 tools/http-fixture-server.py \
+"$http_server" \
   --root "$http_root" \
   --port-file "$port_file" \
   --request-log "$request_log" \
@@ -186,4 +186,5 @@ printf '%s' "$mismatch" | grep -vq 'fixture-query-secret'
 test ! -e "$mismatch_root/etc/apt/sources.list.d/microsoft-prod.list"
 test ! -e "$mismatch_root/var/lib/debz/repository/active-config-v1.json"
 
+test ! -s "$server_stderr"
 printf 'repository-add integration passed\n'

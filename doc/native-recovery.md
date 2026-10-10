@@ -1637,7 +1637,19 @@ Python test entry points have been retired from this Zig-only gate.
 Unprivileged Zig transport negatives also run under
 the repository target and the standard `zig build test` target. A pinned
 `-Dnative-reference-dpkg=...` is forwarded without changing its existing
-meaning. For a local Python installation lacking the signed fixture
+meaning. The network scenario and `test-repository-add` use the compiled
+Zig `http-fixture-server`, not a Python HTTP process. It serves original
+regular-file bytes with GET/HEAD on an ephemeral IPv4 loopback port and
+records request paths without query strings or fragments. The build passes
+the executable explicitly; missing server support is an error, not a skip.
+Unlike the retired general-purpose server, it does not list directories or
+follow source links. Source reads are descriptor-rooted, single-link,
+stable and bounded to 128 MiB; output files are exclusive mode 0600.
+`zig build test-http-fixture-server` exercises real HTTP responses and the
+source/output refusals without root. This removes the HTTP interpreter,
+not the remaining signed fixture generator's Python dependency.
+
+For a local Python installation lacking the signed fixture
 generator's documented `cryptography` requirement, supply
 `-Dnative-repository-fixture-python=/absolute/path/to/python`; this option
 selects **fixture generation only**, not the acceptance runner. For a

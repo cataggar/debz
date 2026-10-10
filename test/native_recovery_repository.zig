@@ -919,8 +919,7 @@ fn terminalEvidence(fixture: *foundation.Fixture, root: []const u8, relative: []
     defer caller.deinit();
     const pending = caller.record;
     if (pending.outcome != .pending or !pending.operation.eql(.{ .repository_bootstrap = .add }) or
-        !std.mem.eql(u8, &(state.state.plan_sha256 orelse return error.MissingRepositoryPlan),
-            &(pending.plan_sha256 orelse return error.MissingRepositoryPlan)))
+        !std.mem.eql(u8, &(state.state.plan_sha256 orelse return error.MissingRepositoryPlan), &(pending.plan_sha256 orelse return error.MissingRepositoryPlan)))
         return error.RepositoryCallerCheckpointMismatch;
     const checkpoint_file = try support.path(allocator, relative, checkpoint_path[1..]);
     if ((try fixture.dir.statFile(fixture.io, checkpoint_file, .{ .follow_symlinks = false })).permissions.toMode() & 0o777 != 0o600)
@@ -984,8 +983,7 @@ fn terminalEvidence(fixture: *foundation.Fixture, root: []const u8, relative: []
     for (completion.foreign_architectures, pending.foreign_architectures) |actual, previous| {
         if (!std.mem.eql(u8, actual, previous)) return error.RepositoryCompletionBindingMismatch;
     }
-    try parity_evidence.verifyProjected(fixture, root, debz.live_root.logical_root_path, state.state.architecture,
-        &proof.document.exact_lock_sha256, failed);
+    try parity_evidence.verifyProjected(fixture, root, debz.live_root.logical_root_path, state.state.architecture, &proof.document.exact_lock_sha256, failed);
     var discharge = std.crypto.hash.sha2.Sha256.init(.{});
     discharge.update("debz-native-repository-completion-request-v1\x00");
     discharge.update(&pending.attempt_id);
@@ -1032,11 +1030,7 @@ fn terminalEvidence(fixture: *foundation.Fixture, root: []const u8, relative: []
             !std.mem.eql(u8, &execution.caller.policy_sha256, &std.fmt.bytesToHex(pending.policy_sha256, .lower)))
             return error.RepositoryExecutionRequestChanged;
         const mount = request.helper() orelse return error.MissingRepositoryHelperBinding;
-        try oracle.validateHelperInvocation(allocator, debz.live_root.logical_root_path, mount.source_path, mount.target_path, mount.sha256,
-            execution.program.script_policy_sha256, .{ .package = script.package, .version = script.package_version,
-                .architecture = script.architecture, .kind = @tagName(script.kind), .source = script.source,
-                .arguments = script.arguments, .environment = script.environment, .script_sha256 = script.script_sha256,
-                .invocation_sha256 = script.invocation_sha256 });
+        try oracle.validateHelperInvocation(allocator, debz.live_root.logical_root_path, mount.source_path, mount.target_path, mount.sha256, execution.program.script_policy_sha256, .{ .package = script.package, .version = script.package_version, .architecture = script.architecture, .kind = @tagName(script.kind), .source = script.source, .arguments = script.arguments, .environment = script.environment, .script_sha256 = script.script_sha256, .invocation_sha256 = script.invocation_sha256 });
         script_count += 1;
     }
     if (script_count != 2) return error.MissingRepositoryScripts;
@@ -1169,9 +1163,8 @@ fn executionCase(
         try absent(fixture, root, namespace ++ "root-operation-completion-v2.json");
         try absent(fixture, root, "fixture/repository-native-receipt.json");
         for ([_][]const u8{
-            "fixture/repository-retained-receipt-path", namespace ++ "repository", "repository-trace",
-            "usr/bin/dpkg-trigger", namespace ++ "native-helper-cache-v1",
-            "usr/share/doc/debz-native-repository/README",
+            "fixture/repository-retained-receipt-path", namespace ++ "repository",             "repository-trace",
+            "usr/bin/dpkg-trigger",                     namespace ++ "native-helper-cache-v1", "usr/share/doc/debz-native-repository/README",
         }) |path| try absent(fixture, root, path);
     }
     try assertText(fixture, try support.path(fixture.allocator, relative, "usr/share/held"), "untouched\n");
@@ -1352,16 +1345,15 @@ const NetworkServer = struct {
     }
 };
 
-fn startNetworkServer(fixture: *foundation.Fixture, python: []const u8) !NetworkServer {
+fn startNetworkServer(fixture: *foundation.Fixture, executable: []const u8) !NetworkServer {
     try fixture.directory("repository-http/root/fixture");
-    const script = try std.fmt.allocPrint(fixture.allocator, "{s}/tools/http-fixture-server.py", .{options.repository});
     const root = try fixture.absolute("repository-http/root/fixture");
     const port_path = try fixture.absolute("repository-http/http.port");
     const requests = try fixture.absolute("repository-http/http.requests");
     var stderr = try fixture.dir.createFile(fixture.io, "repository-http/http.stderr", .{});
     errdefer stderr.close(fixture.io);
     var child = try std.process.spawn(fixture.io, .{
-        .argv = &.{ python, "-B", script, "--root", root, "--port-file", port_path, "--request-log", requests },
+        .argv = &.{ executable, "--root", root, "--port-file", port_path, "--request-log", requests },
         .environ_map = &fixture.environment,
         .stdin = .ignore,
         .stdout = .ignore,
@@ -1611,6 +1603,7 @@ fn cliScenario(
     cli: []const u8,
     arch: []const u8,
     python: []const u8,
+    http_server: []const u8,
     reference: []const u8,
     case: []const u8,
 ) !void {
@@ -1620,7 +1613,7 @@ fn cliScenario(
     const blocked = std.mem.eql(u8, case, "refresh_failure") or
         std.mem.eql(u8, case, "signal") or std.mem.eql(u8, case, "deadline");
     const network = std.mem.eql(u8, case, "network");
-    var server: ?NetworkServer = if (network) try startNetworkServer(fixture, python) else null;
+    var server: ?NetworkServer = if (network) try startNetworkServer(fixture, http_server) else null;
     defer if (server) |*running| running.stop();
     const transport = if (server) |running| running.url else "file:///fixture";
     const root = try makeRoot(fixture, name, arch);
@@ -1688,9 +1681,9 @@ fn cliScenario(
     const url = try std.fmt.allocPrint(fixture.allocator, "{s}/descriptor.deb{s}", .{ transport, if (network) "?token=native-query-secret" else "" });
     var arguments: std.ArrayList([]const u8) = .empty;
     try arguments.appendSlice(fixture.allocator, &.{
-        "repo",           "add",           "--url",                                                                                                      url,
-        "--sha256",       hash,            "--root",                                                                                                     "/",
-        "--architecture", arch,            "--transaction-backend",                                                                                      "native",
+        "repo",           "add",           "--url",                                                                                                       url,
+        "--sha256",       hash,            "--root",                                                                                                      "/",
+        "--architecture", arch,            "--transaction-backend",                                                                                       "native",
         "--json",         "--deadline-ms", if (std.mem.eql(u8, case, "lock_wait")) "75" else if (std.mem.eql(u8, case, "deadline")) "15000" else "60000",
     });
     if (no_refresh) try arguments.append(fixture.allocator, "--no-refresh");
@@ -1799,9 +1792,11 @@ pub fn main(init: std.process.Init) !void {
             return inside(init, allocator, root, mode);
         }
         const cli = iterator.next() orelse return error.MissingRepositoryCli;
+        const http_server = iterator.next() orelse return error.MissingHttpFixtureServer;
         const runner_path = try std.fs.path.resolve(allocator, &.{ options.repository, self });
         const native_path = try std.fs.path.resolve(allocator, &.{ options.repository, first });
         const cli_path = try std.fs.path.resolve(allocator, &.{ options.repository, cli });
+        const http_server_path = try std.fs.path.resolve(allocator, &.{ options.repository, http_server });
         var fixture_python: []const u8 = "python3";
         var selected_cli_case: ?[]const u8 = null;
         var pinned: ?[]const u8 = null;
@@ -1863,7 +1858,7 @@ pub fn main(init: std.process.Init) !void {
                 if (selected_cli_case) |chosen| {
                     if (!std.mem.eql(u8, chosen, case)) continue;
                 }
-                try cliScenario(&fixture, runner_path, cli_path, reference.architecture, fixture_python, reference.executable, case);
+                try cliScenario(&fixture, runner_path, cli_path, reference.architecture, fixture_python, http_server_path, reference.executable, case);
             }
             if (selected_cli_case == null or std.mem.eql(u8, selected_cli_case.?, "missing_descriptor"))
                 try cliCase(&fixture, runner_path, cli_path, reference.architecture);
