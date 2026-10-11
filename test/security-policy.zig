@@ -1715,6 +1715,11 @@ test "security: actual integration signing binds every consumer to the native he
         "realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_signing, self.arena)",
         "\"--signing-helper\", signing_helper",
     });
+    for ([_][]const u8{ "tools/test-integration-roots.sh", "tools/test-repository-add.sh" }) |path|
+        try nativeMutations(&f, "native-integration-signing", path, &.{
+            "*) DEBZ_INTEGRATION_SIGNING=\"$PWD/$DEBZ_INTEGRATION_SIGNING\" ;;",
+            "if [ ! -x \"$DEBZ_INTEGRATION_SIGNING\" ]; then",
+        });
     try nativeMutations(&f, "native-integration-signing", ".github/workflows/ci.yml", &.{
         "zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all",
         "--signing-helper \"$PWD/zig-out/bin/debz-integration-signing\"",

@@ -5080,10 +5080,12 @@ def native_integration_signing_failures(texts: dict[str, str]) -> list[str]:
         ),
         INTEGRATION_SIGNING_PATHS[3]: (
             'export DEBZ_INTEGRATION_SIGNING=${3:-"$PWD/zig-out/bin/debz-integration-signing"}',
+            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
             'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
         ),
         INTEGRATION_SIGNING_PATHS[4]: (
             'export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}',
+            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
             'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
         ),
         **{path: (
