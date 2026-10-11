@@ -272,6 +272,7 @@ pub fn build(b: *std.Build) void {
     b.step("build-integration-archive", "Build original integration fixture archive encoding").dependOn(&install_integration_archive.step);
     const integration_archive_test_options = b.addOptions();
     integration_archive_test_options.addOptionPath("executable", integration_archive.getEmittedBin());
+    integration_archive_test_options.addOption([]const u8, "repository", b.pathFromRoot("."));
     const integration_archive_test_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-archive.zig"),
         .target = target,

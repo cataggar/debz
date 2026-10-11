@@ -1,6 +1,7 @@
 //! Original deterministic integration archive encoding, not package authority.
 const std = @import("std");
-const fs = @import("debz").root_fs;
+const debz = @import("debz");
+const fs = debz.root_fs;
 const maximum_bytes = 8 * 1024 * 1024;
 const epoch = 1_700_000_000;
 
@@ -143,10 +144,71 @@ fn encode(io: std.Io, allocator: std.mem.Allocator, workspace: []const u8, reque
     return out.toOwnedSlice(allocator);
 }
 
+fn extraControl(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const outer = switch (debz.deb_archive.parse(bytes, .{
+        .max_archive_bytes = maximum_bytes,
+        .max_member_bytes = maximum_bytes,
+    })) {
+        .archive => |archive| archive,
+        .diagnostic => |diagnostic| {
+            std.log.err("extra package outer archive refused: {s}", .{diagnostic.message()});
+            return error.InvalidExtraPackageArchive;
+        },
+    };
+    if (outer.control.compression == .zstd) return error.UnsupportedExtraControlCompression;
+    const text = switch (debz.deb_payload.inspectControlAlloc(allocator, bytes, .{
+        .outer = .{ .max_archive_bytes = maximum_bytes, .max_member_bytes = maximum_bytes },
+        .max_control_compressed_bytes = maximum_bytes,
+        .max_control_decompressed_bytes = maximum_bytes,
+        .max_control_file_bytes = maximum_bytes,
+        .max_entries_per_tar = maximum_bytes / 512,
+        .max_inventory_bytes_per_tar = maximum_bytes * 2,
+    })) {
+        .bytes => |text| text,
+        .diagnostic => |diagnostic| {
+            std.log.err("extra package control refused: stage={s} code={s} {s}", .{
+                @tagName(diagnostic.stage), @tagName(diagnostic.code), diagnostic.message(),
+            });
+            return error.InvalidExtraPackageControl;
+        },
+    };
+    errdefer allocator.free(text);
+    if (!std.unicode.utf8ValidateSlice(text) or !std.mem.endsWith(u8, text, "\n") or
+        std.mem.indexOf(u8, text, "\n\n") != null)
+        return error.InvalidExtraControlParagraph;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        for ([_][]const u8{ "Filename:", "Size:", "SHA256:", "SHA512:", "MD5sum:" }) |field|
+            if (std.mem.startsWith(u8, line, field)) return error.ExtraControlRepositoryFields;
+    }
+    return text;
+}
+
+fn extraControlFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidExtraPackagePath;
+    var root = try fs.openAbsoluteRoot(io, std.fs.path.dirname(path) orelse return error.InvalidExtraPackagePath);
+    defer root.close();
+    var pin = try root.root.pinRegularFile(try fs.Path.init(std.fs.path.basename(path)));
+    defer pin.close();
+    const source = try pin.observeStableAlloc(allocator, maximum_bytes);
+    defer allocator.free(source.bytes);
+    return extraControl(allocator, source.bytes);
+}
+
 pub fn main(init: std.process.Init) !void {
     var args = init.minimal.args.iterate();
     _ = args.next();
     const workspace = args.next() orelse return error.MissingIntegrationArchiveWorkspace;
+    if (std.mem.eql(u8, workspace, "--extra-control")) {
+        const path = args.next() orelse return error.InvalidExtraPackagePath;
+        if (args.next() != null) return error.InvalidExtraPackagePath;
+        const output = extraControlFile(init.io, init.arena.allocator(), path) catch |err| {
+            std.log.err("native extra package parsing refused: {s}", .{@errorName(err)});
+            return err;
+        };
+        try std.Io.File.stdout().writeStreamingAll(init.io, output);
+        return;
+    }
     if (args.next() != null or !std.fs.path.isAbsolute(workspace)) return error.InvalidIntegrationArchiveWorkspace;
     var root = try fs.openAbsoluteRoot(init.io, workspace);
     defer root.close();
@@ -222,4 +284,119 @@ test "integration archive encoder refuses existing scratch aliases without chang
     try std.testing.expectError(error.IntegrationScratchExists, encode(std.testing.io, allocator, workspace, .{ .control = &.{}, .data = &.{} }));
     try std.testing.expectEqualStrings("unchanged", try temporary.dir.readFileAlloc(std.testing.io, "outside", allocator, .limited(32)));
     try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "control.tar", .{}));
+}
+
+fn extraPackage(allocator: std.mem.Allocator, name: []const u8, control: []const u8) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try append(allocator, &bytes, "!<arch>\n");
+    try ar(allocator, &bytes, "debian-binary", "2.0\n");
+    try ar(allocator, &bytes, name, control);
+    try ar(allocator, &bytes, "data.tar", "data payload is deliberately not decoded");
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn originalControlFixture(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{
+        @import("integration_archive_test_options").repository, "src/fixtures/deb-payload", name,
+    });
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(maximum_bytes));
+}
+
+fn expectExtraRefusal(allocator: std.mem.Allocator, bytes: []const u8, message: []const u8) !void {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "extra.deb", .data = bytes });
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ directory, "extra.deb" });
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ @import("integration_archive_test_options").executable, "--extra-control", path },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(8192),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, message) != null);
+    try std.testing.expectEqualSlices(u8, bytes, try temporary.dir.readFileAlloc(std.testing.io, "extra.deb", allocator, .limited(maximum_bytes)));
+}
+
+test "extra control parser preserves original raw gzip and xz control bytes with no interpreter or data extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const expected = "Package: demo\nVersion: 1.0\nArchitecture: amd64\n";
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ directory, "extra.deb" });
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/no-host-interpreters");
+    for ([_][]const u8{ "control.tar", "control.tar.gz", "control.tar.xz" }) |name| {
+        const package = try extraPackage(allocator, name, try originalControlFixture(allocator, name));
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "extra.deb", .data = package });
+        const result = try std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ @import("integration_archive_test_options").executable, "--extra-control", path },
+            .environ_map = &environment,
+            .stdout_limit = .limited(maximum_bytes),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings(expected, result.stdout);
+    }
+}
+
+test "extra control parser rejects malformed archives duplicate controls and repository transport fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const raw = try originalControlFixture(allocator, "control.tar");
+    const package = try extraPackage(allocator, "control.tar", raw);
+    try expectExtraRefusal(allocator, package[0 .. package.len - 1], "InvalidExtraPackageArchive");
+    const corrupted = try allocator.dupe(u8, raw);
+    corrupted[0] ^= 1;
+    try expectExtraRefusal(allocator, try extraPackage(allocator, "control.tar", corrupted), "tar_bad_checksum");
+    const corrupt_gzip = try originalControlFixture(allocator, "control.tar.gz");
+    corrupt_gzip[corrupt_gzip.len - 8] ^= 1;
+    try expectExtraRefusal(allocator, try extraPackage(allocator, "control.tar.gz", corrupt_gzip), "decompression_failed");
+    var duplicates: std.ArrayList(u8) = .empty;
+    try member(allocator, &duplicates, "./control", "Package: demo\n", 0o644, false);
+    try member(allocator, &duplicates, "control", "Package: demo\n", 0o644, false);
+    try append(allocator, &duplicates, &(@as([1024]u8, @splat(0))));
+    try expectExtraRefusal(allocator, try extraPackage(allocator, "control.tar", duplicates.items), "duplicate_path");
+    for ([_][]const u8{ "Package: demo", "Package: demo\n\nVersion: 1\n", "Package: \xff\n" }) |text| {
+        const hex = try std.fmt.allocPrint(allocator, "{x}", .{text});
+        const control = try tar(allocator, &.{.{ .name = "./control", .hex = hex, .mode = 0o644 }});
+        try std.testing.expectError(error.InvalidExtraControlParagraph, extraControl(allocator, try extraPackage(allocator, "control.tar", control)));
+    }
+    for ([_][]const u8{ "Filename:", "Size:", "SHA256:", "SHA512:", "MD5sum:" }) |field| {
+        const text = try std.fmt.allocPrint(allocator, "Package: demo\n{s} injected\n", .{field});
+        const hex = try std.fmt.allocPrint(allocator, "{x}", .{text});
+        const control = try tar(allocator, &.{.{ .name = "./control", .hex = hex, .mode = 0o644 }});
+        try std.testing.expectError(error.ExtraControlRepositoryFields, extraControl(allocator, try extraPackage(allocator, "control.tar", control)));
+    }
+    try std.testing.expectError(error.UnsupportedExtraControlCompression, extraControl(allocator, try extraPackage(allocator, "control.tar.zst", "not supported")));
+}
+
+test "extra control file refuses relative symlink and oversized inputs without changing files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "outside", .data = "unchanged" });
+    try temporary.dir.symLink(std.testing.io, "outside", "extra.deb", .{});
+    const directory = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const path = try std.fs.path.join(allocator, &.{ directory, "extra.deb" });
+    try std.testing.expectError(error.InvalidExtraPackagePath, extraControlFile(std.testing.io, allocator, "relative.deb"));
+    if (extraControlFile(std.testing.io, allocator, path)) |bytes| {
+        allocator.free(bytes);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expect(err != error.InvalidExtraPackageArchive);
+    try std.testing.expectEqualStrings("unchanged", try temporary.dir.readFileAlloc(std.testing.io, "outside", allocator, .limited(32)));
+    try temporary.dir.deleteFile(std.testing.io, "extra.deb");
+    const file = try temporary.dir.createFile(std.testing.io, "extra.deb", .{});
+    defer file.close(std.testing.io);
+    try file.setLength(std.testing.io, maximum_bytes + 1);
+    try std.testing.expectError(error.FileTooLarge, extraControlFile(std.testing.io, allocator, path));
 }

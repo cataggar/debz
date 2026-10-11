@@ -395,6 +395,57 @@ pub const Result = union(enum) {
     diagnostic: Diagnostic,
 };
 
+pub const ControlResult = union(enum) {
+    bytes: []u8,
+    diagnostic: Diagnostic,
+};
+
+/// Copies only the bounded regular control file. This is not package
+/// validation or authentication: data.tar is neither decoded nor inspected.
+pub fn inspectControlAlloc(allocator: std.mem.Allocator, bytes: []const u8, limits: Limits) ControlResult {
+    const outer = switch (deb_archive.parse(bytes, limits.outer)) {
+        .archive => |archive| archive,
+        .diagnostic => |diagnostic| return .{ .diagnostic = .{
+            .stage = .outer,
+            .code = .outer_archive,
+            .offset = diagnostic.offset,
+            .outer = diagnostic,
+        } },
+    };
+    const raw = decompressMember(allocator, outer, outer.control, true, limits) catch |err|
+        return .{ .diagnostic = .{
+            .stage = .control_decompression,
+            .code = .decompression_failed,
+            .offset = outer.control.content.start,
+            .decompression_error = err,
+        } };
+    defer allocator.free(raw);
+    var diagnostic: Diagnostic = undefined;
+    var inventory = parseTar(allocator, raw, outer.control, .control_tar, limits, false, &diagnostic) catch
+        return .{ .diagnostic = diagnostic };
+    defer freeInventory(allocator, &inventory);
+    const entry = findControl(inventory.entries) orelse return .{ .diagnostic = .{
+        .stage = .control_metadata,
+        .code = .missing_control,
+        .offset = outer.control.content.start,
+    } };
+    const content = entryContent(raw, entry) orelse return .{ .diagnostic = .{
+        .stage = .control_metadata,
+        .code = .invalid_control,
+        .offset = outer.control.content.start,
+    } };
+    if (content.len > limits.max_control_file_bytes) return .{ .diagnostic = .{
+        .stage = .control_metadata,
+        .code = .invalid_control,
+        .offset = outer.control.content.start,
+    } };
+    return .{ .bytes = allocator.dupe(u8, content) catch return .{ .diagnostic = .{
+        .stage = .control_metadata,
+        .code = .out_of_memory,
+        .offset = outer.control.content.start,
+    } } };
+}
+
 pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expected, limits: Limits) Result {
     return validateInternal(allocator, bytes, .{ .repository = expected }, limits, false);
 }
