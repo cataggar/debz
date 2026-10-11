@@ -65,7 +65,8 @@ for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "src/private_network.zig",
              repository / "tools/real-snapshot-reference-order.py",
              repository / "tools/real_snapshot_reference_paths.py",
-             repository / "tools/prepare-native-dpkg.py",
+             repository / "tools/prepare-native-dpkg.zig",
+             repository / "zig-out/bin/debz-native-dpkg-reference",
              repository / "tools/native-differential.py",
              dpkg, lock, workspace / "evidence/create.json"):
     protected(path)
@@ -149,7 +150,7 @@ if (( ${#bootstrap[@]} != 30 )); then
   echo "reference bootstrap tool closure is incomplete" >&2
   exit 1
 fi
-python3 tools/prepare-native-dpkg.py --architecture "$architecture" \
+zig-out/bin/debz-native-dpkg-reference --architecture "$architecture" \
   --verify-only "$reference_dpkg"
 
 mkdir -m 0700 "$reference_root"

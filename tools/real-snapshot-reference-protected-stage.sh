@@ -86,7 +86,7 @@ for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
   tools/real-snapshot-reference-escape-probe.zig \
   src/private_network.zig src/fixtures/script_network_probe.zig \
-  tools/prepare-native-dpkg.py tools/real_snapshot_reference_paths.py; do
+  tools/prepare-native-dpkg.zig tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
 done
 require_protected_path "$repository_root/.real-snapshot"
@@ -131,6 +131,9 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
 unset ZIG_LIB_DIR
 export PYTHONNOUSERSITE=1 LC_ALL=C SOURCE_DATE_EPOCH=0
+"$zig" build build-native-dpkg-reference -Doptimize=ReleaseSafe -j2
+native_reference=$repository_root/zig-out/bin/debz-native-dpkg-reference
+require_protected_file "$native_reference"
 
 install -d -o root -g root -m 0700 "$workspace"
 evidence=$workspace/evidence
@@ -266,36 +269,12 @@ done
 # The hash-pinned Debian dpkg; the launcher executes dpkg itself from outside
 # the root and dpkg runs its pinned dpkg-deb/dpkg-split helpers inside it.
 dpkg_prefix=$workspace/dpkg
-python3 -I - "$repository_root/tools/prepare-native-dpkg.py" "$architecture" \
-  "$workspace/build/dpkg.deb" <<'PY'
-import importlib.util
-import pathlib
-import sys
-
-spec = importlib.util.spec_from_file_location("prepare_native_dpkg", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-_, content = module.download_archive(sys.argv[2])
-target = pathlib.Path(sys.argv[3])
-target.write_bytes(content)
-module.verify_file(target, module.PINS[sys.argv[2]]["archive"])
-PY
+"$native_reference" --architecture "$architecture" --download-archive "$workspace/build/dpkg.deb"
 install -d -o root -g root -m 0755 "$dpkg_prefix"
 dpkg-deb --extract "$workspace/build/dpkg.deb" "$dpkg_prefix"
-python3 -I - "$repository_root/tools/prepare-native-dpkg.py" "$architecture" \
-  "$dpkg_prefix/usr/bin/dpkg" "$workspace/build/dpkg.deb" <<'PY'
-import importlib.util
-import pathlib
-import sys
-
-spec = importlib.util.spec_from_file_location("prepare_native_dpkg", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-module.verify_file(pathlib.Path(sys.argv[3]), module.PINS[sys.argv[2]]["executable"])
-module.receipt_from_extracted_archive(
-    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])
-PY
-python3 -B "$repository_root/tools/prepare-native-dpkg.py" \
+"$native_reference" --architecture "$architecture" \
+  --receipt-from-archive "$workspace/build/dpkg.deb" --prefix "$dpkg_prefix"
+"$native_reference" \
   --architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"
 for helper in dpkg-deb dpkg-split; do
   install -o root -g root -m 0755 "$dpkg_prefix/usr/bin/$helper" "$template/usr/bin/$helper"

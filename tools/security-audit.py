@@ -2078,7 +2078,8 @@ RECOVERY_ZIG_SHARDS = {
 ROOT_IMPORT_STEP = "Compare pinned-dpkg root import and copied-root refusals"
 ROOT_IMPORT_COMMANDS = [
     "mkdir -p .tmp",
-    'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+    "zig build build-native-dpkg-reference -j2",
+    'reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"',
     'zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
     'zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
 ]
@@ -2114,6 +2115,7 @@ WORKLOAD_PARTITIONS = {
         "run_apt_system_orchestrator_tests", "run_required_orchestrator_security_tests",
     )),
     "workload_native": ("test-workload-native", (
+        "native_dpkg_tests",
         "run_native_program_corpus_tests", "native_outcome_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
@@ -2197,10 +2199,12 @@ WORKLOAD_CORE_RUNS_ON = (
 )
 WORKLOAD_DEBUG = "${{ matrix.optimize == 'Debug' }}"
 WORKLOAD_RELEASESAFE = "${{ matrix.optimize == 'ReleaseSafe' }}"
-WORKLOAD_PREPARE_DPKG = 'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"'
+WORKLOAD_PREPARE_DPKG = 'reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"'
+WORKLOAD_BUILD_DPKG = "zig build build-native-dpkg-reference -j2"
 WORKLOAD_DPKG_MODE = '-Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all'
 WORKLOAD_MODE = '-Doptimize="$OPTIMIZE" -j2 --summary all'
 WORKLOAD_SELECTOR_COMMANDS = [
+    WORKLOAD_BUILD_DPKG,
     WORKLOAD_PREPARE_DPKG,
     f"zig build build-native-acceptance-zig {WORKLOAD_MODE}",
     'lifecycle="$PWD/.tmp/zig-lifecycle-workspace-$OPTIMIZE"',
@@ -2258,6 +2262,7 @@ WORKLOAD_JOBS = {
         ], ()),
         "Compare native triggers and diversion settlement with dpkg": (None, [
             "mkdir -p .tmp",
+            WORKLOAD_BUILD_DPKG,
             WORKLOAD_PREPARE_DPKG,
             f"zig build test-native-triggers-zig test-native-diversion-settlement-zig {WORKLOAD_DPKG_MODE}",
         ], ()),
@@ -2296,6 +2301,7 @@ WORKLOAD_JOBS = {
         ], ()),
         "Compare native materialization, conffiles, differential, and lifecycle with dpkg": (None, [
             "mkdir -p .tmp",
+            WORKLOAD_BUILD_DPKG,
             WORKLOAD_PREPARE_DPKG,
             "zig build test-native-materialization test-native-conffiles test-native-differential "
             f"{WORKLOAD_DPKG_MODE}",
@@ -2315,6 +2321,7 @@ WORKLOAD_JOBS = {
         ], ()),
         "Run pinned dpkg lifecycle and trigger reference oracles": (None, [
             "mkdir -p .tmp",
+            WORKLOAD_BUILD_DPKG,
             WORKLOAD_PREPARE_DPKG,
             "zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle "
             f"test-native-triggers-zig-settlement-reference {WORKLOAD_DPKG_MODE}",
@@ -2324,7 +2331,7 @@ WORKLOAD_JOBS = {
         ),
     }),
 }
-# The retired single workload ran these Zig targets once per mode; each must stay exactly once.
+# Original targets stay once per mode; each of four preparations also builds its native helper.
 WORKLOAD_ZIG_TARGETS = (
     "install", "run", "test-release", "fuzz", "build-native-acceptance-zig",
     "test-native-materialization", "test-native-conffiles", "test-native-differential",
@@ -2332,6 +2339,7 @@ WORKLOAD_ZIG_TARGETS = (
     "test-native-lifecycle-zig-oracle", "test-native-triggers-zig-oracle",
     "test-native-triggers-zig-settlement-reference", "test-native-helper-namespace",
     "test-apt-system-acceptance", "test-apt-system",
+    *(("build-native-dpkg-reference",) * 4),
     *(step_name for step_name, _ in WORKLOAD_PARTITIONS.values()),
 )
 WORKLOAD_RESULTS = (
@@ -2625,7 +2633,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real_snapshot_less_stage.py",
     "tools/real_snapshot_less_fixtures.py",
     "tools/real_snapshot_python_fixtures.py",
-    "tools/prepare-native-dpkg.py",
+    "tools/prepare-native-dpkg.zig",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2764,7 +2772,8 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     '[[ $mode == proof ]] || prefix=native-ci',
     'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
     'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2',
-    'module.verify_extracted_bindings(prefix, architecture)',
+    '"$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \\\n'
+    '    --receipt-from-archive "$tree/reference-dpkg.deb" --prefix "$tree/reference-dpkg"',
     'print(toolchain(Path(sys.argv[2])))',
     "readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb",
@@ -2832,8 +2841,11 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6")',
         'bytes <= 8 * 1024 * 1024 * 1024',
     ),
-    "tools/prepare-native-dpkg.py": (
-        'with path.open("x", encoding="utf-8") as output:',
+    "tools/prepare-native-dpkg.zig": (
+        '            .exclusive = true,',
+        'try self.root.publishFile(try absolute(path), bytes, .{',
+        '            .overwrite = .fail_if_exists,',
+        'try cleanupStaging(parent.root, self.allocator, stage, stage_entry);',
     ),
     "tools/real-snapshot-less-protected-stage.sh": (
         '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
@@ -3097,7 +3109,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'if [[ $purpose == arm64-bash ]]; then packages=(bash dash util-linux libc-bin); fi',
         '  for package in "${packages[@]}"; do',
         '    authenticated_lock "$package_lock"',
-        'module.receipt_from_extracted_archive(\n    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])',
+        '"$native_reference" --architecture "$architecture" \\\n'
+        '  --receipt-from-archive "$workspace/build/dpkg.deb" --prefix "$dpkg_prefix"',
+        'require_protected_file "$native_reference"',
         '--architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"',
         "  for profile in systemd udev sudo; do\n",
         """  printf -- '-Dreference-protected-profile-scripts=%s\\n' "$profiles"\n""",
@@ -3439,17 +3453,33 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     if (not binding_list or re.search(r"\bsort\b", binding_list) or
             '>"$source_root/var/lib/dpkg/info/sudo.list"' not in binding_list):
         failures.append("signed sudo binding list must retain authenticated archive member order")
-    producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
-        "def receipt_from_extracted_archive("
-    )[2].partition("\ndef ")[0]
-    for token in ("verify_file(archive, PINS[architecture][\"archive\"])",
-                  "verify_archive_metadata(archive, architecture)",
-                  "verify_extracted_bindings(prefix, architecture)", "write_receipt(",
-                  "verify_receipt(prefix / RECEIPT, architecture)",
-                  "metadata.st_nlink != 1 or metadata.st_mode & 0o022",
-                  "path.resolve(strict=True) != path"):
+    reference = texts.get("tools/prepare-native-dpkg.zig", "")
+    producer = reference.partition("pub fn receiptFromArchive(")[2].partition("\n    fn fixture(")[0]
+    for token in (
+        "try fs.openAbsoluteRoot(self.io, prefix)",
+        "try self.read(archive, maximum_bytes, true)",
+        "if (!std.mem.eql(u8, &hash(raw), self.expected.archive))",
+        "try self.read(path, maximum_bytes, true)",
+        "if (!std.mem.eql(u8, &hash(bytes), toolDigest(self.expected, tool)))",
+        "try self.archiveMetadata(archive)",
+        "try self.writeReceipt(prefix, raw.len)",
+        "self.allocator.free(try self.verifyReceipt(receipt))",
+    ):
         if token not in producer:
             failures.append(f"protected extracted reference receipt producer lost {token}")
+    for token in (
+        "self.root.pinRegularFile(try absolute(path))",
+        "pin.observeAlloc(self.allocator, maximum)",
+        "observed.entry.link_count != 1",
+        "observed.entry.uid != std.os.linux.geteuid()",
+        "observed.entry.gid != std.os.linux.getegid()",
+        "observed.entry.mode & 0o022 != 0",
+        "cleanupStaging(parent.root, self.allocator, stage, stage_entry)",
+    ):
+        if token not in reference:
+            failures.append(f"native pinned-dpkg reference lost {token}")
+    if "tools/prepare-native-dpkg.py" in texts:
+        failures.append("retired Python pinned-dpkg preparation helper remains")
     ci = texts.get(".github/workflows/ci.yml", "")
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
@@ -3581,7 +3611,8 @@ def native_recovery_ci_failures(text: str) -> list[str]:
                     "native-recovery-zig-helper",
                     "native-recovery-zig-family",
                 ) else []),
-                'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                "zig build build-native-dpkg-reference -j2",
+                'reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"',
                 *recovery_zig_commands(targets, sharded=name == "native-recovery-zig-diversions"),
             ],
         )
@@ -3739,7 +3770,8 @@ SIGNED_PROC_CI_STEPS = {
     ),
     "Install metadata decompression dependency": (),
     "Prepare pinned dpkg as the runner user": (
-        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"',
+        '          zig build build-native-dpkg-reference -j2',
+        '          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture amd64)"',
         '          test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/amd64/usr/bin/dpkg"',
     ),
     "Refuse unprotected and incomplete signed replay inputs": (
@@ -3762,6 +3794,8 @@ SIGNED_PROC_CI_STEPS = {
         "            test \"$(stat -c '%u:%g' \"$path\")\" = 0:0",
         "            test $(( 8#$(stat -c '%a' \"$path\") & 022 )) -eq 0",
         '          sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"',
+        '            zig build --build-file "$PROTECTED/checkout/build.zig" build-native-dpkg-reference \\',
+        '            "$PROTECTED/checkout/zig-out/bin/debz-native-dpkg-reference" --architecture amd64 \\',
         '            --verify-only "$PROTECTED/checkout/.real-snapshot/pinned-dpkg/usr/bin/dpkg"',
     ),
     "Build the protected snapshot client": (

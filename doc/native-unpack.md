@@ -298,7 +298,7 @@ asserted rather than normalized. Use the existing runner to exercise only the
 reference specification:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
 zig build build-native-acceptance-zig -j2
 sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
   zig-out/bin/native-trigger-zig-acceptance \
@@ -702,7 +702,7 @@ tampering, version-gated fallback, archive verification before extraction,
 cache tampering, root refusal, and the package manifest. Python lifecycle,
 trigger, and recovery tests still import reusable compatibility fixtures from
 `tools/native-materialization-fixtures.py`. Offline reference-preparation
-regressions use `tools/prepare-native-dpkg.py --fixture-root` with a disposable
+regressions use `tools/prepare-native-dpkg.zig --fixture-root` with a disposable
 marker and `--fixture-archive` bytes that must still match the published pin;
 `--simulate-root` can only force refusal. These options never relax the
 production digest, privilege, or HTTPS checks. Package ownership matches the

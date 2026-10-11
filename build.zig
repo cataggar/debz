@@ -284,6 +284,27 @@ pub fn build(b: *std.Build) void {
     b.step("test-integration-archive", "Test original archive byte identities and fail-closed encoding").dependOn(&integration_archive_tests.step);
     workload_core.dependOn(&integration_archive_tests.step);
 
+    const native_dpkg_options = b.addOptions();
+    native_dpkg_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    const native_dpkg_module = b.createModule(.{
+        .root_source_file = b.path("tools/prepare-native-dpkg.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_dpkg_module.addImport("debz", debz);
+    native_dpkg_module.addOptions("native_dpkg_options", native_dpkg_options);
+    const native_dpkg = b.addExecutable(.{
+        .name = "debz-native-dpkg-reference",
+        .root_module = native_dpkg_module,
+    });
+    const install_native_dpkg = b.addInstallArtifact(native_dpkg, .{});
+    b.getInstallStep().dependOn(&install_native_dpkg.step);
+    b.step("build-native-dpkg-reference", "Build pinned independent dpkg preparation and receipt tooling").dependOn(&install_native_dpkg.step);
+    const native_dpkg_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_dpkg_module }));
+    workload_native.dependOn(&native_dpkg_tests.step);
+    const native_dpkg_test_step = b.step("test-native-dpkg-reference", "Run actual native reference selection and preparation refusals");
+    native_dpkg_test_step.dependOn(&native_dpkg_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -743,7 +764,9 @@ pub fn build(b: *std.Build) void {
         },
     );
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
+    audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
+    audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_step.dependOn(&audit_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),
@@ -1464,10 +1487,12 @@ pub fn build(b: *std.Build) void {
     native_fixture_module.addImport("debz", debz);
     const native_fixture_options = b.addOptions();
     native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_fixture_options.addOptionPath("native_dpkg_reference", native_dpkg.getEmittedBin());
     native_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());
     native_fixture_module.addOptions("native_test_options", native_fixture_options);
     const native_fixture_tests = b.addTest(.{ .root_module = native_fixture_module });
     const run_native_fixture_tests = b.addRunArtifact(native_fixture_tests);
+    native_dpkg_test_step.dependOn(&run_native_fixture_tests.step);
     const native_fixture = b.addExecutable(.{
         .name = "native-materialization-acceptance",
         .root_module = native_fixture_module,
@@ -1507,13 +1532,16 @@ pub fn build(b: *std.Build) void {
 
     const dpkg_config_reference = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), "python3",
-        "tools/dpkg-config-reference.py",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{b.getInstallPath(.bin, "debz-native-dpkg-reference")}),
+        "python3",                                      "tools/dpkg-config-reference.py",
     });
     dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
+    dpkg_config_reference.step.dependOn(&install_native_dpkg.step);
     const dpkg_config_reference_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
     );
+    dpkg_config_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
+    dpkg_config_reference_tests.step.dependOn(&install_native_dpkg.step);
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     workload_native.dependOn(&dpkg_config_reference_tests.step);
     b.step("test-dpkg-config-reference", "Verify pinned-dpkg config control-member behavior")
@@ -1521,15 +1549,18 @@ pub fn build(b: *std.Build) void {
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), "python3",
-        "tools/dpkg-alternatives-reference.py",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{b.getInstallPath(.bin, "debz-native-dpkg-reference")}),
+        "python3",                                      "tools/dpkg-alternatives-reference.py",
     });
     dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);
+    dpkg_alternatives_reference.step.dependOn(&install_native_dpkg.step);
     const dpkg_alternatives_reference_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_alternatives_reference.py" },
     );
     dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
+    dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
     dpkg_alternatives_reference_tests.step.dependOn(&install_disposable_runtime.step);
+    dpkg_alternatives_reference_tests.step.dependOn(&install_native_dpkg.step);
     dpkg_alternatives_reference.step.dependOn(&dpkg_alternatives_reference_tests.step);
     workload_native.dependOn(&dpkg_alternatives_reference_tests.step);
     b.step(

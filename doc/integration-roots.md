@@ -569,7 +569,7 @@ dpkg's closure from the pinned authenticated Ubuntu snapshot, verifies each
 SHA512 archive before extracting the loader, libraries, tar and GNU `rm`
 into a script-free merged-usr template with `/dev/null`, `/proc` and a 1777
 `/tmp`, downloads and verifies the SHA256-pinned Debian dpkg 1.22.22 with
-`tools/prepare-native-dpkg.py`, builds the ReleaseSafe launcher and static
+`tools/prepare-native-dpkg.zig`, builds the ReleaseSafe launcher and static
 probe, builds both proof archives, and writes `reference-protected.args`
 plus an `evidence/staging-manifest.txt` of input hashes. Pass that file's
 options to the target, for example
@@ -2777,7 +2777,7 @@ environment, fd probe, update fragment, log, timeout, and process, and rejects
 traversing, symlink, and special-file control fixtures.
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
+reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture amd64)"
 zig build test-dpkg-config-reference \
   -Dnative-reference-dpkg="$reference_dpkg" \
   -Dnative-reference-architecture=amd64 -j2

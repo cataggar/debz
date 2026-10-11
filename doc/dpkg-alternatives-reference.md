@@ -7,7 +7,7 @@ limited to the pinned architectures, tool digests, bounded literal script
 commands, typed canonical records, and authenticated root topology described
 below; all state outside that boundary remains fail-closed.
 
-The same `tools/prepare-native-dpkg.py` receipt also binds the sibling
+The same `tools/prepare-native-dpkg.zig` receipt also binds the sibling
 `dpkg-query` 1.22.22 binary for test-only fresh-root and
 [imported-then-mutated query parity checks](native-lifecycle.md#read-only-imported-root-query-oracle). That
 pin does not admit a production `dpkg-query` dependency or broaden the separate
@@ -96,7 +96,7 @@ executable is used to identify the architecture.
 Prepare and run the reference:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
+reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture amd64)"
 zig build test-dpkg-alternatives-reference \
   -Dnative-reference-dpkg="$reference_dpkg" \
   -Dnative-reference-architecture=amd64 -j2
