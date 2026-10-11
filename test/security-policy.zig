@@ -1672,8 +1672,23 @@ test "security: actual integration archive encoding and every fixture consumer r
         "[str(INTEGRATION_ARCHIVE), directory]",
         "return native_archive(control_entries, [(payload_path, data, 0o644)])",
     });
-    try nativeMutations(&f, "native-integration-archive", "test/native_recovery_parity.zig", &.{
-        "\"--archive-helper\", options.integration_archive",
+    for ([_][]const u8{
+        "test/native_recovery_parity.zig",
+        "test/native_recovery_family.zig",
+        "test/native_recovery_repository.zig",
+    }) |path| {
+        try nativeMutations(&f, "native-integration-archive", path, &.{
+            "const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });",
+            "\"--archive-helper\", archive_helper",
+        });
+    }
+    try nativeMutations(&f, "native-integration-archive", "test/apt-system-acceptance.zig", &.{
+        "const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_archive, self.arena);",
+        "\"--archive-helper\", archive_helper",
+    });
+    try nativeMutations(&f, "native-integration-archive", ".github/workflows/ci.yml", &.{
+        "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all",
+        "--archive-helper \"$PWD/zig-out/bin/debz-integration-archive\"",
     });
     const original = try f.source("tools/generate-integration-repository.py");
     const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", try std.mem.concat(f.arena.allocator(), u8, &.{ original, "\ndef tar_gz(entries):\n    return b''\n" }));

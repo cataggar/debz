@@ -4900,6 +4900,7 @@ INTEGRATION_ARCHIVE_PATHS = (
     "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
     "test/native_recovery_parity.zig", "test/native_recovery_family.zig",
     "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
+    ".github/workflows/ci.yml",
 )
 
 
@@ -4932,8 +4933,14 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
     for path in INTEGRATION_ARCHIVE_PATHS[3:5]:
         required[path] = ("export DEBZ_INTEGRATION_ARCHIVE", 'if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then')
     for path in INTEGRATION_ARCHIVE_PATHS[5:8]:
-        required[path] = ('"--archive-helper", options.integration_archive',)
-    required[INTEGRATION_ARCHIVE_PATHS[8]] = ('"--archive-helper", @import("apt_acceptance_fixture_options").integration_archive',)
+        required[path] = (
+            'const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });',
+            '"--archive-helper", archive_helper',
+        )
+    required[INTEGRATION_ARCHIVE_PATHS[8]] = (
+        'const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_archive, self.arena);',
+        '"--archive-helper", archive_helper',
+    )
     failures = [
         f"{path}: required native integration archive encoding or real consumer wiring is missing"
         for path, tokens in required.items()
@@ -4941,6 +4948,15 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
     ]
     if re.search(r"(?m)^def (?:tar_member|tar_gz|ar_member)\(", texts.get(INTEGRATION_ARCHIVE_PATHS[2], "")):
         failures.append("retired Python integration archive encoder was restored")
+    container = texts.get(INTEGRATION_ARCHIVE_PATHS[9], "").partition(
+        "  download-action-container-fixture:"
+    )[2].partition("\n  download-action-container:")[0]
+    build_helper = "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all"
+    generate = "python3 tools/generate-integration-repository.py"
+    if (build_helper not in container or generate not in container or
+            container.index(build_helper) > container.index(generate) or
+            '--archive-helper "$PWD/zig-out/bin/debz-integration-archive"' not in container):
+        failures.append("container fixture must build and pass its native archive helper before generation")
     return failures
 
 DISPOSABLE_RUNTIME_PATHS = (
