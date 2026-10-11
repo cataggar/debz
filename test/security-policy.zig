@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 59), members);
+    try testing.expectEqual(@as(usize, 60), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1683,6 +1683,29 @@ test "security: disposable runtime consumers require native copying without a Py
     const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python disposable runtime implementation was restored");
+}
+
+test "security: actual release core consumes native tags plans ELF mappings and original GNU tar" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-release-core", "build.zig", &.{
+        "workload_release.dependOn(&release_tool_tests.step);",
+        "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
+    });
+    try nativeMutations(&f, "native-release-core", "tools/release.py", &.{
+        "return native_release(\"version\", tag).decode().removesuffix(\"\\n\")",
+        "native_release(\"check-elf\", \"--platform\", platform, input=binary)",
+        "return json.loads(native_release(\"dry-run\", \"--tag\", tag))",
+        "\"encode-tar\",",
+        "\"PATH\": \"/no-host-interpreters\"",
+    });
+    try nativeMutations(&f, "native-release-core", "tools/release.zig", &.{
+        "if (file_mapping.? != virtual_mapping.?)",
+        "if (value.offset - load.file_start != value.address - load.virtual_start)",
+        "if (tag == 1)",
+        "if (terminated and tag != 0)",
+        "const padding = (10240 - output.items.len % 10240) % 10240;",
+    });
 }
 
 test "security: native Debian readiness keeps pinned freshness, bounded input and actual closure handoffs" {

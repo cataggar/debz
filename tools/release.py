@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import io
 import json
@@ -13,7 +14,6 @@ import lzma
 import os
 import pathlib
 import re
-import struct
 import subprocess
 import sys
 import tarfile
@@ -25,11 +25,6 @@ FORMATS = ("tar.gz", "tar.xz")
 DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v3"
 DIGEST_INVENTORY_NAME = "digest-inventory-v1.tsv"
 DIGEST_SEMANTIC_ALLOWLIST_NAME = "digest-semantic-allowlist-v1.tsv"
-SEMVER = re.compile(
-    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-((?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*))*))?"
-    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
-)
 FORBIDDEN_PARTS = {
     ".git",
     ".zig-cache",
@@ -50,10 +45,29 @@ class ReleaseError(Exception):
     """A release input or artifact failed validation."""
 
 
+def native_release(*arguments: str, input: bytes | None = None) -> bytes:
+    helper = pathlib.Path(
+        os.environ.get("DEBZ_RELEASE", pathlib.Path(__file__).resolve().parent.parent / "zig-out/bin/debz-release")
+    )
+    try:
+        result = subprocess.run(
+            [str(helper), *arguments],
+            input=input,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "PATH": "/no-host-interpreters"},
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ReleaseError(f"native release helper failed: {error}") from error
+    if result.returncode:
+        raise ReleaseError(result.stderr.decode("utf-8", errors="replace").strip())
+    return result.stdout
+
+
 def parse_tag(tag: str) -> str:
-    if not tag.startswith("v") or not SEMVER.fullmatch(tag[1:]):
-        raise ReleaseError(f"invalid release tag: {tag!r}")
-    return tag[1:]
+    return native_release("version", tag).decode().removesuffix("\n")
 
 
 def canonical_json(value: object) -> bytes:
@@ -88,34 +102,16 @@ def validate_payload(path: pathlib.PurePosixPath, data: bytes) -> None:
             raise ReleaseError(f"possible secret in release input: {path}")
 
 
-def tar_info(name: str, mode: int, epoch: int, size: int = 0, directory: bool = False) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name + ("/" if directory and not name.endswith("/") else ""))
-    info.type = tarfile.DIRTYPE if directory else tarfile.REGTYPE
-    info.size = 0 if directory else size
-    info.mode = mode
-    info.mtime = epoch
-    info.uid = 0
-    info.gid = 0
-    info.uname = "root"
-    info.gname = "root"
-    return info
-
-
 def build_tar(entries: list[tuple[str, bytes | None, int]], epoch: int) -> bytes:
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w", format=tarfile.GNU_FORMAT) as archive:
-        directories: set[str] = set()
-        for name, _, _ in entries:
-            parts = pathlib.PurePosixPath(name).parts[:-1]
-            for index in range(1, len(parts) + 1):
-                directories.add("/".join(parts[:index]))
-        records = [(directory, None, 0o755) for directory in directories] + entries
-        for name, data, mode in sorted(records, key=lambda item: item[0]):
-            if data is None:
-                archive.addfile(tar_info(name, mode, epoch, directory=True))
-            else:
-                archive.addfile(tar_info(name, mode, epoch, len(data)), io.BytesIO(data))
-    return output.getvalue()
+    return native_release(
+        "encode-tar",
+        "--epoch",
+        str(epoch),
+        input=canonical_json([
+            {"name": name, "data_base64": None if data is None else base64.b64encode(data).decode(), "mode": mode}
+            for name, data, mode in entries
+        ]),
+    )
 
 
 def compress_tar(tar_data: bytes, archive_format: str) -> bytes:
@@ -273,187 +269,8 @@ def validate_runtime_manifest(data: bytes, dependencies: list[dict[str, object]]
         )
 
 
-def checked_elf_region(data: bytes, offset: int, size: int, description: str) -> memoryview:
-    if offset < 0 or size < 0 or offset > len(data) or size > len(data) - offset:
-        raise ReleaseError(f"malformed ELF {description} offset or size")
-    return memoryview(data)[offset : offset + size]
-
-
-def checked_elf_address_end(address: int, size: int, description: str) -> int:
-    if address < 0 or size < 0 or address > (1 << 64) - 1 - size:
-        raise ReleaseError(f"malformed ELF {description} address or size")
-    return address + size
-
-
 def validate_static_elf(binary: bytes, platform: str) -> None:
-    if len(binary) < 64 or not binary.startswith(b"\x7fELF"):
-        raise ReleaseError("bin/debz is not an ELF64 executable")
-    if binary[4] != 2:
-        raise ReleaseError("bin/debz is not an ELF64 executable")
-    if binary[5] != 1 or binary[6] != 1:
-        raise ReleaseError("bin/debz has an unsupported ELF encoding or version")
-
-    header = struct.unpack_from("<HHIQQQIHHHHHH", binary, 16)
-    (
-        elf_type,
-        machine,
-        elf_version,
-        _entry,
-        program_offset,
-        section_offset,
-        _flags,
-        header_size,
-        program_entry_size,
-        program_count,
-        section_entry_size,
-        section_count,
-        section_names_index,
-    ) = header
-    expected_machine = {"linux-x64": 62, "linux-arm64": 183}[platform]
-    if elf_type not in (2, 3) or elf_version != 1 or header_size != 64:
-        raise ReleaseError("bin/debz has a malformed ELF64 header")
-    if machine != expected_machine:
-        raise ReleaseError(f"ELF architecture {machine} does not match {platform}")
-    if program_count in (0, 0xFFFF) or program_entry_size != 56:
-        raise ReleaseError("bin/debz has a malformed ELF64 program header table")
-    if program_offset < header_size or program_offset % 8:
-        raise ReleaseError("bin/debz has a malformed ELF64 program header offset")
-    program_headers = checked_elf_region(
-        binary,
-        program_offset,
-        program_count * program_entry_size,
-        "program header table",
-    )
-
-    if section_offset == 0:
-        if section_count != 0 or section_names_index != 0 or section_entry_size not in (0, 64):
-            raise ReleaseError("bin/debz has malformed section-header-less ELF metadata")
-    else:
-        if (
-            section_count == 0
-            or section_names_index == 0xFFFF
-            or section_names_index >= section_count
-            or section_entry_size != 64
-            or section_offset < header_size
-            or section_offset % 8
-        ):
-            raise ReleaseError("bin/debz has a malformed ELF64 section header table")
-        sections = checked_elf_region(
-            binary,
-            section_offset,
-            section_count * section_entry_size,
-            "section header table",
-        )
-        for index in range(section_count):
-            section = struct.unpack_from("<IIQQQQIIQQ", sections, index * section_entry_size)
-            section_type, section_file_offset, section_size, alignment = (
-                section[1],
-                section[4],
-                section[5],
-                section[8],
-            )
-            if alignment not in (0, 1) and alignment & (alignment - 1):
-                raise ReleaseError("bin/debz has a malformed ELF64 section alignment")
-            if section_type != 8 and section_size:
-                checked_elf_region(binary, section_file_offset, section_size, "section")
-
-    load_regions: list[tuple[int, int, int, int, int]] = []
-    dynamic_regions: list[tuple[int, int, int, int]] = []
-    for index in range(program_count):
-        program = struct.unpack_from("<IIQQQQQQ", program_headers, index * program_entry_size)
-        program_type, file_offset, virtual_address, file_size, memory_size, alignment = (
-            program[0],
-            program[2],
-            program[3],
-            program[5],
-            program[6],
-            program[7],
-        )
-        if file_size > memory_size:
-            raise ReleaseError("bin/debz has an ELF segment larger on disk than in memory")
-        if alignment not in (0, 1) and alignment & (alignment - 1):
-            raise ReleaseError("bin/debz has a malformed ELF segment alignment")
-        if program_type == 1 and alignment > 1 and file_offset % alignment != virtual_address % alignment:
-            raise ReleaseError("bin/debz has a misaligned ELF load segment")
-        if file_size:
-            checked_elf_region(binary, file_offset, file_size, "segment")
-        if program_type == 1:
-            load_regions.append(
-                (
-                    file_offset,
-                    file_offset + file_size,
-                    virtual_address,
-                    checked_elf_address_end(
-                        virtual_address, file_size, "load segment file mapping"
-                    ),
-                    checked_elf_address_end(
-                        virtual_address, memory_size, "load segment memory mapping"
-                    ),
-                )
-            )
-        elif program_type == 2:
-            dynamic_regions.append(
-                (file_offset, virtual_address, file_size, memory_size)
-            )
-        elif program_type == 3:
-            raise ReleaseError("bin/debz contains a PT_INTERP dynamic loader")
-
-    if not load_regions:
-        raise ReleaseError("bin/debz has no ELF load segment")
-    if len(dynamic_regions) > 1:
-        raise ReleaseError("bin/debz has multiple PT_DYNAMIC segments")
-    for dynamic_offset, dynamic_address, dynamic_size, dynamic_memory_size in dynamic_regions:
-        if (
-            dynamic_offset % 8
-            or dynamic_address % 8
-            or dynamic_size == 0
-            or dynamic_size % 16
-            or dynamic_memory_size != dynamic_size
-        ):
-            raise ReleaseError("bin/debz has a malformed PT_DYNAMIC segment")
-        dynamic_file_end = dynamic_offset + dynamic_size
-        dynamic_address_end = checked_elf_address_end(
-            dynamic_address, dynamic_size, "PT_DYNAMIC mapping"
-        )
-        file_mappings = [
-            index
-            for index, (file_start, file_end, _, _, _) in enumerate(load_regions)
-            if dynamic_offset >= file_start and dynamic_file_end <= file_end
-        ]
-        virtual_mappings = [
-            index
-            for index, (_, _, virtual_start, virtual_file_end, virtual_memory_end) in enumerate(
-                load_regions
-            )
-            if dynamic_address >= virtual_start
-            and dynamic_address_end <= virtual_file_end
-            and dynamic_address_end <= virtual_memory_end
-        ]
-        if len(file_mappings) != 1 or len(virtual_mappings) != 1:
-            raise ReleaseError(
-                "bin/debz has an ambiguous or unmapped PT_DYNAMIC file/virtual range"
-            )
-        if file_mappings[0] != virtual_mappings[0]:
-            raise ReleaseError(
-                "bin/debz has mismatched PT_DYNAMIC file and virtual mappings"
-            )
-        load = load_regions[file_mappings[0]]
-        if dynamic_offset - load[0] != dynamic_address - load[2]:
-            raise ReleaseError(
-                "bin/debz has inconsistent PT_DYNAMIC file and virtual offsets"
-            )
-        dynamic = checked_elf_region(binary, dynamic_offset, dynamic_size, "PT_DYNAMIC segment")
-        terminated = False
-        for offset in range(0, dynamic_size, 16):
-            tag, _value = struct.unpack_from("<qQ", dynamic, offset)
-            if tag == 1:
-                raise ReleaseError("bin/debz contains a DT_NEEDED shared-library dependency")
-            if terminated and tag != 0:
-                raise ReleaseError("bin/debz has data after the PT_DYNAMIC terminator")
-            if tag == 0:
-                terminated = True
-        if not terminated:
-            raise ReleaseError("bin/debz has an unterminated PT_DYNAMIC segment")
+    native_release("check-elf", "--platform", platform, input=binary)
 
 
 def create_release_files(
@@ -584,17 +401,7 @@ def validate_installed_policies(
 
 
 def release_plan(tag: str) -> dict[str, object]:
-    version = parse_tag(tag)
-    return {
-        "schemaVersion": 1,
-        "tag": tag,
-        "version": version,
-        "platforms": [
-            {"architecture": "x86_64", "name": "linux-x64", "os": "linux"},
-            {"architecture": "aarch64", "name": "linux-arm64", "os": "linux"},
-        ],
-        "assets": expected_asset_names(version),
-    }
+    return json.loads(native_release("dry-run", "--tag", tag))
 
 
 def audit_archive(

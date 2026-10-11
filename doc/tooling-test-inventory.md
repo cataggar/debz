@@ -7,6 +7,21 @@ share one Zig test with independent mutations.
 
 ## Release (`tools/test_release.py`)
 
+The native `debz-release` core now owns tag parsing, the canonical four-asset
+plan, complete static ELF validation and original GNU tar serialization. The
+actual `tools/release.py` producer hands these operations to the emitted helper
+with `PATH=/no-host-interpreters`; `DEBZ_RELEASE` binds custom-prefix builds.
+Its original tag/plan/tar/ELF implementations are removed rather than retained
+as fallbacks. Native tests cover load/dynamic file and virtual mappings, overflow,
+loader/shared-library refusals, long names and signed epochs.
+
+The remaining compression, archive reading, dependency/runtime/policy checks,
+packaging/publication and smoke orchestration still use Python. This bounded
+core migration does not complete PY2 or no-host-Python release qualification.
+Existing twelve real release consumer cases still exercise both compression
+formats, full binary/archive checks and all four assets. Complete byte-level
+crosschecks retain the unchanged original implementation outside the repository.
+
 | Previous case | Zig test (`test/release-tooling.zig`, `release:` prefix) |
 | --- | --- |
 | `test_strict_tags_and_consistency` | strict tags, version consistency, and exact four asset names |

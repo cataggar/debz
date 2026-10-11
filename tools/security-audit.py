@@ -2128,7 +2128,7 @@ WORKLOAD_PARTITIONS = {
         "run_package_cache_archive_tests",
     )),
     "workload_release": ("test-workload-release", (
-        "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests",
+        "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests", "release_tool_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
@@ -4961,6 +4961,53 @@ DEBIAN_READINESS_PATHS = (
     "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.py",
 )
 
+NATIVE_RELEASE_CORE_PATHS = ("build.zig", "tools/release.zig", "tools/release.py")
+
+
+def native_release_core_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        "build.zig": (
+            'b.path("tools/release.zig")',
+            "b.getInstallStep().dependOn(&install_release_tool.step);",
+            "workload_release.dependOn(&release_tool_tests.step);",
+            'run_release_policy_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));',
+            "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
+        ),
+        "tools/release.py": (
+            '"PATH": "/no-host-interpreters"',
+            "timeout=60,",
+            'return native_release("version", tag).decode().removesuffix("\\n")',
+            'native_release("check-elf", "--platform", platform, input=binary)',
+            'return json.loads(native_release("dry-run", "--tag", tag))',
+            '"encode-tar",',
+            'base64.b64encode(data).decode()',
+        ),
+        "tools/release.zig": (
+            "pub fn parseTag(",
+            "pub fn validateStaticElf(",
+            "pub fn buildTar(",
+            'try validateStaticElf(allocator, binary, platform);',
+            "try buildTar(allocator, entries, epoch)",
+            "if (machine != platform.machine())",
+            "if (file_mapping.? != virtual_mapping.?)",
+            "if (value.offset - load.file_start != value.address - load.virtual_start)",
+            "if (tag == 1)",
+            "if (!terminated)",
+            "if (terminated and tag != 0)",
+            'tarHeader("././@LongLink", 0, 0, name.len + 1, \'L\', true)',
+            "const padding = (10240 - output.items.len % 10240) % 10240;",
+        ),
+    }
+    failures = [
+        f"{path}: native release tag, plan, ELF or GNU tar binding is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT"):
+        if retired in texts.get("tools/release.py", ""):
+            failures.append("tools/release.py: retired release core implementation was restored")
+    return failures
+
 
 def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
     required = {
@@ -5106,9 +5153,14 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
         body = match.group(1) if match else ""
         if body.count('"$PWD/zig-out/bin/debz-integration-repository" \\') != expected_count:
             failures.append(f"{job}: every native repository fixture invocation must remain wired")
-    failures.extend(ghr_zig_workflow_failures(texts.get(".github/workflows/release.yml", ""), "release.yml", 2))
-    release = texts.get(".github/workflows/release.yml", "").partition("      - name: Install verified standalone ghr")[2]
-    if not 0 <= release.find("cataggar/zig@v0.16.0") < release.find("zig build build-integration-repository "):
+    failures.extend(ghr_zig_workflow_failures(texts.get(".github/workflows/release.yml", ""), "release.yml", 3))
+    match = re.search(
+        r"(?ms)^  smoke:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        texts.get(".github/workflows/release.yml", ""),
+    )
+    release = match.group(1) if match else ""
+    install = release.find(GHR_ZIG_INSTALL)
+    if not 0 <= install < install + len(GHR_ZIG_INSTALL) <= release.find("zig build build-integration-repository "):
         failures.append("release fixture must install the verified native compiler before building its producer")
     return failures
 
@@ -5476,6 +5528,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_release_core_failures({
+        path: (ROOT / path).read_text() for path in NATIVE_RELEASE_CORE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_debian_readiness_failures({
         path: (ROOT / path).read_text() for path in DEBIAN_READINESS_PATHS if (ROOT / path).is_file()
     }):
@@ -5625,7 +5681,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 21, "release.yml": 2}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 23, "release.yml": 3}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -6575,9 +6631,9 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 23)
     elif kind == "ghr-release":
-        failures = ghr_zig_workflow_failures(text, "release.yml", 2)
+        failures = ghr_zig_workflow_failures(text, "release.yml", 3)
     elif kind == "workflow-failure":
         failures = workflow_failure_handling_failures(text, "ci.yml")
     elif kind == "ci-concurrency":
@@ -6592,7 +6648,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness", "native-release-core",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6617,6 +6673,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
             "native-debian-readiness": DEBIAN_READINESS_PATHS,
+            "native-release-core": NATIVE_RELEASE_CORE_PATHS,
             "native-integration-archive": INTEGRATION_ARCHIVE_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
@@ -6684,6 +6741,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_action_empty_lock_failures(texts)
         elif kind == "native-debian-readiness":
             failures = native_debian_readiness_failures(texts)
+        elif kind == "native-release-core":
+            failures = native_release_core_failures(texts)
         elif kind == "native-integration-archive":
             failures = native_integration_archive_failures(texts)
         elif kind == "native-baseline-fixture":

@@ -3,7 +3,14 @@
 Copyright 2026 debz contributors. SPDX-License-Identifier: Apache-2.0.
 
 `tools/release.py` is an independently authored, network-free release packager
-and validator using Python's standard library. Release inputs are rejected when
+and validator. Its tag parsing, four-asset plan, complete static ELF validation
+and canonical GNU tar encoder run in the installed Zig `debz-release` helper,
+with `PATH=/no-host-interpreters` and no Python fallback. `DEBZ_RELEASE` selects
+the helper in a custom build prefix. Compression, archive reading, runtime and
+policy validation, packaging and smoke orchestration still use Python's standard
+library; this bounded core port does not complete Python retirement.
+
+Release inputs are rejected when
 they contain links, generated artifacts, cache paths, common secret formats,
 missing notices, unsafe names, or ELF binaries that are not fully static for
 the declared architecture.
@@ -21,6 +28,7 @@ The install prefix must contain:
 Typical CI usage:
 
 ```sh
+zig build build-release-tool
 python3 tools/release.py version v0.3.0 --expect zon=0.3.0 --expect binary=0.3.0
 python3 tools/release.py dry-run --tag v0.3.0
 python3 tools/release.py binary --tag v0.3.0 --platform linux-x64 \
@@ -30,6 +38,12 @@ python3 tools/release.py audit --tag v0.3.0 \
 python3 tools/release.py verify --tag v0.3.0 --assets dist \
   --policy security/dependency-policy.json --smoke
 ```
+
+CI builds this host-native helper before every actual release consumer. Each
+release job first verifies main ancestry, then installs the exactly pinned,
+version-checked Zig compiler before compiling the helper. The publication and
+dry-run verifier jobs have their own compiler installation and helper build;
+they do not assume an artifact or a helper left over from another job.
 
 Run the Zig-owned tooling tests with `zig build test-release` (or
 `zig build test-release -Doptimize=ReleaseSafe`). The

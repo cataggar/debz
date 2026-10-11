@@ -45,7 +45,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         return match.group()
 
     def test_reviewed_jobs_have_one_exact_verified_install_each(self) -> None:
-        self.assertEqual(len(policy.CI_GHR_ZIG_JOBS), 21)
+        self.assertEqual(len(policy.CI_GHR_ZIG_JOBS), 23)
         self.assertEqual(self.failures(self.ci), [])
 
     def test_balanced_move_between_new_jobs_still_fails(self) -> None:
@@ -54,7 +54,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         changed = self.ci.replace(
             repository, repository.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
         ).replace(helper, helper + policy.GHR_ZIG_INSTALL, 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 21)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 23)
         self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_balanced_move_out_of_diversion_shard_still_fails(self) -> None:
@@ -63,7 +63,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         changed = self.ci.replace(
             diversions, diversions.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
         ).replace(helper, helper + policy.GHR_ZIG_INSTALL, 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 21)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 23)
         self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_balanced_move_between_workload_jobs_still_fails(self) -> None:
@@ -78,7 +78,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
                 changed = self.ci.replace(
                     moved_from, moved_from.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
                 ).replace(moved_to, moved_to + policy.GHR_ZIG_INSTALL, 1)
-                self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 21)
+                self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 23)
                 self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_balanced_move_out_of_native_oracle_evidence_job_still_fails(self) -> None:
@@ -87,7 +87,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         changed = self.ci.replace(
             oracle, oracle.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
         ).replace(helper, helper + policy.GHR_ZIG_INSTALL, 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 21)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 23)
         self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_unverified_or_duplicate_install_refuses(self) -> None:
@@ -98,14 +98,31 @@ class ZigInstallPolicyTests(unittest.TestCase):
 
     def test_release_install_remains_exact(self) -> None:
         changed = self.release.replace(policy.GHR_ZIG_INSTALL, "", 1)
-        self.assertIn("release.yml: expected 2 exact verified ghr Zig install blocks", " ".join(self.failures(self.ci, changed)))
+        self.assertIn("release.yml: expected 3 exact verified ghr Zig install blocks", " ".join(self.failures(self.ci, changed)))
 
     def test_balanced_move_out_of_release_fixture_job_still_fails(self) -> None:
         smoke = self.release.partition("\n  smoke:\n")[2]
         changed = self.release.replace(smoke, smoke.replace(policy.GHR_ZIG_INSTALL, "", 1), 1)
         changed = changed.replace("\n  smoke:\n", policy.GHR_ZIG_INSTALL + "\n  smoke:\n", 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 2)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 3)
         self.assertIn("reviewed release job inventory", " ".join(self.failures(self.ci, changed)))
+
+    def test_native_release_build_and_consumers_follow_verified_compiler_and_main_ancestry(self) -> None:
+        policy.audit_release_core_bootstrap(self.ci, self.release)
+        self.assertEqual(policy.FAILURES, [])
+        for job in ("release-dry-run", "release-dry-run-verify", "release-policy"):
+            body = self.job(job)
+            moved = body.replace("          zig build build-release-tool -j2\n", "", 1)
+            moved = moved.replace(policy.GHR_ZIG_INSTALL, "      - name: Premature helper build\n        run: zig build build-release-tool -j2\n" + policy.GHR_ZIG_INSTALL, 1)
+            policy.FAILURES.clear()
+            policy.audit_release_core_bootstrap(self.ci.replace(body, moved, 1), self.release)
+            self.assertIn("verified compiler install", " ".join(policy.FAILURES))
+        for job in policy.RELEASE_GHR_ZIG_JOBS:
+            body = re.search(rf"(?ms)^  {job}:\n.*?(?=^  [a-z][a-z0-9-]*:\n|\Z)", self.release).group()
+            changed = body.replace('git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main', "true", 1)
+            policy.FAILURES.clear()
+            policy.audit_release_core_bootstrap(self.ci, self.release.replace(body, changed, 1))
+            self.assertIn("main ancestry", " ".join(policy.FAILURES))
 
     def test_ci_concurrency_remains_exact(self) -> None:
         self.assertEqual(self.concurrency_failures(self.ci), [])

@@ -322,6 +322,19 @@ pub fn build(b: *std.Build) void {
     b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals").dependOn(&debian_readiness_tests.step);
     workload_core.dependOn(&debian_readiness_tests.step);
 
+    const release_tool_module = b.createModule(.{
+        .root_source_file = b.path("tools/release.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const release_tool = b.addExecutable(.{ .name = "debz-release", .root_module = release_tool_module });
+    const install_release_tool = b.addInstallArtifact(release_tool, .{});
+    b.getInstallStep().dependOn(&install_release_tool.step);
+    b.step("build-release-tool", "Build native release tag, plan and static ELF validation").dependOn(&install_release_tool.step);
+    const release_tool_tests = b.addRunArtifact(b.addTest(.{ .root_module = release_tool_module }));
+    b.step("test-release-tool", "Test native release tags and complete static ELF mapping refusals").dependOn(&release_tool_tests.step);
+    workload_release.dependOn(&release_tool_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -782,9 +795,11 @@ pub fn build(b: *std.Build) void {
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
     audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));
+    audit_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_tests.step.dependOn(&install_debian_readiness.step);
+    audit_tests.step.dependOn(&install_release_tool.step);
     audit_step.dependOn(&audit_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),
@@ -889,6 +904,9 @@ pub fn build(b: *std.Build) void {
     });
     const run_release_policy_tests = b.addRunArtifact(release_policy_tests);
     run_release_policy_tests.setCwd(b.path("."));
+    run_release_policy_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));
+    run_release_policy_tests.step.dependOn(&install_release_tool.step);
+    release_test_step.dependOn(&release_tool_tests.step);
     release_test_step.dependOn(&run_release_policy_tests.step);
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),

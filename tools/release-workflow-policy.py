@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -59,11 +60,35 @@ CI_GHR_ZIG_JOBS = (
     "signed-proc-protected-replay",
     "security-audit",
     "release-dry-run",
+    "release-dry-run-verify",
+    "release-policy",
     "fuzz",
     "integration-required",
     "integration-full",
 )
-RELEASE_GHR_ZIG_JOBS = ("binaries", "smoke")
+RELEASE_GHR_ZIG_JOBS = ("binaries", "release", "smoke")
+
+
+def audit_release_core_bootstrap(ci: str, release: str) -> None:
+    for label, text, names in (
+        ("ci.yml", ci, ("release-dry-run", "release-dry-run-verify", "release-policy")),
+        ("release.yml", release, RELEASE_GHR_ZIG_JOBS),
+    ):
+        for name in names:
+            match = re.search(rf"(?ms)^  {name}:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", text)
+            body = match.group(1) if match else ""
+            install = body.find(GHR_ZIG_INSTALL)
+            build = body.find("zig build build-release-tool -j2")
+            consumer = body.find("python3 tools/release.py")
+            if name == "release-policy":
+                consumer = body.find("tools/release-workflow-policy.py")
+            if (install < 0 or build < install + len(GHR_ZIG_INSTALL) or
+                    consumer <= build or body.count("zig build build-release-tool -j2") != 1):
+                FAILURES.append(f"{label} {name}: native release consumers must follow one verified compiler install and helper build")
+            if label == "release.yml":
+                ancestry = body.find('git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main')
+                if ancestry < 0 or ancestry >= install:
+                    FAILURES.append(f"{label} {name}: main ancestry must be verified before compiling release tooling")
 
 
 def require(pattern: str, message: str, text: str, flags: int = 0) -> None:
@@ -472,6 +497,7 @@ def main() -> None:
     audit_actions(ci, CI)
     audit_ci_concurrency(ci)
     audit_zig_installation(ci, release)
+    audit_release_core_bootstrap(ci, release)
     audit_ghr_smoke(ci, release)
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
@@ -563,8 +589,12 @@ def main() -> None:
 
     plan = json.loads(
         subprocess.run(
-            ["python3", str(ROOT / "tools/release.py"), "dry-run", "--tag", "v0.1.0"],
+            [
+                os.environ.get("DEBZ_RELEASE", str(ROOT / "zig-out/bin/debz-release")),
+                "dry-run", "--tag", "v0.1.0",
+            ],
             cwd=ROOT,
+            env={**os.environ, "PATH": "/no-host-interpreters"},
             check=True,
             text=True,
             stdout=subprocess.PIPE,
