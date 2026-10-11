@@ -20,6 +20,9 @@ EPOCH = 1_700_000_000
 PACKAGE = "debz-native-demo"
 PAYLOAD = Path("usr/share") / PACKAGE
 REFERENCE_DPKG = "dpkg"
+DISPOSABLE_RUNTIME = Path(os.environ.get(
+    "DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",
+))
 
 REFERENCE_SPEC = importlib.util.spec_from_file_location(
     "debz_reference_dpkg", REPOSITORY / "tools/prepare-native-dpkg.py",
@@ -59,6 +62,13 @@ def write(path: Path, data: bytes, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     path.chmod(mode)
+
+
+def copy_program(root: Path, source: Path, destination: str) -> None:
+    subprocess.run(
+        [str(DISPOSABLE_RUNTIME), str(root), str(source), destination],
+        stdin=subprocess.DEVNULL, timeout=120, check=True,
+    )
 
 
 def make_package(
