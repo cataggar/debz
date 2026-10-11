@@ -1657,11 +1657,10 @@ follow source links. Source reads are descriptor-rooted, single-link,
 stable and bounded to 128 MiB; output files are exclusive mode 0600.
 `zig build test-http-fixture-server` exercises real HTTP responses and the
 source/output refusals without root. This removes the HTTP interpreter,
-not the remaining signed fixture generator's Python dependency.
+and the signed fixture producer is now native too.
 
-To select the fixture producer's Python installation, supply
-`-Dnative-repository-fixture-python=/absolute/path/to/python`; this option
-selects **fixture generation only**, not the acceptance runner. For a
+The build binds the emitted `debz-integration-repository` producer, including
+custom prefixes. The fixture-Python build option is retired. For a
 focused CLI run, combine `-Dnative-repository-cli-only=true` with
 `-Dnative-zig-repository-case=known_failure` (or another case in the table
 below); the default still runs all cases.
@@ -1917,8 +1916,8 @@ There were 56 Python methods: all have Zig assertions for the portable behavior,
 `referencing`/`Registry`/`RefResolver` implementation in `tools/*.py` was in
 `tools/test-native-recovery.py`, whose sole Python importer was
 `tools/test_native_recovery.py`. The signed Zig FAMILY, parity and repository
-targets instead invoke `tools/generate-integration-repository.py`, which
-uses the required emitted native integration signer, not Python cryptography,
+targets instead invoke the emitted `debz-integration-repository`, which
+directly reuses the native archive/parser and original test-key signer, not Python cryptography,
 the recovery acceptance module or `jsonschema`. Remaining required Python schema checks
 (`test_vendor_state_capture.py`, `test_dpkg_config_reference.py`,
 `test_dpkg_alternatives_reference.py`) call `jsonschema.Draft202012Validator`
@@ -1984,9 +1983,7 @@ complete pre-retirement matrix proves parity.
 `-Doptimize=ReleaseSafe` run `test/native_recovery_parity.zig` as the real
 privileged consumer, with the optional pinned reference
 `-Dnative-reference-dpkg=/absolute/path/to/dpkg`. The fixture generator
-requires Python only for repository/scenario production; to select another
-interpreter, use
-`-Dnative-zig-recovery-parity-fixture-python=/absolute/path/to/python`.
+is the emitted native repository driver; its fixture-Python option is retired.
 `-Dnative-zig-recovery-parity-case=debian-stable/pre-depends` selects a
 **single debugging case**, not the 30-row acceptance gate. The unfiltered
 target is required in CI on amd64 and arm64 in Debug and ReleaseSafe.
@@ -2027,12 +2024,11 @@ interrupted recovery have separate release boundaries; the signed source and
 keyring paths, lock path, and first completion used across those boundaries
 remain in the fixture's outer allocator. This bounds FAMILY runner memory
 without dropping signed child processes or pinned-dpkg comparisons. The existing
-`tools/generate-integration-repository.py` is invoked **only to build**
+`debz-integration-repository` is invoked **only to build**
 worktree-local signed metadata and matching `.deb` archives; the test runner,
 all assertions and all FAMILY invocations are Zig-owned. The fixture builder
-uses the required emitted native integration signer and no Python cryptography.
-To select another repository/scenario interpreter, use
-`-Dnative-zig-recovery-family-fixture-python=/absolute/path/to/python`.
+directly reuses the native encoder/parser and original signer without Python.
+The former repository/scenario interpreter option is retired.
 `-Dnative-zig-recovery-family-executed-only=true` selects just the
 archive-backed and active-inspection scenarios for focused runs.
 The aggregate includes this target alongside the repository, crash and
@@ -2179,7 +2175,7 @@ before retiring the Python entry points from the required gate.
 | `exercise_literal_path_recovery`: v1/during-filesystem, v1/after-trigger, v2/after-trigger, v1/after-trigger conffile drift, v2/after-trigger staged-script drift | `test-native-recovery-zig-literal`, five `cases` + `runCase`; escaped path and trigger evidence, genuine crash/refusal and pinned-dpkg successful recovery. | Executed: 5/5. |
 | `exercise_scriptless_recovery`: `{installed,new}` × `{before_scriptless_trigger_completion,after_scriptless_trigger_completion,before_scriptless_trigger_completion + postinst-presence drift}` | `test-native-recovery-zig-scriptless`, six calls to `runCase`; real scriptless/no-handler and scripted listener, absence of invented script, pending state, reference dpkg and changed-presence refusals. | Executed: 6/6. |
 | `exercise_consumer_parity`: `{debian-stable,ubuntu-26.04}` × `{pre-depends,pre-depends-known-failure,virtual-provides,dependency-cycle,without-recommends,with-recommends,multiarch-package,literal-package-paths,retained-metadata,suite-trigger,upgrade-all,held-unchanged,conffile-keep,conffile-replace,known-script-failure}` | `test-native-recovery-zig-parity`, `parity_suites × parity_cases` + `execute`: 30 signed real public core/FAMILY plans and executions, byte-equal exact locks, independent SHA-512/SHA-256/size checks, pinned-dpkg snapshot parity and installed helper identity. For each of the 28 changed cases, both receipts run `native_recovery_parity_evidence.verify`: canonical provenance and all retained-byte digests, typed manifest/document digests, caller request and program/authorization bindings, progress/outcome and managed histories, isolated helper and script output/invocation/expected environment, successful script trace, typed diversion-cache and unpack-cache bindings, and independent bounded capture of actual dpkg files for both final generation and distinct final closure digests. Failed scripts must retain nonzero exit evidence; the failed-script fixture does not promise a trace line. Both held cases instead require no receipt/completion and an unchanged entire root. | Executed per receipt on arm64 with pinned dpkg; 30/30 signed cases, 56 changed receipts and four held roots; aggregate runner. |
-| #288 signed FIFO closures (additional Zig-only cases) | `test-native-recovery-zig-parity`, `fifoClosure` per `parity_suites` entry (`<suite>/fifo-closure`): a signed two-generation FIFO package plus `essential-core` and `native-helper-target`. The FIFO archives are built in Zig, and `tools/generate-integration-repository.py --extra-deb` publishes their exact bytes in the signed repository. Public CLI `plan --lock-output` and native `install --lock-input` for both generations; every locked package's pool bytes are checked against independent SHA-512/SHA-256/size, and its FIFO inventory against `deb_payload.validate`. A workflow-resolved remove lock is executed by the public CLI `remove --lock-input`; purge runs through the native lifecycle driver. After each step the root is compared with pinned dpkg 1.22.22, including kind, mode, owner, mtime, `statoverride`, `status`, `info/*.list` and `*.md5sums`. Install, upgrade and remove receipts must bind the exact lock and pass retained evidence (install and upgrade also pass `transaction-result verify`), and the helper identity must be unchanged. A full run fails unless both closures execute; these cases are not substitutes for any Python tuple. | Executed: 2/2 suites on arm64 with pinned dpkg (install, upgrade, remove and purge). |
+| #288 signed FIFO closures (additional Zig-only cases) | `test-native-recovery-zig-parity`, `fifoClosure` per `parity_suites` entry (`<suite>/fifo-closure`): a signed two-generation FIFO package plus `essential-core` and `native-helper-target`. The FIFO archives are built in Zig, and `debz-integration-repository --extra-deb` publishes their exact bytes in the signed repository. Public CLI `plan --lock-output` and native `install --lock-input` for both generations; every locked package's pool bytes are checked against independent SHA-512/SHA-256/size, and its FIFO inventory against `deb_payload.validate`. A workflow-resolved remove lock is executed by the public CLI `remove --lock-input`; purge runs through the native lifecycle driver. After each step the root is compared with pinned dpkg 1.22.22, including kind, mode, owner, mtime, `statoverride`, `status`, `info/*.list` and `*.md5sums`. Install, upgrade and remove receipts must bind the exact lock and pass retained evidence (install and upgrade also pass `transaction-result verify`), and the helper identity must be unchanged. A full run fails unless both closures execute; these cases are not substitutes for any Python tuple. | Executed: 2/2 suites on arm64 with pinned dpkg (install, upgrade, remove and purge). |
 | `exercise_workflows`: each named signed create/customize/update/recover/inspect/batch/owner/verification/review case in the [workflow scenario inventory](#exercise_workflows-scenario-inventory-python-lines-27824136) | `test-native-recovery-zig-family` (`native_recovery_family` and `native_recovery_projected_workflows`); signed driver/reference children and projected owner reviews. | Executed at the named-scenario level per the workflow ledger; aggregate runner. |
 | `exercise_repository_cli` / `repository_cli_cases`: `success`, `no_refresh`, `unchanged`, `unchanged_no_refresh`, `known_failure`, `refresh_failure`, `signal`, `lock_wait`, `lock_signal`, `unsafe_runtime`, `deadline`, `network` | `test-native-recovery-zig-repository`, `cliScenario` and `verifyCliScenario`: twelve supervised public CLI processes in disposable projections, canonical typed result decoding, three-call replay or bounded one-call refusal, real lock/signal/HTTP and helper/stale-root checks. | Executed: 12/12; CLI success and refusal shapes checked. |
 | `exercise_projection`: one read-only root with *both* `native_transaction_result.test.projected root external fixture` and `apt_system_orchestrator.test.projected native dispatch external fixture` | `test-native-recovery-zig-family`, `readOnlyProjection`: private PID/mount child runs the **actual test executable** with `DEBZ_NATIVE_PROJECTION_FIXTURE=1`, requires both named tests to report OK, byte-identical root evidence, empty lock and no leaked projection mount. The three signed projected workflows are separate cases, not proxies for this row. | Executed: 1/1. |

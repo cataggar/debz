@@ -8,19 +8,14 @@ if [ ! -x "$runtime" ]; then
   printf 'native disposable runtime helper is not executable: %s\n' "$runtime" >&2
   exit 2
 fi
-DEBZ_INTEGRATION_ARCHIVE=${3:-"$PWD/zig-out/bin/debz-integration-archive"}
-if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then
-  printf 'native integration archive helper is not executable: %s\n' "$DEBZ_INTEGRATION_ARCHIVE" >&2
-  exit 2
-fi
-export DEBZ_INTEGRATION_ARCHIVE
-export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}
-case "$DEBZ_INTEGRATION_SIGNING" in
+repository_generator=${3:-"$PWD/zig-out/bin/debz-integration-repository"}
+test "$#" -le 3 || { echo "unexpected integration fixture argument" >&2; exit 2; }
+case "$repository_generator" in
   /*) ;;
-  *) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;
+  *) repository_generator="$PWD/$repository_generator" ;;
 esac
-if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then
-  printf 'native integration signer is not executable: %s\n' "$DEBZ_INTEGRATION_SIGNING" >&2
+if [ ! -x "$repository_generator" ]; then
+  printf 'native integration repository generator is not executable: %s\n' "$repository_generator" >&2
   exit 2
 fi
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
@@ -54,7 +49,7 @@ mkdir -p "$root/var/lib/dpkg" "$root/var/lib/debz" "$cache" "$state"
 mkdir -p "$root/var/lib/dpkg/info" "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/triggers"
 printf '1\n' >"$root/var/lib/dpkg/info/format"
 : >"$root/var/lib/dpkg/status"
-python3 tools/generate-integration-repository.py \
+"$repository_generator" \
   --output "$repo" --suite "$suite" --architecture "$architecture"
 cat >"$source_file" <<EOF
 Types: deb
@@ -70,7 +65,7 @@ EOF
 # coverage and the native signed-SHA256 binding use this Debian-like fixture;
 # the main fixture also publishes signed SHA512 for native exact-lock v3.
 sha256_repo="$workspace/sha256-repository"
-python3 tools/generate-integration-repository.py \
+"$repository_generator" \
   --output "$sha256_repo" --suite "$suite" --architecture "$architecture" --sha256-only
 if grep -q '^SHA512:' "$sha256_repo/dists/$suite/main/binary-$architecture/Packages"; then
   echo "SHA256-only fixture unexpectedly publishes SHA512" >&2
@@ -829,7 +824,7 @@ set -e
 test "$moving_repository_status" -eq 4
 test ! -s "$stderr_file"
 printf '%s' "$moving_repository" | grep -q '"id":"repository_authentication_failed"'
-python3 tools/generate-integration-repository.py \
+"$repository_generator" \
   --output "$sha256_repo" --suite "$suite" --architecture "$architecture" --sha256-only
 
 find "$package_cache_root/packages-v2/objects" -mindepth 1 -maxdepth 1 -type f |
@@ -851,7 +846,7 @@ run_json download $common base-dep | grep -q '"exit_status":0'
 run_json download $common --offline base-dep | grep -q '"exit_status":0'
 
 cp "$repo/fixture-provenance.txt" "$workspace/provenance.first"
-python3 tools/generate-integration-repository.py \
+"$repository_generator" \
   --output "$repo" --suite "$suite" --architecture "$architecture"
 cmp "$workspace/provenance.first" "$repo/fixture-provenance.txt"
 

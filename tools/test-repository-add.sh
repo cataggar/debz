@@ -1,24 +1,18 @@
 #!/bin/sh
 set -eu
 umask 077
-export PYTHONDONTWRITEBYTECODE=1
 
 debz=$1
 harness=$2
 http_server=$3
-DEBZ_INTEGRATION_ARCHIVE=${4:-"$PWD/zig-out/bin/debz-integration-archive"}
-if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then
-  printf 'native integration archive helper is not executable: %s\n' "$DEBZ_INTEGRATION_ARCHIVE" >&2
-  exit 2
-fi
-export DEBZ_INTEGRATION_ARCHIVE
-export DEBZ_INTEGRATION_SIGNING=${5:-"$PWD/zig-out/bin/debz-integration-signing"}
-case "$DEBZ_INTEGRATION_SIGNING" in
+repository_generator=${4:-"$PWD/zig-out/bin/debz-integration-repository"}
+test "$#" -le 4 || { echo "unexpected repository fixture argument" >&2; exit 2; }
+case "$repository_generator" in
   /*) ;;
-  *) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;
+  *) repository_generator="$PWD/$repository_generator" ;;
 esac
-if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then
-  printf 'native integration signer is not executable: %s\n' "$DEBZ_INTEGRATION_SIGNING" >&2
+if [ ! -x "$repository_generator" ]; then
+  printf 'native integration repository generator is not executable: %s\n' "$repository_generator" >&2
   exit 2
 fi
 workspace="$PWD/.zig-cache/repository-add-integration"
@@ -60,7 +54,7 @@ port=$(cat "$port_file")
 repository_url="http://127.0.0.1:$port/repository"
 descriptor_url="http://127.0.0.1:$port/config/packages-microsoft-prod.deb?token=fixture-query-secret"
 
-python3 tools/generate-integration-repository.py \
+"$repository_generator" \
   --output "$repository" \
   --suite debian-stable \
   --architecture amd64 \

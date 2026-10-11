@@ -219,6 +219,17 @@ jobs:
         uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         with:
           ghr-version: v0.8.1
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
       - name: Create signed release download fixture
         id: download-fixture
         env:
@@ -227,7 +238,8 @@ jobs:
         run: |
           workspace="$PWD/.zig-cache/download-release"
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
-          python3 tools/generate-integration-repository.py \
+          zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE" --sha256-only
           cat >"$workspace/fixture.sources" <<EOF

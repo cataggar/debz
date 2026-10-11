@@ -98,7 +98,14 @@ class ZigInstallPolicyTests(unittest.TestCase):
 
     def test_release_install_remains_exact(self) -> None:
         changed = self.release.replace(policy.GHR_ZIG_INSTALL, "", 1)
-        self.assertIn("release.yml: expected 1 exact verified ghr Zig install blocks", " ".join(self.failures(self.ci, changed)))
+        self.assertIn("release.yml: expected 2 exact verified ghr Zig install blocks", " ".join(self.failures(self.ci, changed)))
+
+    def test_balanced_move_out_of_release_fixture_job_still_fails(self) -> None:
+        smoke = self.release.partition("\n  smoke:\n")[2]
+        changed = self.release.replace(smoke, smoke.replace(policy.GHR_ZIG_INSTALL, "", 1), 1)
+        changed = changed.replace("\n  smoke:\n", policy.GHR_ZIG_INSTALL + "\n  smoke:\n", 1)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 2)
+        self.assertIn("reviewed release job inventory", " ".join(self.failures(self.ci, changed)))
 
     def test_ci_concurrency_remains_exact(self) -> None:
         self.assertEqual(self.concurrency_failures(self.ci), [])
