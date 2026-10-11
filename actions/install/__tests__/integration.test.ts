@@ -186,10 +186,12 @@ def load(name, filename):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-generator = load("install_repository", "generate-integration-repository.py")
 lifecycle = load("install_lifecycle", "native-lifecycle-fixtures.py")
 repository = workspace / "repository"
-generator.write_repository(repository, "debian-stable", arch)
+subprocess.run([
+    str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository),
+    "--suite", "debian-stable", "--architecture", arch,
+], check=True, timeout=60, env={"PATH": "/no-host-interpreters"})
 keyring = workspace / "keyring.gpg"
 shutil.copyfile(repository / "fixture-keyring.gpg", keyring)
 source = workspace / "repo.sources"

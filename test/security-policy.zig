@@ -459,7 +459,7 @@ const workload_jobs = [_]WorkloadJob{
         .mutations = &.{
             "          zig build -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
             "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help\n",
-            "          python3 tools/generate-integration-repository.py \\\n",
+            "          \"$PWD/zig-out/bin/debz-integration-repository\" \\\n",
             "        uses: ./actions/download\n",
             "          test \"$DOWNLOADED\" -gt 0\n",
         },
@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 56), members);
+    try testing.expectEqual(@as(usize, 57), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1685,13 +1685,13 @@ test "security: disposable runtime consumers require native copying without a Py
     try restored.failsWith("retired Python disposable runtime implementation was restored");
 }
 
-test "security: actual integration archive encoding and every fixture consumer require the native helper" {
+test "security: actual integration archive encoding and every fixture consumer require the native repository producer" {
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "native-integration-archive", "build.zig", &.{
         "b.getInstallStep().dependOn(&install_integration_archive.step);",
-        "integration_tests.addArtifactArg(integration_archive);",
-        "repository_add_tests.addArtifactArg(integration_archive);",
+        "integration_tests.addArtifactArg(integration_repository);",
+        "repository_add_tests.addArtifactArg(integration_repository);",
         "workload_core.dependOn(&integration_archive_tests.step);",
     });
     try nativeMutations(&f, "native-integration-archive", "tools/integration-archive.zig", &.{
@@ -1702,10 +1702,11 @@ test "security: actual integration archive encoding and every fixture consumer r
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
         "return error.ExtraControlRepositoryFields;",
     });
-    try nativeMutations(&f, "native-integration-archive", "tools/generate-integration-repository.py", &.{
-        "[str(INTEGRATION_ARCHIVE), directory]",
-        "return native_archive(control_entries, [(payload_path, data, 0o644)])",
-        "[str(INTEGRATION_ARCHIVE), \"--extra-control\", str(path)]",
+    try nativeMutations(&f, "native-integration-archive", "tools/generate-integration-repository.zig", &.{
+        "archive.encode(io, allocator, workspace",
+        "try archive.extraControl(allocator, bytes)",
+        "if (seen.contains(key)) return error.DuplicateExtraPackageIdentity;",
+        "if (point == .before_rename) try self.check();",
     });
     for ([_][]const u8{
         "test/native_recovery_parity.zig",
@@ -1713,22 +1714,26 @@ test "security: actual integration archive encoding and every fixture consumer r
         "test/native_recovery_repository.zig",
     }) |path| {
         try nativeMutations(&f, "native-integration-archive", path, &.{
-            "const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });",
-            "\"--archive-helper\", archive_helper",
+            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository })",
+            "\"--output\"",
         });
     }
     try nativeMutations(&f, "native-integration-archive", "test/apt-system-acceptance.zig", &.{
-        "const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_archive, self.arena);",
-        "\"--archive-helper\", archive_helper",
+        "realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_repository, self.arena)",
+        "\"--output\"",
     });
     try nativeMutations(&f, "native-integration-archive", ".github/workflows/ci.yml", &.{
-        "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all",
-        "--archive-helper \"$PWD/zig-out/bin/debz-integration-archive\"",
+        "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
+        "\"$PWD/zig-out/bin/debz-integration-repository\"",
     });
-    const original = try f.source("tools/generate-integration-repository.py");
-    const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", try std.mem.concat(f.arena.allocator(), u8, &.{ original, "\ndef tar_gz(entries):\n    return b''\n" }));
+    try nativeMutations(&f, "native-integration-archive", "actions/install/__tests__/integration.test.ts", &.{
+        "str(Path(cli).parent / \"debz-integration-repository\"), \"--output\", str(repository)",
+        "\"--suite\", \"debian-stable\", \"--architecture\", arch",
+        "check=True, timeout=60, env={\"PATH\": \"/no-host-interpreters\"}",
+    });
+    const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", "def tar_gz(entries):\n    return b''\n");
     defer restored.deinit();
-    try restored.failsWith("retired Python integration archive encoder was restored");
+    try restored.failsWith("retired Python integration repository producer was restored");
 }
 
 test "security: native OpenPGP regeneration executes original signing and refuses the retired Python signer" {
@@ -1753,19 +1758,20 @@ test "security: native OpenPGP regeneration executes original signing and refuse
     try restored.failsWith("retired Python OpenPGP signer was restored");
 }
 
-test "security: actual integration signing binds every consumer to the native helper before fixture side effects" {
+test "security: actual integration signing binds every consumer to the native repository before fixture side effects" {
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "native-integration-signing", "build.zig", &.{
-        "integration_tests.addArtifactArg(integration_signing);",
-        "repository_add_tests.addArtifactArg(integration_signing);",
+        "integration_tests.addArtifactArg(integration_repository);",
+        "repository_add_tests.addArtifactArg(integration_repository);",
         "workload_core.dependOn(&integration_signing_tests.step);",
-        "native_fixture_options.addOptionPath(\"integration_signing\", integration_signing.getEmittedBin());",
-        "apt_acceptance_fixture_options.addOptionPath(\"integration_signing\", integration_signing.getEmittedBin());",
+        "native_fixture_options.addOptionPath(\"integration_repository\", integration_repository.getEmittedBin());",
+        "apt_acceptance_fixture_options.addOptionPath(\"integration_repository\", integration_repository.getEmittedBin());",
+        "workload_core.dependOn(&integration_repository_tests.step);",
     });
-    try nativeMutations(&f, "native-integration-signing", "tools/generate-integration-repository.py", &.{
-        "require_native_signing()\n    require_native_archive()\n    if output.exists():",
-        "keyring, in_release, primary_fingerprint = native_signing(release)",
+    try nativeMutations(&f, "native-integration-signing", "tools/generate-integration-repository.zig", &.{
+        "try signing.sign(allocator, release)",
+        "if (!std.meta.eql(original, try parent.root.entryIfExists(output))) return error.FixtureDestinationChanged;",
     });
     try nativeMutations(&f, "native-integration-signing", "tools/integration-signing.zig", &.{
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
@@ -1773,21 +1779,25 @@ test "security: actual integration signing binds every consumer to the native he
     });
     for ([_][]const u8{ "test/native_recovery_family.zig", "test/native_recovery_parity.zig", "test/native_recovery_repository.zig" }) |path|
         try nativeMutations(&f, "native-integration-signing", path, &.{
-            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing })",
-            "\"--signing-helper\", signing_helper",
+            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository })",
+            "\"--output\"",
         });
     try nativeMutations(&f, "native-integration-signing", "test/apt-system-acceptance.zig", &.{
-        "realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_signing, self.arena)",
-        "\"--signing-helper\", signing_helper",
+        "realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_repository, self.arena)",
+        "\"--output\"",
     });
     for ([_][]const u8{ "tools/test-integration-roots.sh", "tools/test-repository-add.sh" }) |path|
         try nativeMutations(&f, "native-integration-signing", path, &.{
-            "*) DEBZ_INTEGRATION_SIGNING=\"$PWD/$DEBZ_INTEGRATION_SIGNING\" ;;",
-            "if [ ! -x \"$DEBZ_INTEGRATION_SIGNING\" ]; then",
+            "*) repository_generator=\"$PWD/$repository_generator\" ;;",
+            "if [ ! -x \"$repository_generator\" ]; then",
         });
     try nativeMutations(&f, "native-integration-signing", ".github/workflows/ci.yml", &.{
-        "zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all",
-        "--signing-helper \"$PWD/zig-out/bin/debz-integration-signing\"",
+        "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
+        "\"$PWD/zig-out/bin/debz-integration-repository\"",
+    });
+    try nativeMutations(&f, "native-integration-signing", ".github/workflows/release.yml", &.{
+        "cataggar/zig@v0.16.0",
+        "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
     });
     const restored = try nativeCheck(&f, "native-integration-signing", "tools/requirements-openpgp-fixtures.txt", "cryptography\n");
     defer restored.deinit();
@@ -2195,17 +2205,8 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
         "scriptless_recovery,", "statoverride_recovery,", "literal_recovery,",    "metadata_recovery,",
         "conffile_recovery,",   "recovery_diversions,",   "mutation_boundaries,", "publication_recovery,",
     });
-    for ([_][]const u8{
-        "native-zig-recovery-family-fixture-python",
-        "native-zig-recovery-parity-fixture-python",
-        "native-repository-fixture-python",
-    }) |option| {
-        try nativeMutations(&f, "native-gate", "build.zig", &.{option});
-    }
     try nativeMutations(&f, "native-gate", "build.zig", &.{
-        "recovery_family.addArgs(&.{ \"--fixture-python\", path });",
-        "recovery_parity.addArgs(&.{ \"--fixture-python\", path });",
-        "repository_recovery.addArgs(&.{ \"--fixture-python\", python });",
+        "native_fixture_options.addOptionPath(\"integration_repository\", integration_repository.getEmittedBin());",
     });
     for ([_][]const u8{
         "if (script_failure_only) {",                                                               "\"after_failure_outcome\", \"after_script_failure_state\"",
@@ -2451,7 +2452,7 @@ test "security: signed FAMILY allocation boundaries retain each scenario reset" 
         .{ .call = "try transport(&fixture, driver, reference.architecture);", .indent = "        " },
         .{ .call = "try planning(&fixture, driver);", .indent = "        " },
         .{ .call = "try activeInspection(&fixture, driver, reference.architecture);", .indent = "    " },
-        .{ .call = "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);", .indent = "    " },
+        .{ .call = "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, source, keyring);", .indent = "    " },
         .{ .call = "try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);", .indent = "    " },
         .{ .call = "try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);", .indent = "    " },
         .{ .call = "try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);", .indent = "    " },

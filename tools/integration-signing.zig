@@ -4,7 +4,7 @@ const fs = @import("debz").root_fs;
 const pgp = @import("fixture-openpgp.zig");
 const maximum_bytes = 8 * 1024 * 1024;
 
-const Signed = struct { keyring: []const u8, in_release: []const u8, fingerprint: [20]u8 };
+pub const Signed = struct { keyring: []const u8, in_release: []const u8, fingerprint: [20]u8 };
 
 fn hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, bytes.len * 2);
@@ -16,7 +16,7 @@ fn hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out;
 }
 
-fn sign(allocator: std.mem.Allocator, release: []const u8) !Signed {
+pub fn sign(allocator: std.mem.Allocator, release: []const u8) !Signed {
     const primary = try pgp.Key.primary.publicBody(allocator);
     const subkey = try pgp.Key.subkey.publicBody(allocator);
     const primary_fingerprint = try pgp.fingerprint(allocator, primary);
@@ -141,22 +141,19 @@ test "integration signer refuses symlink and oversized inputs without publishing
     try std.testing.expectError(error.FileTooLarge, signFile(std.testing.io, allocator, input));
 }
 
-test "actual repository producer refuses a missing signer before clearing existing output" {
+test "integration signer CLI refuses relative input without changing existing files" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "sentinel", .data = "original output\n" });
-    const output = try temporary.dir.realPathFileAlloc(std.testing.io, ".", allocator);
-    const missing = try std.fs.path.join(allocator, &.{ output, "missing-native-signer" });
-    const script = try std.fs.path.join(allocator, &.{ @import("integration_signing_test_options").repository, "tools/generate-integration-repository.py" });
     const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "python3", script, "--output", output, "--suite", "debian-stable", "--architecture", "arm64", "--signing-helper", missing },
+        .argv = &.{ @import("integration_signing_test_options").executable, "relative-Release" },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "required absolute native integration signer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "InvalidIntegrationSigningInput") != null);
     try std.testing.expectEqualStrings("original output\n", try temporary.dir.readFileAlloc(std.testing.io, "sentinel", allocator, .limited(32)));
 }

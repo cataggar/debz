@@ -193,18 +193,16 @@ fn public(
 
 const Signed = struct { repository: []const u8, source: []const u8, keyring: []const u8 };
 
-fn generate(fixture: *foundation.Fixture, python: []const u8, suite: []const u8, arch: []const u8) !Signed {
-    return generateIn(fixture, python, suite, arch, try std.fmt.allocPrint(fixture.allocator, "parity/{s}", .{suite}), &.{});
+fn generate(fixture: *foundation.Fixture, suite: []const u8, arch: []const u8) !Signed {
+    return generateIn(fixture, suite, arch, try std.fmt.allocPrint(fixture.allocator, "parity/{s}", .{suite}), &.{});
 }
 
-fn generateIn(fixture: *foundation.Fixture, python: []const u8, suite: []const u8, arch: []const u8, directory: []const u8, extra_debs: []const []const u8) !Signed {
+fn generateIn(fixture: *foundation.Fixture, suite: []const u8, arch: []const u8, directory: []const u8, extra_debs: []const []const u8) !Signed {
     try fixture.directory(directory);
-    const script = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
+    const generator = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository });
     const repository = try fixture.absolute(try support.path(fixture.allocator, directory, "repository"));
-    const signing_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing });
-    const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(fixture.allocator, &.{ python, script, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity", "--archive-helper", archive_helper, "--signing-helper", signing_helper });
+    try argv.appendSlice(fixture.allocator, &.{ generator, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity" });
     for (extra_debs) |deb| try argv.appendSlice(fixture.allocator, &.{ "--extra-deb", deb });
     try fixture.run(argv.items, try support.path(fixture.allocator, directory, "generator.log"), 120);
     const keyring = try support.path(fixture.allocator, repository, "fixture-keyring.gpg");
@@ -564,7 +562,6 @@ fn fifoClosure(
     cli: []const u8,
     helper: []const u8,
     dpkg: []const u8,
-    python: []const u8,
     arch: []const u8,
     suite: []const u8,
     archives: [2][]const u8,
@@ -572,7 +569,7 @@ fn fifoClosure(
     const name = try std.fmt.allocPrint(fixture.allocator, "parity/{s}/{s}", .{ suite, fifo_case });
     _ = fixture.environment.swapRemove("DEBZ_NATIVE_LIFECYCLE_REQUEST");
     defer _ = fixture.environment.swapRemove("DEBZ_NATIVE_WORKFLOW_REQUEST");
-    const signed = try generateIn(fixture, python, suite, arch, try support.path(fixture.allocator, name, "signed"), &archives);
+    const signed = try generateIn(fixture, suite, arch, try support.path(fixture.allocator, name, "signed"), &archives);
     var scenario = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
     defer scenario.deinit();
     for ([_][]const u8{ "native-helper-target", "essential-core" }) |seed|
@@ -697,15 +694,12 @@ pub fn main(init: std.process.Init) !void {
     const cli = args[2];
     const helper = args[3];
     var pinned: ?[]const u8 = null;
-    var python: []const u8 = "/usr/bin/python3";
     var selected: ?[]const u8 = null;
     var index: usize = 4;
     while (index < args.len) : (index += 2) {
         if (index + 1 >= args.len) return error.InvalidArguments;
         if (std.mem.eql(u8, args[index], "--reference-dpkg")) {
             pinned = args[index + 1];
-        } else if (std.mem.eql(u8, args[index], "--fixture-python")) {
-            python = args[index + 1];
         } else if (std.mem.eql(u8, args[index], "--case")) {
             selected = args[index + 1];
         } else return error.InvalidArguments;
@@ -723,7 +717,7 @@ pub fn main(init: std.process.Init) !void {
         const fifo_selector = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ suite, fifo_case });
         if (selected == null or std.mem.eql(u8, selected.?, fifo_selector)) {
             if (fifo_archives == null) fifo_archives = try fifoArchives(&fixture, reference.architecture);
-            fifoClosure(&fixture, driver, cli, helper, reference.executable, python, reference.architecture, suite, fifo_archives.?) catch |err| {
+            fifoClosure(&fixture, driver, cli, helper, reference.executable, reference.architecture, suite, fifo_archives.?) catch |err| {
                 std.debug.print("signed FIFO closure {s}: {s}\n", .{ fifo_selector, @errorName(err) });
                 return err;
             };
@@ -731,7 +725,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("signed FIFO closure {s}: install, upgrade, remove and purge matched pinned dpkg\n", .{fifo_selector});
             if (selected != null) continue;
         }
-        const signed = try generate(&fixture, python, suite, reference.architecture);
+        const signed = try generate(&fixture, suite, reference.architecture);
         for (oracle.parity_cases) |case| {
             if (selected) |filter| {
                 const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ suite, case.id });

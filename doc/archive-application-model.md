@@ -159,7 +159,7 @@ The pinned fixtures currently exercise a deliberately small part of the profile.
 | `src/fixtures/packages-microsoft-prod{,-depends}_1.1_all.deb` | Uncompressed control and data tars, USTAR headers, archive root record, directories, regular files, root ownership, `control` only. |
 | `src/fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb` | The reviewed upstream Microsoft Noble descriptor: `./`-prefixed `md5sums`, three `conffiles`, `preinst`/`postinst`/`prerm`, and a data tar without a root record. |
 | `src/fixtures/deb-payload/*.tar{,.gz,.xz,.zst}` | Uncompressed, gzip, xz, and zstd control and data members. |
-| `tools/generate-integration-repository.py` packages | gzip control and data members, `control`, `conffiles`, `triggers` with `interest-noawait` on a path target, an executable `postinst`, inert `templates`/`shlibs`/`symbols`, dependencies, `Pre-Depends`, `Provides`, `Conflicts`, `Breaks`, `Replaces`, `Essential`, `Protected`, and `Multi-Arch`. |
+| `debz-integration-repository` packages | gzip control and data members, `control`, `conffiles`, `triggers` with `interest-noawait` on a path target, an executable `postinst`, inert `templates`/`shlibs`/`symbols`, dependencies, `Pre-Depends`, `Provides`, `Conflicts`, `Breaks`, `Replaces`, `Essential`, `Protected`, and `Multi-Arch`. |
 
 Apart from that upstream descriptor's `md5sums`, no pinned archive-application
 fixture ships `md5sums`, symbolic or hard links,

@@ -38,20 +38,17 @@ the existing native `/usr/bin/gzip -n -9` utility and restores the original
 1700000000/XFL2/OS255 header after checking its footer. Independent original
 package identities and complete original signed repository/descriptor outputs
 are the expectations, never values generated from the new producer.
-Normal builds install it; shell integration/repository-add targets pass the
-emitted executable, and signed recovery FAMILY/parity/repository and apt
-acceptance bind their compiled helper path, including custom prefixes.
-Standalone/import consumers require the normal `zig-out` native helper or an
-explicit `DEBZ_INTEGRATION_ARCHIVE`/`--archive-helper` path.
+Normal builds install the standalone helper. The native repository driver
+reuses its encoder directly; shell and compiled consumers bind the emitted
+repository executable, including custom prefixes.
 The same helper's `--extra-control /absolute/package.deb` now performs the actual
 extra-package ar/gzip/xz/tar parsing through the shared bounded Debian parsers,
 with stable no-follow input and exact UTF-8 control bytes. It does not decode,
 extract or validate data payloads, preserving genuine prebuilt FIFO packages.
 Duplicate controls, malformed inputs and repository transport fields refuse.
 The Python archive/parser implementations have no fallback.
-The Python repository/scenario driver remains; these bounded archive/parser
-ports do not complete PY3. The separate native signing helper below retires
-the fixture cryptography dependency.
+The repository/scenario driver is also native, as described below. Other
+fixture drivers remain under PY3; no whole-tooling cutover is claimed.
 
 `zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
 The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
@@ -92,18 +89,30 @@ suite executes the compiled generator under a no-interpreter PATH and binds
 its complete emitted source to those originals, then tests regeneration and
 symbolic/hardlink refusal. Only the source's generator comment changes.
 The old Python signer and its cryptography requirement are retired. The actual
-integration repository producer now calls the required native
-`debz-integration-signing` helper for its original keyring and signed Release.
+integration repository producer directly reuses `integration-signing.zig`
+for its original keyring and signed Release.
 `build-integration-signing` builds it; `test-integration-signing` verifies the
 independently original keyring/signature bytes with a no-interpreter PATH,
-CRLF canonicalization, and bounded no-follow input refusals. Ordinary builds,
-custom-prefix builds, shell integrations, FAMILY/parity/repository and APT
-consumers bind their emitted helper before fixture generation. The release-only
-download container builds a native-host helper separately. Standalone fixture
-generation uses the normal installed path or an absolute `--signing-helper`
-or `DEBZ_INTEGRATION_SIGNING` path; missing support fails before clearing output.
-The repository/scenario driver and extra-deb parser are still Python; the
-native archive and signing helpers do not complete PY3 or #420.
+CRLF canonicalization, and bounded no-follow input refusals.
+
+`zig build build-integration-repository test-integration-repository` builds
+and tests the actual `debz-integration-repository` driver. Its fixed packages,
+field order, scripts, retained binary metadata, signed metadata, provenance,
+extra-package transport and four descriptor cases retain independently original
+bytes. Tests invoke the real CLI with a no-interpreter PATH and bind complete
+amd64/arm64 inventories and descriptors to the original Python producer.
+Normal/custom-prefix builds, both shell targets, FAMILY/parity/repository, APT,
+CI action fixtures and release fixtures use this binary. Release-only container
+and release-download fixtures build a verified native-host producer separately.
+The Python driver, helper adapters, environment overrides and three
+`*-fixture-python` build options are retired, not silently ignored.
+CLI input and extra-package failures occur before output replacement. Publication
+stages a complete bounded repository; existing destinations must be small
+no-follow trees without special files, hardlinks or `.git`. Repositories remain
+bounded to 8 MiB, with at most 64 extra packages and 512 destination entries.
+Descriptor outputs must not overlap the repository and URLs refuse newlines.
+Ordinary published file/directory modes retain the caller's umask.
+These fixture tooling ports do not complete PY3 or #420.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
