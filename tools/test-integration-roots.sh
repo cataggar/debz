@@ -4,7 +4,10 @@ umask 077
 
 debz=$1
 runtime=${2:-"$PWD/zig-out/bin/debz-disposable-runtime"}
-test -x "$runtime"
+if [ ! -x "$runtime" ]; then
+  printf 'native disposable runtime helper is not executable: %s\n' "$runtime" >&2
+  exit 2
+fi
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
 architecture=${DEBZ_INTEGRATION_ARCH:-amd64}
 mode=${DEBZ_INTEGRATION_MODE:-smoke}

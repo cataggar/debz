@@ -230,6 +230,45 @@ pub fn build(b: *std.Build) void {
     b.step("test-disposable-runtime", "Test original fixture runtime copying and no-follow refusal").dependOn(&disposable_runtime_tests.step);
     workload_core.dependOn(&disposable_runtime_tests.step);
 
+    const openpgp_fixture_options = b.addOptions();
+    openpgp_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    const openpgp_fixture_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-openpgp-fixtures.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    openpgp_fixture_module.addImport("debz", debz);
+    openpgp_fixture_module.addOptions("openpgp_fixture_options", openpgp_fixture_options);
+    const openpgp_fixture = b.addExecutable(.{
+        .name = "debz-openpgp-fixtures",
+        .root_module = openpgp_fixture_module,
+    });
+    const install_openpgp_fixture = b.addInstallArtifact(openpgp_fixture, .{});
+    b.step("build-openpgp-fixtures", "Build the original RSA and Ed25519 fixture generator").dependOn(&install_openpgp_fixture.step);
+    const regenerate_openpgp_fixture = b.addRunArtifact(openpgp_fixture);
+    if (b.args) |args| regenerate_openpgp_fixture.addArgs(args);
+    b.step("generate-openpgp-fixtures", "Regenerate all original OpenPGP fixtures without Python").dependOn(&regenerate_openpgp_fixture.step);
+    const openpgp_fixture_smoke = b.addRunArtifact(openpgp_fixture);
+    openpgp_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
+    openpgp_fixture_smoke.addArg("--output");
+    const generated_openpgp_fixture = openpgp_fixture_smoke.addOutputFileArg("openpgp.zig");
+    openpgp_fixture_smoke.expectExitCode(0);
+    openpgp_fixture_smoke.expectStdOutEqual("");
+    openpgp_fixture_smoke.expectStdErrEqual("");
+    const openpgp_fixture_test_options = b.addOptions();
+    openpgp_fixture_test_options.addOptionPath("generated", generated_openpgp_fixture);
+    const openpgp_fixture_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-openpgp-fixtures.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    openpgp_fixture_test_module.addImport("debz", debz);
+    openpgp_fixture_test_module.addOptions("openpgp_fixture_options", openpgp_fixture_options);
+    openpgp_fixture_test_module.addOptions("openpgp_fixture_test_options", openpgp_fixture_test_options);
+    const openpgp_fixture_tests = b.addRunArtifact(b.addTest(.{ .root_module = openpgp_fixture_test_module }));
+    b.step("test-openpgp-fixtures", "Test original signing, compiled isolated generator and rooted publication").dependOn(&openpgp_fixture_tests.step);
+    workload_core.dependOn(&openpgp_fixture_tests.step);
+
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);

@@ -39,13 +39,25 @@ Those build targets bind their emitted or installed helper path, including a
 custom install prefix; standalone Python consumers use the normal `zig-out`
 binary or an explicit `DEBZ_DISPOSABLE_RUNTIME` native executable path.
 The core `test-disposable-runtime` suite runs the actual compiled copier with
-poisoned Python commands and checks original shell bytes/modes/mtime,
+poisoned Python commands and checks original shell bytes/modes/mtime/xattrs,
 quoted shebangs, invalid interpreter refusal, destination symbolic/hardlinks and
 source/parent replacement before and during staged publication. The copier uses descriptor-rooted
 no-follow publication and preserves the original host fixture program/library
-bytes, rather than the separate Zig lifecycle copier's canonical epoch/modes.
+bytes and nonempty extended attributes, rather than the separate Zig lifecycle
+copier's canonical epoch/modes. Unreadable or unwritable source attributes fail
+explicitly instead of being silently discarded.
 It does not execute copied programs, authenticate snapshot inputs or grant
 production callback authority. Other Python fixture drivers remain under PY3/PY4.
+
+`zig build generate-openpgp-fixtures` is the actual native RSA/Ed25519
+verification-fixture generator. All 34 original output arrays are compared
+byte-for-byte, including expiry, revocation, binding, critical-subpacket and
+frozen/moving Release fixtures. The required `test-openpgp-fixtures` core
+suite executes the compiled generator under a no-interpreter PATH and binds
+its complete emitted source to those originals, then tests regeneration and
+symbolic/hardlink refusal. Only the source's generator comment changes.
+The old Python module remains import-only for the not-yet-ported integration
+repository producer; its real cryptography dependency is not retired.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`

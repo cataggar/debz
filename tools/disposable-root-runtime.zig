@@ -3,6 +3,54 @@ const fs = @import("debz").root_fs;
 const maximum_file_bytes = 32 * 1024 * 1024;
 const maximum_total_bytes = 128 * 1024 * 1024;
 
+const Attribute = struct {
+    name: [:0]u8,
+    value: []u8,
+
+    fn deinit(self: Attribute, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
+};
+
+fn attributes(allocator: std.mem.Allocator, file: std.Io.File) ![]Attribute {
+    const linux = std.os.linux;
+    var names: [64 * 1024]u8 = undefined;
+    const count = linux.flistxattr(file.handle, &names, names.len);
+    switch (linux.errno(count)) {
+        .SUCCESS => {},
+        .OPNOTSUPP => return try allocator.alloc(Attribute, 0),
+        else => return error.FixtureAttributesUnreadable,
+    }
+    var result: std.ArrayList(Attribute) = .empty;
+    errdefer {
+        for (result.items) |attribute| attribute.deinit(allocator);
+        result.deinit(allocator);
+    }
+    var offset: usize = 0;
+    var value: [64 * 1024]u8 = undefined;
+    while (offset < count) {
+        if (result.items.len == 64) return error.FixtureAttributesTooLarge;
+        const end = std.mem.indexOfScalarPos(u8, names[0..count], offset, 0) orelse return error.InvalidFixtureAttribute;
+        const name = try allocator.dupeZ(u8, names[offset..end]);
+        errdefer allocator.free(name);
+        const length = linux.fgetxattr(file.handle, name, &value, value.len);
+        if (linux.errno(length) != .SUCCESS) return error.FixtureAttributesUnreadable;
+        const bytes = try allocator.dupe(u8, value[0..length]);
+        errdefer allocator.free(bytes);
+        try result.append(allocator, .{ .name = name, .value = bytes });
+        offset = end + 1;
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+fn applyAttributes(file: std.Io.File, values: []const Attribute) !void {
+    for (values) |attribute| {
+        const result = std.os.linux.fsetxattr(file.handle, attribute.name, attribute.value.ptr, attribute.value.len, 0);
+        if (std.os.linux.errno(result) != .SUCCESS) return error.FixtureAttributesUnwritable;
+    }
+}
+
 fn interpreter(allocator: std.mem.Allocator, header: []const u8) !?[]u8 {
     if (!std.mem.startsWith(u8, header, "#!")) return null;
     const line = header[2 .. std.mem.indexOfScalar(u8, header, '\n') orelse header.len];
@@ -46,6 +94,7 @@ const Input = struct {
     destination: fs.Path,
     original: ?fs.Entry,
     observed: fs.RegularFileObservation,
+    xattrs: []Attribute,
 
     fn deinit(self: *Input, allocator: std.mem.Allocator) void {
         self.pin.close();
@@ -53,6 +102,8 @@ const Input = struct {
         allocator.free(self.source);
         allocator.free(self.destination.text);
         allocator.free(self.observed.bytes);
+        for (self.xattrs) |attribute| attribute.deinit(allocator);
+        allocator.free(self.xattrs);
     }
 
     fn check(self: *const Input, root: fs.Root) !void {
@@ -111,6 +162,12 @@ const Copier = struct {
         errdefer pin.close();
         const observed = try pin.observeStableAlloc(self.allocator, maximum_file_bytes);
         errdefer self.allocator.free(observed.bytes);
+        const xattrs = try attributes(self.allocator, pin.file);
+        errdefer {
+            for (xattrs) |attribute| attribute.deinit(self.allocator);
+            self.allocator.free(xattrs);
+        }
+        _ = try pin.metadata();
         if (observed.bytes.len > maximum_total_bytes - self.total) return error.FixtureRuntimeTooLarge;
         const path = try self.allocator.dupe(u8, destination.text);
         errdefer self.allocator.free(path);
@@ -122,6 +179,7 @@ const Copier = struct {
             .destination = .{ .text = path },
             .original = original,
             .observed = observed,
+            .xattrs = xattrs,
         });
         self.total += observed.bytes.len;
         return index;
@@ -191,6 +249,7 @@ const Copier = struct {
             defer staged.deinit();
             context.directory = staged.parent.dir;
             try staged.writeAll(input.observed.bytes);
+            try applyAttributes(staged.file, input.xattrs);
             try staged.file.setTimestamps(self.io, .{
                 .modify_timestamp = .{ .new = .{
                     .nanoseconds = std.math.cast(i96, input.observed.entry.modified_nanoseconds) orelse return error.InvalidFixtureTimestamp,
@@ -325,6 +384,27 @@ test "disposable runtime refuses destination links and invalid interpreters befo
     defer std.testing.allocator.free(invalid);
     try std.testing.expectError(error.InvalidFixtureInterpreter, copy(std.testing.io, std.testing.allocator, root, invalid, "/absent"));
     try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, "absent", .{}));
+}
+
+test "disposable runtime preserves original nonempty extended attributes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var file = try temporary.dir.createFile(std.testing.io, "script", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "#!/bin/sh\nexit 0\n");
+    const set = std.os.linux.fsetxattr(file.handle, "user.debz-fixture", "original".ptr, "original".len, 0);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(set));
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "script" });
+    defer std.testing.allocator.free(source);
+    try copy(std.testing.io, std.testing.allocator, root, source, "/copied");
+    var output = try temporary.dir.openFile(std.testing.io, "copied", .{});
+    defer output.close(std.testing.io);
+    var value: [64]u8 = undefined;
+    const length = std.os.linux.fgetxattr(output.handle, "user.debz-fixture", &value, value.len);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(length));
+    try std.testing.expectEqualStrings("original", value[0..length]);
 }
 
 test "disposable runtime refuses changed source and a planted parent before publication" {
