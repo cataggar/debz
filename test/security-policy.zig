@@ -917,7 +917,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 52), members);
+    try testing.expectEqual(@as(usize, 53), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1630,6 +1630,33 @@ test "security: native signed baseline regeneration preserves original bytes and
     const restored = try nativeCheck(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python baseline fixture generator was restored");
+}
+
+test "security: native OpenPGP regeneration executes original signing and keeps legacy consumer import-only" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-openpgp-fixtures", "build.zig", &.{
+        "openpgp_fixture_smoke.setEnvironmentVariable(\"PATH\", \"/no-host-interpreters\");",
+        "openpgp_fixture_test_options.addOptionPath(\"generated\", generated_openpgp_fixture);",
+        "workload_core.dependOn(&openpgp_fixture_tests.step);",
+    });
+    try nativeMutations(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.zig", &.{
+        "try std.testing.expectEqualSlices(u8, &@field(original, field.name), @field(actual, field.name));",
+        "if (point == .before_rename) try self.check();",
+        "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
+    });
+    try nativeMutations(&f, "native-openpgp-fixtures", "tools/fixture-openpgp.zig", &.{
+        "modulus.powWithEncodedExponent(message, &rsa.exponent, .big)",
+        "pair.sign(digest, null)",
+    });
+    const legacy = try f.source("tools/generate-openpgp-fixtures.py");
+    const restored = try nativeCheck(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.py", try std.fmt.allocPrint(
+        f.arena.allocator(),
+        "{s}\ndef main():\n    pass\n",
+        .{legacy},
+    ));
+    defer restored.deinit();
+    try restored.failsWith("retired Python OpenPGP fixture CLI was restored");
 }
 
 test "security: install action uses pinned bundles and validates before emitting result" {
