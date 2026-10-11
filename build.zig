@@ -230,6 +230,32 @@ pub fn build(b: *std.Build) void {
     b.step("test-disposable-runtime", "Test original fixture runtime copying and no-follow refusal").dependOn(&disposable_runtime_tests.step);
     workload_core.dependOn(&disposable_runtime_tests.step);
 
+    const integration_archive_module = b.createModule(.{
+        .root_source_file = b.path("tools/integration-archive.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_archive_module.addImport("debz", debz);
+    const integration_archive = b.addExecutable(.{
+        .name = "debz-integration-archive",
+        .root_module = integration_archive_module,
+    });
+    const install_integration_archive = b.addInstallArtifact(integration_archive, .{});
+    b.getInstallStep().dependOn(&install_integration_archive.step);
+    b.step("build-integration-archive", "Build original integration fixture archive encoding").dependOn(&install_integration_archive.step);
+    const integration_archive_test_options = b.addOptions();
+    integration_archive_test_options.addOptionPath("executable", integration_archive.getEmittedBin());
+    const integration_archive_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/integration-archive.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_archive_test_module.addImport("debz", debz);
+    integration_archive_test_module.addOptions("integration_archive_test_options", integration_archive_test_options);
+    const integration_archive_tests = b.addRunArtifact(b.addTest(.{ .root_module = integration_archive_test_module }));
+    b.step("test-integration-archive", "Test original archive byte identities and fail-closed encoding").dependOn(&integration_archive_tests.step);
+    workload_core.dependOn(&integration_archive_tests.step);
+
     const openpgp_fixture_options = b.addOptions();
     openpgp_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
     const openpgp_fixture_module = b.createModule(.{
@@ -366,6 +392,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.step.dependOn(&install_disposable_runtime.step);
     integration_tests.addArtifactArg(cli);
     integration_tests.addArtifactArg(disposable_runtime);
+    integration_tests.addArtifactArg(integration_archive);
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
@@ -486,6 +513,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     apt_system_acceptance_module.link_libc = true;
+    const apt_acceptance_fixture_options = b.addOptions();
+    apt_acceptance_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());
+    apt_system_acceptance_module.addOptions("apt_acceptance_fixture_options", apt_acceptance_fixture_options);
     const apt_system_acceptance_binary = b.addExecutable(.{
         .name = "apt-system-acceptance",
         .root_module = apt_system_acceptance_module,
@@ -542,6 +572,7 @@ pub fn build(b: *std.Build) void {
     repository_add_tests.addArtifactArg(cli);
     repository_add_tests.addArtifactArg(repository_add_harness);
     repository_add_tests.addArtifactArg(http_fixture_server);
+    repository_add_tests.addArtifactArg(integration_archive);
     const repository_add_step = b.step(
         "test-repository-add",
         "Run the hermetic Microsoft-shaped repository add integration",
@@ -1377,6 +1408,7 @@ pub fn build(b: *std.Build) void {
     native_fixture_module.addImport("debz", debz);
     const native_fixture_options = b.addOptions();
     native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());
     native_fixture_module.addOptions("native_test_options", native_fixture_options);
     const native_fixture_tests = b.addTest(.{ .root_module = native_fixture_module });
     const run_native_fixture_tests = b.addRunArtifact(native_fixture_tests);
@@ -2001,6 +2033,10 @@ pub fn build(b: *std.Build) void {
         .name = "native-recovery-zig-repository",
         .root_module = repository_recovery_module,
     });
+    const integration_archive_consumers = b.step("build-integration-archive-consumers", "Compile actual archive consumers without running privileged references");
+    for ([_]*std.Build.Step.Compile{
+        apt_system_acceptance_binary, recovery_family_executable, recovery_parity_executable, repository_recovery_executable,
+    }) |consumer| integration_archive_consumers.dependOn(&consumer.step);
     http_fixture_step.dependOn(&repository_recovery_executable.step);
     const repository_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
