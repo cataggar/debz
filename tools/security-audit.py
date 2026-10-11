@@ -2096,7 +2096,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "native_action_empty_lock_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -4895,6 +4895,37 @@ ACTION_EMPTY_LOCK_PATHS = (
     ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
 )
 
+BASELINE_FIXTURE_PATHS = (
+    "build.zig", "tools/generate-native-baseline-fixture.zig",
+    "tools/generate-native-baseline-fixture.py",
+)
+
+
+def native_baseline_fixture_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        BASELINE_FIXTURE_PATHS[0]: (
+            'b.path("tools/generate-native-baseline-fixture.zig")',
+            'b.step("generate-native-baseline-fixture",',
+            'baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");',
+            'baseline_fixture_test_options.addOptionPath("generated", generated_baseline_fixture);',
+            "workload_core.dependOn(&baseline_fixture_tests.step);",
+        ),
+        BASELINE_FIXTURE_PATHS[1]: (
+            "modulus.powWithEncodedExponent(message, &fixture_private_exponent, .big)",
+            "try targets[index].check();",
+            "if (point == .before_rename) try self.check();",
+            "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
+            "try std.testing.expectEqualSlices(u8, expected, generated);",
+        ),
+    }
+    failures = []
+    for path, tokens in required.items():
+        if any(token not in texts.get(path, "") for token in tokens):
+            failures.append(f"{path}: native signed baseline fixture contract is missing")
+    if BASELINE_FIXTURE_PATHS[2] in texts or BASELINE_FIXTURE_PATHS[2] in texts.get("build.zig", ""):
+        failures.append("retired Python baseline fixture generator was restored")
+    return failures
+
 
 def native_action_empty_lock_failures(texts: dict[str, str]) -> list[str]:
     ci = texts.get(ACTION_EMPTY_LOCK_PATHS[0], "")
@@ -5050,6 +5081,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_baseline_fixture_failures({
+        path: (ROOT / path).read_text() for path in BASELINE_FIXTURE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_cli_smoke_failures({
         path: (ROOT / path).read_text() for path in CLI_SMOKE_PATHS if (ROOT / path).is_file()
     }):
@@ -6149,7 +6184,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-baseline-fixture",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6173,6 +6208,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "protected-reference": PROTECTED_REFERENCE_PATHS,
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
+            "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -6233,6 +6269,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_cli_smoke_failures(texts)
         elif kind == "native-action-empty-lock":
             failures = native_action_empty_lock_failures(texts)
+        elif kind == "native-baseline-fixture":
+            failures = native_baseline_fixture_failures(texts)
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

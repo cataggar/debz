@@ -917,7 +917,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 51), members);
+    try testing.expectEqual(@as(usize, 52), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1612,6 +1612,24 @@ test "security: action empty-lock fixture uses the native canonical codec withou
         "try file.observeStableAlloc(allocator, locks.maximum_document_bytes)",
         ".overwrite = .fail_if_exists,",
     });
+}
+
+test "security: native signed baseline regeneration preserves original bytes and refuses unsafe publication" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-baseline-fixture", "build.zig", &.{
+        "baseline_fixture_smoke.setEnvironmentVariable(\"PATH\", \"/no-host-interpreters\");",
+        "baseline_fixture_test_options.addOptionPath(\"generated\", generated_baseline_fixture);",
+        "workload_core.dependOn(&baseline_fixture_tests.step);",
+    });
+    try nativeMutations(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.zig", &.{
+        "try targets[index].check();",
+        "if (point == .before_rename) try self.check();",
+        "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
+    });
+    const restored = try nativeCheck(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.py", "#!/usr/bin/env python3\n");
+    defer restored.deinit();
+    try restored.failsWith("retired Python baseline fixture generator was restored");
 }
 
 test "security: install action uses pinned bundles and validates before emitting result" {
