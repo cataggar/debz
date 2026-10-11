@@ -1726,6 +1726,11 @@ test "security: actual integration archive encoding and every fixture consumer r
         "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
         "\"$PWD/zig-out/bin/debz-integration-repository\"",
     });
+    try nativeMutations(&f, "native-integration-archive", "actions/install/__tests__/integration.test.ts", &.{
+        "str(Path(cli).parent / \"debz-integration-repository\"), \"--output\", str(repository)",
+        "\"--suite\", \"debian-stable\", \"--architecture\", arch",
+        "check=True, timeout=60, env={\"PATH\": \"/no-host-interpreters\"}",
+    });
     const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", "def tar_gz(entries):\n    return b''\n");
     defer restored.deinit();
     try restored.failsWith("retired Python integration repository producer was restored");
