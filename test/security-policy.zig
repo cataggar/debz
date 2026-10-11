@@ -1679,10 +1679,14 @@ test "security: actual integration archive encoding and every fixture consumer r
         ".argv = &.{ \"/usr/bin/gzip\", \"-n\", \"-9\", \"-c\", absolute }",
         "result.stdout[9] = 255;",
         "std.hash.crc.Crc32.hash(raw)",
+        "debz.deb_payload.inspectControlAlloc(allocator, bytes",
+        "try pin.observeStableAlloc(allocator, maximum_bytes)",
+        "return error.ExtraControlRepositoryFields;",
     });
     try nativeMutations(&f, "native-integration-archive", "tools/generate-integration-repository.py", &.{
         "[str(INTEGRATION_ARCHIVE), directory]",
         "return native_archive(control_entries, [(payload_path, data, 0o644)])",
+        "[str(INTEGRATION_ARCHIVE), \"--extra-control\", str(path)]",
     });
     for ([_][]const u8{
         "test/native_recovery_parity.zig",

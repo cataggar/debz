@@ -4921,6 +4921,9 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
             "result.stdout[9] = 255;",
             "std.hash.crc.Crc32.hash(raw)",
             "return error.IntegrationScratchExists;",
+            "debz.deb_payload.inspectControlAlloc(allocator, bytes",
+            "try pin.observeStableAlloc(allocator, maximum_bytes)",
+            "return error.ExtraControlRepositoryFields;",
         ),
         INTEGRATION_ARCHIVE_PATHS[2]: (
             "def require_native_archive()",
@@ -4928,6 +4931,7 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
             "stdin=subprocess.DEVNULL, timeout=30, check=False,",
             'descriptor = native_archive(control_entries, data_entries, origin="fixture structural signature member")',
             "return native_archive(control_entries, [(payload_path, data, 0o644)])",
+            '[str(INTEGRATION_ARCHIVE), "--extra-control", str(path)]',
         ),
     }
     for path in INTEGRATION_ARCHIVE_PATHS[3:5]:
@@ -4946,7 +4950,8 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
     ]
-    if re.search(r"(?m)^def (?:tar_member|tar_gz|ar_member)\(", texts.get(INTEGRATION_ARCHIVE_PATHS[2], "")):
+    producer = texts.get(INTEGRATION_ARCHIVE_PATHS[2], "")
+    if re.search(r"(?m)^def (?:tar_member|tar_gz|ar_member|ar_members)\(|^import (?:gzip|io|lzma|tarfile)$", producer):
         failures.append("retired Python integration archive encoder was restored")
     container = texts.get(INTEGRATION_ARCHIVE_PATHS[9], "").partition(
         "  download-action-container-fixture:"

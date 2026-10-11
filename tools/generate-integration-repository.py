@@ -4,18 +4,14 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import hashlib
 import importlib.util
-import io
 import json
-import lzma
 import os
 import pathlib
 import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
 
 from cryptography.hazmat.primitives import serialization
@@ -169,52 +165,21 @@ def package_specs(suite: str, architecture: str, *, signed_parity: bool = False)
     return specs
 
 
-def ar_members(deb: bytes) -> dict[str, bytes]:
-    if not deb.startswith(b"!<arch>\n"):
-        raise RuntimeError("extra package is not an ar archive")
-    members: dict[str, bytes] = {}
-    offset = 8
-    while offset < len(deb):
-        header = deb[offset : offset + 60]
-        if len(header) != 60 or header[58:60] != b"`\n":
-            raise RuntimeError("extra package has a malformed ar header")
-        name = header[:16].decode("ascii").strip().removesuffix("/")
-        size = int(header[48:58].decode("ascii").strip())
-        start = offset + 60
-        if name in members or start + size > len(deb):
-            raise RuntimeError("extra package has duplicate or truncated ar members")
-        members[name] = deb[start : start + size]
-        offset = start + size + (size % 2)
-    return members
-
-
 def extra_control(deb: bytes) -> str:
-    members = ar_members(deb)
-    if members.get("debian-binary") != b"2.0\n":
-        raise RuntimeError("extra package lacks debian-binary 2.0")
-    names = [name for name in members if name.startswith("control.tar")]
-    if len(names) != 1:
-        raise RuntimeError("extra package needs exactly one control member")
-    raw = members[names[0]]
-    if names[0] == "control.tar.gz":
-        raw = gzip.decompress(raw)
-    elif names[0] == "control.tar.xz":
-        raw = lzma.decompress(raw)
-    elif names[0] != "control.tar":
-        raise RuntimeError(f"unsupported extra control compression {names[0]}")
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
-        controls = [member for member in archive.getmembers() if member.isfile() and member.name in ("control", "./control")]
-        if len(controls) != 1:
-            raise RuntimeError("extra package needs exactly one control file")
-        stream = archive.extractfile(controls[0])
-        assert stream is not None
-        text = stream.read().decode("utf-8")
-    if not text.endswith("\n") or "\n\n" in text:
-        raise RuntimeError("extra package control must be one newline-terminated paragraph")
-    for line in text.splitlines():
-        if line.startswith(("Filename:", "Size:", "SHA256:", "SHA512:", "MD5sum:")):
-            raise RuntimeError("extra package control must not carry repository fields")
-    return text
+    require_native_archive()
+    if len(deb) > MAX_REPOSITORY_BYTES:
+        raise RuntimeError("extra package exceeds its byte limit")
+    (ROOT / ".tmp").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="integration-extra-control-", dir=ROOT / ".tmp") as directory:
+        path = pathlib.Path(directory, "extra.deb")
+        path.write_bytes(deb)
+        result = subprocess.run(
+            [str(INTEGRATION_ARCHIVE), "--extra-control", str(path)],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=30, check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(f"native extra package parsing exited {result.returncode}: {result.stderr.decode(errors='replace')}")
+    return result.stdout.decode("utf-8")
 
 
 def control_field(text: str, name: str) -> str:

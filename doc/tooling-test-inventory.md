@@ -43,7 +43,13 @@ emitted executable, and signed recovery FAMILY/parity/repository and apt
 acceptance bind their compiled helper path, including custom prefixes.
 Standalone/import consumers require the normal `zig-out` native helper or an
 explicit `DEBZ_INTEGRATION_ARCHIVE`/`--archive-helper` path.
-The Python repository/scenario/signing driver and extra-deb parser remain;
+The same helper's `--extra-control /absolute/package.deb` now performs the actual
+extra-package ar/gzip/xz/tar parsing through the shared bounded Debian parsers,
+with stable no-follow input and exact UTF-8 control bytes. It does not decode,
+extract or validate data payloads, preserving genuine prebuilt FIFO packages.
+Duplicate controls, malformed inputs and repository transport fields refuse.
+The Python archive/parser implementations have no fallback.
+The Python repository/scenario/signing driver remains;
 this bounded archive-encoding port does not complete PY3 or retire cryptography.
 
 `zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
