@@ -96,6 +96,16 @@ checks, fresh post-apply database import, `status-old` verification and
 independently durable phase completion remain unchanged. No DB-only actions
 are grouped.
 
+Each capture pins the dpkg database directory and its `info`, `triggers` and
+`updates` directories once, then reads through those descriptors instead of
+reopening the same ancestor chain for every entry. All original files, byte
+limits, metadata, imports and hashes remain part of the capture. Before it can
+return, every pinned directory must still match its original descriptor,
+parent name and root-relative path. Replacing a database or child directory
+during capture refuses rather than admitting bytes from a detached namespace.
+This is scoped traversal within one capture, not a retained generation cache,
+an atomic snapshot against another privileged writer, or deferred verification.
+
 The synthetic 1/175-package state-transition checks compare identical inputs
 against a seam that restores the removed capture/import. They establish fewer
 captures/imports/hashes with equal final generation, status, exact `status-old`,
