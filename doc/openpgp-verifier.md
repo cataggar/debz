@@ -98,5 +98,6 @@ binding), Release canonicalization and ASCII armor preserve the independent
 original bytes. `zig build build-integration-signing test-integration-signing`
 builds and tests it, including a real no-interpreter launch and pinned bounded
 input refusals. The former import-only Python signer and cryptography dependency
-are removed. The remaining Python repository/scenario/archive producer is not
-retired by this signing slice; PY3 and #420 remain open.
+are removed. The archive encoder also uses its required native helper. The
+remaining Python repository/scenario driver and extra-deb parser are not
+retired by these slices; PY3 and #420 remain open.

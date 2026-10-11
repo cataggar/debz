@@ -626,10 +626,12 @@ jobs:
           zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
             -Dversion=0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }} \
             release-install --prefix "$PWD/out/download-container/release"
+          zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all
           zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all
           python3 tools/generate-integration-repository.py \
             --output "$PWD/out/download-container/repository" \
             --suite debian-stable --architecture amd64 --sha256-only \
+            --archive-helper "$PWD/zig-out/bin/debz-integration-archive" \
             --signing-helper "$PWD/zig-out/bin/debz-integration-signing"
       - name: Upload container fixture
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

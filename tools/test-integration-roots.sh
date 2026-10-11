@@ -8,7 +8,13 @@ if [ ! -x "$runtime" ]; then
   printf 'native disposable runtime helper is not executable: %s\n' "$runtime" >&2
   exit 2
 fi
-export DEBZ_INTEGRATION_SIGNING=${3:-"$PWD/zig-out/bin/debz-integration-signing"}
+DEBZ_INTEGRATION_ARCHIVE=${3:-"$PWD/zig-out/bin/debz-integration-archive"}
+if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then
+  printf 'native integration archive helper is not executable: %s\n' "$DEBZ_INTEGRATION_ARCHIVE" >&2
+  exit 2
+fi
+export DEBZ_INTEGRATION_ARCHIVE
+export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}
 case "$DEBZ_INTEGRATION_SIGNING" in
   /*) ;;
   *) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;

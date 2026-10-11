@@ -6,7 +6,13 @@ export PYTHONDONTWRITEBYTECODE=1
 debz=$1
 harness=$2
 http_server=$3
-export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}
+DEBZ_INTEGRATION_ARCHIVE=${4:-"$PWD/zig-out/bin/debz-integration-archive"}
+if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then
+  printf 'native integration archive helper is not executable: %s\n' "$DEBZ_INTEGRATION_ARCHIVE" >&2
+  exit 2
+fi
+export DEBZ_INTEGRATION_ARCHIVE
+export DEBZ_INTEGRATION_SIGNING=${5:-"$PWD/zig-out/bin/debz-integration-signing"}
 case "$DEBZ_INTEGRATION_SIGNING" in
   /*) ;;
   *) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;

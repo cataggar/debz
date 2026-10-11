@@ -316,7 +316,8 @@ const Runner = struct {
             _ = try self.command(&.{ "mknod", "-m", "666", location, "c", "1", device[1] }, 10, null);
         }
         const signing_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_signing, self.arena);
-        _ = try self.command(&.{ "python3", "tools/generate-integration-repository.py", "--output", try self.path("/repository"), "--suite", "debian-stable", "--architecture", arch, "--signing-helper", signing_helper }, 120, null);
+        const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_archive, self.arena);
+        _ = try self.command(&.{ "python3", "tools/generate-integration-repository.py", "--output", try self.path("/repository"), "--suite", "debian-stable", "--architecture", arch, "--archive-helper", archive_helper, "--signing-helper", signing_helper }, 120, null);
         try self.writeRoot("/etc/debz/fixture.sources", try std.fmt.allocPrint(self.arena, "Types: deb\nURIs: file:///repository\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: /repository/fixture-keyring.gpg\n", .{arch}));
         try self.writeRoot("/etc/debz/default.json", try profile(self.arena, arch, .legacy_dpkg, true));
         try self.writeRoot("/etc/apt/sources.list", "invalid ambient apt source\n");

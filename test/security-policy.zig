@@ -917,7 +917,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 55), members);
+    try testing.expectEqual(@as(usize, 56), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1666,6 +1666,48 @@ test "security: disposable runtime consumers require native copying without a Py
     try restored.failsWith("retired Python disposable runtime implementation was restored");
 }
 
+test "security: actual integration archive encoding and every fixture consumer require the native helper" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-integration-archive", "build.zig", &.{
+        "b.getInstallStep().dependOn(&install_integration_archive.step);",
+        "integration_tests.addArtifactArg(integration_archive);",
+        "repository_add_tests.addArtifactArg(integration_archive);",
+        "workload_core.dependOn(&integration_archive_tests.step);",
+    });
+    try nativeMutations(&f, "native-integration-archive", "tools/integration-archive.zig", &.{
+        ".argv = &.{ \"/usr/bin/gzip\", \"-n\", \"-9\", \"-c\", absolute }",
+        "result.stdout[9] = 255;",
+        "std.hash.crc.Crc32.hash(raw)",
+    });
+    try nativeMutations(&f, "native-integration-archive", "tools/generate-integration-repository.py", &.{
+        "[str(INTEGRATION_ARCHIVE), directory]",
+        "return native_archive(control_entries, [(payload_path, data, 0o644)])",
+    });
+    for ([_][]const u8{
+        "test/native_recovery_parity.zig",
+        "test/native_recovery_family.zig",
+        "test/native_recovery_repository.zig",
+    }) |path| {
+        try nativeMutations(&f, "native-integration-archive", path, &.{
+            "const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });",
+            "\"--archive-helper\", archive_helper",
+        });
+    }
+    try nativeMutations(&f, "native-integration-archive", "test/apt-system-acceptance.zig", &.{
+        "const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_archive, self.arena);",
+        "\"--archive-helper\", archive_helper",
+    });
+    try nativeMutations(&f, "native-integration-archive", ".github/workflows/ci.yml", &.{
+        "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all",
+        "--archive-helper \"$PWD/zig-out/bin/debz-integration-archive\"",
+    });
+    const original = try f.source("tools/generate-integration-repository.py");
+    const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", try std.mem.concat(f.arena.allocator(), u8, &.{ original, "\ndef tar_gz(entries):\n    return b''\n" }));
+    defer restored.deinit();
+    try restored.failsWith("retired Python integration archive encoder was restored");
+}
+
 test "security: native OpenPGP regeneration executes original signing and refuses the retired Python signer" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1699,7 +1741,7 @@ test "security: actual integration signing binds every consumer to the native he
         "apt_acceptance_fixture_options.addOptionPath(\"integration_signing\", integration_signing.getEmittedBin());",
     });
     try nativeMutations(&f, "native-integration-signing", "tools/generate-integration-repository.py", &.{
-        "require_native_signing()\n    if output.exists():",
+        "require_native_signing()\n    require_native_archive()\n    if output.exists():",
         "keyring, in_release, primary_fingerprint = native_signing(release)",
     });
     try nativeMutations(&f, "native-integration-signing", "tools/integration-signing.zig", &.{
