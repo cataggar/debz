@@ -22,8 +22,11 @@ Native cases verify deterministic output, both decoded original tar payloads,
 checksum damage, trailing data and forbidden gzip metadata. Portable compressed
 input validation does not equate deflate implementations' compressed bytes.
 
-The remaining tar member reading, dependency/runtime/policy checks,
-packaging/publication and smoke orchestration still use Python. This bounded
+Tar member reading now uses the same native strict container decoder, with
+GNU long names, signed epochs, checksum/size bounds and original metadata
+refusals. Audit and smoke consume those original member bytes without Python
+archive decoding. The remaining dependency/runtime/policy checks,
+metadata adapters, packaging/publication and smoke orchestration still use Python. This bounded
 core migration does not complete PY2 or no-host-Python release qualification.
 Existing twelve real release consumer cases still exercise both compression
 formats, full binary/archive checks and all four assets. Complete byte-level

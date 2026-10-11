@@ -12,10 +12,13 @@ encoder build from the already pinned upstream sources. The product retains its
 decoder-only library. Decoder CRC, completeness, trailing-data, input, output
 and memory limits are enforced before returning a tar payload.
 
-`DEBZ_RELEASE` selects the helper in a custom build prefix. Tar member reading,
-runtime and policy validation, packaging and smoke orchestration still use
-Python's standard library; this bounded core port does not complete Python
-retirement.
+`DEBZ_RELEASE` selects the helper in a custom build prefix. Tar member reading
+also runs natively, preserving GNU long names and signed epochs while checking
+checksums, bounds, names, order, ownership, modes and timestamp equality. Audit
+and smoke use the returned original member bytes; they no longer open or decode
+the archive with Python. Python still adapts member metadata, validates runtime
+and policy inputs, and orchestrates packaging, publication and smoke execution.
+This bounded port does not complete Python retirement.
 
 Release inputs are rejected when
 they contain links, generated artifacts, cache paths, common secret formats,

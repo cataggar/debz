@@ -5001,6 +5001,7 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             'base64.b64encode(data).decode()',
             'return native_release("compress-tar", "--format", archive_format, input=tar_data)',
             'native_release("decode-tar", "--name", archive_path.name, input=archive_path.read_bytes())',
+            '"read-archive", "--name", archive_path.name, input=archive_path.read_bytes()',
         ),
         "tools/release.zig": (
             "pub fn parseTag(",
@@ -5024,6 +5025,12 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             "if (input[3] != 0)",
             "if (!std.mem.allEqual(u8, input[4..8], 0))",
             "debz.metadata_decompression.decompress(allocator, format, input",
+            "const tar = try decompressedTar(allocator, input, args[3]);",
+            "const entries = try readTar(allocator, tar);",
+            "if (checksum != try tarValue(header[148..156]))",
+            "if (signed_size < 0 or signed_size > tar.len - start)",
+            "if ((try seen.getOrPut(name)).found_existing)",
+            "if (mtime != first)",
         ),
     }
     failures = [
@@ -5031,8 +5038,29 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
     ]
+    python_source = texts.get("tools/release.py", "")
+    handoff = python_source.partition("def native_release(")[2].partition("\ndef parse_tag(")[0]
+    if any(token not in handoff for token in (
+        '"PATH": "/no-host-interpreters"', "timeout=60,", "stdout=subprocess.PIPE", "if result.returncode:",
+    )):
+        failures.append("tools/release.py: native helper interpreter refusal or bounded handoff is missing")
+    smoke = python_source.partition("def smoke_binary(")[2].partition("\ndef command_version(")[0]
+    if any(token not in smoke for token in (
+        "entries = archive_entries(archive_path)",
+        "os.utime(root / member.name, (member.mtime, member.mtime))",
+        '"PATH": "/no-host-interpreters"', "timeout=60,",
+    )):
+        failures.append("tools/release.py: native member smoke handoff, timestamps or bounded interpreter refusal is missing")
+    native = texts.get("tools/release.zig", "")
+    reader_command = native.partition('if (std.mem.eql(u8, args[1], "read-archive")) {')[2].partition("const compress = ")[0]
+    if any(token not in reader_command for token in (
+        "const tar = try decompressedTar(allocator, input, args[3]);",
+        "const entries = try readTar(allocator, tar);",
+        "std.Io.File.stdout().writeStreamingAll",
+    )):
+        failures.append("tools/release.zig: actual native archive reader command binding is missing")
     failures.extend(liblzma_decoder_configuration_failures(texts.get("build/liblzma.zig", "")))
-    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT", "gzip.GzipFile(", "lzma.compress(", "zlib.decompressobj(", "lzma.LZMADecompressor("):
+    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT", "gzip.GzipFile(", "lzma.compress(", "zlib.decompressobj(", "lzma.LZMADecompressor(", "tarfile.open("):
         if retired in texts.get("tools/release.py", ""):
             failures.append("tools/release.py: retired release core implementation was restored")
     return failures

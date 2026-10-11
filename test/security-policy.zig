@@ -1701,6 +1701,13 @@ test "security: actual release core consumes native tags plans ELF mappings and 
         "\"PATH\": \"/no-host-interpreters\"",
         "return native_release(\"compress-tar\", \"--format\", archive_format, input=tar_data)",
         "native_release(\"decode-tar\", \"--name\", archive_path.name, input=archive_path.read_bytes())",
+        "\"read-archive\", \"--name\", archive_path.name, input=archive_path.read_bytes()",
+    });
+    try nativeMutationsIn(&f, "native-release-core", "tools/release.py", "def smoke_binary(", "def command_version(", &.{
+        "entries = archive_entries(archive_path)",
+        "os.utime(root / member.name, (member.mtime, member.mtime))",
+        "\"PATH\": \"/no-host-interpreters\"",
+        "timeout=60,",
     });
     try nativeMutations(&f, "native-release-core", "tools/release.zig", &.{
         "if (file_mapping.? != virtual_mapping.?)",
@@ -1711,6 +1718,11 @@ test "security: actual release core consumes native tags plans ELF mappings and 
         "if (input[3] != 0)",
         "if (!std.mem.allEqual(u8, input[4..8], 0))",
         "if (produced > maximum_compressed_bytes - output.items.len)",
+        "const entries = try readTar(allocator, tar);",
+        "if (checksum != try tarValue(header[148..156]))",
+        "if (signed_size < 0 or signed_size > tar.len - start)",
+        "if ((try seen.getOrPut(name)).found_existing)",
+        "if (mtime != first)",
     });
     try nativeMutations(&f, "native-release-core", "build/liblzma.zig", &.{
         "const library = addStaticLibrary(b, xz, target, optimize);",

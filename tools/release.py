@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import lzma
 import os
 import pathlib
 import re
@@ -16,7 +15,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import zlib
 
 PLATFORMS = ("linux-x64", "linux-arm64")
 FORMATS = ("tar.gz", "tar.xz")
@@ -125,41 +123,27 @@ def decompressed_tar(archive_path: pathlib.Path) -> bytes:
 
 def archive_entries(archive_path: pathlib.Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
     try:
-        with tarfile.open(archive_path, mode="r:*") as archive:
-            result: list[tuple[tarfile.TarInfo, bytes | None]] = []
-            seen: set[str] = set()
-            previous = ""
-            timestamp: int | float | None = None
-            for member in archive:
-                path = safe_relative(member.name.rstrip("/"))
-                normalized = str(path)
-                if normalized in seen:
-                    raise ReleaseError(f"duplicate archive entry: {normalized}")
-                if normalized < previous:
-                    raise ReleaseError(f"archive entries are not sorted: {normalized}")
-                seen.add(normalized)
-                previous = normalized
-                if member.issym() or member.islnk():
-                    raise ReleaseError(f"archive contains a link: {normalized}")
-                if not (member.isfile() or member.isdir()):
-                    raise ReleaseError(f"archive contains a special file: {normalized}")
-                if member.uid != 0 or member.gid != 0 or member.uname != "root" or member.gname != "root":
-                    raise ReleaseError(f"non-canonical ownership: {normalized}")
-                if member.mode not in ({0o755} if member.isdir() else {0o644, 0o755}):
-                    raise ReleaseError(f"non-canonical mode: {normalized}")
-                if timestamp is None:
-                    timestamp = member.mtime
-                elif member.mtime != timestamp:
-                    raise ReleaseError(f"archive timestamps differ: {normalized}")
-                if forbidden_path(path):
-                    raise ReleaseError(f"forbidden archive path: {normalized}")
-                data = archive.extractfile(member).read() if member.isfile() else None
-                if data is not None:
-                    validate_payload(path, data)
-                result.append((member, data))
-            return result
-    except (tarfile.TarError, OSError, EOFError, lzma.LZMAError, zlib.error) as error:
+        records = json.loads(native_release(
+            "read-archive", "--name", archive_path.name, input=archive_path.read_bytes()
+        ))
+    except OSError as error:
         raise ReleaseError(f"cannot read archive {archive_path}: {error}") from error
+    result = []
+    for record in records:
+        member = tarfile.TarInfo(record["name"])
+        member.mode = record["mode"]
+        member.mtime = record["mtime"]
+        member.uname = member.gname = "root"
+        data = None if record["data_base64"] is None else base64.b64decode(record["data_base64"], validate=True)
+        member.type = tarfile.DIRTYPE if data is None else tarfile.REGTYPE
+        member.size = 0 if data is None else len(data)
+        path = safe_relative(member.name)
+        if forbidden_path(path):
+            raise ReleaseError(f"forbidden archive path: {member.name}")
+        if data is not None:
+            validate_payload(path, data)
+        result.append((member, data))
+    return result
 
 
 def policy_dependencies(policy_path: pathlib.Path) -> list[dict[str, object]]:
@@ -444,21 +428,34 @@ def native_platform() -> str | None:
 def smoke_binary(archive_path: pathlib.Path, version: str) -> None:
     with tempfile.TemporaryDirectory(prefix=".debz-release-smoke-", dir=archive_path.parent) as directory:
         root = pathlib.Path(directory).resolve()
-        with tarfile.open(archive_path, "r:*") as archive:
-            for member in archive:
-                destination = (root / member.name).resolve()
-                if root not in destination.parents:
-                    raise ReleaseError(f"unsafe extraction path: {member.name}")
-            archive.extractall(root, filter="data")
+        entries = archive_entries(archive_path)
+        for member, _ in entries:
+            destination = (root / member.name).resolve()
+            if root not in destination.parents:
+                raise ReleaseError(f"unsafe extraction path: {member.name}")
+        for member, data in entries:
+            destination = root / member.name
+            if data is None:
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            destination.chmod(member.mode)
+        for member, _ in reversed(entries):
+            os.utime(root / member.name, (member.mtime, member.mtime))
         binary = next(root.glob("*/bin/debz"))
         for argument, expected in (
             ("version", version),
             ("-h", "debz <command> [options] [packages...]"),
             ("--help", "debz <command> [options] [packages...]"),
         ):
-            result = subprocess.run(
-                [binary, argument], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-            )
+            try:
+                result = subprocess.run(
+                    [binary, argument], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    env={**os.environ, "PATH": "/no-host-interpreters"}, timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise ReleaseError(f"native smoke failed for {argument}: {error}") from error
             if result.returncode or expected not in result.stdout:
                 raise ReleaseError(f"native smoke failed for {argument}: {result.stdout.strip()}")
 

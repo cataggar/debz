@@ -244,6 +244,17 @@ fn paddedData(allocator: std.mem.Allocator, output: *std.ArrayList(u8), bytes: [
     try appendTar(allocator, output, zeroes[0..padding]);
 }
 
+fn validateArchiveName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 4096 or name[0] == '/' or
+        std.mem.indexOfAny(u8, name, "\x00\\") != null or !std.unicode.utf8ValidateSlice(name))
+        return refuse("unsafe archive path: {s}", .{name});
+    var components = std.mem.splitScalar(u8, name, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
+            return refuse("unsafe archive path: {s}", .{name});
+    }
+}
+
 pub fn buildTar(allocator: std.mem.Allocator, entries: []const Entry, epoch: i64) ![]u8 {
     if (entries.len > maximum_entries) return refuse("too many release archive entries", .{});
     var records: std.ArrayList(Entry) = .empty;
@@ -251,14 +262,7 @@ pub fn buildTar(allocator: std.mem.Allocator, entries: []const Entry, epoch: i64
     var directories = std.StringHashMap(void).init(allocator);
     defer directories.deinit();
     for (entries) |entry| {
-        if (entry.name.len == 0 or entry.name.len > 4096 or entry.name[0] == '/' or
-            std.mem.indexOfAny(u8, entry.name, "\x00\\") != null or !std.unicode.utf8ValidateSlice(entry.name))
-            return refuse("unsafe archive path: {s}", .{entry.name});
-        var components = std.mem.splitScalar(u8, entry.name, '/');
-        while (components.next()) |component| {
-            if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, ".."))
-                return refuse("unsafe archive path: {s}", .{entry.name});
-        }
+        try validateArchiveName(entry.name);
         for (entry.name, 0..) |byte, index| if (byte == '/') {
             if (directories.count() == maximum_entries) return refuse("too many release archive directories", .{});
             try directories.put(entry.name[0..index], {});
@@ -293,6 +297,97 @@ pub fn buildTar(allocator: std.mem.Allocator, entries: []const Entry, epoch: i64
     const padding = (10240 - output.items.len % 10240) % 10240;
     try appendTar(allocator, &output, zeroes[0..padding]);
     return output.toOwnedSlice(allocator);
+}
+
+fn tarValue(field: []const u8) !i64 {
+    if (field.len == 0 or field.len > 12) return refuse("cannot read archive: invalid tar numeric field", .{});
+    if (field[0] == 0x80 or field[0] == 0xff) {
+        var value: i128 = 0;
+        for (field[1..]) |byte| value = value * 256 + byte;
+        if (field[0] == 0xff) value -= @as(i128, 1) << @intCast(8 * (field.len - 1));
+        return std.math.cast(i64, value) orelse refuse("cannot read archive: tar numeric field exceeds signed64 bits", .{});
+    }
+    const octal = std.mem.trim(u8, std.mem.sliceTo(field, 0), " ");
+    if (octal.len == 0) return 0;
+    return std.fmt.parseInt(i64, octal, 8) catch refuse("cannot read archive: malformed tar numeric field", .{});
+}
+
+const ArchiveEntry = struct { name: []const u8, bytes: ?[]const u8, mode: u32, mtime: i64 };
+
+fn readTar(allocator: std.mem.Allocator, tar: []const u8) ![]ArchiveEntry {
+    if (tar.len < 512 or tar.len > maximum_tar_bytes)
+        return refuse("cannot read archive: tar input is truncated or exceeds its bound", .{});
+    var entries: std.ArrayList(ArchiveEntry) = .empty;
+    errdefer entries.deinit(allocator);
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var previous: []const u8 = "";
+    var timestamp: ?i64 = null;
+    var long_name: ?[]const u8 = null;
+    var offset: usize = 0;
+    while (offset < tar.len) {
+        if (tar.len - offset < 512) return refuse("cannot read archive: truncated tar header", .{});
+        const header = tar[offset..][0..512];
+        if (std.mem.allEqual(u8, header, 0)) break;
+        var checksum: i64 = 0;
+        for (header, 0..) |byte, index| checksum += if (index >= 148 and index < 156) 32 else byte;
+        if (checksum != try tarValue(header[148..156]))
+            return refuse("cannot read archive: tar header checksum differs", .{});
+        const signed_size = try tarValue(header[124..136]);
+        const start = offset + 512;
+        if (signed_size < 0 or signed_size > tar.len - start)
+            return refuse("cannot read archive: truncated tar member", .{});
+        const size: usize = @intCast(signed_size);
+        const padded = std.mem.alignForward(usize, size, 512);
+        if (padded > tar.len - start) return refuse("cannot read archive: truncated tar member padding", .{});
+        const bytes = tar[start..][0..size];
+        offset = start + padded;
+        const kind = header[156];
+        if (kind == 'L') {
+            if (long_name != null or bytes.len == 0 or bytes.len > 4097)
+                return refuse("cannot read archive: invalid GNU long name", .{});
+            long_name = std.mem.sliceTo(bytes, 0);
+            continue;
+        }
+        const raw_name = long_name orelse blk: {
+            const name = std.mem.sliceTo(header[0..100], 0);
+            if (std.mem.eql(u8, header[257..263], "ustar\x00")) {
+                const prefix = std.mem.sliceTo(header[345..500], 0);
+                if (prefix.len != 0) break :blk try std.mem.concat(allocator, u8, &.{ prefix, "/", name });
+            }
+            break :blk name;
+        };
+        long_name = null;
+        const name = std.mem.trimEnd(u8, raw_name, "/");
+        try validateArchiveName(name);
+        if ((try seen.getOrPut(name)).found_existing)
+            return refuse("duplicate archive entry: {s}", .{name});
+        if (std.mem.lessThan(u8, name, previous))
+            return refuse("archive entries are not sorted: {s}", .{name});
+        previous = name;
+        if (kind == '1' or kind == '2' or kind == 'K')
+            return refuse("archive contains a link: {s}", .{name});
+        const directory = kind == '5';
+        if (!directory and kind != '0' and kind != 0 and kind != '7')
+            return refuse("archive contains a special file: {s}", .{name});
+        if (try tarValue(header[108..116]) != 0 or try tarValue(header[116..124]) != 0 or
+            !std.mem.eql(u8, std.mem.sliceTo(header[265..297], 0), "root") or
+            !std.mem.eql(u8, std.mem.sliceTo(header[297..329], 0), "root"))
+            return refuse("non-canonical ownership: {s}", .{name});
+        const mode = std.math.cast(u32, try tarValue(header[100..108])) orelse
+            return refuse("non-canonical mode: {s}", .{name});
+        if ((directory and mode != 0o755) or (!directory and mode != 0o644 and mode != 0o755))
+            return refuse("non-canonical mode: {s}", .{name});
+        const mtime = try tarValue(header[136..148]);
+        if (timestamp) |first| {
+            if (mtime != first) return refuse("archive timestamps differ: {s}", .{name});
+        } else timestamp = mtime;
+        if (entries.items.len == 2 * maximum_entries)
+            return refuse("too many release archive members", .{});
+        try entries.append(allocator, .{ .name = name, .bytes = if (directory) null else bytes, .mode = mode, .mtime = mtime });
+    }
+    if (long_name != null) return refuse("cannot read archive: GNU long name lacks a member", .{});
+    return entries.toOwnedSlice(allocator);
 }
 
 pub fn validateStaticElf(allocator: std.mem.Allocator, binary: []const u8, platform: Platform) !void {
@@ -409,6 +504,25 @@ fn execute(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len < 2) return refuse("a release subcommand is required", .{});
+    if (std.mem.eql(u8, args[1], "read-archive")) {
+        if (args.len != 4 or !std.mem.eql(u8, args[2], "--name"))
+            return refuse("read-archive requires --name and compressed binary stdin", .{});
+        var reader = std.Io.File.stdin().reader(init.io, &.{});
+        const input = try reader.interface.allocRemaining(allocator, .limited(maximum_compressed_bytes));
+        const tar = try decompressedTar(allocator, input, args[3]);
+        const entries = try readTar(allocator, tar);
+        const Output = struct { name: []const u8, data_base64: ?[]const u8, mode: u32, mtime: i64 };
+        const records = try allocator.alloc(Output, entries.len);
+        for (entries, records) |entry, *record| {
+            const encoded = if (entry.bytes) |bytes| blk: {
+                const buffer = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+                break :blk std.base64.standard.Encoder.encode(buffer, bytes);
+            } else null;
+            record.* = .{ .name = entry.name, .data_base64 = encoded, .mode = entry.mode, .mtime = entry.mtime };
+        }
+        try std.Io.File.stdout().writeStreamingAll(init.io, try std.json.Stringify.valueAlloc(allocator, records, .{}));
+        return;
+    }
     const compress = std.mem.eql(u8, args[1], "compress-tar");
     const decompress = std.mem.eql(u8, args[1], "decode-tar");
     if (compress or decompress) {
@@ -624,4 +738,48 @@ test "release decoders reject trailing input corruption and noncanonical gzip me
             try std.testing.expectError(error.InvalidReleaseInput, decompressedTar(allocator, bytes, name));
         }
     }
+}
+
+test "release member reader preserves original GNU long names signed epochs and all file bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const name = "root/" ++ "a" ** 101;
+    for ([_]i64{ -1, 123, std.math.maxInt(i64), std.math.minInt(i64) }) |epoch| {
+        const tar = try buildTar(allocator, &.{
+            .{ .name = name, .bytes = "independent\x00bytes", .mode = 0o644 },
+            .{ .name = "root/bin/debz", .bytes = "original", .mode = 0o755 },
+        }, epoch);
+        const entries = try readTar(allocator, tar);
+        try std.testing.expectEqual(@as(usize, 4), entries.len);
+        try std.testing.expectEqualStrings(name, entries[1].name);
+        try std.testing.expectEqualStrings("independent\x00bytes", entries[1].bytes.?);
+        try std.testing.expectEqualStrings("root/bin/debz", entries[3].name);
+        for (entries) |entry| try std.testing.expectEqual(epoch, entry.mtime);
+    }
+}
+
+test "release member reader rejects checksum size ownership mode order duplicate and link mutations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const first = try tarHeader("root/a", 0o644, 123, 0, '0', false);
+    const second = try tarHeader("root/b", 0o644, 123, 0, '0', false);
+    const valid = try std.mem.concat(allocator, u8, &.{ &first, &second, &([_]u8{0} ** 1024) });
+    try std.testing.expectEqual(@as(usize, 2), (try readTar(allocator, valid)).len);
+    const corrupt = try allocator.dupe(u8, valid);
+    corrupt[0] ^= 1;
+    try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, corrupt));
+    for ([_]struct { name: []const u8 = "root/b", mode: u32 = 0o644, epoch: i64 = 123, size: usize = 0, kind: u8 = '0' }{
+        .{ .name = "../escape" }, .{ .name = "root/a" }, .{ .name = "root/0" },
+        .{ .mode = 0o777 },       .{ .epoch = 124 },     .{ .size = 8192 },
+        .{ .kind = '2' },         .{ .kind = '3' },      .{ .kind = 'L' },
+    }) |mutation| {
+        const header = try tarHeader(mutation.name, mutation.mode, mutation.epoch, mutation.size, mutation.kind, false);
+        const bytes = try std.mem.concat(allocator, u8, &.{ &first, &header, &([_]u8{0} ** 1024) });
+        try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
+    }
+    const wrong_owner = try tarHeader("root/b", 0o644, 123, 0, '0', true);
+    const bytes = try std.mem.concat(allocator, u8, &.{ &first, &wrong_owner, &([_]u8{0} ** 1024) });
+    try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
 }
