@@ -1602,7 +1602,6 @@ fn cliScenario(
     self: []const u8,
     cli: []const u8,
     arch: []const u8,
-    python: []const u8,
     http_server: []const u8,
     reference: []const u8,
     case: []const u8,
@@ -1628,17 +1627,14 @@ fn cliScenario(
     if (blocked) try copyRunner(fixture, root, "/bin/sleep", "/bin/sleep");
     const generated_relative = try support.path(fixture.allocator, name, "generated");
     const generated = try fixture.absolute(generated_relative);
-    const generator = try std.fmt.allocPrint(fixture.allocator, "{s}/tools/generate-integration-repository.py", .{options.repository});
+    const generator = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository });
     const descriptor_relative = try support.path(fixture.allocator, name, "root/fixture/descriptor.deb");
     const descriptor = try fixture.absolute(descriptor_relative);
     const generator_log = try support.path(fixture.allocator, name, "generator.log");
     const repository_url = try std.fmt.allocPrint(fixture.allocator, "{s}/repository", .{transport});
-    const signing_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing });
-    const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });
     try fixture.run(&.{
-        python,                                                                                               "-B",               generator,             "--output",         generated,                     "--suite",      "debian-stable",
-        "--architecture",                                                                                     arch,               "--descriptor-output", descriptor,         "--descriptor-repository-url", repository_url, "--descriptor-script-case",
-        if (std.mem.eql(u8, case, "known_failure")) "known_failure" else if (blocked) "blocked" else "trace", "--signing-helper", signing_helper,        "--archive-helper", archive_helper,
+        generator,             "--output", generated,                     "--suite",      "debian-stable",            "--architecture",                                                                                     arch,
+        "--descriptor-output", descriptor, "--descriptor-repository-url", repository_url, "--descriptor-script-case", if (std.mem.eql(u8, case, "known_failure")) "known_failure" else if (blocked) "blocked" else "trace",
     }, generator_log, 60);
     for ([_][]const u8{ "repository", "bootstrap-repository" }) |destination| {
         const target = try std.fmt.allocPrint(fixture.allocator, "{s}/fixture/{s}", .{ relative, destination });
@@ -1799,7 +1795,6 @@ pub fn main(init: std.process.Init) !void {
         const native_path = try std.fs.path.resolve(allocator, &.{ options.repository, first });
         const cli_path = try std.fs.path.resolve(allocator, &.{ options.repository, cli });
         const http_server_path = try std.fs.path.resolve(allocator, &.{ options.repository, http_server });
-        var fixture_python: []const u8 = "python3";
         var selected_cli_case: ?[]const u8 = null;
         var pinned: ?[]const u8 = null;
         var projection_only = false;
@@ -1815,8 +1810,6 @@ pub fn main(init: std.process.Init) !void {
                 execution_only = true;
             } else if (std.mem.eql(u8, argument, "--cli-only")) {
                 cli_only = true;
-            } else if (std.mem.eql(u8, argument, "--fixture-python")) {
-                fixture_python = iterator.next() orelse return error.MissingFixturePython;
             } else if (std.mem.eql(u8, argument, "--cli-scenario")) {
                 if (selected_cli_case != null) return error.DuplicateRepositoryScenario;
                 selected_cli_case = iterator.next() orelse return error.MissingRepositoryScenario;
@@ -1834,8 +1827,6 @@ pub fn main(init: std.process.Init) !void {
                 if (!found) return error.InvalidRepositoryScenario;
             }
         }
-        if (std.mem.indexOfScalar(u8, fixture_python, '/') != null)
-            fixture_python = try std.fs.path.resolve(allocator, &.{ options.repository, fixture_python });
         const selected = try selectMode(false, projection_only, execution_only, cli_only);
         reportRunner(init.io, allocator);
         const reference = try support.prerequisites(init, allocator, pinned);
@@ -1860,7 +1851,7 @@ pub fn main(init: std.process.Init) !void {
                 if (selected_cli_case) |chosen| {
                     if (!std.mem.eql(u8, chosen, case)) continue;
                 }
-                try cliScenario(&fixture, runner_path, cli_path, reference.architecture, fixture_python, http_server_path, reference.executable, case);
+                try cliScenario(&fixture, runner_path, cli_path, reference.architecture, http_server_path, reference.executable, case);
             }
             if (selected_cli_case == null or std.mem.eql(u8, selected_cli_case.?, "missing_descriptor"))
                 try cliCase(&fixture, runner_path, cli_path, reference.architecture);

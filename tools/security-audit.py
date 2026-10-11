@@ -2097,7 +2097,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -2239,7 +2239,7 @@ WORKLOAD_JOBS = {
         ], ()),
         "Prepare native download action fixture": (WORKLOAD_RELEASESAFE, None, (
             "        id: download-fixture",
-            "          python3 tools/generate-integration-repository.py \\",
+            '          "$PWD/zig-out/bin/debz-integration-repository" \\',
             "          zig-out/bin/debz plan \\",
             '          printf \'%s\\n\' "$PWD/zig-out/bin" >>"$GITHUB_PATH"',
         )),
@@ -4164,18 +4164,10 @@ def native_recovery_gate_wiring_failures(
     ):
         if token not in diversions:
             failures.append(f"test/native_recovery_diversions.zig: required numbered or named shard behavior lost {token}")
-    for option, variable, runner in (
-        ("native-zig-recovery-family-fixture-python", "path", "recovery_family"),
-        ("native-zig-recovery-parity-fixture-python", "path", "recovery_parity"),
-        ("native-repository-fixture-python", "python", "repository_recovery"),
-    ):
-        handoff = re.search(
-            rf'if \(b\.option\(\[\]const u8, "{re.escape(option)}", [^\n]+\)\) \|{variable}\|\s*'
-            + re.escape(f'{runner}.addArgs(&.{{ "--fixture-python", {variable} }});'),
-            graph,
-        )
-        if handoff is None:
-            failures.append(f"build.zig: signed recovery fixture interpreter lost {option} handoff")
+    if 'native_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());' not in build:
+        failures.append("build.zig: signed recovery lost its native repository producer")
+    if re.search(r"fixture-python|--fixture-python", graph):
+        failures.append("build.zig: retired signed fixture interpreter option was restored")
     for source, tokens in (
         (helper, ("if (script_failure_only) {", '"after_failure_outcome", "after_script_failure_state"')),
         (family, ('if (projection_only) {', "try projected.runReadOnly(&fixture, self orelse return error.MissingSelf, driver, reference.architecture);")),
@@ -4665,7 +4657,7 @@ def native_workflow_acceptance_wiring_failures(
         "try transport(&fixture, driver, reference.architecture);",
         "try planning(&fixture, driver);",
         "try activeInspection(&fixture, driver, reference.architecture);",
-        "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);",
+        "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, source, keyring);",
         "try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
         "try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
         "try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
@@ -4964,73 +4956,121 @@ ACTION_EMPTY_LOCK_PATHS = (
     ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
 )
 
-INTEGRATION_ARCHIVE_PATHS = (
-    "build.zig", "tools/integration-archive.zig", "tools/generate-integration-repository.py",
+INTEGRATION_REPOSITORY_PATHS = (
+    "build.zig", "tools/generate-integration-repository.zig", "tools/generate-integration-repository.py",
     "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
     "test/native_recovery_parity.zig", "test/native_recovery_family.zig",
     "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
-    ".github/workflows/ci.yml",
+    ".github/workflows/ci.yml", ".github/workflows/release.yml",
 )
+
+INTEGRATION_ARCHIVE_PATHS = INTEGRATION_REPOSITORY_PATHS + ("tools/integration-archive.zig",)
+
+
+def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        "build.zig": (
+            'b.path("tools/generate-integration-repository.zig")',
+            "b.getInstallStep().dependOn(&install_integration_repository.step);",
+            "workload_core.dependOn(&integration_repository_tests.step);",
+            "integration_tests.addArtifactArg(integration_repository);",
+            "repository_add_tests.addArtifactArg(integration_repository);",
+            'native_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());',
+            'apt_acceptance_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());',
+        ),
+        "tools/generate-integration-repository.zig": (
+            "archive.encode(io, allocator, workspace",
+            "try archive.extraControl(allocator, bytes)",
+            "try signing.sign(allocator, release)",
+            "try pin.observeStableAlloc(allocator, maximum_bytes)",
+            "if (bytes.len > maximum_bytes - self.size) return error.FixtureRepositoryTooLarge;",
+            "if (seen.contains(key)) return error.DuplicateExtraPackageIdentity;",
+            "if (!std.meta.eql(original, try parent.root.entryIfExists(output))) return error.FixtureDestinationChanged;",
+            "if (point == .before_rename) try self.check();",
+            'try environment.put("PATH", "/no-host-interpreters");',
+        ),
+    }
+    for path in INTEGRATION_REPOSITORY_PATHS[3:5]:
+        required[path] = (
+            '*) repository_generator="$PWD/$repository_generator" ;;',
+            'if [ ! -x "$repository_generator" ]; then',
+            '"$repository_generator" \\',
+        )
+    for path in INTEGRATION_REPOSITORY_PATHS[5:8]:
+        required[path] = (
+            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository })",
+            'generator, "--output"',
+        )
+    required["test/apt-system-acceptance.zig"] = (
+        'realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_repository, self.arena)',
+        'generator, "--output"',
+    )
+    for path in INTEGRATION_REPOSITORY_PATHS[9:11]:
+        required[path] = (
+            "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
+            '"$PWD/zig-out/bin/debz-integration-repository" \\',
+        )
+    failures = [
+        f"{path}: required native repository producer or real consumer wiring is missing"
+        for path, tokens in required.items()
+        if any(token not in re.sub(r"\s+", " ", texts.get(path, "")) for token in tokens)
+    ]
+    if "tools/generate-integration-repository.py" in texts:
+        failures.append("retired Python integration repository producer was restored")
+    producer = texts.get("tools/generate-integration-repository.zig", "")
+    for function in ("buildDeb", "descriptor"):
+        body = producer.partition(f"fn {function}(")[2].partition("\nfn ")[0]
+        if "archive.encode(io, allocator, workspace" not in body:
+            failures.append(f"native repository {function} must reuse the original native archive encoder")
+    for path in INTEGRATION_REPOSITORY_PATHS[3:]:
+        if re.search(r"generate-integration-repository\.py|--fixture-python|DEBZ_INTEGRATION_(?:ARCHIVE|SIGNING)", texts.get(path, "")):
+            failures.append(f"{path}: retired Python repository or helper adapter was restored")
+    container = texts.get(".github/workflows/ci.yml", "").partition(
+        "  download-action-container-fixture:"
+    )[2].partition("\n  download-action-container:")[0]
+    build = container.find("zig build build-integration-repository ")
+    generate = container.find('"$PWD/zig-out/bin/debz-integration-repository"')
+    if not 0 <= build < generate:
+        failures.append("container fixture must build its native-host repository producer before generation")
+    ci = texts.get(".github/workflows/ci.yml", "")
+    for job, expected_count in (
+        ("install-action-native", 1), ("download-action-cache", 2),
+        ("download-action-container-fixture", 1), ("build-and-test-workload", 1),
+    ):
+        match = re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci)
+        body = match.group(1) if match else ""
+        if body.count('"$PWD/zig-out/bin/debz-integration-repository" \\') != expected_count:
+            failures.append(f"{job}: every native repository fixture invocation must remain wired")
+    failures.extend(ghr_zig_workflow_failures(texts.get(".github/workflows/release.yml", ""), "release.yml", 2))
+    release = texts.get(".github/workflows/release.yml", "").partition("      - name: Install verified standalone ghr")[2]
+    if not 0 <= release.find("cataggar/zig@v0.16.0") < release.find("zig build build-integration-repository "):
+        failures.append("release fixture must install the verified native compiler before building its producer")
+    return failures
 
 
 def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
-    required = {
-        INTEGRATION_ARCHIVE_PATHS[0]: (
-            "b.getInstallStep().dependOn(&install_integration_archive.step);",
-            "integration_tests.addArtifactArg(integration_archive);",
-            "repository_add_tests.addArtifactArg(integration_archive);",
-            'native_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());',
-            'apt_acceptance_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());',
-            "workload_core.dependOn(&integration_archive_tests.step);",
-        ),
-        INTEGRATION_ARCHIVE_PATHS[1]: (
-            'try root.root.pinRegularFile(try fs.Path.init("request.json"))',
-            '.argv = &.{ "/usr/bin/gzip", "-n", "-9", "-c", absolute }',
-            "std.mem.writeInt(u32, result.stdout[4..8], epoch, .little)",
-            "result.stdout[9] = 255;",
-            "std.hash.crc.Crc32.hash(raw)",
-            "return error.IntegrationScratchExists;",
-            "debz.deb_payload.inspectControlAlloc(allocator, bytes",
-            "try pin.observeStableAlloc(allocator, maximum_bytes)",
-            "return error.ExtraControlRepositoryFields;",
-        ),
-        INTEGRATION_ARCHIVE_PATHS[2]: (
-            "def require_native_archive()",
-            "[str(INTEGRATION_ARCHIVE), directory]",
-            "stdin=subprocess.DEVNULL, timeout=30, check=False,",
-            'descriptor = native_archive(control_entries, data_entries, origin="fixture structural signature member")',
-            "return native_archive(control_entries, [(payload_path, data, 0o644)])",
-            '[str(INTEGRATION_ARCHIVE), "--extra-control", str(path)]',
-        ),
-    }
-    for path in INTEGRATION_ARCHIVE_PATHS[3:5]:
-        required[path] = ("export DEBZ_INTEGRATION_ARCHIVE", 'if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then')
-    for path in INTEGRATION_ARCHIVE_PATHS[5:8]:
-        required[path] = (
-            'const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });',
-            '"--archive-helper", archive_helper',
-        )
-    required[INTEGRATION_ARCHIVE_PATHS[8]] = (
-        'const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_archive, self.arena);',
-        '"--archive-helper", archive_helper',
-    )
-    failures = [
-        f"{path}: required native integration archive encoding or real consumer wiring is missing"
-        for path, tokens in required.items()
-        if any(token not in texts.get(path, "") for token in tokens)
-    ]
-    producer = texts.get(INTEGRATION_ARCHIVE_PATHS[2], "")
-    if re.search(r"(?m)^def (?:tar_member|tar_gz|ar_member|ar_members)\(|^import (?:gzip|io|lzma|tarfile)$", producer):
-        failures.append("retired Python integration archive encoder was restored")
-    container = texts.get(INTEGRATION_ARCHIVE_PATHS[9], "").partition(
-        "  download-action-container-fixture:"
-    )[2].partition("\n  download-action-container:")[0]
-    build_helper = "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all"
-    generate = "python3 tools/generate-integration-repository.py"
-    if (build_helper not in container or generate not in container or
-            container.index(build_helper) > container.index(generate) or
-            '--archive-helper "$PWD/zig-out/bin/debz-integration-archive"' not in container):
-        failures.append("container fixture must build and pass its native archive helper before generation")
+    failures = native_integration_repository_failures(texts)
+    build = texts.get("build.zig", "")
+    helper = texts.get("tools/integration-archive.zig", "")
+    for token in (
+        "b.getInstallStep().dependOn(&install_integration_archive.step);",
+        "workload_core.dependOn(&integration_archive_tests.step);",
+    ):
+        if token not in build:
+            failures.append("build.zig: native integration archive build or test was lost")
+    for token in (
+        'try root.root.pinRegularFile(try fs.Path.init("request.json"))',
+        '.argv = &.{ "/usr/bin/gzip", "-n", "-9", "-c", absolute }',
+        "std.mem.writeInt(u32, result.stdout[4..8], epoch, .little)",
+        "result.stdout[9] = 255;",
+        "std.hash.crc.Crc32.hash(raw)",
+        "return error.IntegrationScratchExists;",
+        "debz.deb_payload.inspectControlAlloc(allocator, bytes",
+        "try pin.observeStableAlloc(allocator, maximum_bytes)",
+        "return error.ExtraControlRepositoryFields;",
+    ):
+        if token not in helper:
+            failures.append("tools/integration-archive.zig: native archive or control-only parser contract was lost")
     return failures
 
 DISPOSABLE_RUNTIME_PATHS = (
@@ -5178,28 +5218,21 @@ def native_openpgp_fixture_failures(texts: dict[str, str]) -> list[str]:
     return failures
 
 
-INTEGRATION_SIGNING_PATHS = (
-    "build.zig", "tools/integration-signing.zig", "tools/generate-integration-repository.py",
-    "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
-    "test/native_recovery_family.zig", "test/native_recovery_parity.zig",
-    "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
-    ".github/workflows/ci.yml", "tools/requirements-openpgp-fixtures.txt",
+INTEGRATION_SIGNING_PATHS = INTEGRATION_REPOSITORY_PATHS + (
+    "tools/integration-signing.zig", "tools/requirements-openpgp-fixtures.txt",
 )
 
 
 def native_integration_signing_failures(texts: dict[str, str]) -> list[str]:
+    failures = native_integration_repository_failures(texts)
     required = {
-        INTEGRATION_SIGNING_PATHS[0]: (
+        "build.zig": (
             'b.path("tools/integration-signing.zig")',
             "b.getInstallStep().dependOn(&install_integration_signing.step);",
             "workload_core.dependOn(&integration_signing_tests.step);",
             'integration_signing_test_options.addOptionPath("executable", integration_signing.getEmittedBin());',
-            "integration_tests.addArtifactArg(integration_signing);",
-            "repository_add_tests.addArtifactArg(integration_signing);",
-            'native_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());',
-            'apt_acceptance_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());',
         ),
-        INTEGRATION_SIGNING_PATHS[1]: (
+        "tools/integration-signing.zig": (
             'const pgp = @import("fixture-openpgp.zig");',
             "try pin.observeStableAlloc(allocator, maximum_bytes)",
             "try pgp.subpacket(allocator, 32, try pgp.packetBody(primary_binding))",
@@ -5208,55 +5241,19 @@ def native_integration_signing_failures(texts: dict[str, str]) -> list[str]:
             "3907b432b4746fcd56702acccbf4bfb0308a99b07331c1fa11d7998865796b14",
             "9cc9b4c7976ea7cdafa5097ad8f2777122b5644479e9828f3c7ae63d81ee4d9f",
         ),
-        INTEGRATION_SIGNING_PATHS[2]: (
-            '"DEBZ_INTEGRATION_SIGNING", ROOT / "zig-out/bin/debz-integration-signing",',
-            "require_native_signing()\n    require_native_archive()\n    if output.exists():",
-            "[str(INTEGRATION_SIGNING), str(path)]",
-            "stdin=subprocess.DEVNULL, timeout=30, check=False,",
-            "keyring, in_release, primary_fingerprint = native_signing(release)",
-            '"--signing-helper must be absolute"',
-        ),
-        INTEGRATION_SIGNING_PATHS[3]: (
-            'export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}',
-            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
-            'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
-        ),
-        INTEGRATION_SIGNING_PATHS[4]: (
-            'export DEBZ_INTEGRATION_SIGNING=${5:-"$PWD/zig-out/bin/debz-integration-signing"}',
-            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
-            'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
-        ),
-        **{path: (
-            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing })",
-            '"--signing-helper", signing_helper',
-        ) for path in INTEGRATION_SIGNING_PATHS[5:8]},
-        INTEGRATION_SIGNING_PATHS[8]: (
-            'realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_signing, self.arena)',
-            '"--signing-helper", signing_helper',
-        ),
-        INTEGRATION_SIGNING_PATHS[9]: (
-            "zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all",
-            '--signing-helper "$PWD/zig-out/bin/debz-integration-signing"',
-        ),
     }
-    failures = [
+    failures.extend(
         f"{path}: native integration signing contract is missing"
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
-    ]
-    if INTEGRATION_SIGNING_PATHS[10] in texts:
+    )
+    if "tools/requirements-openpgp-fixtures.txt" in texts:
         failures.append("retired integration cryptography dependency was restored")
-    if re.search(r"cryptography|generate-openpgp-fixtures\.py|load_openpgp_fixture_module", texts.get(INTEGRATION_SIGNING_PATHS[2], "")):
+    if re.search(r"cryptography|generate-openpgp-fixtures\.py|load_openpgp_fixture_module", texts.get("tools/generate-integration-repository.zig", "")):
         failures.append("retired Python integration signing consumer was restored")
-    workflow = texts.get(INTEGRATION_SIGNING_PATHS[9], "")
+    workflow = texts.get(".github/workflows/ci.yml", "")
     if "python3-cryptography" in workflow or "import cryptography" in workflow:
         failures.append("retired CI fixture cryptography dependency was restored")
-    container = re.search(r"(?ms)^  download-action-container-fixture:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", workflow)
-    body = container.group(1) if container else ""
-    build = body.find("zig build build-integration-signing ")
-    generate = body.find("python3 tools/generate-integration-repository.py")
-    if not 0 <= build < generate:
-        failures.append("container must build its native-host signer before generation")
     return failures
 
 
@@ -5559,7 +5556,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 21, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 21, "release.yml": 2}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -6511,7 +6508,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     elif kind == "ghr-ci":
         failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
     elif kind == "ghr-release":
-        failures = ghr_zig_workflow_failures(text, "release.yml", 1)
+        failures = ghr_zig_workflow_failures(text, "release.yml", 2)
     elif kind == "workflow-failure":
         failures = workflow_failure_handling_failures(text, "ci.yml")
     elif kind == "ci-concurrency":

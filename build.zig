@@ -305,6 +305,34 @@ pub fn build(b: *std.Build) void {
     const native_dpkg_test_step = b.step("test-native-dpkg-reference", "Run actual native reference selection and preparation refusals");
     native_dpkg_test_step.dependOn(&native_dpkg_tests.step);
 
+    const integration_repository_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-integration-repository.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_repository_module.addImport("debz", debz);
+    const integration_repository = b.addExecutable(.{
+        .name = "debz-integration-repository",
+        .root_module = integration_repository_module,
+    });
+    const install_integration_repository = b.addInstallArtifact(integration_repository, .{});
+    b.getInstallStep().dependOn(&install_integration_repository.step);
+    b.step("build-integration-repository", "Build original integration repositories without Python").dependOn(&install_integration_repository.step);
+    const integration_repository_test_options = b.addOptions();
+    integration_repository_test_options.addOptionPath("executable", integration_repository.getEmittedBin());
+    const integration_repository_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/generate-integration-repository.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_repository_test_module.addImport("debz", debz);
+    integration_repository_test_module.addOptions("integration_repository_test_options", integration_repository_test_options);
+    integration_repository_test_module.addOptions("integration_archive_test_options", integration_archive_test_options);
+    integration_repository_test_module.addOptions("integration_signing_test_options", integration_signing_test_options);
+    const integration_repository_tests = b.addRunArtifact(b.addTest(.{ .root_module = integration_repository_test_module }));
+    b.step("test-integration-repository", "Test original complete repositories and pre-publication refusal without Python").dependOn(&integration_repository_tests.step);
+    workload_core.dependOn(&integration_repository_tests.step);
+
     const openpgp_fixture_options = b.addOptions();
     openpgp_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
     const openpgp_fixture_module = b.createModule(.{
@@ -441,8 +469,7 @@ pub fn build(b: *std.Build) void {
     integration_tests.step.dependOn(&install_disposable_runtime.step);
     integration_tests.addArtifactArg(cli);
     integration_tests.addArtifactArg(disposable_runtime);
-    integration_tests.addArtifactArg(integration_archive);
-    integration_tests.addArtifactArg(integration_signing);
+    integration_tests.addArtifactArg(integration_repository);
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
@@ -564,8 +591,7 @@ pub fn build(b: *std.Build) void {
     });
     apt_system_acceptance_module.link_libc = true;
     const apt_acceptance_fixture_options = b.addOptions();
-    apt_acceptance_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());
-    apt_acceptance_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());
+    apt_acceptance_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());
     apt_system_acceptance_module.addOptions("apt_acceptance_fixture_options", apt_acceptance_fixture_options);
     const apt_system_acceptance_binary = b.addExecutable(.{
         .name = "apt-system-acceptance",
@@ -623,8 +649,7 @@ pub fn build(b: *std.Build) void {
     repository_add_tests.addArtifactArg(cli);
     repository_add_tests.addArtifactArg(repository_add_harness);
     repository_add_tests.addArtifactArg(http_fixture_server);
-    repository_add_tests.addArtifactArg(integration_archive);
-    repository_add_tests.addArtifactArg(integration_signing);
+    repository_add_tests.addArtifactArg(integration_repository);
     const repository_add_step = b.step(
         "test-repository-add",
         "Run the hermetic Microsoft-shaped repository add integration",
@@ -1463,8 +1488,7 @@ pub fn build(b: *std.Build) void {
     const native_fixture_options = b.addOptions();
     native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
     native_fixture_options.addOptionPath("native_dpkg_reference", native_dpkg.getEmittedBin());
-    native_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());
-    native_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());
+    native_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());
     native_fixture_module.addOptions("native_test_options", native_fixture_options);
     const native_fixture_tests = b.addTest(.{ .root_module = native_fixture_module });
     const run_native_fixture_tests = b.addRunArtifact(native_fixture_tests);
@@ -1974,8 +1998,6 @@ pub fn build(b: *std.Build) void {
     recovery_family.addArg("--cli");
     recovery_family.addArtifactArg(cli);
     if (repository_projection_only) recovery_family.addArg("--projection-only");
-    if (b.option([]const u8, "native-zig-recovery-family-fixture-python", "Python interpreter for the existing signed-archive fixture builder")) |path|
-        recovery_family.addArgs(&.{ "--fixture-python", path });
     const family_executed_only = b.option(bool, "native-zig-recovery-family-executed-only", "Select archive-backed FAMILY execution and active inspection") orelse false;
     if (family_executed_only)
         recovery_family.addArg("--executed-only");
@@ -2001,8 +2023,6 @@ pub fn build(b: *std.Build) void {
     recovery_parity.addArtifactArg(native_lifecycle_tests);
     recovery_parity.addArtifactArg(cli);
     recovery_parity.addArtifactArg(native_trigger_helper);
-    if (b.option([]const u8, "native-zig-recovery-parity-fixture-python", "Python interpreter for signed-archive fixture generation")) |path|
-        recovery_parity.addArgs(&.{ "--fixture-python", path });
     const parity_case = b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging");
     if (parity_case) |case|
         recovery_parity.addArgs(&.{ "--case", case });
@@ -2113,8 +2133,10 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Step.Compile{
         apt_system_acceptance_binary, recovery_family_executable, recovery_parity_executable, repository_recovery_executable,
     }) |consumer| integration_signing_consumers.dependOn(&consumer.step);
-    if (b.option([]const u8, "native-repository-fixture-python", "Python with signed-repository fixture generator dependencies")) |python|
-        repository_recovery.addArgs(&.{ "--fixture-python", python });
+    const integration_repository_consumers = b.step("build-integration-repository-consumers", "Compile native repository consumers without running privileged references");
+    for ([_]*std.Build.Step.Compile{
+        apt_system_acceptance_binary, recovery_family_executable, recovery_parity_executable, repository_recovery_executable,
+    }) |consumer| integration_repository_consumers.dependOn(&consumer.step);
     const repository_case = b.option([]const u8, "native-zig-repository-case", "Run one Zig repository CLI scenario");
     if (repository_case) |case|
         repository_recovery.addArgs(&.{ "--cli-scenario", case });

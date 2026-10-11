@@ -10,7 +10,7 @@ network-derived input.
 ## Local prerequisites
 
 - Zig 0.16.0 and liblzma development files;
-- Python 3 for repository/scenario production (no cryptography dependency);
+- the native repository fixture driver (built by the integration target);
 - `dpkg` for full/native lanes; native execution also requires Linux private
   mount-namespace privileges (use `DEBZ_INTEGRATION_SUDO=1` when needed).
 
@@ -23,11 +23,12 @@ DEBZ_INTEGRATION_MODE=smoke \
 zig build test-integration
 ```
 
-The build supplies the required native fixture signer, including custom install
-prefixes. Standalone `tools/generate-integration-repository.py` invocations first
-need `zig build build-integration-signing` or an absolute `--signing-helper`
-(`DEBZ_INTEGRATION_SIGNING` also selects that executable). Missing signing
-support fails before any existing repository output is cleared.
+The build supplies the native repository driver, including custom install
+prefixes. Standalone generation first needs `zig build build-integration-repository`,
+then `zig-out/bin/debz-integration-repository --output /absolute/path --suite
+debian-stable --architecture arm64`. The driver directly reuses the native
+archive encoder, control-only extra-package parser and original test-key signer;
+there is no Python producer or helper fallback.
 
 Accepted suites are `debian-stable` and `ubuntu-26.04`; architectures are
 `amd64` and `arm64`; modes are `smoke`, `native`, and `full`. Full mode requires `dpkg`
@@ -48,7 +49,7 @@ execution without changing package state or leaving an active root record.
 
 The generated repository publishes signed SHA256 and SHA512 for every archive
 by default, so native lanes satisfy the native default
-`sha512_identity_required` policy. `tools/generate-integration-repository.py
+`sha512_identity_required` policy. `debz-integration-repository
 --sha256-only` (incompatible with `--signed-parity`) instead generates a
 Debian-shaped repository that signs only SHA256. The legacy archive and
 package-cache lanes, including the GitHub Action fixtures, use it: the legacy
