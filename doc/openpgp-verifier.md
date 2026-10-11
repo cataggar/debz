@@ -99,5 +99,5 @@ original bytes. `zig build build-integration-signing test-integration-signing`
 builds and tests it, including a real no-interpreter launch and pinned bounded
 input refusals. The former import-only Python signer and cryptography dependency
 are removed. The archive encoder also uses its required native helper. The
-remaining Python repository/scenario driver and extra-deb parser are not
+remaining Python repository/scenario driver is not
 retired by these slices; PY3 and #420 remain open.

@@ -43,9 +43,15 @@ emitted executable, and signed recovery FAMILY/parity/repository and apt
 acceptance bind their compiled helper path, including custom prefixes.
 Standalone/import consumers require the normal `zig-out` native helper or an
 explicit `DEBZ_INTEGRATION_ARCHIVE`/`--archive-helper` path.
-The Python repository/scenario driver and extra-deb parser remain;
-this bounded archive-encoding port does not complete PY3. The separate native
-signing helper below retires the fixture cryptography dependency.
+The same helper's `--extra-control /absolute/package.deb` now performs the actual
+extra-package ar/gzip/xz/tar parsing through the shared bounded Debian parsers,
+with stable no-follow input and exact UTF-8 control bytes. It does not decode,
+extract or validate data payloads, preserving genuine prebuilt FIFO packages.
+Duplicate controls, malformed inputs and repository transport fields refuse.
+The Python archive/parser implementations have no fallback.
+The Python repository/scenario driver remains; these bounded archive/parser
+ports do not complete PY3. The separate native signing helper below retires
+the fixture cryptography dependency.
 
 `zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
 The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
@@ -96,8 +102,8 @@ consumers bind their emitted helper before fixture generation. The release-only
 download container builds a native-host helper separately. Standalone fixture
 generation uses the normal installed path or an absolute `--signing-helper`
 or `DEBZ_INTEGRATION_SIGNING` path; missing support fails before clearing output.
-The repository/scenario driver and extra-deb parser are still Python; the
-native archive and signing helpers do not complete PY3 or #420.
+The repository/scenario driver is still Python; the native archive/parser and
+signing helpers do not complete PY3 or #420.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
