@@ -626,9 +626,11 @@ jobs:
           zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
             -Dversion=0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }} \
             release-install --prefix "$PWD/out/download-container/release"
+          zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all
           python3 tools/generate-integration-repository.py \
             --output "$PWD/out/download-container/repository" \
-            --suite debian-stable --architecture amd64 --sha256-only
+            --suite debian-stable --architecture amd64 --sha256-only \
+            --signing-helper "$PWD/zig-out/bin/debz-integration-signing"
       - name: Upload container fixture
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -1163,14 +1165,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise Zig recovery units in both modes
         run: |
@@ -1222,14 +1224,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise Zig repository recovery
         run: |
@@ -1270,14 +1272,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise Zig helper, bootstrap, parity and rollback recovery
         run: |
@@ -1324,14 +1326,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise Zig signed FAMILY recovery
         run: |
@@ -1372,14 +1374,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise Zig recovery scenario and mutation matrices
         run: |
@@ -1453,14 +1455,14 @@ jobs:
         run: |
           if ! command -v pkg-config >/dev/null ||
              ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Exercise counted Zig diversion recovery shard
         run: |
@@ -2204,7 +2206,7 @@ jobs:
           fi
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
             -o Acquire::https::Timeout=30 update
-          sudo apt-get install --yes --no-install-recommends dpkg liblzma-dev libzstd-dev python3-cryptography
+          sudo apt-get install --yes --no-install-recommends dpkg liblzma-dev libzstd-dev
       - name: Run required integration root
         env:
           DEBZ_INTEGRATION_SUITE: ${{ matrix.suite }}
@@ -2257,7 +2259,7 @@ jobs:
       - name: Install bounded fixture prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends dpkg liblzma-dev libzstd-dev python3-cryptography
+          sudo apt-get install --yes --no-install-recommends dpkg liblzma-dev libzstd-dev
       - name: Run full integration root
         env:
           DEBZ_INTEGRATION_SUITE: ${{ matrix.suite }}

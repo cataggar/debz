@@ -49,11 +49,13 @@ Completed #217 migration inventory:
 privileged gate on Linux amd64 and arm64 in both Debug and ReleaseSafe; local
 arm64 root runs passed in both modes. Missing privileges or fixture
 prerequisites fail rather than skip. Run the acceptance target as root with
-Linux mount, PID, and network namespace support, Python 3 with `cryptography`
+Linux mount, PID, and network namespace support, Python 3
 for the **fixture generator only**, and the host's dpkg, dpkg-deb, dpkg-split,
 dpkg-trigger, GNU tar, shell, ldconfig, start-stop-daemon, rm, and diff available.
 The Zig runner also uses host `cp`, `ldd`, `mknod`, `unshare`, `mount`, and
 `chroot` for disposable fixture setup and execution.
+The build passes its emitted native integration signer explicitly, including
+custom prefixes; signing no longer needs Python cryptography.
 
 The check invokes the built `debz` executable in separate disposable legacy and
 native chroots under the repository's `.zig-cache`, using an authenticated fixture

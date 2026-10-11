@@ -1633,10 +1633,11 @@ fn cliScenario(
     const descriptor = try fixture.absolute(descriptor_relative);
     const generator_log = try support.path(fixture.allocator, name, "generator.log");
     const repository_url = try std.fmt.allocPrint(fixture.allocator, "{s}/repository", .{transport});
+    const signing_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing });
     try fixture.run(&.{
-        python,                                                                                               "-B", generator,             "--output", generated,                     "--suite",      "debian-stable",
-        "--architecture",                                                                                     arch, "--descriptor-output", descriptor, "--descriptor-repository-url", repository_url, "--descriptor-script-case",
-        if (std.mem.eql(u8, case, "known_failure")) "known_failure" else if (blocked) "blocked" else "trace",
+        python,                                                                                               "-B",               generator,             "--output", generated,                     "--suite",      "debian-stable",
+        "--architecture",                                                                                     arch,               "--descriptor-output", descriptor, "--descriptor-repository-url", repository_url, "--descriptor-script-case",
+        if (std.mem.eql(u8, case, "known_failure")) "known_failure" else if (blocked) "blocked" else "trace", "--signing-helper", signing_helper,
     }, generator_log, 60);
     for ([_][]const u8{ "repository", "bootstrap-repository" }) |destination| {
         const target = try std.fmt.allocPrint(fixture.allocator, "{s}/fixture/{s}", .{ relative, destination });

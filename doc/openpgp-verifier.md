@@ -91,8 +91,12 @@ partition. The shared `tools/fixture-openpgp.zig` signer also preserves the
 original signed native baseline fixture bytes; it is never production
 signing authority.
 
-`tools/generate-openpgp-fixtures.py` is now import-only: the integration
-repository producer still imports its original signer and requires the
-pinned `tools/requirements-openpgp-fixtures.txt` dependency. That remaining
-producer must be ported before its Python/cryptography dependency can be
-removed; this generator port alone does not complete PY3 or #420.
+The integration repository producer now requires the native
+`debz-integration-signing` helper, sharing this original test-key mechanism.
+Its key certification, signing subkey binding (including the embedded primary
+binding), Release canonicalization and ASCII armor preserve the independent
+original bytes. `zig build build-integration-signing test-integration-signing`
+builds and tests it, including a real no-interpreter launch and pinned bounded
+input refusals. The former import-only Python signer and cryptography dependency
+are removed. The remaining Python repository/scenario/archive producer is not
+retired by this signing slice; PY3 and #420 remain open.

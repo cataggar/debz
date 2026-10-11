@@ -6,6 +6,11 @@ export PYTHONDONTWRITEBYTECODE=1
 debz=$1
 harness=$2
 http_server=$3
+export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}
+if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then
+  printf 'native integration signer is not executable: %s\n' "$DEBZ_INTEGRATION_SIGNING" >&2
+  exit 2
+fi
 workspace="$PWD/.zig-cache/repository-add-integration"
 http_root="$workspace/http"
 repository="$http_root/repository"

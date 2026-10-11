@@ -8,6 +8,11 @@ if [ ! -x "$runtime" ]; then
   printf 'native disposable runtime helper is not executable: %s\n' "$runtime" >&2
   exit 2
 fi
+export DEBZ_INTEGRATION_SIGNING=${3:-"$PWD/zig-out/bin/debz-integration-signing"}
+if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then
+  printf 'native integration signer is not executable: %s\n' "$DEBZ_INTEGRATION_SIGNING" >&2
+  exit 2
+fi
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
 architecture=${DEBZ_INTEGRATION_ARCH:-amd64}
 mode=${DEBZ_INTEGRATION_MODE:-smoke}

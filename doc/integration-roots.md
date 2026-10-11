@@ -10,7 +10,7 @@ network-derived input.
 ## Local prerequisites
 
 - Zig 0.16.0 and liblzma development files;
-- Python 3 with `cryptography`;
+- Python 3 for repository/scenario production (no cryptography dependency);
 - `dpkg` for full/native lanes; native execution also requires Linux private
   mount-namespace privileges (use `DEBZ_INTEGRATION_SUDO=1` when needed).
 
@@ -22,6 +22,12 @@ DEBZ_INTEGRATION_ARCH=amd64 \
 DEBZ_INTEGRATION_MODE=smoke \
 zig build test-integration
 ```
+
+The build supplies the required native fixture signer, including custom install
+prefixes. Standalone `tools/generate-integration-repository.py` invocations first
+need `zig build build-integration-signing` or an absolute `--signing-helper`
+(`DEBZ_INTEGRATION_SIGNING` also selects that executable). Missing signing
+support fails before any existing repository output is cleared.
 
 Accepted suites are `debian-stable` and `ubuntu-26.04`; architectures are
 `amd64` and `arm64`; modes are `smoke`, `native`, and `full`. Full mode requires `dpkg`

@@ -83,12 +83,8 @@ def forbidden_path(path: pathlib.PurePosixPath) -> bool:
 def validate_payload(path: pathlib.PurePosixPath, data: bytes) -> None:
     if forbidden_path(path):
         raise ReleaseError(f"forbidden generated/cache path: {path}")
-    synthetic_fixture = (
-        path.parts[-2:] == ("tools", "generate-openpgp-fixtures.py")
-        and b"checked-in, non-secret OpenPGP verification fixtures" in data
-    )
     for pattern in SECRET_PATTERNS:
-        if pattern.search(data) and not synthetic_fixture:
+        if pattern.search(data):
             raise ReleaseError(f"possible secret in release input: {path}")
 
 
