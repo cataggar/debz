@@ -296,7 +296,7 @@ test "security: native-only production candidate refuses shipped routes and exac
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |message| try baseline.failsWith(message);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.py:") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.zig:") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/native-differential.py:") == null);
 
     for ([_]struct { path: []const u8, from: []const u8, to: []const u8, message: []const u8 }{
@@ -472,7 +472,7 @@ const workload_jobs = [_]WorkloadJob{
         .commands = &.{"build test-workload-production -Doptimize={s} -j2 --summary all"},
         .mutations = &.{
             "          mkdir -p .tmp\n",
-            "          reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"\n",
+            "          reference_dpkg=\"$(zig-out/bin/debz-native-dpkg-reference)\"\n",
             " test-native-diversion-settlement-zig",
             "-Dnative-reference-dpkg=\"$reference_dpkg\" ",
         },
@@ -1043,7 +1043,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             timeout,                               "      fail-fast: false",
             "          - os: ubuntu-24.04",        "          - os: ubuntu-24.04-arm",
             "      - name: Install Zig via ghr\n", "      - name: Install metadata decompression and signed fixture dependencies\n",
-            "libzstd-dev python3-jsonschema",      "reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"",
+            "libzstd-dev python3-jsonschema",      "reference_dpkg=\"$(zig-out/bin/debz-native-dpkg-reference)\"",
         }) |token| {
             const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
             const rejected = try f.check("ci-recovery", changed);
@@ -2664,7 +2664,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "step proof 0 \"executed without skips\" timeout --signal=TERM --kill-after=60s 45m \\\n",
         "  mode=native-staging\n",
         "print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))\n",
-        "module.verify_extracted_bindings(prefix, architecture)\n",
+        "    --receipt-from-archive \"$tree/reference-dpkg.deb\" --prefix \"$tree/reference-dpkg\"\n",
         "    bash tools/real-snapshot-python3-protected-stage.sh \"$zig\" \"$checkout/zig-out/bin/debz\" \\\n",
         "  [[ ${#python3_arguments[@]} == 20 ]]\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-python3-protected \"${python3_arguments[@]}\" \\\n",
@@ -2682,8 +2682,18 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "  \"-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
-        "module.receipt_from_extracted_archive(\n",
+        "  --receipt-from-archive \"$workspace/build/dpkg.deb\" --prefix \"$dpkg_prefix\"\n",
+        "require_protected_file \"$native_reference\"\n",
         "  --architecture \"$architecture\" --verify-only \"$dpkg_prefix/usr/bin/dpkg\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/prepare-native-dpkg.zig", &.{
+        "        try self.archiveMetadata(archive);\n",
+        "        try self.writeReceipt(prefix, raw.len);\n",
+        "observed.entry.link_count != 1",
+        "observed.entry.uid != std.os.linux.geteuid()",
+        "observed.entry.gid != std.os.linux.getegid()",
+        "observed.entry.mode & 0o022 != 0",
+        "        try cleanupStaging(parent.root, self.allocator, stage, stage_entry);\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_python_fixtures.py", &.{
         "    create_exclusive(shadow, \"usr/sbin/update-alternatives\", b\"shadow\\n\", 0o644)\n",

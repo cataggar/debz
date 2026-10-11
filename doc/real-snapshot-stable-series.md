@@ -200,7 +200,7 @@ passes. However, the docs are inaccurate, and any evidence that binds the old
 Other Debian facts:
 
 - trixie's `dpkg` is **1.22.22**. Its archives are byte-identical to the
-  pinned reference archives in `tools/prepare-native-dpkg.py` (amd64
+  pinned reference archives in `tools/prepare-native-dpkg.zig` (amd64
   `3e800c6d…`, arm64 `1142468e…`).
 - None of the Debian Release files list SHA-512, so #289 binds signed SHA-256
   with a derived SHA-512.
@@ -232,7 +232,7 @@ three-key-set witness problem the owner described on #330.
 **dpkg references:**
 
 - Pinned dpkg 1.22.22 remains the series-independent lifecycle, recovery and
-  alternatives oracle. `tools/prepare-native-dpkg.py` downloads it from
+  alternatives oracle. `tools/prepare-native-dpkg.zig` downloads it from
   `deb.debian.org`, so it is unaffected by this move.
 - The real-snapshot reference scripts use the snapshot's own dpkg. They pin
   `usr/bin/dpkg` 1.23.7ubuntu1 per architecture (digests above), replacing
@@ -574,7 +574,7 @@ These differences are reviewed once, in the migration PR.
 ### Tool
 
 `tools/real-snapshot-repin.py` uses only the Python standard library, like
-`tools/prepare-native-dpkg.py` and #289's `tools/debian-stable-closure.py`.
+`tools/prepare-native-dpkg.zig` and #289's `tools/debian-stable-closure.py`.
 Its subcommands (`probe`, `diff`, `record`, `check`) follow the latter's
 `run`/`compare`/`record`/`check` pattern, so the Debian lane can adopt it
 through a second series profile.

@@ -531,7 +531,7 @@
   ],
   "historical_reference_paths": [
     {
-      "path": "tools/prepare-native-dpkg.py",
+      "path": "tools/prepare-native-dpkg.zig",
       "role": "pinned_reference_transport",
       "retain_after_cutover": true
     },

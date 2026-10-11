@@ -556,26 +556,13 @@ step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree
 stage_native_inputs() {
   step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
   step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2
-  python3 -I - "$checkout/tools" "$architecture" "$tree/reference-dpkg" <<'PY'
-import importlib.util
-from pathlib import Path
-import subprocess
-import sys
-
-spec = importlib.util.spec_from_file_location("prepare_native_dpkg", Path(sys.argv[1]) / "prepare-native-dpkg.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-architecture, prefix = sys.argv[2], Path(sys.argv[3])
-url, content = module.download_archive(architecture)
-archive = prefix.parent / "reference-dpkg.deb"
-archive.write_bytes(content)
-module.verify_file(archive, module.PINS[architecture]["archive"])
-module.verify_archive_metadata(archive, architecture)
-subprocess.run(["dpkg-deb", "--extract", str(archive), str(prefix)], check=True, timeout=60)
-module.verify_extracted_bindings(prefix, architecture)
-module.write_receipt(architecture, url, content, prefix)
-module.verify_receipt(prefix / module.RECEIPT, architecture)
-PY
+  "$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \
+    --download-archive "$tree/reference-dpkg.deb"
+  dpkg-deb --extract "$tree/reference-dpkg.deb" "$tree/reference-dpkg"
+  "$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \
+    --receipt-from-archive "$tree/reference-dpkg.deb" --prefix "$tree/reference-dpkg"
+  "$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \
+    --verify-receipt "$tree/reference-dpkg/reference-receipt-v1.json"
   install -d -o root -g root -m 0700 "$checkout/.real-snapshot"
   printf '%s\n' "$zig" "$tree/reference-dpkg/usr/bin/dpkg" "$staged_archive_keyring" \
     >"$tree/native-inputs.args"

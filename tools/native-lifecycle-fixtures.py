@@ -318,8 +318,7 @@ class Scenario:
 
     def enable_alternatives(self) -> None:
         source = Path(m.REFERENCE_DPKG).with_name("update-alternatives")
-        expected = m.reference_dpkg.PINS[self.architecture]["update_alternatives"]
-        m.reference_dpkg.verify_file(source, expected)
+        m.verify_reference(source, self.architecture, "update-alternatives")
         for root in self.roots:
             for relative in (
                 "etc/alternatives",
@@ -336,10 +335,7 @@ class Scenario:
                 source,
                 "/usr/bin/update-alternatives",
             )
-            m.reference_dpkg.verify_file(
-                root / "usr/bin/update-alternatives",
-                expected,
-            )
+            m.verify_reference(root / "usr/bin/update-alternatives", self.architecture, "update-alternatives")
 
     def seed(self, archive: Path, *, configure: bool = True) -> None:
         for root in self.roots:

@@ -200,7 +200,7 @@ def candidate_failures(
             failures.append(f"{path}: declared deleted but production path still exists")
     if guard_paths != GUARD_PATHS:
         failures.append(f"{LEGACY_POLICY}: missing/unreviewed compatibility guard paths: {sorted(guard_paths ^ GUARD_PATHS)}")
-    if reference_paths != {"tools/native-differential.py", "tools/prepare-native-dpkg.py"}:
+    if reference_paths != {"tools/native-differential.py", "tools/prepare-native-dpkg.zig"}:
         failures.append(f"{LEGACY_POLICY}: reference-only paths must be exact, not a dpkg basename allowance")
     if contract_paths != {"actions/download/dist/index.js", "actions/install/dist/index.js"}:
         failures.append(f"{LEGACY_POLICY}: missing or unclassified generated Actions bundle")
@@ -221,7 +221,7 @@ def candidate_failures(
             or journal[0].get("new_execution") != "version_4_only"):
         failures.append(f"{LEGACY_POLICY}: journal v1-v4 historical legacy decoding is unclassified")
     if production_paths & removed_paths or production_paths | removed_paths != set(CUTOVER_ROUTES) or guard_paths != GUARD_PATHS or reference_paths != {
-        "tools/native-differential.py", "tools/prepare-native-dpkg.py",
+        "tools/native-differential.py", "tools/prepare-native-dpkg.zig",
     } or contract_paths != {"actions/download/dist/index.js", "actions/install/dist/index.js"}:
         return failures
 

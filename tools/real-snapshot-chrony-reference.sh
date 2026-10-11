@@ -61,7 +61,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   exit 2
 }
 require_protected_file "$script_path"
-require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
+require_protected_file "$repository_root/zig-out/bin/debz-native-dpkg-reference"
 require_protected_path "$repository_root/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
   echo "the reference fixture directory must be root-owned and mode 0700" >&2
@@ -97,7 +97,7 @@ done
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" \
   -W -f='${Version} ${Status}' chrony) == \
   '4.8-2ubuntu1 install ok half-configured' ]]
-python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
+zig-out/bin/debz-native-dpkg-reference --architecture amd64 --verify-only "$pinned"
 
 cp -a --reflink=auto -- "$source_root" "$proof_root"
 install -o root -g root -m 0755 "$pinned" "$proof_root/usr/bin/dpkg"

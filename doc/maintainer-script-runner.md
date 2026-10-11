@@ -605,7 +605,7 @@ To replay **ordinary** signed lifecycle fixtures on either native
 architecture, the existing CI uses
 `zig build test-native-lifecycle-zig -Dnative-reference-dpkg=PATH
 -Doptimize=Debug -j2` and its ReleaseSafe variant; `PATH` is prepared
-with `python3 tools/prepare-native-dpkg.py --architecture amd64` or
+with `zig-out/bin/debz-native-dpkg-reference --architecture amd64` or
 `--architecture arm64` in that runner's worktree. These fixtures prove
 script execution and pinned-dpkg parity for the selected native architecture
 but **cannot** substitute for exact Ubuntu signed systemd/udev/sudo bytes.

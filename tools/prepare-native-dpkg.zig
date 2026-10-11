@@ -83,6 +83,56 @@ fn hash(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+const Observed = struct { path: fs.Path, entry: fs.Entry };
+
+fn stagingTree(root: fs.Root, allocator: std.mem.Allocator, path: fs.Path, entries: *std.ArrayList(Observed), bytes: *u64, depth: usize) !void {
+    if (entries.items.len >= 2048 or depth > 32) return error.ReferenceStagingTooLarge;
+    const entry = try root.entry(path);
+    if (!entry.isRegularFile() and !entry.isDirectory() and !entry.isSymbolicLink())
+        return error.UnsafeReferenceStaging;
+    if (entry.size > 256 * 1024 * 1024 - bytes.*) return error.ReferenceStagingTooLarge;
+    bytes.* += entry.size;
+    const owned = try allocator.dupe(u8, path.text);
+    entries.append(allocator, .{ .path = try fs.Path.init(owned), .entry = entry }) catch |err| {
+        allocator.free(owned);
+        return err;
+    };
+    if (entry.isDirectory()) {
+        var pin = try root.pinDirectory(path);
+        defer pin.close();
+        var observed = try pin.observeAlloc(allocator, 2048, 128 * 1024);
+        defer observed.deinit();
+        for (observed.members) |member| {
+            const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path.text, member.name });
+            defer allocator.free(child);
+            try stagingTree(root, allocator, try fs.Path.init(child), entries, bytes, depth + 1);
+        }
+        _ = try pin.metadata();
+    }
+}
+
+fn cleanupStaging(root: fs.Root, allocator: std.mem.Allocator, path: fs.Path, original: fs.Entry) !void {
+    const named = try root.entry(path);
+    if (named.device != original.device or named.inode != original.inode or !named.isDirectory())
+        return error.ReferenceStagingChanged;
+    var entries: std.ArrayList(Observed) = .empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry.path.text);
+        entries.deinit(allocator);
+    }
+    var bytes: u64 = 0;
+    try stagingTree(root, allocator, path, &entries, &bytes, 0);
+    var index = entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const item = entries.items[index];
+        const current = try root.entry(item.path);
+        if (current.device != item.entry.device or current.inode != item.entry.inode or current.kind != item.entry.kind)
+            return error.ReferenceStagingChanged;
+        if (current.isDirectory()) try root.removeDirectory(item.path) else try root.removeFile(item.path);
+    }
+}
+
 fn canonical(allocator: std.mem.Allocator, value: Receipt) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -349,6 +399,15 @@ pub const Context = struct {
         return bytes;
     }
 
+    pub fn downloadArchive(self: Context, path: []const u8) !void {
+        const bytes = try self.download(null, null);
+        defer self.allocator.free(bytes);
+        try self.root.publishFile(try absolute(path), bytes, .{
+            .permissions = .fromMode(0o600),
+            .overwrite = .fail_if_exists,
+        });
+    }
+
     fn validatePrefix(self: Context, prefix: []const u8) !void {
         var directory = try fs.openAbsoluteRoot(self.io, prefix);
         defer directory.close();
@@ -410,8 +469,9 @@ pub const Context = struct {
         const stage = try fs.Path.init(try std.fmt.allocPrint(self.allocator, "preparing-{s}", .{std.fmt.bytesToHex(random, .lower)}));
         defer self.allocator.free(stage.text);
         try parent.root.createDirectory(stage, .fromMode(0o700));
-        defer {
-            parent.root.dir.deleteTree(self.io, stage.text) catch |err|
+        const stage_entry = try parent.root.entry(stage);
+        errdefer {
+            cleanupStaging(parent.root, self.allocator, stage, stage_entry) catch |err|
                 std.log.err("private reference staging cleanup failed: {s}", .{@errorName(err)});
         }
         const workspace = try std.fs.path.join(self.allocator, &.{ std.fs.path.dirname(prefix).?, stage.text });
@@ -435,7 +495,10 @@ pub const Context = struct {
         const receipt = try std.fs.path.join(self.allocator, &.{ prefix, receipt_name });
         defer self.allocator.free(receipt);
         self.allocator.free(try self.verifyReceipt(receipt));
-        return std.fs.path.join(self.allocator, &.{ prefix, "usr/bin/dpkg" });
+        const executable = try std.fs.path.join(self.allocator, &.{ prefix, "usr/bin/dpkg" });
+        errdefer self.allocator.free(executable);
+        try cleanupStaging(parent.root, self.allocator, stage, stage_entry);
+        return executable;
     }
 };
 
@@ -446,13 +509,19 @@ fn cli(init: std.process.Init) !void {
     var verify_only: ?[]const u8 = null;
     var receipt_path: ?[]const u8 = null;
     var receipt_archive: ?[]const u8 = null;
+    var download_archive: ?[]const u8 = null;
+    var verify_binding: ?[]const u8 = null;
+    var selected_path: ?[]const u8 = null;
     var prefix: ?[]const u8 = null;
     var fixture_root: ?[]const u8 = null;
     var fixture_archive: ?[]const u8 = null;
     var check_host = false;
     var root_accounts = false;
     var simulate_root = false;
+    var describe = false;
+    var archive_binding = false;
     var tool: Tool = .dpkg;
+    var tool_seen = false;
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--check-host")) {
             if (check_host) return error.InvalidArguments;
@@ -463,25 +532,47 @@ fn cli(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, argument, "--simulate-root")) {
             if (simulate_root) return error.InvalidArguments;
             simulate_root = true;
+        } else if (std.mem.eql(u8, argument, "--describe")) {
+            if (describe) return error.InvalidArguments;
+            describe = true;
         } else if (std.mem.eql(u8, argument, "--tool")) {
+            if (tool_seen) return error.InvalidArguments;
+            tool_seen = true;
             const name = args.next() orelse return error.InvalidArguments;
+            archive_binding = std.mem.eql(u8, name, "archive");
+            if (archive_binding) continue;
             tool = if (std.mem.eql(u8, name, "dpkg")) .dpkg else if (std.mem.eql(u8, name, "dpkg-query")) .dpkg_query else if (std.mem.eql(u8, name, "update-alternatives")) .update_alternatives else return error.InvalidArguments;
         } else {
-            const destination: *?[]const u8 = if (std.mem.eql(u8, argument, "--architecture")) &architecture else if (std.mem.eql(u8, argument, "--verify-only")) &verify_only else if (std.mem.eql(u8, argument, "--verify-receipt")) &receipt_path else if (std.mem.eql(u8, argument, "--receipt-from-archive")) &receipt_archive else if (std.mem.eql(u8, argument, "--prefix")) &prefix else if (std.mem.eql(u8, argument, "--fixture-root")) &fixture_root else if (std.mem.eql(u8, argument, "--fixture-archive")) &fixture_archive else return error.InvalidArguments;
+            const destination: *?[]const u8 = if (std.mem.eql(u8, argument, "--architecture")) &architecture else if (std.mem.eql(u8, argument, "--verify-only")) &verify_only else if (std.mem.eql(u8, argument, "--verify-receipt")) &receipt_path else if (std.mem.eql(u8, argument, "--receipt-from-archive")) &receipt_archive else if (std.mem.eql(u8, argument, "--download-archive")) &download_archive else if (std.mem.eql(u8, argument, "--verify-binding")) &verify_binding else if (std.mem.eql(u8, argument, "--select")) &selected_path else if (std.mem.eql(u8, argument, "--prefix")) &prefix else if (std.mem.eql(u8, argument, "--fixture-root")) &fixture_root else if (std.mem.eql(u8, argument, "--fixture-archive")) &fixture_archive else return error.InvalidArguments;
             if (destination.* != null) return error.InvalidArguments;
             destination.* = args.next() orelse return error.InvalidArguments;
         }
     }
 
     const modes = @as(u8, @intFromBool(check_host)) + @intFromBool(verify_only != null) +
-        @intFromBool(receipt_path != null) + @intFromBool(receipt_archive != null);
-    if (modes > 1 or (root_accounts and !check_host) or
+        @intFromBool(receipt_path != null) + @intFromBool(receipt_archive != null) +
+        @intFromBool(download_archive != null) + @intFromBool(verify_binding != null) +
+        @intFromBool(selected_path != null) + @intFromBool(describe);
+    if (modes > 1 or (root_accounts and !check_host and selected_path == null) or
         ((fixture_archive != null or simulate_root) and fixture_root == null) or
         (modes != 0 and (fixture_root != null or fixture_archive != null or simulate_root)) or
         ((receipt_archive != null) != (prefix != null)) or
-        (tool != .dpkg and verify_only == null))
+        (tool_seen and verify_only == null and verify_binding == null and selected_path == null) or
+        (archive_binding and verify_binding == null) or
+        (describe and architecture != null))
         return error.InvalidArguments;
     const allocator = init.arena.allocator();
+    if (describe) {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        try std.json.Stringify.value(.{
+            .version = version,
+            .architectures = .{ .amd64 = try pins("amd64"), .arm64 = try pins("arm64") },
+        }, .{}, &output.writer);
+        try output.writer.writeByte('\n');
+        try std.Io.File.stdout().writeStreamingAll(init.io, output.written());
+        return;
+    }
     var filesystem = try fs.openAbsoluteRoot(init.io, "/");
     defer filesystem.close();
     var environment = try init.environ_map.clone(allocator);
@@ -509,7 +600,15 @@ fn cli(init: std.process.Init) !void {
             allocator.free(try context.verifyReceipt(receipt));
         }
         break :blk "";
-    } else if (check_host)
+    } else if (download_archive) |path| blk: {
+        try context.downloadArchive(path);
+        break :blk "";
+    } else if (verify_binding) |path| blk: {
+        _ = try context.verifyFile(path, if (archive_binding) context.expected.archive else toolDigest(context.expected, tool));
+        break :blk "";
+    } else if (selected_path) |path|
+        try context.select(path, tool, root_accounts)
+    else if (check_host)
         try context.select(null, .dpkg, root_accounts)
     else
         try context.prepare(options.repository, fixture_root, fixture_archive, simulate_root);
@@ -581,56 +680,102 @@ test "reference receipt verifies all bound tools and refuses changed or noncanon
 }
 
 test "extracted receipt requires protected independent archive and tool bindings before publication" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const io = std.testing.io;
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        try temporary.dir.createDirPath(io, "package/DEBIAN");
+        try temporary.dir.createDirPath(io, "package/usr/bin");
+        try temporary.dir.writeFile(io, .{
+            .sub_path = "package/DEBIAN/control",
+            .data = try std.fmt.allocPrint(allocator, "Package: dpkg\nVersion: 1.22.22\nArchitecture: {s}\nMaintainer: fixture <fixture@example.invalid>\nDescription: Independent receipt fixture\n", .{architecture}),
+        });
+        const bytes = "independent receipt tool\n";
+        const digest = try allocator.dupe(u8, &hash(bytes));
+        for ([_][]const u8{ "dpkg", "dpkg-query", "update-alternatives" }) |name|
+            try temporary.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(allocator, "package/usr/bin/{s}", .{name}), .data = bytes });
+        const workspace = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+        var filesystem = try fs.openAbsoluteRoot(io, "/");
+        defer filesystem.close();
+        var environment = std.process.Environ.Map.init(allocator);
+        defer environment.deinit();
+        try environment.put("LC_ALL", "C");
+        try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+        var context: Context = .{
+            .allocator = allocator,
+            .io = io,
+            .root = filesystem.root,
+            .environment = &environment,
+            .architecture = architecture,
+            .expected = .{ .archive = digest, .executable = digest, .dpkg_query = digest, .update_alternatives = digest },
+        };
+        const package = try std.fs.path.join(allocator, &.{ workspace, "package" });
+        const archive = try std.fs.path.join(allocator, &.{ workspace, "dpkg.deb" });
+        allocator.free(try context.run(&.{ "/usr/bin/dpkg-deb", "--build", "--root-owner-group", package, archive }, 10));
+        context.expected.archive = try allocator.dupe(u8, &hash(try temporary.dir.readFileAlloc(io, "dpkg.deb", allocator, .limited(maximum_bytes))));
+        const prefix = try std.fs.path.join(allocator, &.{ workspace, "prefix" });
+        allocator.free(try context.run(&.{ "/usr/bin/dpkg-deb", "--extract", archive, prefix }, 10));
+        try context.receiptFromArchive(archive, prefix);
+        const receipt = try std.fs.path.join(allocator, &.{ prefix, receipt_name });
+        const original = try context.verifyReceipt(receipt);
+        try std.testing.expectError(error.PathAlreadyExists, context.receiptFromArchive(archive, prefix));
+        try std.testing.expectEqualSlices(u8, original, try context.verifyReceipt(receipt));
+        try context.root.removeFile(try absolute(receipt));
+        try std.testing.expectError(error.FileNotFound, context.verifyReceipt(receipt));
+        try std.Io.Dir.hardLink(temporary.dir, "prefix/usr/bin/dpkg-query", temporary.dir, "tool-alias", io, .{});
+        try std.testing.expectError(error.HardLinkedReferenceFile, context.receiptFromArchive(archive, prefix));
+        try std.testing.expectEqual(@as(?fs.Entry, null), try context.root.entryIfExists(try absolute(receipt)));
+        try temporary.dir.deleteFile(io, "tool-alias");
+        const query = try temporary.dir.openFile(io, "prefix/usr/bin/dpkg-query", .{});
+        defer query.close(io);
+        try query.setPermissions(io, .fromMode(0o777));
+        try std.testing.expectError(error.UnprotectedReferenceFile, context.receiptFromArchive(archive, prefix));
+        try query.setPermissions(io, .fromMode(0o644));
+        {
+            try context.root.rename(try absolute(try std.fs.path.join(allocator, &.{ prefix, "usr/bin" })), try absolute(try std.fs.path.join(allocator, &.{ prefix, "usr/aliased-bin" })), .fail_if_exists);
+            try temporary.dir.symLink(io, "aliased-bin", "prefix/usr/bin", .{});
+            try std.testing.expectError(error.SymbolicLinkComponent, context.receiptFromArchive(archive, prefix));
+            try temporary.dir.deleteFile(io, "prefix/usr/bin");
+            try context.root.rename(try absolute(try std.fs.path.join(allocator, &.{ prefix, "usr/aliased-bin" })), try absolute(try std.fs.path.join(allocator, &.{ prefix, "usr/bin" })), .fail_if_exists);
+        }
+        for ([_][]const u8{ "dpkg-query", "update-alternatives" }) |name| {
+            const path = try std.fmt.allocPrint(allocator, "prefix/usr/bin/{s}", .{name});
+            try temporary.dir.writeFile(io, .{ .sub_path = path, .data = "tampered" });
+            try std.testing.expectError(error.ReferenceDigestMismatch, context.receiptFromArchive(archive, prefix));
+            try std.testing.expectEqual(@as(?fs.Entry, null), try context.root.entryIfExists(try absolute(receipt)));
+            try temporary.dir.writeFile(io, .{ .sub_path = path, .data = bytes });
+        }
+        try context.receiptFromArchive(archive, prefix);
+        try temporary.dir.writeFile(io, .{ .sub_path = "prefix/usr/bin/dpkg-query", .data = "tampered after receipt" });
+        try std.testing.expectError(error.ReferenceDigestMismatch, context.verifyReceipt(receipt));
+    }
+}
+
+test "private reference cleanup refuses substituted staging and never follows extracted links" {
+    const allocator = std.testing.allocator;
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    try temporary.dir.createDirPath(io, "package/DEBIAN");
-    try temporary.dir.createDirPath(io, "package/usr/bin");
-    try temporary.dir.writeFile(io, .{
-        .sub_path = "package/DEBIAN/control",
-        .data = "Package: dpkg\nVersion: 1.22.22\nArchitecture: arm64\nMaintainer: fixture <fixture@example.invalid>\nDescription: Independent receipt fixture\n",
-    });
-    const bytes = "independent receipt tool\n";
-    const digest = try allocator.dupe(u8, &hash(bytes));
-    for ([_][]const u8{ "dpkg", "dpkg-query", "update-alternatives" }) |name|
-        try temporary.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(allocator, "package/usr/bin/{s}", .{name}), .data = bytes });
-    const workspace = try temporary.dir.realPathFileAlloc(io, ".", allocator);
-    var filesystem = try fs.openAbsoluteRoot(io, "/");
-    defer filesystem.close();
-    var environment = std.process.Environ.Map.init(allocator);
-    defer environment.deinit();
-    try environment.put("LC_ALL", "C");
-    try environment.put("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-    var context: Context = .{
-        .allocator = allocator,
-        .io = io,
-        .root = filesystem.root,
-        .environment = &environment,
-        .architecture = "arm64",
-        .expected = .{ .archive = digest, .executable = digest, .dpkg_query = digest, .update_alternatives = digest },
-    };
-    const package = try std.fs.path.join(allocator, &.{ workspace, "package" });
-    const archive = try std.fs.path.join(allocator, &.{ workspace, "dpkg.deb" });
-    allocator.free(try context.run(&.{ "/usr/bin/dpkg-deb", "--build", "--root-owner-group", package, archive }, 10));
-    context.expected.archive = try allocator.dupe(u8, &hash(try temporary.dir.readFileAlloc(io, "dpkg.deb", allocator, .limited(maximum_bytes))));
-    const prefix = try std.fs.path.join(allocator, &.{ workspace, "prefix" });
-    allocator.free(try context.run(&.{ "/usr/bin/dpkg-deb", "--extract", archive, prefix }, 10));
-    try context.receiptFromArchive(archive, prefix);
-    const receipt = try std.fs.path.join(allocator, &.{ prefix, receipt_name });
-    try context.root.removeFile(try absolute(receipt));
-    try std.Io.Dir.hardLink(temporary.dir, "prefix/usr/bin/dpkg-query", temporary.dir, "tool-alias", io, .{});
-    try std.testing.expectError(error.HardLinkedReferenceFile, context.receiptFromArchive(archive, prefix));
-    try std.testing.expectEqual(@as(?fs.Entry, null), try context.root.entryIfExists(try absolute(receipt)));
-    try temporary.dir.deleteFile(io, "tool-alias");
-    const query = try temporary.dir.openFile(io, "prefix/usr/bin/dpkg-query", .{});
-    defer query.close(io);
-    try query.setPermissions(io, .fromMode(0o777));
-    try std.testing.expectError(error.UnprotectedReferenceFile, context.receiptFromArchive(archive, prefix));
-    try query.setPermissions(io, .fromMode(0o644));
-    try temporary.dir.writeFile(io, .{ .sub_path = "prefix/usr/bin/dpkg-query", .data = "tampered" });
-    try std.testing.expectError(error.ReferenceDigestMismatch, context.receiptFromArchive(archive, prefix));
-    try std.testing.expectEqual(@as(?fs.Entry, null), try context.root.entryIfExists(try absolute(receipt)));
+    try temporary.dir.createDirPath(io, "stage/prefix");
+    try temporary.dir.writeFile(io, .{ .sub_path = "outside", .data = "preserve outside staging\n" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "stage/prefix/tool", .data = "owned staging\n" });
+    try temporary.dir.symLink(io, "../../outside", "stage/prefix/link", .{});
+    const root = fs.Root.init(io, temporary.dir);
+    const stage = try fs.Path.init("stage");
+    const original = try root.entry(stage);
+    try root.rename(stage, try fs.Path.init("saved"), .fail_if_exists);
+    try root.createDirectory(stage, .fromMode(0o700));
+    try temporary.dir.writeFile(io, .{ .sub_path = "stage/unrelated", .data = "preserve replacement\n" });
+    try std.testing.expectError(error.ReferenceStagingChanged, cleanupStaging(root, allocator, stage, original));
+    const replacement = try temporary.dir.readFileAlloc(io, "stage/unrelated", allocator, .limited(128));
+    defer allocator.free(replacement);
+    try std.testing.expectEqualStrings("preserve replacement\n", replacement);
+    try cleanupStaging(root, allocator, try fs.Path.init("saved"), original);
+    try std.testing.expectEqual(@as(?fs.Entry, null), try root.entryIfExists(try fs.Path.init("saved")));
+    const outside = try temporary.dir.readFileAlloc(io, "outside", allocator, .limited(128));
+    defer allocator.free(outside);
+    try std.testing.expectEqualStrings("preserve outside staging\n", outside);
 }

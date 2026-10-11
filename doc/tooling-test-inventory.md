@@ -108,14 +108,25 @@ architecture binaries. `--verify-only`, `--check-host`, `--verify-receipt`
 and `--receipt-from-archive ARCHIVE --prefix PREFIX` retain their distinct
 verification and preparation boundaries. Extracted receipts require owned,
 protected regular inputs; symbolic links, hardlinks and changed bindings
-refuse before receipt publication.
+refuse before receipt publication. `--download-archive` publishes only an
+authenticated archive to a new protected file; `--verify-binding --tool`
+hashes the selected archive or tool without executing it. `--select` retains
+the separate genuine version probe, and `--describe` supplies the original
+version/pins to still-Python oracle provenance consumers without duplicating
+the authority.
 
 `test-native-dpkg-reference` runs the native receipt regressions and the
 materialization suite's actual preparation/refusal consumers against the
 emitted executable, including custom prefixes. The native workload partition
-also runs these cases. The remaining Python CLI/import and protected staging
-consumers are not yet retired; this native implementation and migrated Zig
-consumer are not full PY3 or no-host-Python acceptance.
+also runs these cases. The actual Python preparation helper and imported
+receipt test are retired: the equivalent archive/receipt refusal cases run
+in Zig for both architectures, with independent dpkg-deb fixtures. Every CI
+preparation, protected download/receipt/verification and remaining Python
+oracle consumer now calls the native implementation. Protected compilation
+occurs only after the existing compiler and checkout trust checks; foreign
+tools are never executed during preparation. Identity-checked bounded cleanup
+refuses a substituted staging tree and does not follow extracted links.
+This helper retirement is not full PY3 or no-host-Python acceptance.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`

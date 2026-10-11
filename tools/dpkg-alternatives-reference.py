@@ -217,13 +217,14 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
     ):
         raise OracleError("vendor invocation provenance changed")
 
-    if source["dpkg"]["version"] != m.reference_dpkg.VERSION:
+    description = m.reference_description()
+    if source["dpkg"]["version"] != description["version"]:
         raise OracleError("dpkg reference version binding changed")
     if source["dpkg"]["configuration_sha256"] != sha256_bytes(
         config.PINNED_DPKG_CONFIG
     ):
         raise OracleError("dpkg configuration binding changed")
-    for architecture, pins in m.reference_dpkg.PINS.items():
+    for architecture, pins in description["architectures"].items():
         expected = source["dpkg"]["architectures"][architecture]
         if expected != {
             "archive_sha256": pins["archive"],
@@ -1331,10 +1332,7 @@ def prepare_dpkg_root(
         "/usr/bin/update-alternatives",
     )
     copied = root / "usr/bin/update-alternatives"
-    m.reference_dpkg.verify_file(
-        copied,
-        m.reference_dpkg.PINS[architecture]["update_alternatives"],
-    )
+    m.verify_reference(copied, architecture, "update-alternatives")
     m.write(root / TRACE, b"")
 
 
@@ -2164,7 +2162,7 @@ def select_references(
     prefix = (
         ROOT
         / ".cache/native-dpkg-reference"
-        / m.reference_dpkg.VERSION
+        / m.reference_description()["version"]
         / architecture
         / "usr/bin"
     )
@@ -2172,16 +2170,16 @@ def select_references(
     selected_update = update_path or prefix / "update-alternatives"
     if not selected_dpkg.is_file() or not selected_update.is_file():
         raise OracleError(
-            "missing pinned references; run python3 tools/prepare-native-dpkg.py "
+            "missing pinned references; run zig-out/bin/debz-native-dpkg-reference "
             "as the build user"
         )
-    for path, key in (
-        (selected_dpkg, "executable"),
-        (selected_update, "update_alternatives"),
+    for path, tool in (
+        (selected_dpkg, "dpkg"),
+        (selected_update, "update-alternatives"),
     ):
         if not path.is_absolute() or path.resolve(strict=True) != path:
             raise OracleError("pinned reference must be an absolute, non-symlink path")
-        m.reference_dpkg.verify_file(path, m.reference_dpkg.PINS[architecture][key])
+        m.verify_reference(path, architecture, tool)
     return str(selected_dpkg), str(selected_update)
 
 
@@ -2417,14 +2415,8 @@ def main() -> int:
             )
     finally:
         assert_host_unchanged(host_state)
-        m.reference_dpkg.verify_file(
-            Path(dpkg),
-            m.reference_dpkg.PINS[architecture]["executable"],
-        )
-        m.reference_dpkg.verify_file(
-            Path(update_alternatives),
-            m.reference_dpkg.PINS[architecture]["update_alternatives"],
-        )
+        m.verify_reference(Path(dpkg), architecture)
+        m.verify_reference(Path(update_alternatives), architecture, "update-alternatives")
 
     assert observed is not None
     if arguments.update_reference:

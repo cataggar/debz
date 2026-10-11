@@ -425,7 +425,7 @@ or another compatible Linux host with an older dpkg, prepare that reference
 without root privileges:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
+reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture amd64)"
 zig build test-dpkg-config-reference test-native-lifecycle test-native-recovery \
   -Dnative-reference-dpkg="$reference_dpkg" \
   -Dnative-reference-architecture=amd64 -j2
@@ -617,7 +617,7 @@ absent callback.
 For a focused local run of the new lifecycle family:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
 zig build build-native-acceptance-zig -j2
 sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
   zig-out/bin/native-lifecycle-zig-acceptance \

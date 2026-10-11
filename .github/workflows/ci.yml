@@ -898,7 +898,8 @@ jobs:
       - name: Compare native triggers and diversion settlement with dpkg
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           # Zig-owned trigger and settlement targets replace the Python trigger gate invocations.
           zig build test-native-triggers-zig test-native-diversion-settlement-zig \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
@@ -1040,7 +1041,8 @@ jobs:
       - name: Compare native materialization, conffiles, differential, and lifecycle with dpkg
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-materialization test-native-conffiles test-native-differential \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
           # Zig-owned lifecycle targets replace the Python lifecycle gate invocations.
@@ -1107,13 +1109,15 @@ jobs:
       - name: Run pinned dpkg lifecycle and trigger reference oracles
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           # Failed-postinst listeners remain pinned-dpkg reference-only, never native parity.
           zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Exercise standalone Zig workspace selectors and fail-closed combinations
         run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all
           lifecycle="$PWD/.tmp/zig-lifecycle-workspace-$OPTIMIZE"
           trigger="$PWD/.tmp/zig-trigger-workspace-$OPTIMIZE"
@@ -1184,13 +1188,15 @@ jobs:
       - name: Exercise Zig core recovery
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
       - name: Compare pinned-dpkg root import and copied-root refusals
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
@@ -1238,7 +1244,8 @@ jobs:
       - name: Exercise Zig repository recovery
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
@@ -1286,7 +1293,8 @@ jobs:
       - name: Exercise Zig helper, bootstrap, parity and rollback recovery
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
@@ -1340,7 +1348,8 @@ jobs:
       - name: Exercise Zig signed FAMILY recovery
         run: |
           mkdir -p .tmp
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
@@ -1387,7 +1396,8 @@ jobs:
           fi
       - name: Exercise Zig recovery scenario and mutation matrices
         run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
@@ -1468,7 +1478,8 @@ jobs:
           fi
       - name: Exercise counted Zig diversion recovery shard
         run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"
           zig build test-native-recovery-zig-diversions -Dnative-zig-recovery-diversion-shard="${{ matrix.shard }}" -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-diversions -Dnative-zig-recovery-diversion-shard="${{ matrix.shard }}" -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
@@ -1509,7 +1520,8 @@ jobs:
           zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all
       - name: Prepare digest-verified private ARM64 tools
         run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture arm64)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture arm64)"
           reference_prefix="$(dirname "$(dirname "$reference_dpkg")")"
           test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin/dpkg"
           test -x "$reference_prefix/bin/update-alternatives"
@@ -1662,7 +1674,8 @@ jobs:
       - name: Prepare pinned dpkg as the runner user
         id: reference
         run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
+          zig build build-native-dpkg-reference -j2
+          reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference --architecture amd64)"
           test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/amd64/usr/bin/dpkg"
           printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
       - name: Refuse unprotected and incomplete signed replay inputs
@@ -1717,8 +1730,13 @@ jobs:
           done
           sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"
           test "$(sudo -n env -i "$PROTECTED/zig/zig" version)" = 0.16.0
-          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 \
-            python3 "$PROTECTED/checkout/tools/prepare-native-dpkg.py" --architecture amd64 \
+          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
+            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
+            zig build --build-file "$PROTECTED/checkout/build.zig" build-native-dpkg-reference \
+              -Doptimize=Debug -j2 --summary all
+          sudo -n chmod -R go-w "$PROTECTED/checkout/zig-out" "$PROTECTED/checkout/.zig-cache"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            "$PROTECTED/checkout/zig-out/bin/debz-native-dpkg-reference" --architecture amd64 \
             --verify-only "$PROTECTED/checkout/.real-snapshot/pinned-dpkg/usr/bin/dpkg"
           sha256sum .tmp/protected-checkout.tar "$zig_binary"
       - name: Build the protected snapshot client

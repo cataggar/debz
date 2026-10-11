@@ -66,7 +66,7 @@ class DpkgConfigReferenceTests(unittest.TestCase):
                     "archive_sha256": pins["archive"],
                     "executable_sha256": pins["executable"],
                 }
-                for architecture, pins in oracle.m.reference_dpkg.PINS.items()
+                for architecture, pins in oracle.m.reference_description()["architectures"].items()
             },
         )
 

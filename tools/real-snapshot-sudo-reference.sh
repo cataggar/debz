@@ -57,7 +57,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   exit 2
 }
 require_protected_file "$script_path"
-require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
+require_protected_file "$repository_root/zig-out/bin/debz-native-dpkg-reference"
 require_protected_path "$repository_root/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
   echo "reference fixture directory must be root-owned and mode 0700" >&2
@@ -111,7 +111,7 @@ for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
   [[ -L "$source_root/$name" && $(readlink -- "$source_root/$name") == "$target" ]]
   [[ $(stat -c '%u:%g:%a:%h' -- "$source_root/$name") == 0:0:777:1 ]]
 done
-python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
+zig-out/bin/debz-native-dpkg-reference --architecture amd64 --verify-only "$pinned"
 
 cp -a --reflink=auto -- "$source_root" "$proof_root"
 for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
