@@ -8,11 +8,15 @@ import gzip
 import hashlib
 import importlib.util
 import io
+import json
 import lzma
+import os
 import pathlib
 import re
 import shutil
+import subprocess
 import tarfile
+import tempfile
 
 from cryptography.hazmat.primitives import serialization
 
@@ -20,6 +24,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE_MODULE = ROOT / "tools/generate-openpgp-fixtures.py"
 EPOCH = 1_700_000_000
 MAX_REPOSITORY_BYTES = 8 * 1024 * 1024
+INTEGRATION_ARCHIVE = pathlib.Path(os.environ.get(
+    "DEBZ_INTEGRATION_ARCHIVE", ROOT / "zig-out/bin/debz-integration-archive",
+))
 
 
 def load_openpgp_fixture_module():
@@ -31,52 +38,33 @@ def load_openpgp_fixture_module():
     return module
 
 
-def tar_member(name: str, data: bytes, mode: int = 0o644) -> tarfile.TarInfo:
-    member = tarfile.TarInfo(name)
-    member.size = len(data)
-    member.mode = mode
-    member.uid = member.gid = 0
-    member.uname = member.gname = "root"
-    member.mtime = EPOCH
-    return member
+def require_native_archive() -> None:
+    if not INTEGRATION_ARCHIVE.is_file() or not os.access(INTEGRATION_ARCHIVE, os.X_OK):
+        raise FileNotFoundError(f"required native integration archive encoder: {INTEGRATION_ARCHIVE}")
 
 
-def tar_gz(entries: list[tuple[str, bytes, int]]) -> bytes:
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        directories: set[str] = set()
-        for name, data, mode in entries:
-            parent = pathlib.PurePosixPath(name).parent
-            parents: list[pathlib.PurePosixPath] = []
-            while str(parent) not in (".", ""):
-                parents.append(parent)
-                parent = parent.parent
-            for directory in reversed(parents):
-                directory_name = str(directory)
-                if directory_name in directories:
-                    continue
-                member = tar_member(directory_name, b"", 0o755)
-                member.type = tarfile.DIRTYPE
-                archive.addfile(member)
-                directories.add(directory_name)
-            archive.addfile(tar_member(name, data, mode), io.BytesIO(data))
-    output = io.BytesIO()
-    with gzip.GzipFile(fileobj=output, mode="wb", mtime=EPOCH, filename="") as stream:
-        stream.write(raw.getvalue())
-    return output.getvalue()
+def native_archive(
+    control: list[tuple[str, bytes, int]], data: list[tuple[str, bytes, int]],
+    *, origin: str | None = None,
+) -> bytes:
+    require_native_archive()
 
+    def entries(values: list[tuple[str, bytes, int]]) -> list[dict[str, str | int]]:
+        return [{"name": name, "hex": body.hex(), "mode": mode} for name, body, mode in values]
 
-def ar_member(name: str, data: bytes) -> bytes:
-    header = (
-        f"{name}/".ljust(16)
-        + str(EPOCH).ljust(12)
-        + "0".ljust(6)
-        + "0".ljust(6)
-        + "100644".ljust(8)
-        + str(len(data)).ljust(10)
-        + "`\n"
-    ).encode("ascii")
-    return header + data + (b"\n" if len(data) % 2 else b"")
+    document = json.dumps({"control": entries(control), "data": entries(data), "origin": origin}).encode()
+    if len(document) > MAX_REPOSITORY_BYTES * 2:
+        raise RuntimeError("native integration archive request exceeds its byte limit")
+    (ROOT / ".tmp").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="integration-archive-", dir=ROOT / ".tmp") as directory:
+        pathlib.Path(directory, "request.json").write_bytes(document)
+        result = subprocess.run(
+            [str(INTEGRATION_ARCHIVE), directory], capture_output=True,
+            stdin=subprocess.DEVNULL, timeout=30, check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(f"native integration archive exited {result.returncode}: {result.stderr.decode(errors='replace')}")
+    return result.stdout
 
 
 def build_deb(
@@ -127,12 +115,7 @@ def build_deb(
         payload_path = "./usr/bin/dpkg-trigger"
     if literal_paths:
         payload_path = "./usr/lib/systemd/system/system-debz\\x2dliteral.slice"
-    return (
-        b"!<arch>\n"
-        + ar_member("debian-binary", b"2.0\n")
-        + ar_member("control.tar.gz", tar_gz(control_entries))
-        + ar_member("data.tar.gz", tar_gz([(payload_path, data, 0o644)]))
-    )
+    return native_archive(control_entries, [(payload_path, data, 0o644)])
 
 
 def package_specs(suite: str, architecture: str, *, signed_parity: bool = False):
@@ -250,6 +233,7 @@ def write_repository(
     sha256_only: bool = False,
     extra_debs: list[pathlib.Path] | None = None,
 ) -> None:
+    require_native_archive()
     if signed_parity and sha256_only:
         raise ValueError("--signed-parity requires published SHA512 records")
     if output.exists():
@@ -389,6 +373,7 @@ def write_repository_descriptor(
     *,
     scripts: dict[str, bytes] | None = None,
 ) -> None:
+    require_native_archive()
     source_path = "etc/apt/sources.list.d/microsoft-prod.list"
     keyring_path = "usr/share/keyrings/microsoft-prod.gpg"
     package = "packages-microsoft-prod"
@@ -432,18 +417,13 @@ def write_repository_descriptor(
             0o644,
         ),
     ]
-    descriptor = (
-        b"!<arch>\n"
-        + ar_member("debian-binary", b"2.0\n")
-        + ar_member("control.tar.gz", tar_gz(control_entries))
-        + ar_member("data.tar.gz", tar_gz(data_entries))
-        + ar_member("_gpgorigin", b"fixture structural signature member")
-    )
+    descriptor = native_archive(control_entries, data_entries, origin="fixture structural signature member")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(descriptor)
 
 
 def main() -> None:
+    global INTEGRATION_ARCHIVE
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--suite", required=True, choices=("debian-stable", "ubuntu-26.04"))
@@ -451,6 +431,7 @@ def main() -> None:
     parser.add_argument("--signed-parity", action="store_true")
     parser.add_argument("--sha256-only", action="store_true")
     parser.add_argument("--extra-deb", action="append", default=[], type=pathlib.Path)
+    parser.add_argument("--archive-helper", type=pathlib.Path)
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
     parser.add_argument(
@@ -459,6 +440,10 @@ def main() -> None:
         default="default",
     )
     args = parser.parse_args()
+    if args.archive_helper is not None:
+        if not args.archive_helper.is_absolute():
+            raise SystemExit("--archive-helper must be absolute")
+        INTEGRATION_ARCHIVE = args.archive_helper
     if not args.output.is_absolute():
         raise SystemExit("--output must be absolute")
     if (args.descriptor_output is None) != (args.descriptor_repository_url is None):

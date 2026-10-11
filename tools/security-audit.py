@@ -2096,7 +2096,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -4895,6 +4895,70 @@ ACTION_EMPTY_LOCK_PATHS = (
     ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
 )
 
+INTEGRATION_ARCHIVE_PATHS = (
+    "build.zig", "tools/integration-archive.zig", "tools/generate-integration-repository.py",
+    "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
+    "test/native_recovery_parity.zig", "test/native_recovery_family.zig",
+    "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
+    ".github/workflows/ci.yml",
+)
+
+
+def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        INTEGRATION_ARCHIVE_PATHS[0]: (
+            "b.getInstallStep().dependOn(&install_integration_archive.step);",
+            "integration_tests.addArtifactArg(integration_archive);",
+            "repository_add_tests.addArtifactArg(integration_archive);",
+            'native_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());',
+            'apt_acceptance_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());',
+            "workload_core.dependOn(&integration_archive_tests.step);",
+        ),
+        INTEGRATION_ARCHIVE_PATHS[1]: (
+            'try root.root.pinRegularFile(try fs.Path.init("request.json"))',
+            '.argv = &.{ "/usr/bin/gzip", "-n", "-9", "-c", absolute }',
+            "std.mem.writeInt(u32, result.stdout[4..8], epoch, .little)",
+            "result.stdout[9] = 255;",
+            "std.hash.crc.Crc32.hash(raw)",
+            "return error.IntegrationScratchExists;",
+        ),
+        INTEGRATION_ARCHIVE_PATHS[2]: (
+            "def require_native_archive()",
+            "[str(INTEGRATION_ARCHIVE), directory]",
+            "stdin=subprocess.DEVNULL, timeout=30, check=False,",
+            'descriptor = native_archive(control_entries, data_entries, origin="fixture structural signature member")',
+            "return native_archive(control_entries, [(payload_path, data, 0o644)])",
+        ),
+    }
+    for path in INTEGRATION_ARCHIVE_PATHS[3:5]:
+        required[path] = ("export DEBZ_INTEGRATION_ARCHIVE", 'if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then')
+    for path in INTEGRATION_ARCHIVE_PATHS[5:8]:
+        required[path] = (
+            'const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });',
+            '"--archive-helper", archive_helper',
+        )
+    required[INTEGRATION_ARCHIVE_PATHS[8]] = (
+        'const archive_helper = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_archive, self.arena);',
+        '"--archive-helper", archive_helper',
+    )
+    failures = [
+        f"{path}: required native integration archive encoding or real consumer wiring is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    if re.search(r"(?m)^def (?:tar_member|tar_gz|ar_member)\(", texts.get(INTEGRATION_ARCHIVE_PATHS[2], "")):
+        failures.append("retired Python integration archive encoder was restored")
+    container = texts.get(INTEGRATION_ARCHIVE_PATHS[9], "").partition(
+        "  download-action-container-fixture:"
+    )[2].partition("\n  download-action-container:")[0]
+    build_helper = "zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all"
+    generate = "python3 tools/generate-integration-repository.py"
+    if (build_helper not in container or generate not in container or
+            container.index(build_helper) > container.index(generate) or
+            '--archive-helper "$PWD/zig-out/bin/debz-integration-archive"' not in container):
+        failures.append("container fixture must build and pass its native archive helper before generation")
+    return failures
+
 DISPOSABLE_RUNTIME_PATHS = (
     "build.zig", "tools/disposable-root-runtime.zig", "tools/disposable_root_runtime.py",
     "tools/native-materialization-fixtures.py", "tools/native-lifecycle-fixtures.py",
@@ -5201,6 +5265,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_integration_archive_failures({
+        path: (ROOT / path).read_text() for path in INTEGRATION_ARCHIVE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_disposable_runtime_failures({
         path: (ROOT / path).read_text() for path in DISPOSABLE_RUNTIME_PATHS if (ROOT / path).is_file()
     }):
@@ -6312,7 +6380,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6336,6 +6404,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "protected-reference": PROTECTED_REFERENCE_PATHS,
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
+            "native-integration-archive": INTEGRATION_ARCHIVE_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
             "native-openpgp-fixtures": OPENPGP_FIXTURE_PATHS,
@@ -6399,6 +6468,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_cli_smoke_failures(texts)
         elif kind == "native-action-empty-lock":
             failures = native_action_empty_lock_failures(texts)
+        elif kind == "native-integration-archive":
+            failures = native_integration_archive_failures(texts)
         elif kind == "native-baseline-fixture":
             failures = native_baseline_fixture_failures(texts)
         elif kind == "native-disposable-runtime":

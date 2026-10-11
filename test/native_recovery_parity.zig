@@ -201,8 +201,9 @@ fn generateIn(fixture: *foundation.Fixture, python: []const u8, suite: []const u
     try fixture.directory(directory);
     const script = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
     const repository = try fixture.absolute(try support.path(fixture.allocator, directory, "repository"));
+    const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(fixture.allocator, &.{ python, script, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity" });
+    try argv.appendSlice(fixture.allocator, &.{ python, script, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity", "--archive-helper", archive_helper });
     for (extra_debs) |deb| try argv.appendSlice(fixture.allocator, &.{ "--extra-deb", deb });
     try fixture.run(argv.items, try support.path(fixture.allocator, directory, "generator.log"), 120);
     const keyring = try support.path(fixture.allocator, repository, "fixture-keyring.gpg");
