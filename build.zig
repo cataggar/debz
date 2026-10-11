@@ -305,6 +305,23 @@ pub fn build(b: *std.Build) void {
     const native_dpkg_test_step = b.step("test-native-dpkg-reference", "Run actual native reference selection and preparation refusals");
     native_dpkg_test_step.dependOn(&native_dpkg_tests.step);
 
+    const debian_readiness_options = b.addOptions();
+    debian_readiness_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    const debian_readiness_module = b.createModule(.{
+        .root_source_file = b.path("tools/debian-stable-readiness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debian_readiness_module.addImport("debz", debz);
+    debian_readiness_module.addOptions("debian_readiness_options", debian_readiness_options);
+    const debian_readiness = b.addExecutable(.{ .name = "debz-debian-stable-readiness", .root_module = debian_readiness_module });
+    const install_debian_readiness = b.addInstallArtifact(debian_readiness, .{});
+    b.getInstallStep().dependOn(&install_debian_readiness.step);
+    b.step("build-debian-stable-readiness", "Build native pinned Debian signed-input readiness tooling").dependOn(&install_debian_readiness.step);
+    const debian_readiness_tests = b.addRunArtifact(b.addTest(.{ .root_module = debian_readiness_module }));
+    b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals").dependOn(&debian_readiness_tests.step);
+    workload_core.dependOn(&debian_readiness_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -758,15 +775,16 @@ pub fn build(b: *std.Build) void {
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
             "tools/test_release_workflow_policy.py",
-            "tools/test_debian_stable_readiness.py",
             "tools/test_debian_stable_closure.py",
             "tools/test_real_snapshot_repin.py",
         },
     );
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
+    audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
+    audit_tests.step.dependOn(&install_debian_readiness.step);
     audit_step.dependOn(&audit_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),

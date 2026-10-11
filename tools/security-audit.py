@@ -2102,7 +2102,7 @@ WORKLOAD_PARTITIONS = {
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
-        "run_debian_closure_inventory_tests",
+        "run_debian_closure_inventory_tests", "debian_readiness_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
     "workload_production": ("test-workload-production", (
@@ -4956,6 +4956,65 @@ ACTION_EMPTY_LOCK_PATHS = (
     ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
 )
 
+DEBIAN_READINESS_PATHS = (
+    "build.zig", "tools/debian-stable-readiness.zig", "tools/debian-stable-readiness.py",
+    "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.py",
+)
+
+
+def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        "build.zig": (
+            'b.path("tools/debian-stable-readiness.zig")',
+            "b.getInstallStep().dependOn(&install_debian_readiness.step);",
+            "workload_core.dependOn(&debian_readiness_tests.step);",
+            'audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));',
+            "audit_tests.step.dependOn(&install_debian_readiness.step);",
+        ),
+        "tools/debian-stable-readiness.zig": (
+            '@embedFile("fixtures/debian-stable-readiness-v1.json")',
+            "return error.SignerArmorDigestChanged;",
+            "return error.SignerBinaryDigestChanged;",
+            "return error.SignerFingerprintChanged;",
+            "return error.InReleaseDigestChanged;",
+            "return error.ReleaseNotFresh;",
+            "if (!std.mem.eql(u8, &digest, index.index_sha256) or entry.size != index.index_size)\n"
+            "            return error.SignedIndexIdentityChanged;",
+            "if (compressed.len != index.index_size or\n"
+            "        !std.mem.eql(u8, &hash(std.crypto.hash.sha2.Sha256, compressed), index.index_sha256))\n"
+            "        return error.SignedIndexIdentityChanged;",
+            "return error.MalformedPublishedSha256;",
+            "return error.AuthenticatedRefreshRefused;",
+            "return error.ReadOnlyRefreshMutatedRoot;",
+            ".require_https = true,",
+            ".maximum_decompressed_bytes = maximum_packages_bytes,",
+            "if (now != null or published != null or index_identity != null) return error.InvalidReadinessArguments;",
+            '.exclusive = true,',
+        ),
+        "tools/debian-stable-closure.py": (
+            'DEBZ_DEBIAN_STABLE_READINESS',
+            '"PATH": "/no-host-interpreters"',
+            'readiness_index_counts(compressed, index)',
+            'key = native_readiness("--check-key", input=readiness_fetch("key"))',
+            'native_readiness("--check-release", "--architecture", architecture, "--now"',
+            'readiness_fetch("index", architecture)',
+        ),
+    }
+    failures = [
+        f"{path}: required native Debian readiness or actual consumer binding is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    if not re.search(r'\bbinary,\s+"refresh",\s+"--install-root",', texts.get("tools/debian-stable-readiness.zig", "")):
+        failures.append("tools/debian-stable-readiness.zig: actual debz read-only refresh invocation is missing")
+    for path in ("tools/debian-stable-readiness.py", "tools/test_debian_stable_readiness.py"):
+        if path in texts:
+            failures.append(f"{path}: retired Python Debian readiness implementation or imported test was restored")
+    if "debian-stable-readiness.py" in texts.get("tools/debian-stable-closure.py", ""):
+        failures.append("Debian closure must not import the retired Python readiness implementation")
+    return failures
+
+
 INTEGRATION_REPOSITORY_PATHS = (
     "build.zig", "tools/generate-integration-repository.zig", "tools/generate-integration-repository.py",
     "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
@@ -5417,6 +5476,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_debian_readiness_failures({
+        path: (ROOT / path).read_text() for path in DEBIAN_READINESS_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_integration_signing_failures({
         path: (ROOT / path).read_text() for path in INTEGRATION_SIGNING_PATHS if (ROOT / path).is_file()
     }):
@@ -6529,7 +6592,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6553,6 +6616,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "protected-reference": PROTECTED_REFERENCE_PATHS,
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
+            "native-debian-readiness": DEBIAN_READINESS_PATHS,
             "native-integration-archive": INTEGRATION_ARCHIVE_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
@@ -6618,6 +6682,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_cli_smoke_failures(texts)
         elif kind == "native-action-empty-lock":
             failures = native_action_empty_lock_failures(texts)
+        elif kind == "native-debian-readiness":
+            failures = native_debian_readiness_failures(texts)
         elif kind == "native-integration-archive":
             failures = native_integration_archive_failures(texts)
         elif kind == "native-baseline-fixture":

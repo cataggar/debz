@@ -72,11 +72,11 @@ amd64 native signed-refresh run.
 
 ## Reproduce the read-only preflight
 
-From a fresh checkout with Zig 0.16.0 and Python 3:
+From a fresh checkout with Zig 0.16.0:
 
 ```sh
 zig build -Doptimize=ReleaseSafe -j2
-python3 tools/debian-stable-readiness.py \
+zig-out/bin/debz-debian-stable-readiness \
   --debz "$PWD/zig-out/bin/debz" \
   --architecture arm64 \
   --workspace "$PWD/.tmp/debian-261-readiness-arm64-1"
@@ -335,7 +335,7 @@ reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
     day. A test runs it with now = 2026-10-14, at the exact boundary and a
     decade later. The verdict never changes; only a diagnostic reports
     `pin_expired_awaiting_point_release`.
-- Live re-resolution (`run`, and the `debian-stable-readiness.py`
+- Live re-resolution (`run`, and the native Debian readiness
   preflight) is manual only. No CI workflow runs it.
 - To reproduce after expiry, review a newer snapshot pin (Release, signer
   and both indexes) in `tools/fixtures/debian-stable-readiness-v1.json`,
@@ -365,7 +365,7 @@ reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
     signed Debian index;
   - unsafe keyrings;
   - expired pins, before any network access.
-- `tools/test_debian_stable_readiness.py` refuses an expired Release and a
+- `zig build test-debian-stable-readiness` refuses an expired Release and a
   substituted Ubuntu Release (`Origin`, `Suite` or `Codename`), even when
   its digest has been repinned.
 - `zig build test-debian-closure-inventory`:
