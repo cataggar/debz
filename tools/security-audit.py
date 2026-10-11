@@ -4962,6 +4962,7 @@ INTEGRATION_REPOSITORY_PATHS = (
     "test/native_recovery_parity.zig", "test/native_recovery_family.zig",
     "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
     ".github/workflows/ci.yml", ".github/workflows/release.yml",
+    "actions/install/__tests__/integration.test.ts",
 )
 
 INTEGRATION_ARCHIVE_PATHS = INTEGRATION_REPOSITORY_PATHS + ("tools/integration-archive.zig",)
@@ -4988,6 +4989,11 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
             "if (!std.meta.eql(original, try parent.root.entryIfExists(output))) return error.FixtureDestinationChanged;",
             "if (point == .before_rename) try self.check();",
             'try environment.put("PATH", "/no-host-interpreters");',
+        ),
+        "actions/install/__tests__/integration.test.ts": (
+            'str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository)',
+            '"--suite", "debian-stable", "--architecture", arch',
+            'check=True, timeout=60, env={"PATH": "/no-host-interpreters"}',
         ),
     }
     for path in INTEGRATION_REPOSITORY_PATHS[3:5]:
