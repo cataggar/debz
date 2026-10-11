@@ -35,6 +35,15 @@ The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
 imports and the integration root's shell consumer require this binary, with
 no Python implementation or missing-tool fallback. The normal install build,
 integration target and pinned config-reference target build it as a prerequisite.
+The pinned alternatives-reference target now uses the same required native
+copier, including its real shell/sleep/update-alternatives consumers, instead of
+a separate Python `copy2`/shebang/`ldd` implementation. It passes its original
+8 MiB per-file bound through `--max-file-bytes`, which constrains every member of
+the native closure before publication; other consumers retain their existing
+32 MiB bound. The alternatives unit suite and audit build the helper first,
+including custom install prefixes, and exercise actual copying and missing-tool
+and oversized-source refusal. Original pinned oracle observations and limits
+remain unchanged; its Python observation driver is not retired by this slice.
 Those build targets bind their emitted or installed helper path, including a
 custom install prefix; standalone Python consumers use the normal `zig-out`
 binary or an explicit `DEBZ_DISPOSABLE_RUNTIME` native executable path.
