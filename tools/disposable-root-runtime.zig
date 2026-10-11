@@ -129,6 +129,7 @@ const Copier = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     root: fs.Root,
+    file_limit: usize = maximum_file_bytes,
     inputs: std.ArrayList(Input) = .empty,
     total: usize = 0,
 
@@ -160,7 +161,7 @@ const Copier = struct {
         errdefer directory.close();
         var pin = try directory.root.pinRegularFile(try fs.Path.init(std.fs.path.basename(canonical)));
         errdefer pin.close();
-        const observed = try pin.observeStableAlloc(self.allocator, maximum_file_bytes);
+        const observed = try pin.observeStableAlloc(self.allocator, self.file_limit);
         errdefer self.allocator.free(observed.bytes);
         const xattrs = try attributes(self.allocator, pin.file);
         errdefer {
@@ -279,6 +280,11 @@ const Copier = struct {
 };
 
 fn copy(io: std.Io, allocator: std.mem.Allocator, root_path: []const u8, source: []const u8, destination: []const u8) !void {
+    try copyBounded(io, allocator, root_path, source, destination, maximum_file_bytes);
+}
+
+fn copyBounded(io: std.Io, allocator: std.mem.Allocator, root_path: []const u8, source: []const u8, destination: []const u8, file_limit: usize) !void {
+    if (file_limit == 0 or file_limit > maximum_file_bytes) return error.InvalidFixtureFileLimit;
     _ = try fs.Path.fromAbsolute(source);
     const path = try fs.Path.fromAbsolute(destination);
     if (std.mem.eql(u8, root_path, "/")) return error.DisposableRootRequired;
@@ -289,7 +295,7 @@ fn copy(io: std.Io, allocator: std.mem.Allocator, root_path: []const u8, source:
         if (entry.link_count != 1) return error.HardLinkedFixtureDestination;
         return;
     }
-    var copier: Copier = .{ .io = io, .allocator = allocator, .root = root.root };
+    var copier: Copier = .{ .io = io, .allocator = allocator, .root = root.root, .file_limit = file_limit };
     defer copier.deinit();
     try copier.plan(source, path);
     try copier.publish();
@@ -301,13 +307,34 @@ pub fn main(init: std.process.Init) !void {
     const root = args.next() orelse return error.MissingFixtureArgument;
     const source = args.next() orelse return error.MissingFixtureArgument;
     const destination = args.next() orelse return error.MissingFixtureArgument;
+    const file_limit = if (args.next()) |argument| blk: {
+        if (!std.mem.eql(u8, argument, "--max-file-bytes")) return error.UnexpectedFixtureArgument;
+        const value = args.next() orelse return error.MissingFixtureArgument;
+        break :blk std.fmt.parseInt(usize, value, 10) catch return error.InvalidFixtureFileLimit;
+    } else maximum_file_bytes;
     if (args.next() != null) return error.UnexpectedFixtureArgument;
-    copy(init.io, init.arena.allocator(), root, source, destination) catch |err| {
+    copyBounded(init.io, init.arena.allocator(), root, source, destination, file_limit) catch |err| {
         std.log.err("disposable runtime refused root={s} source={s} destination={s}: {s}", .{
             root, source, destination, @errorName(err),
         });
         return err;
     };
+}
+
+test "disposable runtime applies the caller's smaller file limit to the whole closure before publication" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "source" });
+    defer std.testing.allocator.free(source);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "source", .data = "12345678" });
+    try std.testing.expectError(error.FileTooLarge, copyBounded(std.testing.io, std.testing.allocator, root, source, "/copied", 7));
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "source", .data = "#!/bin/sh\n" });
+    try std.testing.expectError(error.FileTooLarge, copyBounded(std.testing.io, std.testing.allocator, root, source, "/copied", 10));
+    for ([_][]const u8{ "copied", "bin" }) |path|
+        try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(std.testing.io, path, .{}));
+    try std.testing.expectError(error.InvalidFixtureFileLimit, copyBounded(std.testing.io, std.testing.allocator, root, source, "/copied", maximum_file_bytes + 1));
 }
 
 test "disposable runtime preserves quoted shebangs and refuses malformed interpreter words" {

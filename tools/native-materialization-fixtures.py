@@ -64,9 +64,14 @@ def write(path: Path, data: bytes, mode: int = 0o644) -> None:
     path.chmod(mode)
 
 
-def copy_program(root: Path, source: Path, destination: str) -> None:
+def copy_program(
+    root: Path, source: Path, destination: str, *, max_file_bytes: int | None = None,
+) -> None:
+    command = [str(DISPOSABLE_RUNTIME), str(root), str(source), destination]
+    if max_file_bytes is not None:
+        command.extend(("--max-file-bytes", str(max_file_bytes)))
     subprocess.run(
-        [str(DISPOSABLE_RUNTIME), str(root), str(source), destination],
+        command,
         stdin=subprocess.DEVNULL, timeout=120, check=True,
     )
 

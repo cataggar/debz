@@ -35,6 +35,13 @@ case "$kind" in
         ;;
 esac
 
+DEBZ_DISPOSABLE_RUNTIME="$repository/zig-out/bin/debz-disposable-runtime"
+if [ ! -x "$DEBZ_DISPOSABLE_RUNTIME" ]; then
+    echo "isolated dpkg oracle requires the native disposable runtime" >&2
+    exit 2
+fi
+export DEBZ_DISPOSABLE_RUNTIME
+
 host_config="$repository/.tmp/arm64-dpkg-oracles/host-config/dpkg.cfg"
 host_fragments="$repository/.tmp/arm64-dpkg-oracles/host-config/dpkg.cfg.d"
 case "$output" in
