@@ -30,6 +30,25 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
+The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
+imports and the integration root's shell consumer require this binary, with
+no Python implementation or missing-tool fallback. The normal install build,
+integration target and pinned config-reference target build it as a prerequisite.
+Those build targets bind their emitted or installed helper path, including a
+custom install prefix; standalone Python consumers use the normal `zig-out`
+binary or an explicit `DEBZ_DISPOSABLE_RUNTIME` native executable path.
+The core `test-disposable-runtime` suite runs the actual compiled copier with
+poisoned Python commands and checks original shell bytes/modes/mtime/xattrs,
+quoted shebangs, invalid interpreter refusal, destination symbolic/hardlinks and
+source/parent replacement before and during staged publication. The copier uses descriptor-rooted
+no-follow publication and preserves the original host fixture program/library
+bytes and nonempty extended attributes, rather than the separate Zig lifecycle
+copier's canonical epoch/modes. Unreadable or unwritable source attributes fail
+explicitly instead of being silently discarded.
+It does not execute copied programs, authenticate snapshot inputs or grant
+production callback authority. Other Python fixture drivers remain under PY3/PY4.
+
 `zig build generate-openpgp-fixtures` is the actual native RSA/Ed25519
 verification-fixture generator. All 34 original output arrays are compared
 byte-for-byte, including expiry, revocation, binding, critical-subpacket and

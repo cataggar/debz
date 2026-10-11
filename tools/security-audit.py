@@ -2096,7 +2096,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -4892,6 +4892,54 @@ ACTION_EMPTY_LOCK_PATHS = (
     ".github/workflows/ci.yml", "build.zig", "tools/native-action-empty-lock.zig",
 )
 
+DISPOSABLE_RUNTIME_PATHS = (
+    "build.zig", "tools/disposable-root-runtime.zig", "tools/disposable_root_runtime.py",
+    "tools/native-materialization-fixtures.py", "tools/native-lifecycle-fixtures.py",
+    "tools/test-integration-roots.sh",
+)
+
+
+def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        DISPOSABLE_RUNTIME_PATHS[0]: (
+            'b.path("tools/disposable-root-runtime.zig")',
+            "b.getInstallStep().dependOn(&install_disposable_runtime.step);",
+            "integration_tests.step.dependOn(&install_disposable_runtime.step);",
+            "integration_tests.addArtifactArg(disposable_runtime);",
+            "dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);",
+            'b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}),',
+            "workload_core.dependOn(&disposable_runtime_tests.step);",
+            'disposable_runtime_test_options.addOptionPath("executable", disposable_runtime.getEmittedBin());',
+        ),
+        DISPOSABLE_RUNTIME_PATHS[1]: (
+            "try pin.observeStableAlloc(self.allocator, maximum_file_bytes)",
+            "try context.input.check(context.root);",
+            "try context.input.checkParent(context.root, context.directory.?);",
+            "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[3]: (
+            '"DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",',
+            "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
+            "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[4]: ("runtime = m",),
+        DISPOSABLE_RUNTIME_PATHS[5]: (
+            'runtime=${2:-"$PWD/zig-out/bin/debz-disposable-runtime"}',
+            '$privileged "$runtime" "$native_root" /bin/sh /bin/sh',
+        ),
+    }
+    failures = [
+        f"{path}: native disposable runtime contract is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    if texts.get(DISPOSABLE_RUNTIME_PATHS[2]) is not None:
+        failures.append("retired Python disposable runtime implementation was restored")
+    if any("disposable_root_runtime.py" in texts.get(path, "") for path in DISPOSABLE_RUNTIME_PATHS[3:]):
+        failures.append("retired Python disposable runtime consumer was restored")
+    return failures
+
+
 BASELINE_FIXTURE_PATHS = (
     "build.zig", "tools/generate-native-baseline-fixture.zig",
     "tools/generate-native-baseline-fixture.py",
@@ -5128,6 +5176,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_disposable_runtime_failures({
+        path: (ROOT / path).read_text() for path in DISPOSABLE_RUNTIME_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_openpgp_fixture_failures({
         path: (ROOT / path).read_text() for path in OPENPGP_FIXTURE_PATHS if (ROOT / path).is_file()
     }):
@@ -6235,7 +6287,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-baseline-fixture", "native-openpgp-fixtures",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6260,6 +6312,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
+            "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
             "native-openpgp-fixtures": OPENPGP_FIXTURE_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
@@ -6323,6 +6376,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_action_empty_lock_failures(texts)
         elif kind == "native-baseline-fixture":
             failures = native_baseline_fixture_failures(texts)
+        elif kind == "native-disposable-runtime":
+            failures = native_disposable_runtime_failures(texts)
         elif kind == "native-openpgp-fixtures":
             failures = native_openpgp_fixture_failures(texts)
         else:
