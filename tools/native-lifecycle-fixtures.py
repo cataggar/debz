@@ -21,12 +21,7 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
-RUNTIME_SPEC = importlib.util.spec_from_file_location(
-    "debz_lifecycle_runtime", ROOT / "tools/disposable_root_runtime.py",
-)
-assert RUNTIME_SPEC and RUNTIME_SPEC.loader
-runtime = importlib.util.module_from_spec(RUNTIME_SPEC)
-RUNTIME_SPEC.loader.exec_module(runtime)
+runtime = m
 
 KINDS = ("preinst", "postinst", "prerm", "postrm")
 FAILURE = "lifecycle-fail"

@@ -935,7 +935,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 53), members);
+    try testing.expectEqual(@as(usize, 54), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1648,6 +1648,28 @@ test "security: native signed baseline regeneration preserves original bytes and
     const restored = try nativeCheck(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python baseline fixture generator was restored");
+}
+
+test "security: disposable runtime consumers require native copying without a Python fallback" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-disposable-runtime", "build.zig", &.{
+        "b.getInstallStep().dependOn(&install_disposable_runtime.step);",
+        "integration_tests.step.dependOn(&install_disposable_runtime.step);",
+        "dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", "tools/disposable-root-runtime.zig", &.{
+        "try pin.observeStableAlloc(self.allocator, maximum_file_bytes)",
+        "try context.input.check(context.root);",
+        "try context.input.checkParent(context.root, context.directory.?);",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", "tools/native-materialization-fixtures.py", &.{
+        "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
+        "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+    });
+    const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
+    defer restored.deinit();
+    try restored.failsWith("retired Python disposable runtime implementation was restored");
 }
 
 test "security: native OpenPGP regeneration executes original signing and keeps legacy consumer import-only" {
