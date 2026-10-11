@@ -2096,7 +2096,7 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
 WORKLOAD_TIMEOUT_MINUTES = 45
 WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
-        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
@@ -3628,7 +3628,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             "      - name: Install Zig via ghr\n",
             "      - name: Validate Zig version\n",
             "      - name: Install metadata decompression and signed fixture dependencies\n",
-            "liblzma-dev libzstd-dev python3-cryptography python3-jsonschema",
+            "liblzma-dev libzstd-dev python3-jsonschema",
         )) or re.search(r"(?m)^        if:", setup):
             failures.append(f"ci.yml: {name} must retain pinned Zig and signed fixture dependencies")
         if len(steps) != len(expected_steps) + 3:
@@ -5129,20 +5129,95 @@ def native_openpgp_fixture_failures(texts: dict[str, str]) -> list[str]:
             "modulus.powWithEncodedExponent(message, &rsa.exponent, .big)",
             "pair.sign(digest, null)",
         ),
-        OPENPGP_FIXTURE_PATHS[4]: (
-            'ROOT / "tools/generate-openpgp-fixtures.py"',
-            "fixture.SUBKEY_PEM",
-        ),
     }
     failures = []
     for path, tokens in required.items():
         if any(token not in texts.get(path, "") for token in tokens):
             failures.append(f"{path}: native OpenPGP fixture contract is missing")
-    legacy = texts.get(OPENPGP_FIXTURE_PATHS[2])
-    if legacy is None:
-        failures.append("required import-only original integration signer is missing")
-    elif legacy.startswith("#!") or re.search(r"(?m)^def main\(|^if __name__\s*==", legacy):
-        failures.append("retired Python OpenPGP fixture CLI was restored")
+    if OPENPGP_FIXTURE_PATHS[2] in texts:
+        failures.append("retired Python OpenPGP signer was restored")
+    return failures
+
+
+INTEGRATION_SIGNING_PATHS = (
+    "build.zig", "tools/integration-signing.zig", "tools/generate-integration-repository.py",
+    "tools/test-integration-roots.sh", "tools/test-repository-add.sh",
+    "test/native_recovery_family.zig", "test/native_recovery_parity.zig",
+    "test/native_recovery_repository.zig", "test/apt-system-acceptance.zig",
+    ".github/workflows/ci.yml", "tools/requirements-openpgp-fixtures.txt",
+)
+
+
+def native_integration_signing_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        INTEGRATION_SIGNING_PATHS[0]: (
+            'b.path("tools/integration-signing.zig")',
+            "b.getInstallStep().dependOn(&install_integration_signing.step);",
+            "workload_core.dependOn(&integration_signing_tests.step);",
+            'integration_signing_test_options.addOptionPath("executable", integration_signing.getEmittedBin());',
+            "integration_tests.addArtifactArg(integration_signing);",
+            "repository_add_tests.addArtifactArg(integration_signing);",
+            'native_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());',
+            'apt_acceptance_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());',
+        ),
+        INTEGRATION_SIGNING_PATHS[1]: (
+            'const pgp = @import("fixture-openpgp.zig");',
+            "try pin.observeStableAlloc(allocator, maximum_bytes)",
+            "try pgp.subpacket(allocator, 32, try pgp.packetBody(primary_binding))",
+            "try pgp.clearsign(allocator, .subkey, subkey_fingerprint, release, .{})",
+            'try environment.put("PATH", "/no-host-interpreters");',
+            "3907b432b4746fcd56702acccbf4bfb0308a99b07331c1fa11d7998865796b14",
+            "9cc9b4c7976ea7cdafa5097ad8f2777122b5644479e9828f3c7ae63d81ee4d9f",
+        ),
+        INTEGRATION_SIGNING_PATHS[2]: (
+            '"DEBZ_INTEGRATION_SIGNING", ROOT / "zig-out/bin/debz-integration-signing",',
+            "require_native_signing()\n    require_native_archive()\n    if output.exists():",
+            "[str(INTEGRATION_SIGNING), str(path)]",
+            "stdin=subprocess.DEVNULL, timeout=30, check=False,",
+            "keyring, in_release, primary_fingerprint = native_signing(release)",
+            '"--signing-helper must be absolute"',
+        ),
+        INTEGRATION_SIGNING_PATHS[3]: (
+            'export DEBZ_INTEGRATION_SIGNING=${4:-"$PWD/zig-out/bin/debz-integration-signing"}',
+            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
+            'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
+        ),
+        INTEGRATION_SIGNING_PATHS[4]: (
+            'export DEBZ_INTEGRATION_SIGNING=${5:-"$PWD/zig-out/bin/debz-integration-signing"}',
+            '*) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;',
+            'if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then',
+        ),
+        **{path: (
+            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing })",
+            '"--signing-helper", signing_helper',
+        ) for path in INTEGRATION_SIGNING_PATHS[5:8]},
+        INTEGRATION_SIGNING_PATHS[8]: (
+            'realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_signing, self.arena)',
+            '"--signing-helper", signing_helper',
+        ),
+        INTEGRATION_SIGNING_PATHS[9]: (
+            "zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all",
+            '--signing-helper "$PWD/zig-out/bin/debz-integration-signing"',
+        ),
+    }
+    failures = [
+        f"{path}: native integration signing contract is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    if INTEGRATION_SIGNING_PATHS[10] in texts:
+        failures.append("retired integration cryptography dependency was restored")
+    if re.search(r"cryptography|generate-openpgp-fixtures\.py|load_openpgp_fixture_module", texts.get(INTEGRATION_SIGNING_PATHS[2], "")):
+        failures.append("retired Python integration signing consumer was restored")
+    workflow = texts.get(INTEGRATION_SIGNING_PATHS[9], "")
+    if "python3-cryptography" in workflow or "import cryptography" in workflow:
+        failures.append("retired CI fixture cryptography dependency was restored")
+    container = re.search(r"(?ms)^  download-action-container-fixture:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", workflow)
+    body = container.group(1) if container else ""
+    build = body.find("zig build build-integration-signing ")
+    generate = body.find("python3 tools/generate-integration-repository.py")
+    if not 0 <= build < generate:
+        failures.append("container must build its native-host signer before generation")
     return failures
 
 
@@ -5300,6 +5375,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_integration_signing_failures({
+        path: (ROOT / path).read_text() for path in INTEGRATION_SIGNING_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_integration_archive_failures({
         path: (ROOT / path).read_text() for path in INTEGRATION_ARCHIVE_PATHS if (ROOT / path).is_file()
     }):
@@ -6287,8 +6366,6 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
         re.compile(rb"AKIA[0-9A-Z]{16}"): "AWS access key",
         re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}"): "GitHub token",
     }
-    synthetic_key_path = pathlib.Path("tools/generate-openpgp-fixtures.py")
-    synthetic_key_count = 0
     for path in files:
         relative = path.relative_to(ROOT)
         if "__pycache__" in relative.parts or path.suffix.lower() in {".pyc", ".pyo"}:
@@ -6302,12 +6379,7 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
             matches = list(pattern.finditer(data))
             if not matches:
                 continue
-            if relative == synthetic_key_path and description == "private key":
-                synthetic_key_count += len(matches)
-                continue
             fail(f"{relative}: possible {description}")
-    if synthetic_key_count != 2:
-        fail("synthetic OpenPGP fixture generator must contain exactly two declared test keys")
 
 
 def main() -> int:
@@ -6415,7 +6487,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6443,6 +6515,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
             "native-openpgp-fixtures": OPENPGP_FIXTURE_PATHS,
+            "native-integration-signing": INTEGRATION_SIGNING_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -6511,6 +6584,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_disposable_runtime_failures(texts)
         elif kind == "native-openpgp-fixtures":
             failures = native_openpgp_fixture_failures(texts)
+        elif kind == "native-integration-signing":
+            failures = native_integration_signing_failures(texts)
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

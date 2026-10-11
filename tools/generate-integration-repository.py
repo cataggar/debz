@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import io
 import json
 import lzma
@@ -18,24 +17,38 @@ import subprocess
 import tarfile
 import tempfile
 
-from cryptography.hazmat.primitives import serialization
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FIXTURE_MODULE = ROOT / "tools/generate-openpgp-fixtures.py"
 EPOCH = 1_700_000_000
 MAX_REPOSITORY_BYTES = 8 * 1024 * 1024
+INTEGRATION_SIGNING = pathlib.Path(os.environ.get(
+    "DEBZ_INTEGRATION_SIGNING", ROOT / "zig-out/bin/debz-integration-signing",
+))
 INTEGRATION_ARCHIVE = pathlib.Path(os.environ.get(
     "DEBZ_INTEGRATION_ARCHIVE", ROOT / "zig-out/bin/debz-integration-archive",
 ))
 
 
-def load_openpgp_fixture_module():
-    spec = importlib.util.spec_from_file_location("debz_openpgp_fixture", FIXTURE_MODULE)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load OpenPGP fixture generator")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def require_native_signing() -> None:
+    if not INTEGRATION_SIGNING.is_absolute() or not INTEGRATION_SIGNING.is_file() or not os.access(INTEGRATION_SIGNING, os.X_OK):
+        raise FileNotFoundError(f"required absolute native integration signer: {INTEGRATION_SIGNING}")
+
+
+def native_signing(release: bytes) -> tuple[bytes, bytes, str]:
+    require_native_signing()
+    if len(release) > MAX_REPOSITORY_BYTES:
+        raise RuntimeError("integration signing input exceeds its byte limit")
+    (ROOT / ".tmp").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="integration-signing-", dir=ROOT / ".tmp") as directory:
+        path = pathlib.Path(directory, "Release")
+        path.write_bytes(release)
+        result = subprocess.run(
+            [str(INTEGRATION_SIGNING), str(path)], capture_output=True,
+            stdin=subprocess.DEVNULL, timeout=30, check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(f"native integration signing exited {result.returncode}: {result.stderr.decode(errors='replace')}")
+    signed = json.loads(result.stdout)
+    return bytes.fromhex(signed["keyring"]), bytes.fromhex(signed["in_release"]), signed["fingerprint"]
 
 
 def require_native_archive() -> None:
@@ -233,9 +246,10 @@ def write_repository(
     sha256_only: bool = False,
     extra_debs: list[pathlib.Path] | None = None,
 ) -> None:
-    require_native_archive()
     if signed_parity and sha256_only:
         raise ValueError("--signed-parity requires published SHA512 records")
+    require_native_signing()
+    require_native_archive()
     if output.exists():
         shutil.rmtree(output)
     packages_dir = output / "dists" / suite / "main" / f"binary-{architecture}"
@@ -313,50 +327,14 @@ def write_repository(
         f" {hashlib.sha256(packages).hexdigest()} {len(packages)} {relative_packages}\n"
     ).encode()
 
-    fixture = load_openpgp_fixture_module()
-    primary = serialization.load_pem_private_key(fixture.PRIMARY_PEM, password=None)
-    subkey = serialization.load_pem_private_key(fixture.SUBKEY_PEM, password=None)
-    primary_body = fixture.public_body(primary)
-    subkey_body = fixture.public_body(subkey)
-    primary_fingerprint = fixture.fingerprint(primary_body)
-    subkey_fingerprint = fixture.fingerprint(subkey_body)
-    primary_packet = fixture.packet(6, primary_body)
-    uid_packet = fixture.packet(13, fixture.UID)
-    certification = fixture.signature(
-        primary,
-        0x13,
-        [
-            fixture.key_prefix(primary_body),
-            b"\xb4" + len(fixture.UID).to_bytes(4, "big") + fixture.UID,
-        ],
-        primary_fingerprint,
-        extra_hashed=fixture.subpacket(27, b"\x01"),
-    )
-    subkey_packet = fixture.packet(14, subkey_body)
-    binding_parts = [fixture.key_prefix(primary_body), fixture.key_prefix(subkey_body)]
-    primary_binding = fixture.signature(subkey, 0x19, binding_parts, subkey_fingerprint)
-    binding = fixture.signature(
-        primary,
-        0x18,
-        binding_parts,
-        primary_fingerprint,
-        extra_hashed=fixture.subpacket(27, b"\x02") + fixture.subpacket(32, fixture.packet_body(primary_binding)),
-    )
-    keyring = primary_packet + uid_packet + certification + subkey_packet + binding
-    canonical_release = release.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").removesuffix(b"\r\n")
-    release_signature = fixture.signature(subkey, 0x01, [canonical_release], subkey_fingerprint)
-    in_release = (
-        b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
-        + release
-        + fixture.armor_signature(release_signature)
-    )
+    keyring, in_release, primary_fingerprint = native_signing(release)
     (output / "dists" / suite / "InRelease").write_bytes(in_release)
     (output / "fixture-keyring.gpg").write_bytes(keyring)
     manifest = (
         f"suite={suite}\narchitecture={architecture}\n"
         f"release_sha256={hashlib.sha256(release).hexdigest()}\n"
         f"packages_sha256={hashlib.sha256(packages).hexdigest()}\n"
-        f"signer={primary_fingerprint.hex()}\n"
+        f"signer={primary_fingerprint}\n"
     )
     (output / "fixture-provenance.txt").write_text(manifest)
     total = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
@@ -423,7 +401,7 @@ def write_repository_descriptor(
 
 
 def main() -> None:
-    global INTEGRATION_ARCHIVE
+    global INTEGRATION_SIGNING, INTEGRATION_ARCHIVE
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--suite", required=True, choices=("debian-stable", "ubuntu-26.04"))
@@ -431,6 +409,7 @@ def main() -> None:
     parser.add_argument("--signed-parity", action="store_true")
     parser.add_argument("--sha256-only", action="store_true")
     parser.add_argument("--extra-deb", action="append", default=[], type=pathlib.Path)
+    parser.add_argument("--signing-helper", type=pathlib.Path)
     parser.add_argument("--archive-helper", type=pathlib.Path)
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
@@ -440,6 +419,10 @@ def main() -> None:
         default="default",
     )
     args = parser.parse_args()
+    if args.signing_helper is not None:
+        if not args.signing_helper.is_absolute():
+            raise SystemExit("--signing-helper must be absolute")
+        INTEGRATION_SIGNING = args.signing_helper
     if args.archive_helper is not None:
         if not args.archive_helper.is_absolute():
             raise SystemExit("--archive-helper must be absolute")

@@ -12,6 +12,15 @@ if [ ! -x "$DEBZ_INTEGRATION_ARCHIVE" ]; then
   exit 2
 fi
 export DEBZ_INTEGRATION_ARCHIVE
+export DEBZ_INTEGRATION_SIGNING=${5:-"$PWD/zig-out/bin/debz-integration-signing"}
+case "$DEBZ_INTEGRATION_SIGNING" in
+  /*) ;;
+  *) DEBZ_INTEGRATION_SIGNING="$PWD/$DEBZ_INTEGRATION_SIGNING" ;;
+esac
+if [ ! -x "$DEBZ_INTEGRATION_SIGNING" ]; then
+  printf 'native integration signer is not executable: %s\n' "$DEBZ_INTEGRATION_SIGNING" >&2
+  exit 2
+fi
 workspace="$PWD/.zig-cache/repository-add-integration"
 http_root="$workspace/http"
 repository="$http_root/repository"

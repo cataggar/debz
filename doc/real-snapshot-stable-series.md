@@ -683,7 +683,7 @@ manifest cross-check in normal CI. It fails in these cases:
 - a manifest identity has no consumer.
 
 `test/real-snapshot-repin.zig` runs the tool against synthetic signed fixtures
-(from `tools/generate-openpgp-fixtures.py`) and covers:
+(from `tools/generate-openpgp-fixtures.zig`) and covers:
 
 - a recent `T` is refused;
 - a Release that changes between fetches is refused;

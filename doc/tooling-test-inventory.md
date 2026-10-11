@@ -43,8 +43,9 @@ emitted executable, and signed recovery FAMILY/parity/repository and apt
 acceptance bind their compiled helper path, including custom prefixes.
 Standalone/import consumers require the normal `zig-out` native helper or an
 explicit `DEBZ_INTEGRATION_ARCHIVE`/`--archive-helper` path.
-The Python repository/scenario/signing driver and extra-deb parser remain;
-this bounded archive-encoding port does not complete PY3 or retire cryptography.
+The Python repository/scenario driver and extra-deb parser remain;
+this bounded archive-encoding port does not complete PY3. The separate native
+signing helper below retires the fixture cryptography dependency.
 
 `zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
 The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
@@ -84,8 +85,19 @@ frozen/moving Release fixtures. The required `test-openpgp-fixtures` core
 suite executes the compiled generator under a no-interpreter PATH and binds
 its complete emitted source to those originals, then tests regeneration and
 symbolic/hardlink refusal. Only the source's generator comment changes.
-The old Python module remains import-only for the not-yet-ported integration
-repository producer; its real cryptography dependency is not retired.
+The old Python signer and its cryptography requirement are retired. The actual
+integration repository producer now calls the required native
+`debz-integration-signing` helper for its original keyring and signed Release.
+`build-integration-signing` builds it; `test-integration-signing` verifies the
+independently original keyring/signature bytes with a no-interpreter PATH,
+CRLF canonicalization, and bounded no-follow input refusals. Ordinary builds,
+custom-prefix builds, shell integrations, FAMILY/parity/repository and APT
+consumers bind their emitted helper before fixture generation. The release-only
+download container builds a native-host helper separately. Standalone fixture
+generation uses the normal installed path or an absolute `--signing-helper`
+or `DEBZ_INTEGRATION_SIGNING` path; missing support fails before clearing output.
+The repository/scenario driver and extra-deb parser are still Python; the
+native archive and signing helpers do not complete PY3 or #420.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`

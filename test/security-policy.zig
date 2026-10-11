@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 55), members);
+    try testing.expectEqual(@as(usize, 56), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1040,10 +1040,10 @@ test "security: required recovery shards keep every mode, selector, setup and ag
         const timeout = try std.fmt.allocPrint(f.arena.allocator(), "    timeout-minutes: {d}", .{timeout_minutes});
         const wrong_timeout: []const u8 = if (timeout_minutes == 75) "    timeout-minutes: 35" else "    timeout-minutes: 75";
         for ([_][]const u8{
-            timeout,                                   "      fail-fast: false",
-            "          - os: ubuntu-24.04",            "          - os: ubuntu-24.04-arm",
-            "      - name: Install Zig via ghr\n",     "      - name: Install metadata decompression and signed fixture dependencies\n",
-            "python3-cryptography python3-jsonschema", "reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"",
+            timeout,                               "      fail-fast: false",
+            "          - os: ubuntu-24.04",        "          - os: ubuntu-24.04-arm",
+            "      - name: Install Zig via ghr\n", "      - name: Install metadata decompression and signed fixture dependencies\n",
+            "libzstd-dev python3-jsonschema",      "reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"",
         }) |token| {
             const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
             const rejected = try f.check("ci-recovery", changed);
@@ -1727,7 +1727,7 @@ test "security: actual integration archive encoding and every fixture consumer r
     try restored.failsWith("retired Python integration archive encoder was restored");
 }
 
-test "security: native OpenPGP regeneration executes original signing and keeps legacy consumer import-only" {
+test "security: native OpenPGP regeneration executes original signing and refuses the retired Python signer" {
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "native-openpgp-fixtures", "build.zig", &.{
@@ -1744,14 +1744,50 @@ test "security: native OpenPGP regeneration executes original signing and keeps 
         "modulus.powWithEncodedExponent(message, &rsa.exponent, .big)",
         "pair.sign(digest, null)",
     });
-    const legacy = try f.source("tools/generate-openpgp-fixtures.py");
-    const restored = try nativeCheck(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.py", try std.fmt.allocPrint(
-        f.arena.allocator(),
-        "{s}\ndef main():\n    pass\n",
-        .{legacy},
-    ));
+    const restored = try nativeCheck(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.py", "def signature():\n    pass\n");
     defer restored.deinit();
-    try restored.failsWith("retired Python OpenPGP fixture CLI was restored");
+    try restored.failsWith("retired Python OpenPGP signer was restored");
+}
+
+test "security: actual integration signing binds every consumer to the native helper before fixture side effects" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-integration-signing", "build.zig", &.{
+        "integration_tests.addArtifactArg(integration_signing);",
+        "repository_add_tests.addArtifactArg(integration_signing);",
+        "workload_core.dependOn(&integration_signing_tests.step);",
+        "native_fixture_options.addOptionPath(\"integration_signing\", integration_signing.getEmittedBin());",
+        "apt_acceptance_fixture_options.addOptionPath(\"integration_signing\", integration_signing.getEmittedBin());",
+    });
+    try nativeMutations(&f, "native-integration-signing", "tools/generate-integration-repository.py", &.{
+        "require_native_signing()\n    require_native_archive()\n    if output.exists():",
+        "keyring, in_release, primary_fingerprint = native_signing(release)",
+    });
+    try nativeMutations(&f, "native-integration-signing", "tools/integration-signing.zig", &.{
+        "try pin.observeStableAlloc(allocator, maximum_bytes)",
+        "try environment.put(\"PATH\", \"/no-host-interpreters\");",
+    });
+    for ([_][]const u8{ "test/native_recovery_family.zig", "test/native_recovery_parity.zig", "test/native_recovery_repository.zig" }) |path|
+        try nativeMutations(&f, "native-integration-signing", path, &.{
+            "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing })",
+            "\"--signing-helper\", signing_helper",
+        });
+    try nativeMutations(&f, "native-integration-signing", "test/apt-system-acceptance.zig", &.{
+        "realPathFileAlloc(self.io, @import(\"apt_acceptance_fixture_options\").integration_signing, self.arena)",
+        "\"--signing-helper\", signing_helper",
+    });
+    for ([_][]const u8{ "tools/test-integration-roots.sh", "tools/test-repository-add.sh" }) |path|
+        try nativeMutations(&f, "native-integration-signing", path, &.{
+            "*) DEBZ_INTEGRATION_SIGNING=\"$PWD/$DEBZ_INTEGRATION_SIGNING\" ;;",
+            "if [ ! -x \"$DEBZ_INTEGRATION_SIGNING\" ]; then",
+        });
+    try nativeMutations(&f, "native-integration-signing", ".github/workflows/ci.yml", &.{
+        "zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all",
+        "--signing-helper \"$PWD/zig-out/bin/debz-integration-signing\"",
+    });
+    const restored = try nativeCheck(&f, "native-integration-signing", "tools/requirements-openpgp-fixtures.txt", "cryptography\n");
+    defer restored.deinit();
+    try restored.failsWith("retired integration cryptography dependency was restored");
 }
 
 test "security: install action uses pinned bundles and validates before emitting result" {
