@@ -908,10 +908,11 @@ fn archiveExecution(
     try fixture.directory("executed");
     const generator = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
     const repository = try fixture.absolute("executed/repository");
+    const signing_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing });
     const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });
     try fixture.run(&.{
-        python,             generator,      "--output", repository, "--suite", "debian-stable", "--architecture", arch,
-        "--archive-helper", archive_helper,
+        python,             generator,      "--output",         repository,     "--suite", "debian-stable", "--architecture", arch,
+        "--signing-helper", signing_helper, "--archive-helper", archive_helper,
     }, "executed/generate.log", 120);
     const source_text = try std.fmt.allocPrint(fixture.allocator, "Types: deb\nURIs: file://{s}\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: {s}\n", .{ repository, arch, keyring });
     try fixture.write("executed/workflow.sources", source_text, 0o644);

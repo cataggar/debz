@@ -1649,8 +1649,7 @@ stable and bounded to 128 MiB; output files are exclusive mode 0600.
 source/output refusals without root. This removes the HTTP interpreter,
 not the remaining signed fixture generator's Python dependency.
 
-For a local Python installation lacking the signed fixture
-generator's documented `cryptography` requirement, supply
+To select the fixture producer's Python installation, supply
 `-Dnative-repository-fixture-python=/absolute/path/to/python`; this option
 selects **fixture generation only**, not the acceptance runner. For a
 focused CLI run, combine `-Dnative-repository-cli-only=true` with
@@ -1909,8 +1908,8 @@ There were 56 Python methods: all have Zig assertions for the portable behavior,
 `tools/test-native-recovery.py`, whose sole Python importer was
 `tools/test_native_recovery.py`. The signed Zig FAMILY, parity and repository
 targets instead invoke `tools/generate-integration-repository.py`, which
-imports `generate-openpgp-fixtures.py` and `cryptography`, not the recovery
-acceptance module or `jsonschema`. Remaining required Python schema checks
+uses the required emitted native integration signer, not Python cryptography,
+the recovery acceptance module or `jsonschema`. Remaining required Python schema checks
 (`test_vendor_state_capture.py`, `test_dpkg_config_reference.py`,
 `test_dpkg_alternatives_reference.py`) call `jsonschema.Draft202012Validator`
 directly on self-contained schemas; none imports the recovery fallback or
@@ -1975,7 +1974,8 @@ complete pre-retirement matrix proves parity.
 `-Doptimize=ReleaseSafe` run `test/native_recovery_parity.zig` as the real
 privileged consumer, with the optional pinned reference
 `-Dnative-reference-dpkg=/absolute/path/to/dpkg`. The fixture generator
-requires Python `cryptography`; when it is not in `/usr/bin/python3`, use
+requires Python only for repository/scenario production; to select another
+interpreter, use
 `-Dnative-zig-recovery-parity-fixture-python=/absolute/path/to/python`.
 `-Dnative-zig-recovery-parity-case=debian-stable/pre-depends` selects a
 **single debugging case**, not the 30-row acceptance gate. The unfiltered
@@ -2020,8 +2020,8 @@ without dropping signed child processes or pinned-dpkg comparisons. The existing
 `tools/generate-integration-repository.py` is invoked **only to build**
 worktree-local signed metadata and matching `.deb` archives; the test runner,
 all assertions and all FAMILY invocations are Zig-owned. The fixture builder
-needs Python `cryptography`; environments where
-the system Python lacks it can select a dependency-equipped interpreter with
+uses the required emitted native integration signer and no Python cryptography.
+To select another repository/scenario interpreter, use
 `-Dnative-zig-recovery-family-fixture-python=/absolute/path/to/python`.
 `-Dnative-zig-recovery-family-executed-only=true` selects just the
 archive-backed and active-inspection scenarios for focused runs.
