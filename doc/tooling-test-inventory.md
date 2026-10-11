@@ -30,6 +30,23 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
+The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
+imports and the integration root's shell consumer require this binary, with
+no Python implementation or missing-tool fallback. The normal install build,
+integration target and pinned config-reference target build it as a prerequisite.
+Those build targets bind their emitted or installed helper path, including a
+custom install prefix; standalone Python consumers use the normal `zig-out`
+binary or an explicit `DEBZ_DISPOSABLE_RUNTIME` native executable path.
+The core `test-disposable-runtime` suite runs the actual compiled copier with
+poisoned Python commands and checks original shell bytes/modes/mtime,
+quoted shebangs, invalid interpreter refusal, destination symbolic/hardlinks and
+source/parent replacement before and during staged publication. The copier uses descriptor-rooted
+no-follow publication and preserves the original host fixture program/library
+bytes, rather than the separate Zig lifecycle copier's canonical epoch/modes.
+It does not execute copied programs, authenticate snapshot inputs or grant
+production callback authority. Other Python fixture drivers remain under PY3/PY4.
+
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
 archives, `Packages`, the original fixed RSA keyring and authentic signed

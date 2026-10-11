@@ -204,6 +204,32 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-baseline-fixture", "Test exact signed baseline regeneration and safe publication").dependOn(&baseline_fixture_tests.step);
     workload_core.dependOn(&baseline_fixture_tests.step);
 
+    const disposable_runtime_module = b.createModule(.{
+        .root_source_file = b.path("tools/disposable-root-runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    disposable_runtime_module.addImport("debz", debz);
+    const disposable_runtime = b.addExecutable(.{
+        .name = "debz-disposable-runtime",
+        .root_module = disposable_runtime_module,
+    });
+    const install_disposable_runtime = b.addInstallArtifact(disposable_runtime, .{});
+    b.getInstallStep().dependOn(&install_disposable_runtime.step);
+    b.step("build-disposable-runtime", "Build the native disposable fixture runtime preparer").dependOn(&install_disposable_runtime.step);
+    const disposable_runtime_test_options = b.addOptions();
+    disposable_runtime_test_options.addOptionPath("executable", disposable_runtime.getEmittedBin());
+    const disposable_runtime_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/disposable-root-runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    disposable_runtime_test_module.addImport("debz", debz);
+    disposable_runtime_test_module.addOptions("disposable_runtime_test_options", disposable_runtime_test_options);
+    const disposable_runtime_tests = b.addRunArtifact(b.addTest(.{ .root_module = disposable_runtime_test_module }));
+    b.step("test-disposable-runtime", "Test original fixture runtime copying and no-follow refusal").dependOn(&disposable_runtime_tests.step);
+    workload_core.dependOn(&disposable_runtime_tests.step);
+
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
     workload_core.dependOn(&run_repository_cli_tests.step);
@@ -298,7 +324,9 @@ pub fn build(b: *std.Build) void {
     workload_core.dependOn(&consumer_tests.step);
 
     const integration_tests = b.addSystemCommand(&.{ "sh", "tools/test-integration-roots.sh" });
+    integration_tests.step.dependOn(&install_disposable_runtime.step);
     integration_tests.addArtifactArg(cli);
+    integration_tests.addArtifactArg(disposable_runtime);
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
@@ -1349,9 +1377,11 @@ pub fn build(b: *std.Build) void {
     native_conffile_step.dependOn(&run_native_conffile_zig.step);
 
     const dpkg_config_reference = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/dpkg-config-reference.py",
+        "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), "python3",
+        "tools/dpkg-config-reference.py",
     });
+    dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
     const dpkg_config_reference_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
     );

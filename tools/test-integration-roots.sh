@@ -3,6 +3,8 @@ set -eu
 umask 077
 
 debz=$1
+runtime=${2:-"$PWD/zig-out/bin/debz-disposable-runtime"}
+test -x "$runtime"
 suite=${DEBZ_INTEGRATION_SUITE:-debian-stable}
 architecture=${DEBZ_INTEGRATION_ARCH:-amd64}
 mode=${DEBZ_INTEGRATION_MODE:-smoke}
@@ -576,16 +578,7 @@ PY
     --transaction-backend native --assume-yes --json | grep -q '"changed":false'
   test ! -e "$workspace/native-recovery-unused-cache"
   test ! -e "$native_state"
-  $privileged python3 -B - "$native_root" <<'PY'
-import importlib.util
-from pathlib import Path
-import sys
-
-spec = importlib.util.spec_from_file_location("runtime", "tools/disposable_root_runtime.py")
-runtime = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(runtime)
-runtime.copy_program(Path(sys.argv[1]), Path("/bin/sh"), "/bin/sh")
-PY
+  $privileged "$runtime" "$native_root" /bin/sh /bin/sh
   native_trigger_lock="$workspace/native-trigger.lock.json"
   run_mutating_json plan $native_execution --lock-output "$native_trigger_lock" native-trigger-pkg | grep -q '"exit_status":0'
   run_mutating_json install $native_execution --lock-input "$native_trigger_lock" \
