@@ -4963,6 +4963,8 @@ DISPOSABLE_RUNTIME_PATHS = (
     "build.zig", "tools/disposable-root-runtime.zig", "tools/disposable_root_runtime.py",
     "tools/native-materialization-fixtures.py", "tools/native-lifecycle-fixtures.py",
     "tools/test-integration-roots.sh",
+    "tools/dpkg-alternatives-reference.py",
+    ".github/workflows/ci.yml", "tools/run-dpkg-oracle-isolated.sh",
 )
 
 
@@ -4974,12 +4976,18 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
             "integration_tests.step.dependOn(&install_disposable_runtime.step);",
             "integration_tests.addArtifactArg(disposable_runtime);",
             "dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);",
+            "dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);",
+            "dpkg_alternatives_reference_tests.step.dependOn(&install_disposable_runtime.step);",
+            'dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));',
+            "audit_tests.step.dependOn(&install_disposable_runtime.step);",
+            'audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));',
             'b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}),',
             "workload_core.dependOn(&disposable_runtime_tests.step);",
             'disposable_runtime_test_options.addOptionPath("executable", disposable_runtime.getEmittedBin());',
         ),
         DISPOSABLE_RUNTIME_PATHS[1]: (
-            "try pin.observeStableAlloc(self.allocator, maximum_file_bytes)",
+            "try pin.observeStableAlloc(self.allocator, self.file_limit)",
+            'std.mem.eql(u8, argument, "--max-file-bytes")',
             "try context.input.check(context.root);",
             "try context.input.checkParent(context.root, context.directory.?);",
             "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
@@ -4988,6 +4996,18 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
             '"DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",',
             "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
             "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[6]: (
+            "validate_absolute_path(destination)",
+            "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[7]: (
+            "          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[8]: (
+            'DEBZ_DISPOSABLE_RUNTIME="$repository/zig-out/bin/debz-disposable-runtime"',
+            'if [ ! -x "$DEBZ_DISPOSABLE_RUNTIME" ]; then',
+            "export DEBZ_DISPOSABLE_RUNTIME",
         ),
         DISPOSABLE_RUNTIME_PATHS[4]: ("runtime = m",),
         DISPOSABLE_RUNTIME_PATHS[5]: (
@@ -5004,6 +5024,8 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
         failures.append("retired Python disposable runtime implementation was restored")
     if any("disposable_root_runtime.py" in texts.get(path, "") for path in DISPOSABLE_RUNTIME_PATHS[3:]):
         failures.append("retired Python disposable runtime consumer was restored")
+    if "shutil.copy2" in texts.get(DISPOSABLE_RUNTIME_PATHS[6], ""):
+        failures.append("retired Python alternatives runtime copier was restored")
     return failures
 
 
