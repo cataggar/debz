@@ -30,6 +30,22 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`zig build build-integration-archive` builds the required native producer for
+actual integration package and repository-descriptor ar/USTAR/gzip bytes.
+The Python archive encoders are removed, not kept as a fallback. Zig writes the
+original tar directory order, root metadata, epoch and record padding, then uses
+the existing native `/usr/bin/gzip -n -9` utility and restores the original
+1700000000/XFL2/OS255 header after checking its footer. Independent original
+package identities and complete original signed repository/descriptor outputs
+are the expectations, never values generated from the new producer.
+Normal builds install it; shell integration/repository-add targets pass the
+emitted executable, and signed recovery FAMILY/parity/repository and apt
+acceptance bind their compiled helper path, including custom prefixes.
+Standalone/import consumers require the normal `zig-out` native helper or an
+explicit `DEBZ_INTEGRATION_ARCHIVE`/`--archive-helper` path.
+The Python repository/scenario/signing driver and extra-deb parser remain;
+this bounded archive-encoding port does not complete PY3 or retire cryptography.
+
 `zig build build-disposable-runtime` builds `zig-out/bin/debz-disposable-runtime`.
 The actual disposable fixture copier is Zig; lifecycle/materialization/trigger
 imports and the integration root's shell consumer require this binary, with
