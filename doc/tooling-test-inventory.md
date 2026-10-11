@@ -143,6 +143,26 @@ tools are never executed during preparation. Identity-checked bounded cleanup
 refuses a substituted staging tree and does not follow extracted links.
 This helper retirement is not full PY3 or no-host-Python acceptance.
 
+`zig build build-debian-stable-readiness test-debian-stable-readiness` builds
+the actual native read-only Debian preflight. It retains the original reviewed
+key armor/binary/fingerprint, InRelease and both index pins, bounded real-time
+freshness, HTTPS-only acquisition, xz limits and every published SHA256 check.
+The real closure tool uses its required native CLI for acquisition and key,
+Release and index verification, including a custom installation prefix via
+`DEBZ_DEBIAN_STABLE_READINESS`. There is no Python readiness implementation or
+fallback. Explicit `--now` and supplied index identities are limited to
+read-only verification handoffs; the normal preflight always uses the real
+clock and compiled reviewed pin. The shared original timestamp conversion and
+OpenPGP v4 key fingerprint implementation are reused, not duplicated.
+SHA1 remains solely the frozen
+OpenPGP v4 fingerprint protocol, never signature or archive authority.
+Native tests retain the original Python compressed refusal fixtures and exact
+key test input, including Ubuntu substitution, stale/future Release and partial
+SHA512 refusal. The preflight still performs a real authenticated debz refresh
+and refuses root mutation; it publishes no exact lock or package CAS authority.
+The separate closure driver and its observation tests remain Python.
+This port does not complete PY3, #262 or #420.
+
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
 archives, `Packages`, the original fixed RSA keyring and authentic signed

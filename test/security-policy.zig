@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 58), members);
+    try testing.expectEqual(@as(usize, 59), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1683,6 +1683,35 @@ test "security: disposable runtime consumers require native copying without a Py
     const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python disposable runtime implementation was restored");
+}
+
+test "security: native Debian readiness keeps pinned freshness, bounded input and actual closure handoffs" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-debian-readiness", "build.zig", &.{
+        "workload_core.dependOn(&debian_readiness_tests.step);",
+        "audit_tests.step.dependOn(&install_debian_readiness.step);",
+        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", b.getInstallPath(.bin, \"debz-debian-stable-readiness\"));",
+    });
+    try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-readiness.zig", &.{
+        "return error.SignerFingerprintChanged;",
+        "return error.InReleaseDigestChanged;",
+        "return error.ReleaseNotFresh;",
+        "return error.SignedIndexIdentityChanged;",
+        "return error.ReadOnlyRefreshMutatedRoot;",
+        "\"refresh\",",
+        ".require_https = true,",
+        ".maximum_decompressed_bytes = maximum_packages_bytes,",
+        "if (now != null or published != null or index_identity != null) return error.InvalidReadinessArguments;",
+    });
+    try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-closure.py", &.{
+        "key = native_readiness(\"--check-key\", input=readiness_fetch(\"key\"))",
+        "native_readiness(\"--check-release\", \"--architecture\", architecture, \"--now\"",
+        "readiness_fetch(\"index\", architecture)",
+    });
+    const restored = try nativeCheck(&f, "native-debian-readiness", "tools/debian-stable-readiness.py", "def fetch(url, limit):\n    return b''\n");
+    defer restored.deinit();
+    try restored.failsWith("retired Python Debian readiness implementation");
 }
 
 test "security: actual integration archive encoding and every fixture consumer require the native repository producer" {
