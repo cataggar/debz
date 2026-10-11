@@ -283,6 +283,26 @@ pub fn build(b: *std.Build) void {
     b.step("test-integration-archive", "Test original archive byte identities and fail-closed encoding").dependOn(&integration_archive_tests.step);
     workload_core.dependOn(&integration_archive_tests.step);
 
+    const native_dpkg_options = b.addOptions();
+    native_dpkg_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    const native_dpkg_module = b.createModule(.{
+        .root_source_file = b.path("tools/prepare-native-dpkg.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_dpkg_module.addImport("debz", debz);
+    native_dpkg_module.addOptions("native_dpkg_options", native_dpkg_options);
+    const native_dpkg = b.addExecutable(.{
+        .name = "debz-native-dpkg-reference",
+        .root_module = native_dpkg_module,
+    });
+    const install_native_dpkg = b.addInstallArtifact(native_dpkg, .{});
+    b.step("build-native-dpkg-reference", "Build pinned independent dpkg preparation and receipt tooling").dependOn(&install_native_dpkg.step);
+    const native_dpkg_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_dpkg_module }));
+    workload_native.dependOn(&native_dpkg_tests.step);
+    const native_dpkg_test_step = b.step("test-native-dpkg-reference", "Run actual native reference selection and preparation refusals");
+    native_dpkg_test_step.dependOn(&native_dpkg_tests.step);
+
     const openpgp_fixture_options = b.addOptions();
     openpgp_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
     const openpgp_fixture_module = b.createModule(.{
@@ -1438,11 +1458,13 @@ pub fn build(b: *std.Build) void {
     native_fixture_module.addImport("debz", debz);
     const native_fixture_options = b.addOptions();
     native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_fixture_options.addOptionPath("native_dpkg_reference", native_dpkg.getEmittedBin());
     native_fixture_options.addOptionPath("integration_signing", integration_signing.getEmittedBin());
     native_fixture_options.addOptionPath("integration_archive", integration_archive.getEmittedBin());
     native_fixture_module.addOptions("native_test_options", native_fixture_options);
     const native_fixture_tests = b.addTest(.{ .root_module = native_fixture_module });
     const run_native_fixture_tests = b.addRunArtifact(native_fixture_tests);
+    native_dpkg_test_step.dependOn(&run_native_fixture_tests.step);
     const native_fixture = b.addExecutable(.{
         .name = "native-materialization-acceptance",
         .root_module = native_fixture_module,

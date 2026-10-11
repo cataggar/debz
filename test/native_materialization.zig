@@ -24,7 +24,7 @@ fn assertApplied(report: foundation.Outcome, operation: []const u8) !void {
 }
 
 fn referencePreparation(allocator: std.mem.Allocator) ![]u8 {
-    return std.fs.path.join(allocator, &.{ options.repository, "tools/prepare-native-dpkg.py" });
+    return std.fs.path.resolve(allocator, &.{ options.repository, options.native_dpkg_reference });
 }
 
 fn expectCliFailure(fixture: *foundation.Fixture, argv: []const []const u8, log: []const u8, diagnostic: []const u8) !void {
@@ -569,13 +569,13 @@ test "production reference selection rejects tampered and symlinked dpkg before 
     const selected = try fixture.absolute("changed-dpkg");
     defer std.testing.allocator.free(selected);
     try expectCliFailure(&fixture, &.{
-        "python3", program, "--architecture", "arm64", "--verify-only", selected,
+        program, "--architecture", "arm64", "--verify-only", selected,
     }, "changed.log", "pinned reference digest mismatch");
     try fixture.dir.symLink(std.testing.io, selected, "symlink-dpkg", .{});
     const link = try fixture.absolute("symlink-dpkg");
     defer std.testing.allocator.free(link);
     try expectCliFailure(&fixture, &.{
-        "python3", program, "--architecture", "arm64", "--verify-only", link,
+        program, "--architecture", "arm64", "--verify-only", link,
     }, "symlink.log", "absolute, non-symlink path");
     try assertAbsent(fixture, "spawned");
 }
@@ -590,7 +590,7 @@ test "old host dpkg remains a fallback but cannot establish named statoverride c
     defer std.testing.allocator.free(path);
     try fixture.environment.put("PATH", path);
     try fixture.run(&.{
-        "python3", program, "--architecture", "arm64", "--check-host",
+        program, "--architecture", "arm64", "--check-host",
     }, "fallback.log", 10);
     const selected_log = try fixture.absolute("fallback.log");
     defer std.testing.allocator.free(selected_log);
@@ -601,7 +601,7 @@ test "old host dpkg remains a fallback but cannot establish named statoverride c
     try std.testing.expect(std.mem.indexOf(u8, output, selected) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Native reference: dpkg (1.22.6)") != null);
     try expectCliFailure(&fixture, &.{
-        "python3", program, "--architecture", "arm64", "--check-host", "--root-accounts",
+        program, "--architecture", "arm64", "--check-host", "--root-accounts",
     }, "old-accounts.log", "requires dpkg >= 1.22.16");
 }
 
@@ -622,7 +622,7 @@ test "pinned archive digest is verified before any extraction" {
     defer std.testing.allocator.free(path);
     try fixture.environment.put("PATH", path);
     try expectCliFailure(&fixture, &.{
-        "python3", program, "--architecture", "arm64", "--fixture-root", root, "--fixture-archive", archive,
+        program, "--architecture", "arm64", "--fixture-root", root, "--fixture-archive", archive,
     }, "invalid-download.log", "pinned reference archive digest mismatch");
     try assertAbsent(fixture, "extracted");
     try assertAbsent(fixture, "download/.cache/native-dpkg-reference/1.22.22/arm64");
@@ -647,7 +647,7 @@ test "tampered reference cache cannot trigger download, repair or host installat
     defer std.testing.allocator.free(path);
     try fixture.environment.put("PATH", path);
     try expectCliFailure(&fixture, &.{
-        "python3", program, "--architecture", "amd64", "--fixture-root", root, "--fixture-archive", missing_archive,
+        program, "--architecture", "amd64", "--fixture-root", root, "--fixture-archive", missing_archive,
     }, "tampered-cache.log", "pinned reference digest mismatch");
     try assertAbsent(fixture, "repaired");
     try assertAbsent(fixture, "cache/.cache/native-dpkg-reference/1.22.22/amd64/reference-receipt-v1.json");
@@ -668,8 +668,8 @@ test "reference preparation rejects root before inspecting cache or archive" {
     const missing_archive = try fixture.absolute("unprivileged/missing.deb");
     defer std.testing.allocator.free(missing_archive);
     try expectCliFailure(&fixture, &.{
-        "python3",           program,         "--architecture",  "arm64", "--fixture-root", root,
-        "--fixture-archive", missing_archive, "--simulate-root",
+        program,             "--architecture", "arm64",           "--fixture-root", root,
+        "--fixture-archive", missing_archive,  "--simulate-root",
     }, "root-refusal.log", "build user, not root");
     try assertAbsent(fixture, "unprivileged/.cache");
 }
@@ -685,7 +685,7 @@ test "offline preparation refuses an unguarded root and escaping archive" {
     const archive = try fixture.absolute("unsafe/archive.deb");
     defer std.testing.allocator.free(archive);
     try expectCliFailure(&fixture, &.{
-        "python3",           program, "--architecture", "arm64", "--fixture-root", unsafe,
+        program,             "--architecture", "arm64", "--fixture-root", unsafe,
         "--fixture-archive", archive,
     }, "wrong-guard.log", "requires a disposable fixture root");
     try assertAbsent(fixture, "unsafe/.cache");
@@ -695,7 +695,7 @@ test "offline preparation refuses an unguarded root and escaping archive" {
     const escaping = try fixture.absolute("guarded/archive.deb");
     defer std.testing.allocator.free(escaping);
     try expectCliFailure(&fixture, &.{
-        "python3",           program,  "--architecture", "arm64", "--fixture-root", guarded,
+        program,             "--architecture", "arm64", "--fixture-root", guarded,
         "--fixture-archive", escaping,
     }, "escaping-archive.log", "fixture archive must be a real file inside the disposable root");
     try assertAbsent(fixture, "guarded/.cache/native-dpkg-reference/1.22.22/arm64");

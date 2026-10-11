@@ -99,6 +99,24 @@ or `DEBZ_INTEGRATION_SIGNING` path; missing support fails before clearing output
 The repository/scenario driver and extra-deb parser are still Python; the
 native archive and signing helpers do not complete PY3 or #420.
 
+`zig build build-native-dpkg-reference` builds the native pinned dpkg
+preparation and receipt CLI, `debz-native-dpkg-reference`. It preserves both
+reviewed dpkg 1.22.22 archive/tool pins, canonical receipt bytes and ordinary
+file modes under the caller's umask. Preparation refuses root, stages a
+private reference without host installation, and never executes foreign
+architecture binaries. `--verify-only`, `--check-host`, `--verify-receipt`
+and `--receipt-from-archive ARCHIVE --prefix PREFIX` retain their distinct
+verification and preparation boundaries. Extracted receipts require owned,
+protected regular inputs; symbolic links, hardlinks and changed bindings
+refuse before receipt publication.
+
+`test-native-dpkg-reference` runs the native receipt regressions and the
+materialization suite's actual preparation/refusal consumers against the
+emitted executable, including custom prefixes. The native workload partition
+also runs these cases. The remaining Python CLI/import and protected staging
+consumers are not yet retired; this native implementation and migrated Zig
+consumer are not full PY3 or no-host-Python acceptance.
+
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
 archives, `Packages`, the original fixed RSA keyring and authentic signed
