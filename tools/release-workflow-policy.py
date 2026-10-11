@@ -63,6 +63,7 @@ CI_GHR_ZIG_JOBS = (
     "integration-required",
     "integration-full",
 )
+RELEASE_GHR_ZIG_JOBS = ("binaries", "smoke")
 
 
 def require(pattern: str, message: str, text: str, flags: int = 0) -> None:
@@ -85,7 +86,7 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
 def audit_zig_installation(ci: str, release: str) -> None:
     for label, text, expected_count in (
         ("ci.yml", ci, len(CI_GHR_ZIG_JOBS)),
-        ("release.yml", release, 1),
+        ("release.yml", release, len(RELEASE_GHR_ZIG_JOBS)),
     ):
         if "mlugg/setup-zig" in text or "use-cache:" in text:
             FAILURES.append(f"{label}: obsolete setup-zig installation or cache input remains")
@@ -105,6 +106,15 @@ def audit_zig_installation(ci: str, release: str) -> None:
     ]
     if len(jobs) != len({name for name, _ in jobs}) or sorted(installed) != sorted(CI_GHR_ZIG_JOBS):
         FAILURES.append("ci.yml: exact verified ghr Zig installs must match the reviewed CI job inventory")
+    release_jobs = re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        release.partition("\njobs:\n")[2],
+    )
+    installed = [
+        name for name, body in release_jobs for _ in range(body.count(GHR_ZIG_INSTALL))
+    ]
+    if len(release_jobs) != len({name for name, _ in release_jobs}) or sorted(installed) != sorted(RELEASE_GHR_ZIG_JOBS):
+        FAILURES.append("release.yml: exact verified ghr Zig installs must match the reviewed release job inventory")
 
 
 def audit_ci_concurrency(ci: str) -> None:

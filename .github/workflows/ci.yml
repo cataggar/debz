@@ -244,7 +244,7 @@ jobs:
         run: |
           workspace="$PWD/.zig-cache/install-action-native"
           mkdir -p "$workspace/plan-root" "$workspace/plan-cache" "$workspace/plan-state"
-          python3 tools/generate-integration-repository.py \
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE" --sha256-only
           cat >"$workspace/fixture.sources" <<EOF
@@ -312,10 +312,10 @@ jobs:
             -Dversion="$VERSION"
           workspace="$PWD/.zig-cache/download-action"
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
-          python3 tools/generate-integration-repository.py \
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable --architecture amd64 \
             --sha256-only
-          python3 tools/generate-integration-repository.py \
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/native-repository" --suite debian-stable --architecture amd64
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
@@ -626,13 +626,10 @@ jobs:
           zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
             -Dversion=0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }} \
             release-install --prefix "$PWD/out/download-container/release"
-          zig build build-integration-archive -Doptimize=ReleaseSafe -j2 --summary all
-          zig build build-integration-signing -Doptimize=ReleaseSafe -j2 --summary all
-          python3 tools/generate-integration-repository.py \
+          zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$PWD/out/download-container/repository" \
-            --suite debian-stable --architecture amd64 --sha256-only \
-            --archive-helper "$PWD/zig-out/bin/debz-integration-archive" \
-            --signing-helper "$PWD/zig-out/bin/debz-integration-signing"
+            --suite debian-stable --architecture amd64 --sha256-only
       - name: Upload container fixture
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -798,7 +795,7 @@ jobs:
         run: |
           workspace="$PWD/.zig-cache/download-native"
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
-          python3 tools/generate-integration-repository.py \
+          "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE"
           cat >"$workspace/fixture.sources" <<EOF

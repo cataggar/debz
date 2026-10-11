@@ -901,18 +901,14 @@ fn archiveExecution(
     helper: []const u8,
     reference: []const u8,
     arch: []const u8,
-    python: []const u8,
     source: []const u8,
     keyring: []const u8,
 ) !void {
     try fixture.directory("executed");
-    const generator = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
+    const generator = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository });
     const repository = try fixture.absolute("executed/repository");
-    const signing_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_signing });
-    const archive_helper = try std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_archive });
     try fixture.run(&.{
-        python,             generator,      "--output",         repository,     "--suite", "debian-stable", "--architecture", arch,
-        "--signing-helper", signing_helper, "--archive-helper", archive_helper,
+        generator, "--output", repository, "--suite", "debian-stable", "--architecture", arch,
     }, "executed/generate.log", 120);
     const source_text = try std.fmt.allocPrint(fixture.allocator, "Types: deb\nURIs: file://{s}\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: {s}\n", .{ repository, arch, keyring });
     try fixture.write("executed/workflow.sources", source_text, 0o644);
@@ -3723,7 +3719,6 @@ pub fn main(init: std.process.Init) !void {
     var helper: ?[]const u8 = null;
     var self: ?[]const u8 = null;
     var cli: ?[]const u8 = null;
-    var python: []const u8 = "python3";
     var executed_only = false;
     var projection_only = false;
     while (args.next()) |arg| {
@@ -3737,8 +3732,6 @@ pub fn main(init: std.process.Init) !void {
             self = args.next() orelse return error.MissingSelf;
         } else if (std.mem.eql(u8, arg, "--cli")) {
             cli = args.next() orelse return error.MissingPublicCli;
-        } else if (std.mem.eql(u8, arg, "--fixture-python")) {
-            python = args.next() orelse return error.MissingFixturePython;
         } else if (std.mem.eql(u8, arg, "--executed-only")) {
             executed_only = true;
         } else if (std.mem.eql(u8, arg, "--projection-only")) {
@@ -3775,7 +3768,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try activeInspection(&fixture, driver, reference.architecture);
     _ = phase_arena.reset(.free_all);
-    try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);
+    try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, source, keyring);
     _ = phase_arena.reset(.free_all);
     try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);
     _ = phase_arena.reset(.free_all);

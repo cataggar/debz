@@ -5,8 +5,8 @@ const fs = debz.root_fs;
 const maximum_bytes = 8 * 1024 * 1024;
 const epoch = 1_700_000_000;
 
-const Entry = struct { name: []const u8, hex: []const u8, mode: u16 };
-const Request = struct {
+pub const Entry = struct { name: []const u8, hex: []const u8, mode: u16 };
+pub const Request = struct {
     control: []const Entry,
     data: []const Entry,
     origin: ?[]const u8 = null,
@@ -123,7 +123,7 @@ fn ar(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, d
     if (data.len % 2 != 0) try append(allocator, out, "\n");
 }
 
-fn encode(io: std.Io, allocator: std.mem.Allocator, workspace: []const u8, request: Request) ![]u8 {
+pub fn encode(io: std.Io, allocator: std.mem.Allocator, workspace: []const u8, request: Request) ![]u8 {
     const control = try tar(allocator, request.control);
     const data = try tar(allocator, request.data);
     if (request.origin) |origin| {
@@ -144,7 +144,7 @@ fn encode(io: std.Io, allocator: std.mem.Allocator, workspace: []const u8, reque
     return out.toOwnedSlice(allocator);
 }
 
-fn extraControl(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+pub fn extraControl(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const outer = switch (debz.deb_archive.parse(bytes, .{
         .max_archive_bytes = maximum_bytes,
         .max_member_bytes = maximum_bytes,
