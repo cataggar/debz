@@ -14,7 +14,6 @@ from pathlib import Path, PurePosixPath
 import re
 import resource
 import shutil
-import shlex
 import signal
 import stat
 import subprocess
@@ -417,50 +416,10 @@ def run_bounded_process(
 
 
 def copy_program(root: Path, source: Path, destination: str) -> None:
-    target = root / validate_absolute_path(destination).lstrip("/")
-    if os.path.lexists(target):
-        if target.is_symlink() or not target.is_file():
-            raise OracleError(f"fixture program destination is unsafe: {target}")
-        return
-    resolved = source.resolve(strict=True)
-    data = read_regular(resolved, Limits.maximum_archive_bytes)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(resolved, target)
-    if data.startswith(b"#!"):
-        interpreter = shlex.split(data.split(b"\n", 1)[0][2:].decode())[0]
-        validate_absolute_path(interpreter)
-        copy_program(root, Path(interpreter), interpreter)
-        return
-
-    output = root / "var/log" / (
-        ".debz-alternatives-ldd-" + sha256_bytes(os.fsencode(destination)) + ".log"
+    validate_absolute_path(destination)
+    m.copy_program(
+        root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,
     )
-    try:
-        returncode = run_bounded_process(
-            ["ldd", str(resolved)],
-            dict(ENVIRONMENT),
-            output,
-            timeout=Limits.dependency_timeout_seconds,
-        )
-        dependencies = read_regular(output, Limits.maximum_output_bytes).decode(
-            errors="backslashreplace"
-        )
-    finally:
-        output.unlink(missing_ok=True)
-    static = any(
-        message in dependencies
-        for message in ("not a dynamic executable", "statically linked")
-    )
-    if returncode and not static:
-        raise OracleError(f"cannot inspect fixture libraries: {source}: {dependencies}")
-    if "=> not found" in dependencies:
-        raise OracleError(f"missing fixture library: {source}: {dependencies}")
-    for name in re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)", dependencies, re.MULTILINE):
-        library = root / validate_absolute_path(name).lstrip("/")
-        library.parent.mkdir(parents=True, exist_ok=True)
-        resolved_library = Path(name).resolve(strict=True)
-        read_regular(resolved_library, Limits.maximum_archive_bytes)
-        shutil.copy2(resolved_library, library)
 
 
 def normalize_output(data: bytes, workspace: Path) -> str:

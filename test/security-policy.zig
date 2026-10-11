@@ -1639,15 +1639,27 @@ test "security: disposable runtime consumers require native copying without a Py
         "b.getInstallStep().dependOn(&install_disposable_runtime.step);",
         "integration_tests.step.dependOn(&install_disposable_runtime.step);",
         "dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);",
+        "dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);",
+        "dpkg_alternatives_reference_tests.step.dependOn(&install_disposable_runtime.step);",
+        "audit_tests.step.dependOn(&install_disposable_runtime.step);",
     });
     try nativeMutations(&f, "native-disposable-runtime", "tools/disposable-root-runtime.zig", &.{
-        "try pin.observeStableAlloc(self.allocator, maximum_file_bytes)",
+        "try pin.observeStableAlloc(self.allocator, self.file_limit)",
         "try context.input.check(context.root);",
         "try context.input.checkParent(context.root, context.directory.?);",
     });
     try nativeMutations(&f, "native-disposable-runtime", "tools/native-materialization-fixtures.py", &.{
         "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
         "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-alternatives-reference.py", &.{
+        "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", ".github/workflows/ci.yml", &.{
+        "          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", "tools/run-dpkg-oracle-isolated.sh", &.{
+        "export DEBZ_DISPOSABLE_RUNTIME",
     });
     const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();

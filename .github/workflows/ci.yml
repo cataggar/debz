@@ -1502,6 +1502,7 @@ jobs:
       - name: Build and test native oracle evidence tooling
         run: |
           zig build build-dpkg-oracle-evidence test-dpkg-oracle-evidence -Doptimize=ReleaseSafe -j2 --summary all
+          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all
       - name: Prepare digest-verified private ARM64 tools
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture arm64)"

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import jsonschema
 
@@ -474,6 +475,40 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         (root / "etc/alternatives").symlink_to(escaped)
         with self.assertRaisesRegex(oracle.OracleError, "state directory is unsafe"):
             oracle.validate_root(root)
+
+    def test_native_runtime_copies_the_real_alternatives_consumer_closure(self) -> None:
+        root = self.workspace / "root"
+        oracle.make_root(root, "amd64", dpkg_runtime=True)
+        source = self.workspace / "choice"
+        source.write_bytes(b"#! '/bin/sh' -e\nexit 0\n")
+        source.chmod(0o751)
+        os.utime(source, ns=(1_700_000_000_123_456_789,) * 2)
+        os.setxattr(source, "user.debz-fixture", b"alternatives original attribute")
+        oracle.copy_program(root, source, "/usr/bin/choice")
+        copied = root / "usr/bin/choice"
+        self.assertEqual(copied.read_bytes(), source.read_bytes())
+        self.assertEqual(copied.stat().st_mode, source.stat().st_mode)
+        self.assertEqual(copied.stat().st_mtime_ns, source.stat().st_mtime_ns)
+        self.assertEqual(os.getxattr(copied, "user.debz-fixture"), os.getxattr(source, "user.debz-fixture"))
+        self.assertEqual((root / "bin/sh").read_bytes(), Path("/bin/sh").read_bytes())
+        self.assertEqual((root / "bin/sleep").read_bytes(), Path("/bin/sleep").read_bytes())
+        oracle.copy_program(root, self.workspace / "absent", "/usr/bin/choice")
+        self.assertEqual(copied.read_bytes(), source.read_bytes())
+
+    def test_native_runtime_is_required_and_preserves_the_alternatives_file_bound(self) -> None:
+        root = self.workspace / "root"
+        oracle.make_root(root, "amd64")
+        source = self.workspace / "choice"
+        source.write_bytes(b"plain static fixture\n")
+        with patch.object(oracle.m, "DISPOSABLE_RUNTIME", self.workspace / "missing-native-runtime"):
+            with self.assertRaises(FileNotFoundError):
+                oracle.copy_program(root, source, "/usr/bin/choice")
+        self.assertFalse((root / "usr/bin/choice").exists())
+        with source.open("wb") as stream:
+            stream.truncate(oracle.Limits.maximum_archive_bytes + 1)
+        with self.assertRaises(oracle.subprocess.CalledProcessError):
+            oracle.copy_program(root, source, "/usr/bin/choice")
+        self.assertFalse((root / "usr/bin/choice").exists())
 
     def test_subprocess_timeout_kills_the_complete_process_group(self) -> None:
         output = self.workspace / "timeout.log"
