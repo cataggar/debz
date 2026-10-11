@@ -4897,6 +4897,7 @@ DISPOSABLE_RUNTIME_PATHS = (
     "tools/native-materialization-fixtures.py", "tools/native-lifecycle-fixtures.py",
     "tools/test-integration-roots.sh",
     "tools/dpkg-alternatives-reference.py",
+    ".github/workflows/ci.yml", "tools/run-dpkg-oracle-isolated.sh",
 )
 
 
@@ -4932,6 +4933,14 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
         DISPOSABLE_RUNTIME_PATHS[6]: (
             "validate_absolute_path(destination)",
             "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[7]: (
+            "          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all",
+        ),
+        DISPOSABLE_RUNTIME_PATHS[8]: (
+            'DEBZ_DISPOSABLE_RUNTIME="$repository/zig-out/bin/debz-disposable-runtime"',
+            'if [ ! -x "$DEBZ_DISPOSABLE_RUNTIME" ]; then',
+            "export DEBZ_DISPOSABLE_RUNTIME",
         ),
         DISPOSABLE_RUNTIME_PATHS[4]: ("runtime = m",),
         DISPOSABLE_RUNTIME_PATHS[5]: (

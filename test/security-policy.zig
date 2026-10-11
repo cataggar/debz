@@ -1654,6 +1654,12 @@ test "security: disposable runtime consumers require native copying without a Py
     try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-alternatives-reference.py", &.{
         "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
     });
+    try nativeMutations(&f, "native-disposable-runtime", ".github/workflows/ci.yml", &.{
+        "          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all",
+    });
+    try nativeMutations(&f, "native-disposable-runtime", "tools/run-dpkg-oracle-isolated.sh", &.{
+        "export DEBZ_DISPOSABLE_RUNTIME",
+    });
     const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python disposable runtime implementation was restored");

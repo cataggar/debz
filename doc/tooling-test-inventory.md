@@ -44,6 +44,9 @@ the native closure before publication; other consumers retain their existing
 including custom install prefixes, and exercise actual copying and missing-tool
 and oversized-source refusal. Original pinned oracle observations and limits
 remain unchanged; its Python observation driver is not retired by this slice.
+The opt-in isolated ARM oracle workflow also builds/tests the helper before
+either reference runs; its empty-environment launcher requires and exports the
+exact repository-native path before any mount or oracle side effect.
 Those build targets bind their emitted or installed helper path, including a
 custom install prefix; standalone Python consumers use the normal `zig-out`
 binary or an explicit `DEBZ_DISPOSABLE_RUNTIME` native executable path.
