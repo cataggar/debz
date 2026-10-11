@@ -5,10 +5,17 @@ Copyright 2026 debz contributors. SPDX-License-Identifier: Apache-2.0.
 `tools/release.py` is an independently authored, network-free release packager
 and validator. Its tag parsing, four-asset plan, complete static ELF validation
 and canonical GNU tar encoder run in the installed Zig `debz-release` helper,
-with `PATH=/no-host-interpreters` and no Python fallback. `DEBZ_RELEASE` selects
-the helper in a custom build prefix. Compression, archive reading, runtime and
-policy validation, packaging and smoke orchestration still use Python's standard
-library; this bounded core port does not complete Python retirement.
+with `PATH=/no-host-interpreters` and no Python fallback. Compression and strict
+container decoding also run in this helper: gzip uses Zig's best-level deflate
+encoder with the original zero timestamp and stable header; XZ uses a separate
+encoder build from the already pinned upstream sources. The product retains its
+decoder-only library. Decoder CRC, completeness, trailing-data, input, output
+and memory limits are enforced before returning a tar payload.
+
+`DEBZ_RELEASE` selects the helper in a custom build prefix. Tar member reading,
+runtime and policy validation, packaging and smoke orchestration still use
+Python's standard library; this bounded core port does not complete Python
+retirement.
 
 Release inputs are rejected when
 they contain links, generated artifacts, cache paths, common secret formats,
@@ -50,9 +57,11 @@ Run the Zig-owned tooling tests with `zig build test-release` (or
 [test inventory](tooling-test-inventory.md) maps the former Python cases to
 their Zig assertions. Packaging the same inputs twice in one controlled
 build environment produces byte-identical gzip and xz assets. Portable audit
-does not assume that different zlib, liblzma, or Python versions emit identical
+does not assume that different deflate, liblzma, or Python implementations emit identical
 compressed bytes: it validates container integrity and canonical stable headers,
 then compares the decompressed tar payload with the canonical tar encoding.
+The native gzip producer can differ byte-for-byte from the former zlib encoder;
+existing immutable archives are neither recompressed nor reinterpreted.
 Names, ordering, timestamps, ownership and modes remain strictly enforced. Each
 release contains exactly four binary archives: gzip and xz for Linux x64 and
 Linux arm64. Verification rejects every extra regular file, including checksum

@@ -1691,6 +1691,7 @@ test "security: actual release core consumes native tags plans ELF mappings and 
     try nativeMutations(&f, "native-release-core", "build.zig", &.{
         "workload_release.dependOn(&release_tool_tests.step);",
         "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
+        "release_tool_module.linkLibrary(release_liblzma);",
     });
     try nativeMutations(&f, "native-release-core", "tools/release.py", &.{
         "return native_release(\"version\", tag).decode().removesuffix(\"\\n\")",
@@ -1698,6 +1699,8 @@ test "security: actual release core consumes native tags plans ELF mappings and 
         "return json.loads(native_release(\"dry-run\", \"--tag\", tag))",
         "\"encode-tar\",",
         "\"PATH\": \"/no-host-interpreters\"",
+        "return native_release(\"compress-tar\", \"--format\", archive_format, input=tar_data)",
+        "native_release(\"decode-tar\", \"--name\", archive_path.name, input=archive_path.read_bytes())",
     });
     try nativeMutations(&f, "native-release-core", "tools/release.zig", &.{
         "if (file_mapping.? != virtual_mapping.?)",
@@ -1705,7 +1708,18 @@ test "security: actual release core consumes native tags plans ELF mappings and 
         "if (tag == 1)",
         "if (terminated and tag != 0)",
         "const padding = (10240 - output.items.len % 10240) % 10240;",
+        "if (input[3] != 0)",
+        "if (!std.mem.allEqual(u8, input[4..8], 0))",
+        "if (produced > maximum_compressed_bytes - output.items.len)",
     });
+    try nativeMutations(&f, "native-release-core", "build/liblzma.zig", &.{
+        "const library = addStaticLibrary(b, xz, target, optimize);",
+        "\"src/liblzma/rangecoder/price_table.c\",",
+    });
+    const encoder_in_product = try f.replace(try f.source("build/liblzma.zig"), "\"HAVE_DECODERS\",", "\"HAVE_DECODERS\", \"HAVE_ENCODERS\",");
+    const invalid = try nativeCheck(&f, "native-release-core", "build/liblzma.zig", encoder_in_product);
+    defer invalid.deinit();
+    try invalid.failsWith("reviewed single-threaded decoder configuration");
 }
 
 test "security: native Debian readiness keeps pinned freshness, bounded input and actual closure handoffs" {

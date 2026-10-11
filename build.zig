@@ -327,6 +327,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The product keeps its decoder-only library; only release tooling encodes XZ.
+    const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
+    release_tool_module.addImport("debz", debz);
+    release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    release_tool_module.addCMacro("LZMA_API_STATIC", "1");
+    release_tool_module.linkLibrary(release_liblzma);
     const release_tool = b.addExecutable(.{ .name = "debz-release", .root_module = release_tool_module });
     const install_release_tool = b.addInstallArtifact(release_tool, .{});
     b.getInstallStep().dependOn(&install_release_tool.step);

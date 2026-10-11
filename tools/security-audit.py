@@ -1923,13 +1923,8 @@ def audit_dependencies() -> None:
     ):
         fail("build linkage differs from documented runtime dependency model")
     liblzma_build = (ROOT / "build/liblzma.zig").read_text()
-    if (
-        "stream_decoder_mt.c" in liblzma_build
-        or "encoder.c" in liblzma_build
-        or '"HAVE_DECODERS"' not in liblzma_build
-        or '"HAVE_CHECK_SHA256"' not in liblzma_build
-    ):
-        fail("repository-local liblzma build is not the reviewed single-threaded decoder configuration")
+    for failure in liblzma_decoder_configuration_failures(liblzma_build):
+        fail(failure)
 
     notices = (ROOT / "THIRD_PARTY_NOTICES").read_text()
     for required in (
@@ -4961,7 +4956,20 @@ DEBIAN_READINESS_PATHS = (
     "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.py",
 )
 
-NATIVE_RELEASE_CORE_PATHS = ("build.zig", "tools/release.zig", "tools/release.py")
+def liblzma_decoder_configuration_failures(text: str) -> list[str]:
+    production = text.partition("\npub fn addStaticEncoderLibrary(")[0]
+    if (
+        "stream_decoder_mt.c" in production
+        or "encoder.c" in production
+        or '"HAVE_ENCODERS"' in production
+        or '"HAVE_DECODERS"' not in production
+        or '"HAVE_CHECK_SHA256"' not in production
+    ):
+        return ["repository-local liblzma build is not the reviewed single-threaded decoder configuration"]
+    return []
+
+
+NATIVE_RELEASE_CORE_PATHS = ("build.zig", "build/liblzma.zig", "tools/release.zig", "tools/release.py")
 
 
 def native_release_core_failures(texts: dict[str, str]) -> list[str]:
@@ -4972,6 +4980,16 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             "workload_release.dependOn(&release_tool_tests.step);",
             'run_release_policy_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));',
             "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
+            "const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);",
+            "const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);",
+            "release_tool_module.linkLibrary(release_liblzma);",
+        ),
+        "build/liblzma.zig": (
+            "pub fn addStaticEncoderLibrary(",
+            "const library = addStaticLibrary(b, xz, target, optimize);",
+            '"src/liblzma/rangecoder/price_table.c",',
+            '"HAVE_ENCODER_LZMA1"',
+            '"HAVE_ENCODER_LZMA2"',
         ),
         "tools/release.py": (
             '"PATH": "/no-host-interpreters"',
@@ -4981,6 +4999,8 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             'return json.loads(native_release("dry-run", "--tag", tag))',
             '"encode-tar",',
             'base64.b64encode(data).decode()',
+            'return native_release("compress-tar", "--format", archive_format, input=tar_data)',
+            'native_release("decode-tar", "--name", archive_path.name, input=archive_path.read_bytes())',
         ),
         "tools/release.zig": (
             "pub fn parseTag(",
@@ -4996,6 +5016,14 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             "if (terminated and tag != 0)",
             'tarHeader("././@LongLink", 0, 0, name.len + 1, \'L\', true)',
             "const padding = (10240 - output.items.len % 10240) % 10240;",
+            "std.compress.flate.Compress.init(&writer, history, .gzip, .best)",
+            "output[8] = 2;",
+            "output[9] = 255;",
+            "c.lzma_easy_encoder(&stream, 9, c.LZMA_CHECK_CRC64)",
+            "if (produced > maximum_compressed_bytes - output.items.len)",
+            "if (input[3] != 0)",
+            "if (!std.mem.allEqual(u8, input[4..8], 0))",
+            "debz.metadata_decompression.decompress(allocator, format, input",
         ),
     }
     failures = [
@@ -5003,7 +5031,8 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
     ]
-    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT"):
+    failures.extend(liblzma_decoder_configuration_failures(texts.get("build/liblzma.zig", "")))
+    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT", "gzip.GzipFile(", "lzma.compress(", "zlib.decompressobj(", "lzma.LZMADecompressor("):
         if retired in texts.get("tools/release.py", ""):
             failures.append("tools/release.py: retired release core implementation was restored")
     return failures

@@ -15,7 +15,14 @@ Its original tag/plan/tar/ELF implementations are removed rather than retained
 as fallbacks. Native tests cover load/dynamic file and virtual mappings, overflow,
 loader/shared-library refusals, long names and signed epochs.
 
-The remaining compression, archive reading, dependency/runtime/policy checks,
+Compression and strict compressed-container decoding now also use the native
+helper: Zig's best-level gzip encoder and a tooling-only encoder build from the
+existing pinned XZ sources. The product retains its decoder-only library.
+Native cases verify deterministic output, both decoded original tar payloads,
+checksum damage, trailing data and forbidden gzip metadata. Portable compressed
+input validation does not equate deflate implementations' compressed bytes.
+
+The remaining tar member reading, dependency/runtime/policy checks,
 packaging/publication and smoke orchestration still use Python. This bounded
 core migration does not complete PY2 or no-host-Python release qualification.
 Existing twelve real release consumer cases still exercise both compression

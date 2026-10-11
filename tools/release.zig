@@ -1,5 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const debz = @import("debz");
+const c = @cImport({
+    @cInclude("lzma.h");
+});
 
 const Platform = enum {
     @"linux-x64",
@@ -108,6 +112,84 @@ const Dynamic = struct { offset: u64, address: u64, size: u64, memory_size: u64 
 const maximum_tar_bytes = 256 * 1024 * 1024;
 const maximum_entries = 4096;
 const Entry = struct { name: []const u8, bytes: ?[]const u8, mode: u32 };
+const maximum_compressed_bytes = maximum_tar_bytes + 16 * 1024 * 1024;
+
+const Format = enum {
+    @"tar.gz",
+    @"tar.xz",
+
+    fn parse(value: []const u8) !Format {
+        return std.meta.stringToEnum(Format, value) orelse refuse("unsupported archive format: {s}", .{value});
+    }
+};
+
+fn compressTar(allocator: std.mem.Allocator, input: []const u8, format: Format) ![]u8 {
+    if (input.len > maximum_tar_bytes) return refuse("release payload exceeds the bounded256MiB limit", .{});
+    if (format == .@"tar.gz") {
+        const bound = @min(maximum_compressed_bytes, input.len + input.len / 16 + 8192);
+        const output = try allocator.alloc(u8, bound);
+        errdefer allocator.free(output);
+        var writer = std.Io.Writer.fixed(output);
+        const history = try allocator.alloc(u8, std.compress.flate.max_window_len);
+        defer allocator.free(history);
+        var encoder = try std.compress.flate.Compress.init(&writer, history, .gzip, .best);
+        try encoder.writer.writeAll(input);
+        try encoder.finish();
+        output[8] = 2;
+        output[9] = 255;
+        return allocator.realloc(output, writer.end);
+    }
+    if (c.lzma_easy_encoder_memusage(9) > 1024 * 1024 * 1024)
+        return refuse("release XZ encoder exceeds its memory limit", .{});
+    var stream = std.mem.zeroes(c.lzma_stream);
+    const initialized = c.lzma_easy_encoder(&stream, 9, c.LZMA_CHECK_CRC64);
+    if (initialized != c.LZMA_OK) return refuse("release XZ encoder initialization failed: {d}", .{initialized});
+    defer c.lzma_end(&stream);
+    stream.next_in = input.ptr;
+    stream.avail_in = input.len;
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const before = stream.avail_in;
+        stream.next_out = &chunk;
+        stream.avail_out = chunk.len;
+        const result = c.lzma_code(&stream, c.LZMA_FINISH);
+        const produced = chunk.len - stream.avail_out;
+        if (produced > maximum_compressed_bytes - output.items.len)
+            return refuse("release compressed payload exceeds its limit", .{});
+        try output.appendSlice(allocator, chunk[0..produced]);
+        if (result == c.LZMA_STREAM_END) {
+            if (stream.avail_in != 0) return refuse("release XZ encoder left unconsumed input", .{});
+            return output.toOwnedSlice(allocator);
+        }
+        if (result != c.LZMA_OK or (produced == 0 and before == stream.avail_in))
+            return refuse("release XZ encoder failed: {d}", .{result});
+    }
+}
+
+fn decompressedTar(allocator: std.mem.Allocator, input: []const u8, name: []const u8) ![]u8 {
+    const format: debz.metadata_decompression.Compression = if (std.mem.endsWith(u8, name, ".tar.gz")) blk: {
+        if (input.len < 18 or !std.mem.eql(u8, input[0..3], "\x1f\x8b\x08"))
+            return refuse("archive is not gzip: {s}", .{name});
+        if (input[3] != 0) return refuse("gzip header is not canonical: {s}", .{name});
+        if (!std.mem.allEqual(u8, input[4..8], 0)) return refuse("gzip timestamp is not canonical: {s}", .{name});
+        break :blk .gzip;
+    } else if (std.mem.endsWith(u8, name, ".tar.xz")) blk: {
+        if (!std.mem.startsWith(u8, input, "\xfd7zXZ\x00"))
+            return refuse("archive is not xz: {s}", .{name});
+        break :blk .xz;
+    } else return refuse("unsupported archive format: {s}", .{name});
+    return debz.metadata_decompression.decompress(allocator, format, input, .{
+        .maximum_compressed_bytes = maximum_compressed_bytes,
+        .maximum_decompressed_bytes = maximum_tar_bytes,
+        .maximum_decoder_memory = 256 * 1024 * 1024,
+    }) catch |err| switch (err) {
+        error.Truncated => refuse("{s} stream is incomplete: {s}", .{ @tagName(format), name }),
+        error.TrailingData => refuse("{s} stream has trailing data: {s}", .{ @tagName(format), name }),
+        else => refuse("invalid compressed archive {s}: {s}", .{ name, @errorName(err) }),
+    };
+}
 
 fn tarNumber(field: []u8, value: i64) !void {
     if (value < 0 or @as(u64, @intCast(value)) >= (@as(u64, 1) << @intCast(3 * (field.len - 1)))) {
@@ -327,6 +409,20 @@ fn execute(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len < 2) return refuse("a release subcommand is required", .{});
+    const compress = std.mem.eql(u8, args[1], "compress-tar");
+    const decompress = std.mem.eql(u8, args[1], "decode-tar");
+    if (compress or decompress) {
+        if (args.len != 4 or !std.mem.eql(u8, args[2], if (compress) "--format" else "--name"))
+            return refuse("compression requires a selected format or archive name and binary stdin", .{});
+        var reader = std.Io.File.stdin().reader(init.io, &.{});
+        const input = try reader.interface.allocRemaining(allocator, .limited(if (compress) maximum_tar_bytes else maximum_compressed_bytes));
+        const output = if (compress)
+            try compressTar(allocator, input, try Format.parse(args[3]))
+        else
+            try decompressedTar(allocator, input, args[3]);
+        try std.Io.File.stdout().writeStreamingAll(init.io, output);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "encode-tar")) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--epoch")) return refuse("encode-tar requires --epoch and JSON stdin", .{});
         const epoch = try std.fmt.parseInt(i64, args[3], 10);
@@ -487,4 +583,45 @@ test "release GNU tar preserves long names, signed epochs and canonical record p
     try std.testing.expectEqualStrings(name, std.mem.sliceTo(tar[1024..1536], 0));
     try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** 12), tar[136..148]);
     try std.testing.expectError(error.InvalidReleaseInput, buildTar(allocator, &.{.{ .name = "../escape", .bytes = "x", .mode = 0o644 }}, 123));
+}
+
+test "release compression is deterministic and both containers preserve the original tar payload" {
+    const allocator = std.testing.allocator;
+    const tar = try buildTar(allocator, &.{.{ .name = "root/bin/debz", .bytes = "original payload", .mode = 0o755 }}, 123);
+    defer allocator.free(tar);
+    for ([_]Format{ .@"tar.gz", .@"tar.xz" }) |format| {
+        const name = try std.mem.concat(allocator, u8, &.{ "fixture.", @tagName(format) });
+        defer allocator.free(name);
+        const first = try compressTar(allocator, tar, format);
+        defer allocator.free(first);
+        const second = try compressTar(allocator, tar, format);
+        defer allocator.free(second);
+        try std.testing.expectEqualSlices(u8, first, second);
+        const decoded = try decompressedTar(allocator, first, name);
+        defer allocator.free(decoded);
+        try std.testing.expectEqualSlices(u8, tar, decoded);
+    }
+}
+
+test "release decoders reject trailing input corruption and noncanonical gzip metadata" {
+    const allocator = std.testing.allocator;
+    for ([_]Format{ .@"tar.gz", .@"tar.xz" }) |format| {
+        const name = try std.mem.concat(allocator, u8, &.{ "fixture.", @tagName(format) });
+        defer allocator.free(name);
+        const bytes = try compressTar(allocator, "original payload", format);
+        defer allocator.free(bytes);
+        const trailing = try std.mem.concat(allocator, u8, &.{ bytes, "junk" });
+        defer allocator.free(trailing);
+        try std.testing.expectError(error.InvalidReleaseInput, decompressedTar(allocator, trailing, name));
+        bytes[bytes.len - 1] ^= 1;
+        try std.testing.expectError(error.InvalidReleaseInput, decompressedTar(allocator, bytes, name));
+        bytes[bytes.len - 1] ^= 1;
+        if (format == .@"tar.gz") {
+            bytes[4] = 1;
+            try std.testing.expectError(error.InvalidReleaseInput, decompressedTar(allocator, bytes, name));
+            bytes[4] = 0;
+            bytes[3] = 8;
+            try std.testing.expectError(error.InvalidReleaseInput, decompressedTar(allocator, bytes, name));
+        }
+    }
 }
