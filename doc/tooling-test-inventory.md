@@ -30,6 +30,16 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`zig build generate-openpgp-fixtures` is the actual native RSA/Ed25519
+verification-fixture generator. All 34 original output arrays are compared
+byte-for-byte, including expiry, revocation, binding, critical-subpacket and
+frozen/moving Release fixtures. The required `test-openpgp-fixtures` core
+suite executes the compiled generator under a no-interpreter PATH and binds
+its complete emitted source to those originals, then tests regeneration and
+symbolic/hardlink refusal. Only the source's generator comment changes.
+The old Python module remains import-only for the not-yet-ported integration
+repository producer; its real cryptography dependency is not retired.
+
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
 archives, `Packages`, the original fixed RSA keyring and authentic signed

@@ -4,133 +4,11 @@ const std = @import("std");
 const debz = @import("debz");
 const options = @import("baseline_fixture_options");
 const fs = debz.root_fs;
+const pgp = @import("fixture-openpgp.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
-const created = 1_700_000_000;
-const uid = "debz hermetic archive fixture <fixture.invalid>";
 const names = [_][]const u8{ "alpha.deb", "beta.deb", "Packages", "keyring.gpg", "InRelease" };
 const maximum_fixture_bytes = 64 * 1024;
-
-const modulus_bytes = fixedBytes(
-    "e63d9b520091f3e49cad49e7323f1e9298b89a81a8c35641739eb2b1363fbfa7" ++
-        "1323fa95ecb19119dfd508354cd81c144559f41b81e31c4a0c71558bdfd0f7d7" ++
-        "adc4e84f0a56a0ecf9e627a83faf42a636c0b9d1b20832a889376023984219f5" ++
-        "597affd38deb202bc24618b71612fdcb4f58276aa52e1ac1df8ec3e8e90c8391" ++
-        "a7418ebbaa0ad2e8d122012d915631192968bed9311fb269173dcf9fce0b846e" ++
-        "13e8f6c9bc494a4121dd8834a44de6a17ac3b4e1c65c6993a74b057f2eb2bdcc" ++
-        "9f5ac98ab5cdaa495c8d184d8f5547d5318cad77b1e22ad1245cfd906aefcaf5" ++
-        "167d1a07ceab995092bd09fd30c8a1a00896bda72c0f9fa31f6af21a83040bdd",
-);
-const fixture_private_exponent = fixedBytes(
-    "0578c257b50ec2ea9474a3d47c43b6c0ca235cfca6db9991ada34060e8c6a411" ++
-        "dee9147bfaa78fa8bb428f52e0f423dab1793d4d680d532f49536a328c4ba590" ++
-        "391f7c5be08585868c3bd5867099042efa0f237b61cd4312f14be11b87734eb5" ++
-        "9f7e46552b42c2bd777cfdfa5fea6ca0a7ce93053c4eb7b112d48c405d45805c" ++
-        "eabc9b2876975411f635adb510f5ee3da8c1222b5dad9295a4052c3c7f425785" ++
-        "08ef96509d2d4293bf9a511ea529eb6411abce9be266173fdd42319dff3fbd9b" ++
-        "c57ef4e6c553facb10aefffcf883ba91a8cdfd9661c5b4fc432d36074c5f4884" ++
-        "c1acc45facc60a7dae0cd424351e6eb8a45125fa3f294875eec60e3edd8d5ffb",
-);
-
-fn fixedBytes(comptime hex: []const u8) [hex.len / 2]u8 {
-    var bytes: [hex.len / 2]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, hex) catch unreachable;
-    return bytes;
-}
-
-fn integer(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime T: type, value: T) !void {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &bytes, value, .big);
-    try out.appendSlice(allocator, &bytes);
-}
-
-fn mpi(out: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
-    const first = std.mem.indexOfNone(u8, raw, &.{0}) orelse raw.len;
-    const value = raw[first..];
-    const bits = if (value.len == 0) 0 else value.len * 8 - @clz(value[0]);
-    try integer(out, allocator, u16, @intCast(bits));
-    try out.appendSlice(allocator, value);
-}
-
-fn packet(allocator: std.mem.Allocator, tag: u8, body: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.append(allocator, 0xc0 | tag);
-    if (body.len < 192) {
-        try out.append(allocator, @intCast(body.len));
-    } else if (body.len < 8384) {
-        const adjusted = body.len - 192;
-        try out.appendSlice(allocator, &.{ @intCast((adjusted >> 8) + 192), @intCast(adjusted & 255) });
-    } else {
-        return error.FixturePacketTooLarge;
-    }
-    try out.appendSlice(allocator, body);
-    return out.toOwnedSlice(allocator);
-}
-
-fn subpacket(allocator: std.mem.Allocator, tag: u8, body: []const u8) ![]u8 {
-    if (body.len + 1 >= 192) return error.FixturePacketTooLarge;
-    return std.mem.concat(allocator, u8, &.{ &.{ @intCast(body.len + 1), tag }, body });
-}
-
-fn keyPrefix(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.append(allocator, 0x99);
-    try integer(&out, allocator, u16, @intCast(body.len));
-    try out.appendSlice(allocator, body);
-    return out.toOwnedSlice(allocator);
-}
-
-fn signature(
-    allocator: std.mem.Allocator,
-    kind: u8,
-    parts: []const []const u8,
-    fingerprint: [20]u8,
-    timestamp: u32,
-    flags: ?u8,
-) ![]u8 {
-    var time: [4]u8 = undefined;
-    std.mem.writeInt(u32, &time, timestamp, .big);
-    var issuer: [21]u8 = undefined;
-    issuer[0] = 4;
-    issuer[1..].* = fingerprint;
-    var hashed: std.ArrayList(u8) = .empty;
-    try hashed.appendSlice(allocator, try subpacket(allocator, 2, &time));
-    try hashed.appendSlice(allocator, try subpacket(allocator, 33, &issuer));
-    if (flags) |value| try hashed.appendSlice(allocator, try subpacket(allocator, 27, &.{value}));
-    var prefix: std.ArrayList(u8) = .empty;
-    try prefix.appendSlice(allocator, &.{ 4, kind, 1, 8 });
-    try integer(&prefix, allocator, u16, @intCast(hashed.items.len));
-    try prefix.appendSlice(allocator, hashed.items);
-    var trailer: [6]u8 = .{ 4, 0xff, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, trailer[2..6], @intCast(prefix.items.len), .big);
-    var hash = Sha256.init(.{});
-    for (parts) |part| hash.update(part);
-    hash.update(prefix.items);
-    hash.update(&trailer);
-    const digest = hash.finalResult();
-    const digest_info = fixedBytes("3031300d060960864801650304020105000420");
-    var encoded: [256]u8 = @splat(0xff);
-    encoded[0] = 0;
-    encoded[1] = 1;
-    const separator = encoded.len - digest_info.len - digest.len - 1;
-    encoded[separator] = 0;
-    @memcpy(encoded[separator + 1 ..][0..digest_info.len], &digest_info);
-    @memcpy(encoded[encoded.len - digest.len ..], &digest);
-    const Modulus = std.crypto.ff.Modulus(2048);
-    const modulus = try Modulus.fromBytes(&modulus_bytes, .big);
-    const message = try Modulus.Fe.fromBytes(modulus, &encoded, .big);
-    const signed = try modulus.powWithEncodedExponent(message, &fixture_private_exponent, .big);
-    var raw_signature: [256]u8 = undefined;
-    try signed.toBytes(&raw_signature, .big);
-    var body: std.ArrayList(u8) = .empty;
-    try body.appendSlice(allocator, prefix.items);
-    const unhashed = try subpacket(allocator, 16, fingerprint[12..20]);
-    try integer(&body, allocator, u16, @intCast(unhashed.len));
-    try body.appendSlice(allocator, unhashed);
-    try body.appendSlice(allocator, digest[0..2]);
-    try mpi(&body, allocator, &raw_signature);
-    return packet(allocator, 2, body.items);
-}
 
 fn tar(allocator: std.mem.Allocator, name: []const u8, content: []const u8) ![]u8 {
     if (name.len >= 100 or content.len > 512) return error.FixtureTarTooLarge;
@@ -197,23 +75,19 @@ fn fixtures(allocator: std.mem.Allocator) ![names.len][]const u8 {
         ));
     }
     result[2] = packages.items[0 .. packages.items.len - 1];
-    var public_body: std.ArrayList(u8) = .empty;
-    try public_body.append(allocator, 4);
-    try integer(&public_body, allocator, u32, created);
-    try public_body.append(allocator, 1);
-    try mpi(&public_body, allocator, &modulus_bytes);
-    try mpi(&public_body, allocator, &.{ 1, 0, 1 });
-    const key_prefix = try keyPrefix(allocator, public_body.items);
-    var fingerprint: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash(key_prefix, &fingerprint, .{});
+    const public_body = try pgp.Key.primary.publicBody(allocator);
+    const key_prefix = try pgp.keyPrefix(allocator, public_body);
+    const fingerprint = try pgp.fingerprint(allocator, public_body);
     var uid_prefix: std.ArrayList(u8) = .empty;
     try uid_prefix.append(allocator, 0xb4);
-    try integer(&uid_prefix, allocator, u32, uid.len);
-    try uid_prefix.appendSlice(allocator, uid);
+    try pgp.integer(&uid_prefix, allocator, u32, pgp.uid.len);
+    try uid_prefix.appendSlice(allocator, pgp.uid);
     result[3] = try std.mem.concat(allocator, u8, &.{
-        try packet(allocator, 6, public_body.items),
-        try packet(allocator, 13, uid),
-        try signature(allocator, 0x13, &.{ key_prefix, uid_prefix.items }, fingerprint, created, 0x03),
+        try pgp.packet(allocator, 6, public_body),
+        try pgp.packet(allocator, 13, pgp.uid),
+        try pgp.signature(allocator, .primary, 0x13, &.{ key_prefix, uid_prefix.items }, fingerprint, .{
+            .extra_hashed = try pgp.subpacket(allocator, 27, &.{0x03}),
+        }),
     });
     var sha256: [32]u8 = undefined;
     var sha512: [64]u8 = undefined;
@@ -229,22 +103,7 @@ fn fixtures(allocator: std.mem.Allocator) ![names.len][]const u8 {
             "SHA512:\n {s} {d} main/binary-amd64/Packages\n",
         .{ std.fmt.bytesToHex(sha256, .lower), result[2].len, std.fmt.bytesToHex(sha512, .lower), result[2].len },
     );
-    const canonical = try std.mem.replaceOwned(u8, allocator, release[0 .. release.len - 1], "\n", "\r\n");
-    const signed = try signature(allocator, 0x01, &.{canonical}, fingerprint, 1_788_739_200, null);
-    const encoder = std.base64.standard.Encoder;
-    const encoded = try allocator.alloc(u8, encoder.calcSize(signed.len));
-    _ = encoder.encode(encoded, signed);
-    var envelope: std.ArrayList(u8) = .empty;
-    try envelope.appendSlice(allocator, "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n");
-    try envelope.appendSlice(allocator, release);
-    try envelope.appendSlice(allocator, "-----BEGIN PGP SIGNATURE-----\n\n");
-    var offset: usize = 0;
-    while (offset < encoded.len) : (offset += 64) {
-        try envelope.appendSlice(allocator, encoded[offset..@min(offset + 64, encoded.len)]);
-        try envelope.append(allocator, '\n');
-    }
-    try envelope.appendSlice(allocator, "-----END PGP SIGNATURE-----\n");
-    result[4] = try envelope.toOwnedSlice(allocator);
+    result[4] = try pgp.clearsign(allocator, .primary, fingerprint, release, .{ .timestamp = 1_788_739_200 });
     return result;
 }
 

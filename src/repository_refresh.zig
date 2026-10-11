@@ -3415,7 +3415,7 @@ test "non-frozen snapshot digests and cache encodings stay byte-identical" {
 const frozen_test_bounded: ExpiryPolicy = .{
     .allow_missing_valid_until_with_max_age_seconds = 2_678_400,
 };
-// Dates in tools/generate-openpgp-fixtures.py.
+// Dates in tools/generate-openpgp-fixtures.zig.
 const frozen_test_date: i64 = 1_680_307_200; // Sat, 01 Apr 2023 00:00:00
 const witness_updates_date: i64 = 1_699_992_000; // Tue, 14 Nov 2023 20:00:00
 const witness_security_date: i64 = 1_699_995_600; // Tue, 14 Nov 2023 21:00:00
