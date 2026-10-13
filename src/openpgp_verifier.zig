@@ -523,7 +523,7 @@ fn parseKey(body: []const u8, primary: ?[20]u8, is_primary: bool) !Key {
     };
 }
 
-fn fingerprintV4(body: []const u8) [20]u8 {
+pub fn fingerprintV4(body: []const u8) [20]u8 {
     var hash = std.crypto.hash.Sha1.init(.{});
     hash.update(&.{ 0x99, @intCast(body.len >> 8), @intCast(body.len & 0xff) });
     hash.update(body);

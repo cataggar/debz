@@ -1433,7 +1433,7 @@ fn releaseAgeSeconds(now: i64, date: i64) u64 {
     return @intCast(std.math.sub(i64, now, date) catch std.math.maxInt(i64));
 }
 
-fn timestampUnix(timestamp: release_metadata.Timestamp) i64 {
+pub fn timestampUnix(timestamp: release_metadata.Timestamp) i64 {
     const year: i64 = timestamp.year;
     const adjusted_year = year - @intFromBool(timestamp.month <= 2);
     const era = @divFloor(adjusted_year, 400);

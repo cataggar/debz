@@ -300,11 +300,12 @@ def verify_source_bindings(reference: dict[str, Any]) -> None:
         raise OracleError("vendor config execution requirement identities changed")
 
     dpkg = source["dpkg"]
-    if dpkg["version"] != lifecycle.m.reference_dpkg.VERSION:
+    description = lifecycle.m.reference_description()
+    if dpkg["version"] != description["version"]:
         raise OracleError("dpkg reference version binding changed")
     if dpkg["configuration_sha256"] != sha256_bytes(PINNED_DPKG_CONFIG):
         raise OracleError("dpkg configuration binding changed")
-    for architecture, pins in lifecycle.m.reference_dpkg.PINS.items():
+    for architecture, pins in description["architectures"].items():
         expected = dpkg["architectures"][architecture]
         if (
             pins["archive"] != expected["archive_sha256"]
@@ -1806,16 +1807,16 @@ def select_reference(path: Path | None, architecture: str) -> str:
         selected = (
             ROOT
             / ".cache/native-dpkg-reference"
-            / lifecycle.m.reference_dpkg.VERSION
+            / lifecycle.m.reference_description()["version"]
             / architecture
             / "usr/bin/dpkg"
         )
         if not selected.is_file():
             raise OracleError(
                 "missing pinned dpkg reference; run "
-                "python3 tools/prepare-native-dpkg.py as the build user"
+                "zig-out/bin/debz-native-dpkg-reference as the build user"
             )
-    return lifecycle.m.reference_dpkg.select(selected, architecture)
+    return lifecycle.m.select_reference(selected, architecture)
 
 
 def write_capture(path: Path, observed: dict[str, Any]) -> None:

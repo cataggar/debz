@@ -531,7 +531,12 @@
   ],
   "historical_reference_paths": [
     {
-      "path": "tools/prepare-native-dpkg.py",
+      "path": "tools/debian-stable-readiness.zig",
+      "role": "read_only_pinned_signed_input_preflight",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "tools/prepare-native-dpkg.zig",
       "role": "pinned_reference_transport",
       "retain_after_cutover": true
     },

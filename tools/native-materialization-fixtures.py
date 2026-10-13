@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 import hashlib
 import importlib.util
 import json
@@ -24,12 +25,9 @@ DISPOSABLE_RUNTIME = Path(os.environ.get(
     "DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",
 ))
 
-REFERENCE_SPEC = importlib.util.spec_from_file_location(
-    "debz_reference_dpkg", REPOSITORY / "tools/prepare-native-dpkg.py",
-)
-assert REFERENCE_SPEC and REFERENCE_SPEC.loader
-reference_dpkg = importlib.util.module_from_spec(REFERENCE_SPEC)
-REFERENCE_SPEC.loader.exec_module(reference_dpkg)
+NATIVE_REFERENCE = Path(os.environ.get(
+    "DEBZ_NATIVE_DPKG_REFERENCE", REPOSITORY / "zig-out/bin/debz-native-dpkg-reference",
+))
 
 SPEC = importlib.util.spec_from_file_location(
     "debz_native_differential", REPOSITORY / "tools/native-differential.py"
@@ -38,6 +36,35 @@ assert SPEC and SPEC.loader
 oracle = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = oracle
 SPEC.loader.exec_module(oracle)
+
+
+def native_reference(*arguments: str) -> str:
+    if not NATIVE_REFERENCE.is_absolute():
+        raise ValueError(f"native reference helper requires an absolute path: {NATIVE_REFERENCE}")
+    return subprocess.run(
+        [str(NATIVE_REFERENCE), *arguments], cwd=REPOSITORY,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
+        env={**os.environ, "LC_ALL": "C"}, timeout=120, check=True,
+    ).stdout
+
+
+@lru_cache(maxsize=1)
+def reference_description() -> dict:
+    return json.loads(native_reference("--describe"))
+
+
+def verify_reference(path: Path, architecture: str, tool: str = "dpkg") -> None:
+    native_reference("--architecture", architecture, "--verify-binding", str(path), "--tool", tool)
+
+
+def select_reference(
+    executable: Path | None, architecture: str, *, root_accounts: bool = False,
+) -> str:
+    arguments = ["--architecture", architecture]
+    arguments.extend(("--select", str(executable)) if executable is not None else ("--check-host",))
+    if root_accounts:
+        arguments.append("--root-accounts")
+    return native_reference(*arguments).strip()
 
 
 def run(argv: list[str], environment: dict[str, str], log: Path) -> None:

@@ -90,7 +90,7 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
                     "dpkg_sha256": pins["executable"],
                     "update_alternatives_sha256": pins["update_alternatives"],
                 }
-                for architecture, pins in oracle.m.reference_dpkg.PINS.items()
+                for architecture, pins in oracle.m.reference_description()["architectures"].items()
             },
         )
         self.assertEqual(

@@ -13,7 +13,6 @@ therefore permitted.
 import argparse
 import datetime
 import hashlib
-import importlib.util
 import json
 import lzma
 import os
@@ -26,9 +25,37 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-_SPEC = importlib.util.spec_from_file_location("debian_stable_readiness", ROOT / "tools/debian-stable-readiness.py")
-readiness = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(readiness)
+READINESS = pathlib.Path(os.environ.get(
+    "DEBZ_DEBIAN_STABLE_READINESS", ROOT / "zig-out/bin/debz-debian-stable-readiness",
+))
+
+
+def native_readiness(*arguments, input=None):
+    if not READINESS.is_absolute():
+        raise ValueError(f"native Debian readiness helper requires an absolute path: {READINESS}")
+    result = subprocess.run(
+        [str(READINESS), *arguments], input=input, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=120, check=False,
+        env={**os.environ, "PATH": "/no-host-interpreters"},
+    )
+    if result.returncode:
+        raise ValueError(f"native Debian readiness refused: {result.stderr.decode(errors='replace')}")
+    return result.stdout
+
+
+def readiness_fetch(kind, architecture=None):
+    arguments = [f"--fetch-{kind}"]
+    if architecture is not None:
+        arguments += ["--architecture", architecture]
+    return native_readiness(*arguments)
+
+
+def readiness_index_counts(compressed, index):
+    identity = {field: index[field] for field in ("index_size", "index_sha256", "package_records")}
+    return json.loads(native_readiness(
+        "--check-index", "--index-identity", json.dumps(identity, separators=(",", ":")), input=compressed,
+    ))
+
 
 PIN_PATH = ROOT / "tools/fixtures/debian-stable-readiness-v1.json"
 EVIDENCE_DIR = ROOT / "tools/fixtures/debian-stable-closure-v1"
@@ -192,7 +219,7 @@ def review_lock(lock, pin, architecture, request):
 
 def signed_records(compressed, index):
     """Maps (package, version, architecture) to its signed Filename, Size, and SHA256."""
-    readiness.index_counts(compressed, index)
+    readiness_index_counts(compressed, index)
     text = lzma.decompress(compressed).decode("utf-8")
     records = {}
     for paragraph in text.split("\n\n"):
@@ -329,7 +356,7 @@ def run(args, now):
     inventory_tool = args.inventory.resolve(strict=True)
     if not debz.is_file() or not inventory_tool.is_file():
         raise ValueError("debz and inventory executables must be regular files")
-    key = readiness.decode_key(readiness.fetch(pin["signer"]["url"], readiness.MAX_KEY_BYTES), pin["signer"])
+    key = native_readiness("--check-key", input=readiness_fetch("key"))
     verify_keyring(KEYRING, key)
     workspace = new_workspace(args.workspace)
     evidence = workspace / "evidence"
@@ -372,11 +399,10 @@ def run(args, now):
 
     if any((workspace / "root").iterdir()):
         raise ValueError("lock resolution or download mutated the empty root")
-    base = f"{pin['snapshot_uri']}/dists/{pin['suite']}/"
-    armored = readiness.fetch(base + "InRelease", readiness.MAX_RELEASE_BYTES)
-    readiness.release_index(armored, pin, architecture, now)
+    armored = readiness_fetch("release", architecture)
+    native_readiness("--check-release", "--architecture", architecture, "--now", str(int(now.timestamp())), input=armored)
     index = pin["architectures"][architecture]
-    records = signed_records(readiness.fetch(base + index["index_path"], readiness.MAX_INDEX_BYTES), index)
+    records = signed_records(readiness_fetch("index", architecture), index)
 
     locks = {}
     union = {}

@@ -45,7 +45,7 @@ require_protected_file() {
 checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-python3-reference.sh" ]]
 require_protected_file "$checkout/tools/real-snapshot-python3-reference.sh"
-require_protected_file "$checkout/tools/prepare-native-dpkg.py"
+require_protected_file "$checkout/zig-out/bin/debz-native-dpkg-reference"
 require_protected_file "$checkout/tools/real_snapshot_python_fixtures.py"
 require_protected_file "$checkout/tools/real_snapshot_less_fixtures.py"
 require_protected_file "$checkout/tools/real_snapshot_reference_paths.py"
@@ -102,7 +102,7 @@ for path in "$script_root" "$dpkg_root" \
   [[ ! -e "$path" && ! -L "$path" ]]
   case "$path" in "$source_root"/*) exit 2 ;; esac
 done
-python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
+zig-out/bin/debz-native-dpkg-reference --architecture amd64 --verify-only "$pinned"
 [[ $(sha256sum "$pinned" | cut -d' ' -f1) == \
   0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5 ]]
 

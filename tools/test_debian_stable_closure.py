@@ -76,8 +76,7 @@ class CommittedEvidenceTests(unittest.TestCase):
             datetime=TrappedClock, timezone=datetime.timezone, timedelta=datetime.timedelta,
         )
         with mock.patch.object(closure, "datetime", trapped), \
-                mock.patch.object(closure.readiness, "datetime", trapped), \
-                mock.patch.object(closure.readiness, "fetch", side_effect=AssertionError("network used")):
+                mock.patch.object(closure, "readiness_fetch", side_effect=AssertionError("network used")):
             document = closure.check_evidence()
         self.assertEqual(document["freshness"]["expires_at"], "2026-10-13T07:55:41Z")
         # Only live re-resolution refuses after expiry, and with a typed result.
@@ -230,7 +229,7 @@ class LockReviewTests(unittest.TestCase):
             closure.signed_records(repeated, {
                 "index_size": len(repeated), "index_sha256": closure.sha256(repeated), "package_records": 2,
             })
-        with self.assertRaisesRegex(ValueError, "signed Release identity"):
+        with self.assertRaisesRegex(ValueError, "SignedIndexIdentityChanged"):
             closure.signed_records(lzma.compress(paragraphs.replace(b"Size: 10", b"Size: 11")), index)
 
 
@@ -244,7 +243,7 @@ class FreshnessAndHostTests(unittest.TestCase):
             debz=ROOT / "missing-debz", inventory=ROOT / "missing-inventory",
             architecture="amd64", workspace=workspace,
         )
-        with mock.patch.object(closure.readiness, "fetch", side_effect=AssertionError("network used")):
+        with mock.patch.object(closure, "readiness_fetch", side_effect=AssertionError("network used")):
             with self.assertRaisesRegex(closure.PinExpired, "pin_expired: .*expired at 2026-10-13T07:55:41.*#330"):
                 closure.run(args, expiry + datetime.timedelta(seconds=1))
         self.assertFalse(workspace.exists())

@@ -40,7 +40,7 @@ require_protected_file() {
 
 checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-less-reference.sh" ]]
-for file in tools/real-snapshot-less-reference.sh tools/prepare-native-dpkg.py \
+for file in tools/real-snapshot-less-reference.sh zig-out/bin/debz-native-dpkg-reference \
   tools/real_snapshot_less_fixtures.py tools/real_snapshot_reference_paths.py \
   src/fixtures/ubuntu-resolute-less.preinst src/fixtures/ubuntu-resolute-less.postinst; do require_protected_file "$checkout/$file"; done
 require_protected_path "$checkout/.real-snapshot"
@@ -76,7 +76,7 @@ for path in "$script_root" "$dpkg_root" "$bad_script" "$bad_mode" \
   [[ ! -e "$path" && ! -L "$path" ]]
   case "$path" in "$source_root"/*) exit 2 ;; esac
 done
-python3 tools/prepare-native-dpkg.py --architecture arm64 --verify-only "$pinned"
+zig-out/bin/debz-native-dpkg-reference --architecture arm64 --verify-only "$pinned"
 for source in "$lock" "$less_lock" "$dash_lock"; do
   [[ $(jq -r '.target_architecture' "$source") == arm64 ]]
 done

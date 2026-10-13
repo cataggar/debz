@@ -114,6 +114,55 @@ Descriptor outputs must not overlap the repository and URLs refuse newlines.
 Ordinary published file/directory modes retain the caller's umask.
 These fixture tooling ports do not complete PY3 or #420.
 
+`zig build build-native-dpkg-reference` builds the native pinned dpkg
+preparation and receipt CLI, `debz-native-dpkg-reference`. It preserves both
+reviewed dpkg 1.22.22 archive/tool pins, canonical receipt bytes and ordinary
+file modes under the caller's umask. Preparation refuses root, stages a
+private reference without host installation, and never executes foreign
+architecture binaries. `--verify-only`, `--check-host`, `--verify-receipt`
+and `--receipt-from-archive ARCHIVE --prefix PREFIX` retain their distinct
+verification and preparation boundaries. Extracted receipts require owned,
+protected regular inputs; symbolic links, hardlinks and changed bindings
+refuse before receipt publication. `--download-archive` publishes only an
+authenticated archive to a new protected file; `--verify-binding --tool`
+hashes the selected archive or tool without executing it. `--select` retains
+the separate genuine version probe, and `--describe` supplies the original
+version/pins to still-Python oracle provenance consumers without duplicating
+the authority.
+
+`test-native-dpkg-reference` runs the native receipt regressions and the
+materialization suite's actual preparation/refusal consumers against the
+emitted executable, including custom prefixes. The native workload partition
+also runs these cases. The actual Python preparation helper and imported
+receipt test are retired: the equivalent archive/receipt refusal cases run
+in Zig for both architectures, with independent dpkg-deb fixtures. Every CI
+preparation, protected download/receipt/verification and remaining Python
+oracle consumer now calls the native implementation. Protected compilation
+occurs only after the existing compiler and checkout trust checks; foreign
+tools are never executed during preparation. Identity-checked bounded cleanup
+refuses a substituted staging tree and does not follow extracted links.
+This helper retirement is not full PY3 or no-host-Python acceptance.
+
+`zig build build-debian-stable-readiness test-debian-stable-readiness` builds
+the actual native read-only Debian preflight. It retains the original reviewed
+key armor/binary/fingerprint, InRelease and both index pins, bounded real-time
+freshness, HTTPS-only acquisition, xz limits and every published SHA256 check.
+The real closure tool uses its required native CLI for acquisition and key,
+Release and index verification, including a custom installation prefix via
+`DEBZ_DEBIAN_STABLE_READINESS`. There is no Python readiness implementation or
+fallback. Explicit `--now` and supplied index identities are limited to
+read-only verification handoffs; the normal preflight always uses the real
+clock and compiled reviewed pin. The shared original timestamp conversion and
+OpenPGP v4 key fingerprint implementation are reused, not duplicated.
+SHA1 remains solely the frozen
+OpenPGP v4 fingerprint protocol, never signature or archive authority.
+Native tests retain the original Python compressed refusal fixtures and exact
+key test input, including Ubuntu substitution, stale/future Release and partial
+SHA512 refusal. The preflight still performs a real authenticated debz refresh
+and refuses root mutation; it publishes no exact lock or package CAS authority.
+The separate closure driver and its observation tests remain Python.
+This port does not complete PY3, #262 or #420.
+
 `zig build generate-native-baseline-fixture` replaces the actual Python
 baseline generator. It regenerates the two canonical uncompressed `.deb`
 archives, `Packages`, the original fixed RSA keyring and authentic signed
