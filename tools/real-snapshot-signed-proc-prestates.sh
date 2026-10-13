@@ -3,7 +3,7 @@
 # sudo proc replays from the authenticated amd64 closure that
 # tools/real-snapshot-signed-proc-bindings.sh downloaded into WORKSPACE.
 # Pinned dpkg installs that exact closure in the reviewed reference order;
-# tools/real-snapshot-reference-order.py copies the root just before each
+# debz-reference-order copies the root just before each
 # target is configured. Systemd and udev are copied after dpkg recorded
 # half-configured and was denied execution of the unchanged signed postinst;
 # sudo is copied while it is still unpacked. The copies are disposable
@@ -93,7 +93,12 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   exit 2
 }
 require_protected_file "$script_path"
-require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
+require_protected_file "$repository_root/build.zig"
+require_protected_file "$repository_root/build.zig.zon"
+require_protected_file "$repository_root/tools/real-snapshot-reference-order.zig"
+require_protected_file "$repository_root/tools/real_snapshot_reference_paths.zig"
+require_protected_file "$repository_root/tools/real-snapshot-reference-paths.sh"
+source "$repository_root/tools/real-snapshot-reference-paths.sh"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-guest.zig"
@@ -108,6 +113,7 @@ zig=$(command -v "${DEBZ_ZIG:-zig}") || {
 }
 zig=$(realpath -- "$zig")
 require_protected_file "$zig"
+reference_toolchain "$zig" >/dev/null
 require_protected_path "$repository_root/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
   echo "the fixture directory must be root-owned and mode 0700" >&2
@@ -277,6 +283,11 @@ runtime=$tools/reference-runtime
   amd64 "$lock" "$cache" "$pinned" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
 cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
+"$zig" build build-reference-order -Doptimize=ReleaseSafe -j2 \
+  --cache-dir "$tools/zig-cache" --global-cache-dir "$tools/zig-global-cache" \
+  --prefix "$tools/order-tool"
+order=$tools/order-tool/bin/debz-reference-order
+require_protected_file "$order"
 
 # This oracle has only the four reviewed packages registered. Its one possible
 # libc6 callback is denied before exec; --pending is never used on the closure.
@@ -294,7 +305,7 @@ require_protected_file "$tools/libcap-ng.so.0.0.0"
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 5m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$order" \
     --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prove-base-cycle "$tools/setpriv"
@@ -304,7 +315,7 @@ if [[ $purpose == python3 ]]; then
   env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
     unshare --mount --propagation private -- \
     timeout --signal=TERM --kill-after=30s 20m \
-    python3 -B tools/real-snapshot-reference-order.py \
+    "$order" \
       --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
       --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
       --prestate "python3:amd64=unpacked:$prestates/python3"
@@ -318,7 +329,7 @@ fi
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 20m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$order" \
     --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prestate "systemd:amd64=half-configured:$prestates/systemd" \

@@ -160,19 +160,19 @@ test "security: actual reference diagnostic commands retain independent failure 
         \\exit "$order_rc"
         \\
     ;
-    try f.work.write("python3", order_double);
     try f.work.write("order-tool/bin/debz-reference-order", order_double);
     const prelude =
         \\set -euo pipefail
         \\export workspace=$1 order_rc=$2 source_rc=$3 native_rc=$4 reference_rc=$5 compare_rc=$6 probe_rc=77
         \\export PATH="$workspace:$PATH"
-        \\chmod 700 "$workspace/python3" "$workspace/order-tool/bin/debz-reference-order" "$workspace/trigger-authority-tool/bin/debz-reference-trigger-authority"
+        \\chmod 700 "$workspace/order-tool/bin/debz-reference-order" "$workspace/trigger-authority-tool/bin/debz-reference-trigger-authority"
         \\evidence=$workspace/evidence
         \\mkdir -p "$evidence"
         \\: > "$workspace/events"
         \\zig=compiler_double
         \\compiler_double() { printf 'compiler:%s\n' "$*" >> "$workspace/events"; }
         \\timeout() { shift 3; "$@"; }
+        \\reference_protected_path() { printf 'protected-path:%s\n' "$*" >> "$workspace/events"; }
         \\architecture=arm64 lock=$workspace/original.lock cache=$workspace/original-cache
         \\reference_root=$workspace/reference-root reference_dpkg=$workspace/pinned-dpkg
         \\launcher=$workspace/launcher runtime=$workspace/runtime
@@ -216,7 +216,7 @@ test "security: actual reference diagnostic commands retain independent failure 
         defer support.allocator.free(events);
         try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "authority:inspect-original arm64 {s}/original.lock {s}/original-cache", .{ f.work.root, f.work.root }));
         // The one reviewed trigger handler may run only with the independent transition verifier.
-        try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "independent-order:tools/real-snapshot-reference-order.py --launcher {s}/launcher --runtime {s}/runtime --architecture arm64 --dpkg {s}/pinned-dpkg --root {s}/reference-root --trigger-authority {s}/trigger-authority-tool/bin/debz-reference-trigger-authority --cache {s}/original-cache --evidence {s}/evidence\n", .{ f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root }));
+        try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "protected-path:{s}/order-tool/bin/debz-reference-order file\nindependent-order:--launcher {s}/launcher --runtime {s}/runtime --architecture arm64 --dpkg {s}/pinned-dpkg --root {s}/reference-root --trigger-authority {s}/trigger-authority-tool/bin/debz-reference-trigger-authority --cache {s}/original-cache --evidence {s}/evidence\n", .{ f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root }));
         const refused = case.order != 0;
         const observations_ok = case.source == 0 and case.native == 0 and case.reference == 0;
         try testing.expectEqual(refused, std.mem.indexOf(u8, events, "authority:probe-trigger-authority") != null);
@@ -1069,7 +1069,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 60), members);
+    try testing.expectEqual(@as(usize, 63), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2932,19 +2932,18 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    request.ifru.flags.UP = true;\n",
         "    if (applied != .SUCCESS) return applied;\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
-        "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
-        "                if not target.is_relative_to(library):\n",
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.zig", &.{
+        "    if (payload.len != size or !std.mem.eql(u8, &actual, digest))",
+        "                return error.ToolchainLibrarySymlinkEscapes;\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
         "  printf -- '-Dreference-protected-profile-scripts=%s\\n' \"$profiles\"\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/test_real_snapshot_reference_protected.py", &.{
-        "    profiles = prove_profiles(args, scripts)\n",
-        "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
-        "    \"udev\": (\"proc-pid-only\",),\n",
-        "            if control.returncode != 0 or control.stdout != expected:\n",
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected.zig", &.{
+        "        const profile_result = try self.proveProfiles(signed_scripts);\n",
+        "&.{ \"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\" } else &.{\"proc-pid-only\"}",
+        "observed.code == 0 and eq(u8, observed.stdout, \"DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\\n\")",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
@@ -2956,7 +2955,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     const workflow = try f.source(".github/workflows/ci.yml");
     const ci_script = try f.source("tools/real-snapshot-reference-protected-ci.sh");
-    const harness = try f.source("tools/test_real_snapshot_reference_protected.py");
+    const harness = try f.source("tools/real-snapshot-reference-protected.zig");
     const gate = "    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)\n";
     const stage = "      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n";
     for ([_]struct { path: []const u8, text: []const u8 }{
@@ -2970,7 +2969,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: amd64\n            runner: ubuntu-24.04\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE", "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE") },
         .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "trap collect EXIT\n", "trap collect EXIT\nexit 0\n") },
         .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "  -Doptimize=ReleaseSafe -j2 --summary all\n", "  -Doptimize=ReleaseSafe -j2 --summary all || true\n") },
-        .{ .path = "tools/test_real_snapshot_reference_protected.py", .text = try f.replace(harness, "    profiles = prove_profiles(args, scripts)\n", "    profiles = \"skipped\"\n    unittest.SkipTest\n") },
+        .{ .path = "tools/real-snapshot-reference-protected.zig", .text = try f.replace(harness, "        const profile_result = try self.proveProfiles(signed_scripts);\n", "        const profile_result = \"skipped\"; // SkipTest\n") },
     }) |mutation| {
         const refused = try nativeCheck(&f, "protected-reference", mutation.path, mutation.text);
         defer refused.deinit();

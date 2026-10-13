@@ -25,7 +25,7 @@ for relative in ("tools/real-snapshot-python3-protected-stage.sh",
                  "tools/real-snapshot-python3-reference.sh",
                  "tools/real-snapshot-signed-proc-bindings.sh",
                  "tools/real-snapshot-signed-proc-prestates.sh",
-                 "tools/real-snapshot-reference-order.py",
+                 "tools/real-snapshot-reference-order.zig",
                  "tools/real_snapshot_python_fixtures.py",
                  "tools/real_snapshot_less_fixtures.py",
                  "tools/real_snapshot_reference_paths.py"):

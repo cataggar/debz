@@ -966,7 +966,8 @@ compare per-listener ordering and state with pinned dpkg. The reviewed
 proof and native comparison remain outstanding. The current
 launcher's normal configure path has an exact
 `["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
-profile for any of them. The Python command builder refuses every other trigger
+profile for any of them. The native command builder (`dpkgCommand` in
+`tools/real-snapshot-reference-order.zig`) refuses every other trigger
 verb, including attempts to reuse those configure-only profiles. Until
 these distinct identities and closure ordering are proved, finalization
 refuses rather than silently changing `--pending` behavior. Privileged
