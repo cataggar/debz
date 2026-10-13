@@ -37,6 +37,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_release_original_smoke:
+        description: "Smoke the immutable original v0.3.0 linux-x64 gzip and xz release archives on hosted amd64"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -2228,6 +2233,37 @@ jobs:
         run: |
           zig build build-release-tool -j2
           tools/release-workflow-policy.py
+
+  release-original-smoke:
+    name: Original v0.3.0 release smoke (linux-x64)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_release_original_smoke
+    # A disposable hosted amd64 VM provides the gh, curl, xz, readelf and jq this
+    # host-tool smoke uses and keeps the downloaded historical binary and Sigstore
+    # trust state off the persistent paid pool. Checkout keeps no credentials and
+    # the smoke step receives no token or secret.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Smoke immutable original v0.3.0 linux-x64 archives
+        timeout-minutes: 10
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$RUNNER_ARCH" = X64
+          test -z "$(git status --porcelain)"
+          tools/release-original-smoke.sh linux-x64 "$RUNNER_TEMP/release-original-smoke"
+      - name: Upload original release smoke observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-original-smoke-linux-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/release-original-smoke/observations/
+          if-no-files-found: error
+          retention-days: 14
 
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)

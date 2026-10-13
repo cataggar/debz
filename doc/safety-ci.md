@@ -211,6 +211,33 @@ independently selected by their existing inputs. Omitting `run_full_matrix`
 or setting it to `true` retains full manual coverage, including
 `integration-full`.
 
+The opt-in `release-original-smoke` job runs only for a `workflow_dispatch`
+with `run_release_original_smoke: true`. It runs
+`tools/release-original-smoke.sh` against the immutable original v0.3.0
+linux-x64 gzip and xz release archives. Before anything is decoded, extracted
+or executed, the script verifies the reviewed evidence under
+`security/release-originals/v0.3.0/`, the exact downloaded sizes and digests,
+and the GitHub build provenance in the committed Sigstore bundles: release
+workflow signer, tag and source commit, original run invocation and a
+GitHub-hosted builder. It then records independent member, mode, size,
+content digest, static ELF and runtime-metadata observations, and runs
+`version`, `-h` and `--help` from each extraction with
+`PATH=/no-host-interpreters` and a 60-second timeout. The job uses a
+disposable GitHub-hosted `ubuntu-24.04` amd64 runner because the smoke needs
+that image's `gh`, `curl`, `xz`, `readelf` and `jq`, and because it executes
+a downloaded historical binary that should not run on the persistent paid
+pool. It has only `contents: read`, checkout keeps no credentials, and the
+smoke step receives no token or secret. It uploads the
+`release-original-smoke-linux-x64-<commit>` observations artifact even when
+the smoke fails. `tools/security-audit.py` and `test/security-policy.zig` pin
+the job body, the script's check order and every evidence digest.
+
+```sh
+gh workflow run ci.yml --repo cataggar/debz --ref main \
+  -f run_full_matrix=false \
+  -f run_release_original_smoke=true
+```
+
 The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
 gate selected by the `run_native_real_snapshot` dispatch input. It builds the
 production candidate and Zig comparator, prepares the hash-pinned dpkg oracle

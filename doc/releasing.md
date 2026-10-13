@@ -59,3 +59,13 @@ explicit runner-temporary directory rather than a preexisting host installation.
 Release packaging, installed metadata checks and native archive smoke use the
 installed Zig release CLI. This release-tooling boundary is separate from
 whole-repository no-Python acceptance and the native-only product cutover.
+
+Native `verify --smoke` refuses archives published before the installed
+cutover policies, because the v0.3.0 archives lack
+`share/debz/digest-cutover-policy.json`. The dispatch-only
+`run_release_original_smoke` CI input instead runs
+`tools/release-original-smoke.sh` on hosted amd64 against the immutable
+original linux-x64 gzip and xz assets. It verifies the pinned bytes and the
+committed provenance bundles before extracting or executing anything, compares
+independent member and metadata expectations, and never recompresses,
+re-signs or republishes history. See [safety CI](safety-ci.md).

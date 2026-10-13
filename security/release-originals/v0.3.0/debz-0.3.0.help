@@ -1,0 +1,32 @@
+debz - deterministic Debian package operations
+
+Usage:
+  debz <command> [options] [packages...]
+
+Commands:
+  repo                         Manage repository descriptors
+  package-cache                Prepare an exact-lock package CAS
+  transaction-result           Verify a completed transaction result
+  refresh                      Refresh authenticated repository metadata
+  install                      Install one package
+  remove                       Remove one package
+  upgrade                      Upgrade installed packages or named packages
+  upgrade-all                  Upgrade every eligible installed package
+  reinstall                    Reinstall one package
+  download                     Download one package without installing it
+  plan                         Plan a transaction for zero or one package
+  list-installed               List installed packages
+  list-available               List available packages
+  info                         Show information for one or more packages
+  provides                     Find providers for one or more capabilities
+  why                          Explain why one or more packages are installed
+  clean                        Clean cached package artifacts
+  recover                      Recover an interrupted transaction
+  package-family-capabilities  Print package-family capabilities as JSON
+  version                      Print the version and exit
+
+Options:
+  -h, --help                   Show this help
+
+Run 'debz <command> --help' for command-specific help.
+No host APT configuration, keyrings, proxy, or credentials are inherited.

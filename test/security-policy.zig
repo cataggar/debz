@@ -2974,3 +2974,59 @@ test "security: root reference capability proof stays required outside the sudo-
     defer missing.deinit();
     try testing.expectEqual(@as(u8, 1), missing.code);
 }
+
+test "security: original v0.3.0 release smoke stays dispatch-only, hosted, read-only and verify-first" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const kind = "release-original-smoke";
+    try nativeMutations(&f, kind, ".github/workflows/ci.yml", &.{"      run_release_original_smoke:\n"});
+    try nativeMutationsIn(&f, kind, ".github/workflows/ci.yml", "  release-original-smoke:\n", "\n  fuzz:\n", &.{
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_release_original_smoke\n",
+        "    permissions:\n      contents: read\n",
+        "          persist-credentials: false\n",
+        "          test \"$(git rev-parse HEAD)\" = \"$GITHUB_SHA\"\n",
+        "          test -z \"$(git status --porcelain)\"\n",
+        "          test \"$RUNNER_ARCH\" = X64\n",
+        "          tools/release-original-smoke.sh linux-x64 \"$RUNNER_TEMP/release-original-smoke\"\n",
+        "          if-no-files-found: error\n",
+    });
+    try nativeMutations(&f, kind, "tools/release-original-smoke.sh", &.{
+        "(cd -- \"$evidence\" && printf '%s  %s\\n' \"${pins[@]}\" | sha256sum --check --strict --quiet)\n",
+        "check_size \"$work/assets/$stem.tar.xz\" \"$xz_size\"\n",
+        " --deny-self-hosted-runners",
+        "      and .[0].verificationResult.signature.certificate.runInvocationURI == $invocation\n",
+        "cmp -- \"$work/$stem.tar-gz\" \"$work/$stem.tar-xz\"\n",
+        "  cmp -- \"$evidence/$stem.elf\" \"$observations/elf-tar-$format.txt\"\n",
+        "    test ! -s \"$observations/probe-tar-$format-$name.stderr\"\n",
+        "  rm -rf -- \"$smoke\"\n",
+    });
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const smoke_script = try f.source("tools/release-original-smoke.sh");
+    const gate = "    if: github.event_name == 'workflow_dispatch' && inputs.run_release_original_smoke\n";
+    const smoke_step = "      - name: Smoke immutable original v0.3.0 linux-x64 archives\n        timeout-minutes: 10\n";
+    const decode = "gzip --decompress --stdout -- \"$work/assets/$stem.tar.gz\" > \"$work/$stem.tar-gz\"\n";
+    const size_check = "check_size \"$work/assets/$stem.tar.gz\" \"$gz_size\"\n";
+    for ([_]struct { path: []const u8, text: []const u8 }{
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, gate, "    if: github.event_name != 'pull_request' || inputs.run_release_original_smoke\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    runs-on: ubuntu-24.04\n    timeout-minutes: 15\n", "    runs-on: [self-hosted, Linux, X64, ubuntu2604]\n    timeout-minutes: 15\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    permissions:\n      contents: read\n", "    permissions:\n      contents: read\n      id-token: write\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, smoke_step, smoke_step ++ "        continue-on-error: true\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, smoke_step, smoke_step ++ "        env:\n          GH_TOKEN: ${{ github.token }}\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "\n  fuzz:\n", "\n  release-original-smoke-arm64:\n    runs-on: ubuntu-24.04-arm\n    steps:\n      - run: tools/release-original-smoke.sh linux-arm64 \"$RUNNER_TEMP/smoke\"\n\n  fuzz:\n") },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(try f.replace(smoke_script, decode, ""), size_check, decode ++ size_check) },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(smoke_script, "      > \"$observations/provenance-tar-$format.json\"\n", "      > \"$observations/provenance-tar-$format.json\" || true\n") },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(smoke_script, "  tar --extract ", "  sudo tar --extract ") },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(smoke_script, "/runs/33984408974/attempts/1\n", "/runs/33984408974/attempts/2\n") },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(smoke_script, "    gz_size=6923082\n", "    gz_size=6923083\n") },
+        .{ .path = "tools/release-original-smoke.sh", .text = try f.replace(smoke_script, "  d915cc95", "  e915cc95") },
+    }) |mutation| {
+        const refused = try nativeCheck(&f, kind, mutation.path, mutation.text);
+        defer refused.deinit();
+        if (refused.code == 0) std.debug.print("unchecked {s} mutation in {s}\n", .{ kind, mutation.path });
+        try testing.expectEqual(@as(u8, 1), refused.code);
+        try refused.failsWith("security-audit:");
+    }
+    const missing = try nativeCheck(&f, kind, "tools/release-original-smoke.sh", null);
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.code);
+}

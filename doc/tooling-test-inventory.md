@@ -37,6 +37,11 @@ itself without embedding the secret markers it detects. A fourth runs complete
 after the pinned directory check, and refuses an unrunnable host binary. The real consumers exercise both compression
 formats, full binary/archive checks and all four assets. Complete byte-level
 crosschecks retain the unchanged original implementation outside the repository.
+Native `verify --smoke` refuses the immutable v0.3.0 originals, so the
+dispatch-only `release-original-smoke` CI job smoke-tests them instead. It
+replaces no Python case. The Zig test `security: original v0.3.0 release
+smoke stays dispatch-only, hosted, read-only and verify-first` mutation-tests
+its job body, script check order, forbidden fallbacks and evidence pins.
 
 | Previous case | Zig test (`test/release-tooling.zig`, `release:` prefix) |
 | --- | --- |

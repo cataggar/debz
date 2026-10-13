@@ -3988,6 +3988,160 @@ def signed_proc_ci_failures(text: str) -> list[str]:
     return failures
 
 
+# --- Original v0.3.0 release smoke (#420 PY2) ---------------------------------
+# `debz-release verify --smoke` refuses archives that predate the digest cutover
+# policy, so a dispatch-only hosted amd64 job applies the same smoke protocol to
+# the immutable original archives with host tools. Every pin, the committed
+# Sigstore bundles and the independent expectations are checked before any
+# decoding, extraction or execution.
+RELEASE_ORIGINAL_SMOKE_PATHS = (".github/workflows/ci.yml", "tools/release-original-smoke.sh")
+RELEASE_ORIGINAL_EVIDENCE = "security/release-originals/v0.3.0"
+RELEASE_ORIGINAL_SMOKE_INPUT = (
+    "      run_release_original_smoke:\n"
+    '        description: "Smoke the immutable original v0.3.0 linux-x64 gzip and xz release archives on hosted amd64"\n'
+    "        required: true\n"
+    "        type: boolean\n"
+    "        default: false\n"
+)
+RELEASE_ORIGINAL_SMOKE_JOB = (
+    "    name: Original v0.3.0 release smoke (linux-x64)\n"
+    "    if: github.event_name == 'workflow_dispatch' && inputs.run_release_original_smoke\n"
+    "    # A disposable hosted amd64 VM provides the gh, curl, xz, readelf and jq this\n"
+    "    # host-tool smoke uses and keeps the downloaded historical binary and Sigstore\n"
+    "    # trust state off the persistent paid pool. Checkout keeps no credentials and\n"
+    "    # the smoke step receives no token or secret.\n"
+    "    runs-on: ubuntu-24.04\n"
+    "    timeout-minutes: 15\n"
+    "    permissions:\n"
+    "      contents: read\n"
+    "    steps:\n"
+    "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+    "        with:\n"
+    "          persist-credentials: false\n"
+    "      - name: Smoke immutable original v0.3.0 linux-x64 archives\n"
+    "        timeout-minutes: 10\n"
+    "        run: |\n"
+    '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
+    '          test "$RUNNER_ARCH" = X64\n'
+    '          test -z "$(git status --porcelain)"\n'
+    '          tools/release-original-smoke.sh linux-x64 "$RUNNER_TEMP/release-original-smoke"\n'
+    "      - name: Upload original release smoke observations\n"
+    "        if: ${{ always() }}\n"
+    "        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n"
+    "        with:\n"
+    "          name: release-original-smoke-linux-x64-${{ github.sha }}\n"
+    "          path: ${{ runner.temp }}/release-original-smoke/observations/\n"
+    "          if-no-files-found: error\n"
+    "          retention-days: 14\n"
+)
+RELEASE_ORIGINAL_SMOKE_PINS = (
+    "readonly repository=cataggar/debz\n",
+    "readonly download=https://github.com/cataggar/debz/releases/download/v0.3.0\n",
+    "readonly source_ref=refs/tags/v0.3.0\n",
+    "readonly source_commit=abdcd27e034a05ea25ed7e4bd5d9d44ca0242938\n",
+    "readonly signer=https://github.com/cataggar/debz/.github/workflows/release.yml@refs/tags/v0.3.0\n",
+    "readonly issuer=https://token.actions.githubusercontent.com\n",
+    "readonly invocation=https://github.com/cataggar/debz/actions/runs/33984408974/attempts/1\n",
+    "readonly predicate=https://slsa.dev/provenance/v1\n",
+    "readonly gzip_header=1f8b08000000000002ff\n",
+    "    gz_size=6923082\n",
+    "    gz_sha256=21477d40cebc41feae31ac29babe9b68c128e15eb5cf9c29a7f4cf9d063dd7e4\n",
+    "    xz_size=5096384\n",
+    "    xz_sha256=7394fcf69d0445be2207add0b0776b81e43de6b62cc467d0b71ec959e0ed3925\n",
+    "    tar_size=24852480\n",
+    "    tar_sha256=e1a0ca2589426e579923a66df47f88ddea8ef1849523f69f0ebce7e91ad6eaf8\n",
+)
+# Each step must occur exactly once, in this order.
+RELEASE_ORIGINAL_SMOKE_ORDER = (
+    "set -euo pipefail\n",
+    "if [[ $(uname --machine) != \"$machine\" ]]; then\n",
+    'mkdir --mode=0700 -- "$2"\n',
+    "(cd -- \"$evidence\" && printf '%s  %s\\n' \"${pins[@]}\" | sha256sum --check --strict --quiet)\n",
+    "curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\\n",
+    'check_size "$work/assets/$stem.tar.gz" "$gz_size"\n',
+    'check_size "$work/assets/$stem.tar.xz" "$xz_size"\n',
+    "(cd -- \"$work/assets\" && printf '%s  %s\\n' \"$gz_sha256\" \"$stem.tar.gz\" \"$xz_sha256\" \"$stem.tar.xz\" \\\n",
+    'gh attestation verify "$work/assets/$stem.tar.$format" \\\n',
+    '--bundle "$evidence/provenance-tar-$format.sigstore.jsonl" \\\n',
+    '--repo "$repository" --cert-identity "$signer" --cert-oidc-issuer "$issuer" \\\n',
+    '--signer-digest "$source_commit" --source-ref "$source_ref" --source-digest "$source_commit" \\\n',
+    '--predicate-type "$predicate" --deny-self-hosted-runners --format json \\\n',
+    'jq --exit-status --arg name "$stem.tar.$format" --arg digest "$digest"',
+    "and [.[0].verificationResult.statement.subject[] | select(.name == $name)]\n",
+    "== [{name: $name, digest: {sha256: $digest}}]\n",
+    "and .[0].verificationResult.signature.certificate.runInvocationURI == $invocation\n",
+    'gzip --decompress --stdout -- "$work/assets/$stem.tar.gz" > "$work/$stem.tar-gz"\n',
+    'xz --decompress --stdout -- "$work/assets/$stem.tar.xz" > "$work/$stem.tar-xz"\n',
+    "(cd -- \"$work\" && printf '%s  %s\\n' \"$tar_sha256\" \"$stem.tar-gz\" \"$tar_sha256\" \"$stem.tar-xz\" \\\n",
+    'cmp -- "$work/$stem.tar-gz" "$work/$stem.tar-xz"\n',
+    'test "$(tr -d \' \\n\' < "$observations/gzip-header.txt")" = "$gzip_header"\n',
+    '= "1 1 $xz_size $tar_size CRC64 0"\n',
+    'cmp -- "$evidence/$stem.members" "$observations/members.txt"\n',
+    "awk 'NF != 6 || $2 != \"root/root\" { exit 1 }' \"$observations/tar-named.txt\"\n",
+    'mkdir --mode=0700 -- "$smoke"\n',
+    'tar --extract --preserve-permissions --no-same-owner --file "$work/$stem.tar-$format" --directory "$smoke"\n',
+    'cmp -- "$evidence/$stem.tree" "$observations/tree-tar-$format.txt"\n',
+    'cmp -- "$evidence/$stem.contents" "$observations/contents-tar-$format.txt"\n',
+    'cmp -- "$evidence/$stem.elf" "$observations/elf-tar-$format.txt"\n',
+    "and .linux_release_runtime.system_libraries == []' \\\n",
+    'timeout --kill-after=5 60 env PATH=/no-host-interpreters "$binary" "$probe" \\\n',
+    'test "$status" = 0\n',
+    'test ! -s "$observations/probe-tar-$format-$name.stderr"\n',
+    'cmp -- "$evidence/$expected" "$observations/probe-tar-$format-$name.stdout"\n',
+    'rm -rf -- "$smoke"\n',
+    'test ! -e "$smoke"\n',
+    'note "PASS $stem gzip and xz originals; observations in $observations"\n',
+)
+RELEASE_ORIGINAL_SMOKE_FORBIDDEN = re.compile(
+    r"(?m)\|\|\s*(?:true\b|:(?:\s|$))|^\s*exit 0\b|^\s*set \+[euo]|--insecure|\s-k\s|"
+    r"\bsudo\b|\bpython3?\b|SkipTest|GH_TOKEN=|GITHUB_TOKEN="
+)
+
+
+def release_original_smoke_failures(texts: dict[str, str]) -> list[str]:
+    """Bind the dispatch-only original release smoke and its pinned evidence."""
+    failures: list[str] = []
+    ci = texts.get(".github/workflows/ci.yml", "")
+    script = texts.get("tools/release-original-smoke.sh", "")
+    dispatch = re.search(r"(?m)^  workflow_dispatch:\n    inputs:\n((?: {6,}[^\n]*\n)*)", ci)
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
+    ))
+    if (
+        dispatch is None or dispatch.group(1).count(RELEASE_ORIGINAL_SMOKE_INPUT) != 1
+        or ci.count("run_release_original_smoke") != 2
+        or ci.count("tools/release-original-smoke.sh") != 1
+        or jobs.get("release-original-smoke", "").rstrip("\n") + "\n" != RELEASE_ORIGINAL_SMOKE_JOB
+    ):
+        failures.append(
+            "ci.yml: original v0.3.0 release smoke must remain one exact dispatch-only, hosted amd64, read-only job"
+        )
+    if any(script.count(pin) != 1 for pin in RELEASE_ORIGINAL_SMOKE_PINS):
+        failures.append("tools/release-original-smoke.sh: original v0.3.0 identity or linux-x64 pins changed")
+    positions = [script.find(token) for token in RELEASE_ORIGINAL_SMOKE_ORDER]
+    if any(script.count(token) != 1 for token in RELEASE_ORIGINAL_SMOKE_ORDER) or positions != sorted(positions):
+        failures.append(
+            "tools/release-original-smoke.sh: evidence, size, digest and provenance checks must each run once "
+            "before decoding, extraction and execution"
+        )
+    if RELEASE_ORIGINAL_SMOKE_FORBIDDEN.search(script):
+        failures.append(
+            "tools/release-original-smoke.sh: original release smoke must fail closed without privilege, "
+            "interpreters or tokens"
+        )
+    pins = re.findall(r"(?m)^ +([0-9a-f]+) ((?:debz-0\.3\.0|provenance-tar-)[a-z0-9.-]+)$", script)
+    evidence = ROOT / RELEASE_ORIGINAL_EVIDENCE
+    names = sorted(path.name for path in evidence.iterdir()) if evidence.is_dir() else []
+    if not pins or sorted(name for _, name in pins) != names or any(
+        (evidence / name).is_symlink() or not (evidence / name).is_file()
+        or hashlib.sha256((evidence / name).read_bytes()).hexdigest() != value
+        for value, name in pins
+    ):
+        failures.append(f"{RELEASE_ORIGINAL_EVIDENCE}: committed evidence must exactly match the script pins")
+    return failures
+# --- end original v0.3.0 release smoke -----------------------------------------
+
+
 REPORT_PATH_ORACLE_FILES = (
     "test/native_recovery_oracle.zig",
     "test/native_recovery_unit.zig",
@@ -5810,6 +5964,11 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
+            for failure in release_original_smoke_failures({
+                path: (ROOT / path).read_text()
+                for path in RELEASE_ORIGINAL_SMOKE_PATHS if (ROOT / path).is_file()
+            }):
+                fail(failure)
         expected_ghr_installs = {"ci.yml": 23, "release.yml": 3}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
@@ -6773,6 +6932,27 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = workload_partition_failures(text)
     elif kind == "ci-signed-proc":
         failures = signed_proc_ci_failures(text)
+    elif kind == "release-original-smoke":
+        try:
+            fixture = json.loads(text)
+            if (
+                not isinstance(fixture, dict) or set(fixture) != {"path", "text"}
+                or fixture["path"] not in RELEASE_ORIGINAL_SMOKE_PATHS
+                or (fixture["text"] is not None and not isinstance(fixture["text"], str))
+            ):
+                raise ValueError("invalid original release smoke input")
+        except (ValueError, TypeError):
+            print("security-audit: invalid original release smoke input", file=sys.stderr)
+            return 2
+        texts = {
+            path: (ROOT / path).read_text()
+            for path in RELEASE_ORIGINAL_SMOKE_PATHS if (ROOT / path).is_file()
+        }
+        if fixture["text"] is None:
+            texts.pop(fixture["path"], None)
+        else:
+            texts[fixture["path"]] = fixture["text"]
+        failures = release_original_smoke_failures(texts)
     elif kind in {
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",

@@ -29,6 +29,18 @@ directory is unchanged before smoking the host gzip archive, because that
 extraction briefly adds a directory beside the assets.
 Foreign binaries are audited, never executed.
 
+Archives published before the installed cutover policies, such as v0.3.0,
+lack `share/debz/digest-cutover-policy.json`, so `verify --smoke` refuses
+them rather than relaxing its required-file check. The dispatch-only
+`tools/release-original-smoke.sh` applies the same smoke protocol to the
+immutable v0.3.0 originals with host tools. It verifies the pinned evidence,
+the exact asset bytes and the committed provenance bundles first. Both
+containers must then decode to one identical tar, and every member, mode,
+size, content digest and static ELF fact, plus the runtime metadata, must
+match the independent expectations in `security/release-originals/v0.3.0/`.
+Finally `version`, `-h` and `--help` must exit 0 with empty stderr and the
+exact original output.
+
 Release inputs are rejected when
 they contain links, generated artifacts, cache paths, common secret formats,
 missing notices, unsafe names, or ELF binaries that are not fully static for
