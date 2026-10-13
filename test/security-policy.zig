@@ -2677,6 +2677,55 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
             &.{"try verifyLock(allocator, lock.lock, pin_bytes, now);"};
         try nativeMutationsIn(&f, "protected-reference", "tools/real-snapshot-util-linux-authority.zig", start, "\n}\n", tokens);
     }
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-util-linux-protected-observe.sh", &.{
+        "bash tools/real-snapshot-reference-protected-stage.sh --arm64-bash-source \"$zig\" \"$debz\" \"$workspace\"\n",
+        "\"$inspector\" --protected source \"$lock\" \"$cache\" \"$evidence/util-linux-observation-source.json\"\n",
+        "(( ${#closure[@]} == 175 ))\n",
+        "      tar -xpf - --warning=no-timestamp --keep-directory-symlink --numeric-owner -C /\n",
+        "    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \\\n",
+        "cmp \"$evidence/util-linux-observation-original.postinst\" \"$postinst\"\n",
+        "gzip -9 -n -c \"$trace\" >\"$evidence/util-linux-configure.strace.gz\"\n",
+        "\"$inspector\" --protected observe \"$lock\" \"$cache\" \"$root\" \"$trace\" \"$evidence/util-linux-observation.json\"\n",
+        "  .postinst.exit_status == 0\n",
+        "(( configure_status == 0 ))\n",
+        "echo \"original arm64 util-linux postinst observed without callback admission\"\n",
+    });
+    for ([_][]const u8{ "observe", "observeTrace", "observationReport" }) |name| {
+        const start = try std.fmt.allocPrint(f.arena.allocator(), "fn {s}(", .{name});
+        const tokens: []const []const u8 = if (std.mem.eql(u8, name, "observe"))
+            &.{ "try protectedPath(host.root, args[offset + 4], false);", "if (!std.mem.eql(u8, staged, original.model.scriptBytes(script.*))) return error.ArmUtilLinuxPostinstNotObserved;" }
+        else if (std.mem.eql(u8, name, "observeTrace"))
+            &.{ "return error.ArmUtilLinuxObservationOutsideRoot;", "if (postinst_executions != 1 or postinst.parent == null or postinst_argv.len != expected_argv.len)" }
+        else
+            &.{ ".callback_admitted = false,", ".runtime_proved = false," };
+        try nativeMutationsIn(&f, "protected-reference", "tools/real-snapshot-util-linux-authority.zig", start, "\n}\n", tokens);
+    }
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
+        "elif [[ ${1:-} == --observe-arm64-util-linux ]]; then\n",
+        "[[ $mode != arm64-util-linux-observation ]] || prefix=observe-ci\n",
+        "[[ $mode != arm64-util-linux-observation || $architecture == arm64 ]] || {\n",
+        "    bash tools/real-snapshot-util-linux-protected-observe.sh \"$zig\" \"$checkout/zig-out/bin/debz\" \"$observe_workspace\"\n",
+        "  jq -e '.observation_only == true and .callback_admitted == false and .runtime_proved == false' \\\n",
+        "  step observe-tree-final 0 \"\" python3 -I tools/real-snapshot-reference-tree-check.py tree \"$tree\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
+        "      run_arm64_util_linux_observation:\n",
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_util_linux_observation\n",
+        "            sudo -n apt-get install --yes --no-install-recommends strace\n",
+        "            [[ $tree =~ ^/srv/debz-protected/observe-ci-[0-9]+-[0-9]+-arm64$ && $architecture == arm64 ]]\n",
+        "            exec bash \"$tree/checkout/tools/real-snapshot-reference-protected-ci.sh\" --observe-arm64-util-linux \"$tree\" \"$architecture\" \"$expected\"\n",
+        "          name: arm64-util-linux-observation\n",
+        "            [[ $tree =~ ^/srv/debz-protected/observe-ci-[0-9]+-[0-9]+-arm64$ ]]\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  arm64-util-linux-observation:", "  protected-reference:", &.{
+        "    runs-on: ubuntu-24.04-arm\n",
+        "    timeout-minutes: 100\n",
+        "            mkdir -m 0700 -- \"$tree\"\n",
+        "            git --git-dir=\"$tree/bare.git\" fsck --full --no-dangling\n",
+        "          if-no-files-found: error\n",
+        "              kill -KILL \"${victims[@]}\" 2>/dev/null || true\n",
+        "            rm -rf --one-file-system -- \"$tree\"\n",
+    });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
         "        --force-depends --no-triggers --configure less\n",
     });

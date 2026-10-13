@@ -13,8 +13,11 @@
 # workspace. Bounded evidence is copied into TREE/upload; nothing outside TREE
 # is written.
 # --stage-native stages the same trusted inputs in a distinct native-ci tree,
-# without running or reusing the small proof. --check-keyring verifies protected
-# member bytes against the same reviewed constants for the acceptance consumer.
+# without running or reusing the small proof. --observe-arm64-util-linux runs
+# only the original ARM util-linux postinst observation in a distinct observe-ci
+# tree; it admits no callback and proves no runtime. --check-keyring verifies
+# protected member bytes against the same reviewed constants for the acceptance
+# consumer.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root
@@ -53,6 +56,9 @@ mode=proof
 if [[ ${1:-} == --stage-native ]]; then
   mode=native-staging
   shift
+elif [[ ${1:-} == --observe-arm64-util-linux ]]; then
+  mode=arm64-util-linux-observation
+  shift
 fi
 readonly mode
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
@@ -62,9 +68,14 @@ readonly mode
 tree=$1 architecture=$2 commit=$3
 prefix=ci
 [[ $mode == proof ]] || prefix=native-ci
+[[ $mode != arm64-util-linux-observation ]] || prefix=observe-ci
 [[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&
   $commit =~ ^[0-9a-f]{40}$ ]] || {
   echo "the protected tree, architecture and commit must be the workflow's named values" >&2
+  exit 2
+}
+[[ $mode != arm64-util-linux-observation || $architecture == arm64 ]] || {
+  echo "the original util-linux observation is arm64-only" >&2
   exit 2
 }
 readonly tree architecture commit
@@ -132,6 +143,12 @@ collect() {
     install -d -o root -g root -m 0755 "$upload/arm64-bash"
     find "$checkout/.real-snapshot/bash-arm64/evidence" -maxdepth 1 -type f \
       -size -16777217c -exec install -m 0644 -t "$upload/arm64-bash" {} +
+  fi
+  if [[ -d $checkout/.real-snapshot/util-linux-observe-arm64/evidence &&
+        ! -L $checkout/.real-snapshot/util-linux-observe-arm64/evidence ]]; then
+    install -d -o root -g root -m 0755 "$upload/arm64-util-linux-observation"
+    find "$checkout/.real-snapshot/util-linux-observe-arm64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/arm64-util-linux-observation" {} +
   fi
   for source in snapshot/evidence prestate-build/evidence; do
     local python3_evidence=$checkout/.real-snapshot/python3-amd64/$source
@@ -571,6 +588,26 @@ stage_native_inputs() {
 if [[ $mode == native-staging ]]; then
   stage_native_inputs
   echo "protected native inputs staged; native wrapper and full reference have not executed"
+  exit "$?"
+fi
+if [[ $mode == arm64-util-linux-observation ]]; then
+  observe_workspace=$checkout/.real-snapshot/util-linux-observe-arm64
+  install -d -o root -g root -m 0700 .real-snapshot
+  step arm64-util-linux-observe 0 "original arm64 util-linux postinst observed without callback admission" \
+    timeout --signal=TERM --kill-after=60s 60m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-util-linux-protected-observe.sh "$zig" "$checkout/zig-out/bin/debz" "$observe_workspace"
+  jq -e '.observation_only == true and .callback_admitted == false and .runtime_proved == false' \
+    "$observe_workspace/evidence/util-linux-observation.json" >/dev/null
+  find "$observe_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  if grep -F " $observe_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the ARM util-linux observation workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$observe_workspace"
+  step observe-tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+  echo "protected ARM util-linux observation passed at $commit; callback admission and runtime proof withheld"
   exit "$?"
 fi
 

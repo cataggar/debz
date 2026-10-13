@@ -784,6 +784,43 @@ timeout() {
                 changed[path] = source.replace(body, body.replace(token, "", 1), 1)
                 self.assertTrue(audit.protected_reference_ci_failures(changed))
 
+    def test_arm_util_linux_observation_stays_original_hosted_and_withholds_authority(self) -> None:
+        audit = load("debz_arm_util_linux_observation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        observer = "tools/real-snapshot-util-linux-protected-observe.sh"
+        gzip = 'gzip -9 -n -c "$trace" >"$evidence/util-linux-configure.strace.gz"\n'
+        inspect = '"$inspector" --protected observe "$lock" "$cache" "$root" "$trace" "$evidence/util-linux-observation.json"\n'
+        for path, *replacements in (
+            (".github/workflows/ci.yml", ("    runs-on: ubuntu-24.04-arm\n    # Disposable hosted ARM only",
+                                          "    runs-on: [self-hosted, arm64]\n    # Disposable hosted ARM only")),
+            (".github/workflows/ci.yml", ("inputs.run_arm64_util_linux_observation\n",
+                                          "(inputs.run_arm64_util_linux_observation || github.event_name == 'schedule')\n")),
+            ("tools/real-snapshot-util-linux-authority.zig", (".callback_admitted = false,\n        .runtime_proved",
+                                                              ".callback_admitted = true,\n        .runtime_proved")),
+            (observer, (gzip + "{\n", "{\n")),
+            (observer, (gzip + "{\n", "{\n"), (inspect, inspect + gzip)),
+            (observer, ("--force-depends --no-triggers --configure util-linux",
+                        "--force-depends --force-all --no-triggers --configure util-linux")),
+            ("tools/real-snapshot-reference-protected-ci.sh",
+             ("[[ $mode != arm64-util-linux-observation ]] || prefix=observe-ci\n", "")),
+        ):
+            with self.subTest(path=path, replacements=replacements):
+                changed = dict(texts)
+                for old, new in replacements:
+                    self.assertEqual(changed[path].count(old), 1)
+                    changed[path] = changed[path].replace(old, new, 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def test_arm_util_linux_observation_refuses_unprivileged_or_foreign_workspace(self) -> None:
+        script = TOOLS / "real-snapshot-util-linux-protected-observe.sh"
+        for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz",
+                               str(TOOLS.parent / ".real-snapshot/util-linux-observe-arm64"))):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("observed without callback admission", result.stdout)
+
     def test_arm_less_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
         script = TOOLS / "real-snapshot-less-protected-stage.sh"
         for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz",
@@ -825,7 +862,8 @@ timeout() {
     def test_refuses_outside_its_root_owned_tree(self) -> None:
         script = TOOLS / "real-snapshot-reference-protected-ci.sh"
         for arguments in ((), ("/srv/debz-protected/ci-1-1-amd64", "arm64", "0" * 40),
-                          ("/tmp/elsewhere", "amd64", "0" * 40)):
+                          ("/tmp/elsewhere", "amd64", "0" * 40),
+                          ("--observe-arm64-util-linux", "/srv/debz-protected/ci-1-1-arm64", "arm64", "0" * 40)):
             result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
                                     text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 2, result.stderr)

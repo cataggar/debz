@@ -776,6 +776,50 @@ require `transaction-result verify`, every package installed and no pending
 triggers. The source receipt alone satisfies none of these runtime or
 whole-root acceptance conditions.
 
+### Observing the original postinst without admission
+
+The dispatch-only `arm64-util-linux-observation` CI job
+(`run_arm64_util_linux_observation: true`) collects the first of those inputs
+from the original script itself. It runs only on a disposable hosted
+`ubuntu-24.04-arm` runner, in a new root-owned `observe-ci` tree, and never on
+the schedule, pushes or pull requests.
+`tools/real-snapshot-util-linux-protected-observe.sh` stages the same
+authenticated full lock and fifteen-source receipt as the bash stage. It
+size/SHA512-checks the other 175 original closure archives before any chroot.
+The pinned Debian dpkg 1.22.22 unpacks less and util-linux. The remaining
+archives are extracted by `tar` inside the same sanitized chroot without
+package scripts. The original libc-bin `ldconfig -X` builds the loader cache;
+it must byte-equal the member of its verified archive, so the route adds no
+pin. less is configured first so the pager prestate follows the original order.
+The extracted postinst must equal the authenticated control member
+(SHA-256 `31f01940...`). The pinned dpkg then runs
+`--configure util-linux` exactly once under host `strace`. That run uses
+the existing unshare, `env -i`, chroot and `setpriv` wrapper with no
+`--force-all` and no edited script branch. The raw trace is retained
+gzip-compressed before any check can stop the run.
+
+`debz-arm-util-linux-authority --protected observe LOCK CAS ROOT TRACE OUTPUT`
+then re-verifies the lock and the original postinst bytes in the root. It
+requires the first chroot to be the named root, the postinst to run exactly
+once as `configure ""` with the util-linux/postinst/arm64 maintainer
+environment, and every traced process to end with a recorded exit or kill.
+PID and chroot attribution must be unambiguous. The result decodes every
+execution and path, descriptor, symlink, confinement and network call into the
+exclusive `util-linux-observation.json`. Calls it cannot decode are listed,
+not dropped. The evidence also keeps the stdout/stderr logs, the before/after
+root manifests and their delta, pager records, dpkg status and the
+`ld.so.cache`. Derived tables list the postinst's executions, Perl/shared
+object loads and successful mutations, together with the host tracer's
+provenance.
+
+The report always says `observation_only: true`, `callback_admitted: false`
+and `runtime_proved: false`. Its observation root differs from the original
+installation: only less and util-linux are dpkg-registered, other packages
+ran no scripts, and there is no `/proc` or `/run/systemd/system`. It is
+therefore evidence to review and derive a closed input set from, joined with
+the original native root's state. It is not a helper grant, a profile, or
+native/reference parity.
+
 ## Exact signed python3 preinst inert alternatives call
 
 The separate new-package `python3:amd64` `3.14.3-0ubuntu2`

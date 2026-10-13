@@ -155,6 +155,14 @@ independently selected by their existing inputs. Omitting `run_full_matrix`
 or setting it to `true` retains full manual coverage, including
 `integration-full`.
 
+`run_arm64_util_linux_observation: true` separately selects the dispatch-only
+`arm64-util-linux-observation` job on a disposable hosted `ubuntu-24.04-arm`
+runner. It traces the original authenticated ARM util-linux postinst under
+the protected pinned dpkg and uploads the `arm64-util-linux-observation`
+artifact. It admits no callback and proves no runtime; see "Observing the
+original postinst without admission" in the
+[maintainer-script runner](maintainer-script-runner.md).
+
 The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
 gate selected by the `run_native_real_snapshot` dispatch input. It builds the
 production candidate and Zig comparator, prepares the hash-pinned dpkg oracle

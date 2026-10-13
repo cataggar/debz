@@ -361,6 +361,8 @@ observations before replay copies/mutations. Its source receipts deliberately
 withhold callback/runtime permission; the original manifest, deadlines,
 signed source bundle and production ARM refusal remain unchanged. See the
 maintainer-script runner's separate ARM util-linux remaining-execution contract.
+The dispatch-only ARM util-linux observation reuses that same full lock,
+closure digest and source receipt; it adds no archive pins.
 
 Ownership-list pins bind the original data-tar member order, not a sorted
 path set. Less sealing and Python empty-fixture preparation validate those

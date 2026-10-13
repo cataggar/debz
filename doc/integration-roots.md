@@ -658,6 +658,16 @@ mount remains, and removes the tree with `rm -rf --one-file-system`.
 steps, `sudo -n` use and script tokens, so the job cannot silently skip,
 continue on error or lose its protection.
 
+The dispatch-only `arm64-util-linux-observation` job uses the same bundle,
+bare-repository, clone, evidence and cleanup steps. Its tree is
+`/srv/debz-protected/observe-ci-RUN-ATTEMPT-arm64`, and it runs only on hosted
+`ubuntu-24.04-arm`. It first installs the host `strace` from the runner's
+Ubuntu archive if it is missing. `--observe-arm64-util-linux` then builds
+debz and runs only the original util-linux postinst observation, followed by
+the final tree check. It runs no proof, no negatives and no other stage. Its
+evidence goes to the `arm64-util-linux-observation` artifact. The audit pins
+that job's complete text.
+
 Unsupported namespace errno values have a bounded Zig refusal test. The
 root capability proof also withdraws namespace/loopback-configuration
 authority in a child and requires explicit kernel refusals. These are not

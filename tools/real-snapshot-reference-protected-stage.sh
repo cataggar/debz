@@ -87,6 +87,7 @@ for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-escape-probe.zig \
   tools/real-snapshot-util-linux-authority.zig \
   tools/real-snapshot-util-linux-protected-source.sh \
+  tools/real-snapshot-util-linux-protected-observe.sh \
   src/private_network.zig src/fixtures/script_network_probe.zig \
   tools/prepare-native-dpkg.zig tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"

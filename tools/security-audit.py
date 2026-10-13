@@ -2631,6 +2631,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-less-protected-stage.sh",
     "tools/real-snapshot-bash-protected-stage.sh",
     "tools/real-snapshot-util-linux-protected-source.sh",
+    "tools/real-snapshot-util-linux-protected-observe.sh",
     "tools/real-snapshot-util-linux-authority.zig",
     "tools/real-snapshot-less-reference.sh",
     "tools/real_snapshot_less_stage.py",
@@ -2766,6 +2767,150 @@ PROTECTED_REFERENCE_CLEANUP = (
 )
 
 
+ARM64_UTIL_LINUX_OBSERVATION_INPUT = (
+    '      run_arm64_util_linux_observation:\n'
+    '        description: "Trace the original authenticated ARM util-linux postinst under the protected wrapper; observation only, no callback admission"\n'
+    '        required: true\n'
+    '        type: boolean\n'
+    '        default: false\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_HEADER = (
+    '  arm64-util-linux-observation:\n'
+    "    if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_util_linux_observation\n"
+    '    name: Original ARM util-linux postinst observation (no callback admission)\n'
+    '    runs-on: ubuntu-24.04-arm\n'
+    '    # Disposable hosted ARM only: the host tracer install 10, then root-run Zig\n'
+    '    # download and package fetch 5, debz build 15 and the original closure\n'
+    '    # staging, traced postinst and inspector 60 (its own timeout), leaving 10\n'
+    '    # for evidence, upload and cleanup.\n'
+    '    timeout-minutes: 100\n'
+    '    env:\n'
+    '      ARCHITECTURE: arm64\n'
+    '      PROTECTED_TREE: /srv/debz-protected/observe-ci-${{ github.run_id }}-${{ github.run_attempt }}-arm64\n'
+    '    steps:\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_TRACER = (
+    "      - name: Install the host tracer from the runner's Ubuntu archive\n"
+    '        timeout-minutes: 10\n'
+    '        run: |\n'
+    '          if [ ! -x /usr/bin/strace ]; then\n'
+    '            if [ -f /etc/apt/apt-mirrors.txt ]; then\n'
+    "              sudo -n sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \\\n"
+    '                /etc/apt/apt-mirrors.txt\n'
+    '            fi\n'
+    '            sudo -n apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \\\n'
+    '              -o Acquire::https::Timeout=30 update\n'
+    '            sudo -n apt-get install --yes --no-install-recommends strace\n'
+    '          fi\n'
+    '          /usr/bin/strace -V\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_BOOTSTRAP = (
+    '      - name: Stage the reviewed commit in a root-owned tree and trace the original ARM util-linux postinst\n'
+    '        timeout-minutes: 80\n'
+    '        run: |\n'
+    '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
+    '          test -z "$(git status --porcelain)"\n'
+    '          bundle="$RUNNER_TEMP/debz-observe-$ARCHITECTURE.bundle"\n'
+    '          git bundle create "$bundle" HEAD\n'
+    '          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+    '            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \\\n'
+    "            bash -euo pipefail -c '\n"
+    '            tree=$1 architecture=$2 expected=$3 bundle=$4\n'
+    '            [[ $tree =~ ^/srv/debz-protected/observe-ci-[0-9]+-[0-9]+-arm64$ && $architecture == arm64 ]]\n'
+    '            [[ $expected =~ ^[0-9a-f]{40}$ ]]\n'
+    '            umask 022\n'
+    '            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected\n'
+    '            for ancestor in / /srv /srv/debz-protected; do\n'
+    '              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]\n'
+    '              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))\n'
+    '            done\n'
+    '            mkdir -m 0700 -- "$tree"\n'
+    '            install -o root -g root -m 0600 -- "$bundle" "$tree/debz.bundle"\n'
+    '            git init --quiet --bare "$tree/bare.git"\n'
+    '            printf "%s\\n" "$expected" >"$tree/bare.git/shallow"\n'
+    '            git --git-dir="$tree/bare.git" bundle verify "$tree/debz.bundle"\n'
+    '            git --git-dir="$tree/bare.git" fetch --quiet "$tree/debz.bundle" HEAD:refs/heads/protected\n'
+    '            test "$(git --git-dir="$tree/bare.git" rev-parse refs/heads/protected)" = "$expected"\n'
+    '            git --git-dir="$tree/bare.git" symbolic-ref HEAD refs/heads/protected\n'
+    '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n'
+    '            git clone --quiet --no-hardlinks "file://$tree/bare.git" "$tree/checkout"\n'
+    '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n'
+    '            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --observe-arm64-util-linux "$tree" "$architecture" "$expected"\n'
+    '            \' observe-bootstrap "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$bundle"\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_COPY = (
+    '      - name: Copy bounded observation evidence\n'
+    '        if: always()\n'
+    '        run: |\n'
+    '          output="$RUNNER_TEMP/arm64-util-linux-observation"\n'
+    '          mkdir -p "$output"\n'
+    '          sudo -n test -d "$PROTECTED_TREE/upload"\n'
+    '          sudo -n tar -C "$PROTECTED_TREE/upload" -cf - . >"$RUNNER_TEMP/observation-evidence.tar"\n'
+    '          tar --no-same-owner --no-same-permissions -C "$output" -xf "$RUNNER_TEMP/observation-evidence.tar"\n'
+    '          test -s "$output/result.txt"\n'
+    '          cat "$output/result.txt"\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_UPLOAD = (
+    '      - name: Upload original ARM util-linux observation evidence\n'
+    '        if: always()\n'
+    '        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n'
+    '        with:\n'
+    '          name: arm64-util-linux-observation\n'
+    '          path: ${{ runner.temp }}/arm64-util-linux-observation/\n'
+    '          if-no-files-found: error\n'
+    '          retention-days: 14\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_CLEANUP = (
+    '      - name: Kill observation descendants and remove the named tree\n'
+    '        if: always()\n'
+    '        run: |\n'
+    "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -euo pipefail -c '\n"
+    '            tree=$1\n'
+    '            [[ $tree =~ ^/srv/debz-protected/observe-ci-[0-9]+-[0-9]+-arm64$ ]]\n'
+    '            [[ -e $tree || -L $tree ]] || exit 0\n'
+    '            [[ -d $tree && ! -L $tree ]]\n'
+    '            for attempt in 1 2 3 4 5; do\n'
+    '              victims=()\n'
+    '              for process in /proc/[0-9]*; do\n'
+    '                root=$(readlink "$process/root" 2>/dev/null) || continue\n'
+    '                cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=\n'
+    '                case "$root/ $cwd/" in\n'
+    '                  *"$tree/"*) victims+=("${process#/proc/}") ;;\n'
+    '                esac\n'
+    '              done\n'
+    '              (( ${#victims[@]} )) || break\n'
+    '              echo "killing observation descendants: ${victims[*]}"\n'
+    '              kill -KILL "${victims[@]}" 2>/dev/null || true\n'
+    '              sleep 1\n'
+    '            done\n'
+    '            (( ${#victims[@]} == 0 ))\n'
+    '            if grep -F " $tree" /proc/self/mountinfo; then\n'
+    '              echo "mounts remain beneath $tree" >&2\n'
+    '              exit 1\n'
+    '            fi\n'
+    '            rm -rf --one-file-system -- "$tree"\n'
+    '            test ! -e "$tree"\n'
+    '            \' observe-cleanup "$PROTECTED_TREE"\n'
+)
+
+ARM64_UTIL_LINUX_OBSERVATION_JOB = (
+    ARM64_UTIL_LINUX_OBSERVATION_HEADER
+    + "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+    + "        with:\n          persist-credentials: false\n"
+    + ARM64_UTIL_LINUX_OBSERVATION_TRACER
+    + ARM64_UTIL_LINUX_OBSERVATION_BOOTSTRAP
+    + ARM64_UTIL_LINUX_OBSERVATION_COPY
+    + ARM64_UTIL_LINUX_OBSERVATION_UPLOAD
+    + ARM64_UTIL_LINUX_OBSERVATION_CLEANUP
+)
+
+
 PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "set -euo pipefail",
     'if [[ ${1:-} == --check-keyring && $# == 2 ]]; then',
@@ -2773,6 +2918,20 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     'if [[ ${1:-} == --stage-native ]]; then',
     "  mode=native-staging\n",
     '[[ $mode == proof ]] || prefix=native-ci',
+    'elif [[ ${1:-} == --observe-arm64-util-linux ]]; then\n  mode=arm64-util-linux-observation\n  shift\nfi\n',
+    '[[ $mode != arm64-util-linux-observation ]] || prefix=observe-ci',
+    '[[ $mode != arm64-util-linux-observation || $architecture == arm64 ]] || {',
+    'if [[ $mode == arm64-util-linux-observation ]]; then\n'
+    '  observe_workspace=$checkout/.real-snapshot/util-linux-observe-arm64\n',
+    '  step arm64-util-linux-observe 0 "original arm64 util-linux postinst observed without callback admission" \\\n'
+    '    timeout --signal=TERM --kill-after=60s 60m \\\n'
+    '    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \\\n'
+    '    bash tools/real-snapshot-util-linux-protected-observe.sh "$zig" "$checkout/zig-out/bin/debz" "$observe_workspace"\n',
+    "  jq -e '.observation_only == true and .callback_admitted == false and .runtime_proved == false' \\\n"
+    '    "$observe_workspace/evidence/util-linux-observation.json" >/dev/null\n',
+    '  step observe-tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"\n'
+    '  echo "protected ARM util-linux observation passed at $commit; callback admission and runtime proof withheld"\n'
+    '  exit "$?"\nfi\n',
     'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
     'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2',
     '"$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \\\n'
@@ -2842,6 +3001,38 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'create_exclusive(root / "bad-prestate", "usr/bin/update-menus"',
         '/var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu',
         'cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6")',
+        'bytes <= 8 * 1024 * 1024 * 1024',
+    ),
+    "tools/real-snapshot-util-linux-protected-observe.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
+        'readonly original_postinst_sha256=31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9',
+        '"$workspace" == "$checkout/.real-snapshot/util-linux-observe-arm64"',
+        'toolchain(Path(sys.argv[3]))',
+        "  /usr/bin/strace <<'PY'\n",
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-reference-protected-stage.sh --arm64-bash-source "$zig" "$debz" "$workspace"',
+        "jq -e '.callback_admitted == false and .runtime_proved == false and (.sources | length) == 15'",
+        'if length != 175 then error("unexpected original closure")',
+        '.origin.type != "authenticated_repository" or .archive_identity.primary != "sha512"',
+        '(( ${#closure[@]} == 175 ))',
+        '$(sha512sum "$object" | cut -d\' \' -f1) == "$digest"',
+        'python3 -B -I tools/real_snapshot_less_stage.py prepare "$root" "$lock" "$cache" "$pinned"',
+        'original = archive(json.loads(lock.read_bytes()), cache, "util-linux")',
+        '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb /var/lib/dpkg/producer-util-linux.deb',
+        "'2.41.3-3ubuntu2.2 arm64 install ok unpacked'",
+        'tar -xpf - --warning=no-timestamp --keep-directory-symlink --numeric-owner -C /',
+        'expected = member(archive(json.loads(lock.read_bytes()), cache, "libc-bin"), "usr/sbin/ldconfig")',
+        'if read_regular(root, "usr/sbin/ldconfig", len(expected)) != expected:',
+        'exec setpriv --bounding-set=-sys_admin --no-new-privs /usr/sbin/ldconfig -X',
+        '--force-depends --no-triggers --configure less',
+        "'668-1build1 arm64 install ok installed'",
+        '/usr/bin/dpkg-deb --ctrl-tarfile "$original" |',
+        '$(sha256sum "$evidence/util-linux-observation-original.postinst" | cut -d\' \' -f1) == "$original_postinst_sha256"',
+        '--force-depends --no-triggers --configure util-linux',
+        '.observation_only == true and .callback_admitted == false and .runtime_proved == false and',
+        '.original_postinst.sha256 == $postinst and .closure_digest == $source[0].closure_digest and',
+        '.postinst.exit_status == 0',
+        "'2.41.3-3ubuntu2.2 arm64 install ok installed'",
         'bytes <= 8 * 1024 * 1024 * 1024',
     ),
     "tools/prepare-native-dpkg.zig": (
@@ -3187,6 +3378,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         ("tools/real-snapshot-less-protected-stage.sh", 1),
         ("tools/real-snapshot-less-reference.sh", 3),
         ("tools/real-snapshot-bash-protected-stage.sh", 3),
+        ("tools/real-snapshot-util-linux-protected-observe.sh", 5),
     ):
         commands = re.findall(
             r"timeout --signal=TERM --kill-after=5s 120s \\\n.*?\n  '\n",
@@ -3382,6 +3574,64 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         for token in tokens:
             if token not in body:
                 failures.append(f"protected ARM helper original source function {name} lost {token}")
+    for name, tokens in (
+        ("observe", (
+            'try protectedPath(host.root, args[offset + 3], true);',
+            'try protectedPath(host.root, args[offset + 4], false);',
+            'try verifyLock(allocator, lock.lock, pin_bytes, now);',
+            'var original = try source(allocator, lock.lock, cache.root, "util-linux", protected);',
+            'if (!std.mem.eql(u8, staged, original.model.scriptBytes(script.*))) return error.ArmUtilLinuxPostinstNotObserved;',
+            'const trace = try readStable(allocator, host.root, trace_path.text, maximum_trace_bytes, protected);',
+            '.overwrite = .fail_if_exists,',
+        )),
+        ("observeTrace", (
+            'if (position != 0) return error.InvalidArmUtilLinuxTrace;',
+            'if (processes.contains(child)) return error.InvalidArmUtilLinuxTrace;',
+            'return error.ArmUtilLinuxObservationOutsideRoot;',
+            '"unclassified" }',
+            '"undecoded path operand" }',
+            '.exit = process.exit orelse return error.InvalidArmUtilLinuxTrace,',
+            'if (postinst_executions != 1 or postinst.parent == null or postinst_argv.len != expected_argv.len)',
+            '"DPKG_MAINTSCRIPT_PACKAGE=util-linux", "DPKG_MAINTSCRIPT_NAME=postinst", "DPKG_MAINTSCRIPT_ARCH=arm64"',
+            'if (!std.mem.startsWith(u8, exit, "exited ")) return error.ArmUtilLinuxPostinstNotObserved;',
+        )),
+        ("observationReport", (
+            '.observation_only = true,',
+            '.callback_admitted = false,',
+            '.runtime_proved = false,',
+            '.closure_digest = std.fmt.bytesToHex(try closureDigest(lock), .lower),',
+            '.calls_not_decoded = observation.calls_not_decoded,',
+        )),
+        ("main", (
+            'if (std.mem.eql(u8, args[offset], "observe")) return observe(init, allocator, args, offset, protected);',
+        )),
+    ):
+        body = helper_inspector.partition(f"fn {name}(")[2].partition("\n}\n")[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"protected ARM util-linux observation function {name} lost {token}")
+    if re.search(r"\.(?:callback_admitted|runtime_proved|admitted|proved) = true", helper_inspector):
+        failures.append("protected ARM util-linux inspector must not grant callback or runtime authority")
+    observer = texts.get("tools/real-snapshot-util-linux-protected-observe.sh", "")
+    observe_order = [observer.find(token) for token in (
+        '"$inspector" --protected source "$lock" "$cache" "$evidence/util-linux-observation-source.json"',
+        '(( ${#closure[@]} == 175 ))',
+        'chroot "$root" /bin/sh -c',
+        'cmp "$evidence/util-linux-observation-original.postinst" "$postinst"',
+        '/usr/bin/strace -f -q -y -s 4096 --pidns-translation',
+        'gzip -9 -n -c "$trace" >"$evidence/util-linux-configure.strace.gz"',
+        '"$inspector" --protected observe "$lock" "$cache" "$root" "$trace" "$evidence/util-linux-observation.json"',
+        '(( configure_status == 0 ))',
+        'echo "original arm64 util-linux postinst observed without callback admission"',
+    )]
+    if -1 in observe_order or observe_order != sorted(observe_order) or observer.count("/usr/bin/strace -f") != 1:
+        failures.append(
+            "protected ARM util-linux observation must authenticate the closure and postinst before one traced "
+            "configure and retain the raw trace before inspection"
+        )
+    if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|--force-all|--force-script-chrootless|SkipTest|--skip|"
+                 r'"\$zig" build test-|callback_admitted == true|runtime_proved == true', observer):
+        failures.append("protected ARM util-linux observation must not skip, force or claim authority")
     for path, required in (
         ("tools/real_snapshot_less_stage.py", (
             '"util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad")',
@@ -3603,13 +3853,26 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         )
     if "continue-on-error" in job or "cataggar/ghr" in job or re.search(r"\bsudo (?!-n )", job):
         failures.append("ci.yml: the protected reference job must not hide failures or use unprotected tools")
+    observe_job = jobs.get("arm64-util-linux-observation", "")
+    if (
+        ci.count(ARM64_UTIL_LINUX_OBSERVATION_INPUT) != 1 or ci.count("run_arm64_util_linux_observation") != 2
+        or ci.count("\n  arm64-util-linux-observation:\n") != 1
+        or "  arm64-util-linux-observation:\n" + observe_job.rstrip("\n") + "\n" != ARM64_UTIL_LINUX_OBSERVATION_JOB
+    ):
+        failures.append(
+            "ci.yml: the ARM util-linux observation must stay a dispatch-only disposable hosted arm64 job with its "
+            "exact tracer install, root bootstrap, evidence copy, upload and cleanup"
+        )
     script = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
     for token in PROTECTED_REFERENCE_SCRIPT_TOKENS:
         if script.count(token) != 1:
             failures.append(f"protected reference CI script lost {token.strip()}")
+    observe_block = script.find("if [[ $mode == arm64-util-linux-observation ]]; then\n")
+    if not 0 <= script.find("step debz-build 0 ") < observe_block < script.find('step stage 0 "" "${zenv[@]}"'):
+        failures.append("protected reference CI must observe ARM util-linux only after the protected build and before proof staging")
     if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|SkipTest|--skip", script) or script.count(
         'python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"'
-    ) != 5:
+    ) != 6:
         failures.append("protected reference CI script must not skip and must check the tree at every stage")
     for path, tokens in PROTECTED_REFERENCE_SOURCE_TOKENS.items():
         for token in tokens:
