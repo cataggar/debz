@@ -34,8 +34,6 @@ def load(name: str, path: str):
 
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
-HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
-from real_snapshot_reference_paths import toolchain, verify_keyring
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 # The published signature of the pinned x86_64 Zig 0.16.0 archive.
@@ -210,75 +208,7 @@ def root_owned_lstat(path: str) -> os.stat_result:
     return os.stat_result(values)
 
 
-class ProfileStagingTests(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="debz-profile-test-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        patch = mock.patch.object(HARNESS, "protected",
-                                  side_effect=lambda path, directory=False: path.stat())
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_arm64_stages_no_amd64_profile_scripts(self) -> None:
-        self.assertEqual(HARNESS.profile_scripts(self.root, "arm64"), {})
-        (self.root / "systemd.postinst").write_text("#!/bin/sh\n")
-        with self.assertRaisesRegex(ValueError, "must not stage amd64 profile scripts"):
-            HARNESS.profile_scripts(self.root, "arm64")
-
-    def test_amd64_requires_exactly_the_bound_postinsts(self) -> None:
-        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
-            HARNESS.profile_scripts(self.root, "amd64")
-        for profile in ("systemd", "udev", "sudo"):
-            (self.root / f"{profile}.postinst").write_text(f"#!/bin/sh\n# {profile}\n")
-        self.assertEqual(sorted(HARNESS.profile_scripts(self.root, "amd64")), ["sudo", "systemd", "udev"])
-        (self.root / "extra.postinst").write_text("#!/bin/sh\n")
-        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
-            HARNESS.profile_scripts(self.root, "amd64")
-        (self.root / "extra.postinst").unlink()
-        (self.root / "udev.postinst").write_bytes(b"#" * (HARNESS.PROFILE_SCRIPT_LIMIT + 1))
-        with self.assertRaisesRegex(ValueError, "exceeds limit"):
-            HARNESS.profile_scripts(self.root, "amd64")
-
-    def test_profile_checks_are_reported_by_the_probe(self) -> None:
-        probe = (TOOLS / "real-snapshot-reference-escape-probe.zig").read_text()
-        views = {check for checks in HARNESS.PROFILE_VIEW_CHECKS.values() for check in checks}
-        for check in (*HARNESS.PROFILE_ESCAPE_CHECKS, *HARNESS.PROFILE_COMMON_CHECKS, *views):
-            self.assertIn(f'"{check}"', probe)
-        self.assertNotIn("no-proc-view", HARNESS.PROFILE_ESCAPE_CHECKS)
-        self.assertEqual(set(HARNESS.PROFILE_VIEW_CHECKS), set(HARNESS.ORDER.PROFILE_VERSIONS))
-
-
 class ProtectedCiScriptTests(unittest.TestCase):
-    def test_reference_network_controls_require_reachable_host_and_retain_refusals(self) -> None:
-        receipt = b"DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
-        for status, stdout in ((0, receipt), (1, receipt), (0, b""), (0, receipt + b"extra\n")):
-            with self.subTest(status=status, stdout=stdout), tempfile.TemporaryDirectory() as temporary:
-                workspace = Path(temporary)
-                root = workspace / "root"
-                root.mkdir()
-                result = subprocess.CompletedProcess([], status, stdout, b"original diagnostic\n")
-                with mock.patch.object(HARNESS.subprocess, "run", return_value=result) as run:
-                    if status == 0 and stdout == receipt:
-                        with HARNESS.network_control(workspace, "fixture", root, workspace / "probe") as fd:
-                            self.assertGreaterEqual(fd, 200)
-                            self.assertEqual(run.call_args.kwargs["pass_fds"], (fd,))
-                            port, name, inherited = (root / ".debz-network-control").read_text().splitlines()
-                            self.assertGreater(int(port), 0)
-                            self.assertTrue(name.startswith("debz-reference-"))
-                            self.assertEqual(inherited, str(fd))
-                    else:
-                        with self.assertRaisesRegex(AssertionError, "not genuinely reachable"):
-                            with HARNESS.network_control(workspace, "fixture", root, workspace / "probe"):
-                                self.fail("unverified host control authorized reference execution")
-                        self.assertFalse((root / ".debz-network-control").exists())
-                self.assertEqual((workspace / "fixture.network-host.stdout").read_bytes(), stdout)
-                self.assertEqual((workspace / "fixture.network-host.stderr").read_bytes(), result.stderr)
-                self.assertEqual(
-                    json.loads((workspace / "fixture.network-host.json").read_text())["exit_status"],
-                    status,
-                )
-
     def test_less_orchestration_cleans_environment_before_entering_minimal_guest(self) -> None:
         for filename, count in (("real-snapshot-less-protected-stage.sh", 1),
                                 ("real-snapshot-less-reference.sh", 3)):
@@ -1056,87 +986,6 @@ class NativeEvidenceExportTests(unittest.TestCase):
                 self.assertFalse(self.inventory()["capture_complete"])
                 self.assertFalse((self.source / "native-coordination/native-execution-progress-v1.log").exists())
                 member.unlink()
-
-
-class ProtectedInputTests(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.real_fstat = os.fstat
-
-    def root_owned_fstat(self, fd: int) -> os.stat_result:
-        values = list(self.real_fstat(fd))
-        values[4:6] = [0, 0]
-        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
-        if not path.is_relative_to(self.root):
-            values[0] &= ~0o022
-        return os.stat_result(values)
-
-    def test_keyring_refuses_unprotected_writable_symlinked_and_wrong_bytes(self) -> None:
-        keyring = self.root / "keyring"
-        payload = b"reviewed fixture bytes"
-        keyring.write_bytes(payload)
-        digest = hashlib.sha256(payload).hexdigest()
-        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
-            verify_keyring(keyring, len(payload), digest)
-        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
-            self.assertEqual(verify_keyring(keyring, len(payload), digest), digest)
-            for size, expected in ((len(payload) + 1, digest), (len(payload), "0" * 64)):
-                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "pin mismatch"):
-                    verify_keyring(keyring, size, expected)
-            keyring.write_bytes(payload[:-1] + b"?")
-            with self.assertRaisesRegex(ValueError, "pin mismatch"):
-                verify_keyring(keyring, len(payload), digest)
-            keyring.write_bytes(payload)
-            keyring.chmod(0o666)
-            with self.assertRaisesRegex(ValueError, "writable"):
-                verify_keyring(keyring, len(payload), digest)
-            keyring.chmod(0o644)
-            link = self.root / "linked"
-            link.symlink_to(keyring)
-            with self.assertRaises(OSError):
-                verify_keyring(link, len(payload), digest)
-            directory_link = self.root / "linked-dir"
-            directory_link.symlink_to(self.root, target_is_directory=True)
-            with self.assertRaises(OSError):
-                verify_keyring(directory_link / "keyring", len(payload), digest)
-            self.root.chmod(0o777)
-            with self.assertRaisesRegex(ValueError, "writable"):
-                verify_keyring(keyring, len(payload), digest)
-
-    def test_compiler_binds_protected_library_ancestry_without_resolving_input_links(self) -> None:
-        compiler = self.root / "zig"
-        compiler.write_text("#!/bin/sh\nexit 0\n")
-        compiler.chmod(0o755)
-        library = self.root / "lib"
-        library.mkdir()
-        source = library / "std.zig"
-        source.write_text("fixture")
-        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
-            toolchain(compiler)
-        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
-            self.assertEqual(toolchain(compiler), library)
-            compiler.chmod(0o777)
-            with self.assertRaisesRegex(ValueError, "writable"):
-                toolchain(compiler)
-            compiler.chmod(0o755)
-            source.chmod(0o666)
-            with self.assertRaisesRegex(ValueError, "writable"):
-                toolchain(compiler)
-            source.chmod(0o644)
-            (library / "escape").symlink_to(compiler)
-            with self.assertRaisesRegex(ValueError, "symlink escapes"):
-                toolchain(compiler)
-            (library / "escape").unlink()
-            linked = self.root / "linked-zig"
-            linked.symlink_to(compiler)
-            with self.assertRaises(OSError):
-                toolchain(linked)
-            library.rename(self.root / "real-lib")
-            library.symlink_to(self.root / "real-lib", target_is_directory=True)
-            with self.assertRaises(OSError):
-                toolchain(compiler)
 
 
 class SignedLessStagingTests(unittest.TestCase):

@@ -22,6 +22,8 @@ pub const escape_checks = [_][]const u8{
     "host-time-denied",   "raw-network-denied", "unshare-denied",        "setns-denied",         "clone-user-denied",    "clone-network-denied",
     "clone-mount-denied", "clone3-denied",
 };
+const control_exempt = [_][]const u8{ "inherited-descriptors", "path-escape" };
+const profile_exempt = "no-proc-view";
 const confined_checks = [_][]const u8{ "archive-mount", "descendant-started" };
 const profile_common = [_][]const u8{ "proc-mount", "proc-root", "proc-hidepid", "archive-unbound", "descendant-started" };
 const marker = ".debz-escape-probe-descendant";
@@ -444,9 +446,9 @@ const Harness = struct {
                 break :blk try self.operation(name, root, self.options.runtime, null, null, 0, "configure", profile, try std.fmt.allocPrint(self.ctx.a, "{s}:amd64", .{profile}), false, network.inherited);
             };
             const observed = try probeResults(self.ctx.a, result.stdout);
-            try ensure(result.code == 0 and !observed.contains("no-proc-view"), "signed proc profile refused or used wrong view");
+            try ensure(result.code == 0 and !observed.contains(profile_exempt), "signed proc profile refused or used wrong view");
             for (escape_checks) |check| {
-                if (eq(u8, check, "no-proc-view")) continue;
+                if (eq(u8, check, profile_exempt)) continue;
                 try ensure(eq(u8, observed.get(check) orelse "", "ok"), check);
             }
             for (profile_common ++ .{ "private-network", "result" }) |check| try ensure(eq(u8, observed.get(check) orelse "", "ok"), check);
@@ -563,7 +565,7 @@ const Harness = struct {
         const control_results = try probeResults(self.ctx.a, try self.ctx.read(args.workspace, "escape-control.stdout", order.maximum_probe_output));
         try ensure(control_code == 1 and eq(u8, control_results.get("result") orelse "", "FAIL"), "unconfined probe did not observe root authority");
         for (escape_checks) |check| {
-            if (eq(u8, check, "inherited-descriptors") or eq(u8, check, "path-escape")) continue;
+            if (eq(u8, check, control_exempt[0]) or eq(u8, check, control_exempt[1])) continue;
             try ensure(eq(u8, control_results.get(check) orelse "", "FAIL"), check);
         }
         const escape_root = try self.freshRoot(args.workspace, "escape");
@@ -650,12 +652,64 @@ test "original escape report requires exactly one check and one bound detail" {
     const original = "Preparing to unpack /.debz-reference-archive ...\ndebz-escape-probe: mount-denied ok errno=PERM\ndebz-escape-probe: shared-network-namespace info inet_socket=SUCCESS\ndebz-escape-probe: result ok failures=0 mode=install\n";
     const result = try probeResults(a, original);
     try std.testing.expectEqual(@as(usize, 2), result.count());
+    try std.testing.expectEqualStrings("ok", result.get("mount-denied").?);
+    try std.testing.expectEqualStrings("ok", result.get("result").?);
     try std.testing.expectError(error.AmbiguousEscapeProbeReport, probeResults(a, "debz-escape-probe: mount-denied ok\ndebz-escape-probe: mount-denied FAIL"));
     try std.testing.expectError(error.AmbiguousEscapeProbeReport, probeResults(a, "debz-escape-probe: mount-denied skipped"));
     const mounted = "debz-escape-probe: archive-mount ok size=4096 mount_root=true write=ROFS";
     try std.testing.expectEqualStrings("4096", (try probeDetail(a, mounted, "archive-mount")).get("size").?);
     try std.testing.expectError(error.MissingEscapeProbeDetail, probeDetail(a, "", "archive-mount"));
+    try std.testing.expectError(error.MissingEscapeProbeDetail, probeDetail(a, try std.mem.replaceOwned(u8, a, mounted, " ok ", " FAIL "), "archive-mount"));
     try std.testing.expectError(error.AmbiguousEscapeProbeDetail, probeDetail(a, mounted ++ "\n" ++ mounted, "archive-mount"));
+}
+
+test "original escape control confined and signed profile vocabularies match the probe and ordering profiles" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const original_escape = [_][]const u8{
+        "pid-namespace",        "no-proc-view",         "inherited-descriptors", "no-new-privileges",
+        "seccomp-filter",       "capabilities",         "path-escape",           "re-chroot-denied",
+        "pivot-root-denied",    "handle-escape-denied", "mount-denied",          "umount-denied",
+        "move-mount-denied",    "device-node-denied",   "module-load-denied",    "module-file-denied",
+        "module-remove-denied", "host-admin-denied",    "host-time-denied",      "raw-network-denied",
+        "unshare-denied",       "setns-denied",         "clone-user-denied",     "clone-network-denied",
+        "clone-mount-denied",   "clone3-denied",
+    };
+    try std.testing.expectEqual(original_escape.len, escape_checks.len);
+    for (original_escape, escape_checks) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    const original_exempt = [_][]const u8{ "inherited-descriptors", "path-escape" };
+    try std.testing.expectEqual(original_exempt.len, control_exempt.len);
+    for (original_exempt, control_exempt) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    var detected: usize = 0;
+    for (escape_checks) |check| {
+        var exempt = false;
+        for (control_exempt) |name| exempt = exempt or eq(u8, check, name);
+        if (!exempt) detected += 1;
+    }
+    for (control_exempt) |exempt| {
+        var found: usize = 0;
+        for (escape_checks) |check| if (eq(u8, check, exempt)) {
+            found += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), found);
+    }
+    try std.testing.expectEqual(escape_checks.len, detected + control_exempt.len);
+    for (confined_checks) |confined| for (escape_checks) |check| try std.testing.expect(!eq(u8, confined, check));
+    try std.testing.expectEqualStrings("no-proc-view", profile_exempt);
+    const probe = @embedFile("real-snapshot-reference-escape-probe.zig");
+    const views = [_][]const u8{ "proc-read-only", "proc-sys-masked", "proc-boot-id", "proc-pid-only" };
+    for (escape_checks ++ confined_checks ++ profile_common ++ views ++ [_][]const u8{"result"}) |check|
+        try std.testing.expect(std.mem.indexOf(u8, probe, try std.fmt.allocPrint(a, "\"{s}\"", .{check})) != null);
+    try std.testing.expectEqual(order.script_profiles.len, profiles.len);
+    for (profiles) |profile| {
+        var matches: usize = 0;
+        for (order.script_profiles) |entry| if (eq(u8, entry[0], profile)) {
+            matches += 1;
+            try std.testing.expectEqualStrings(entry[1], profileVersion(profile));
+        };
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
 }
 
 fn testHarness(a: A, env: *const std.process.Environ.Map, root: []const u8) !Harness {
@@ -692,6 +746,7 @@ test "original amd64 profile staging is an exact bounded set and arm64 never bor
     var work = std.testing.tmpDir(.{ .iterate = true });
     defer work.cleanup();
     var harness = try testHarness(a, &env, try testRoot(a, work));
+    try std.testing.expectError(error.ProtectedReferenceProofFailed, harness.profileScripts());
     harness.options.architecture = "arm64";
     try std.testing.expect((try harness.profileScripts()).count() == 0);
     try work.dir.writeFile(std.testing.io, .{ .sub_path = "systemd.postinst", .data = "#!/bin/sh\n" });

@@ -461,7 +461,11 @@ tests use `test-real-snapshot-reference-order`,
 `test-real-snapshot-reference-protected-pure`; genuine independent dpkg,
 noexec callback denial, network isolation and whole-root continuation
 remain separate `test-real-snapshot-reference-protected` proofs on
-disposable hosted root runners, without skips.
+disposable hosted root runners, without skips. The Python ordering module
+and protected proof harness are retired: their original unprivileged
+launcher, cycle, pending-oracle, profile-staging and network-control
+observations run with unchanged inputs and expectations in those native
+suites, and the protected Python 3 stage binds the native ordering source.
 
 `tools/real-snapshot-signed-proc-prestates.sh PINNED_DPKG WORKSPACE`
 manufactures the three before-script sources. Run it **as root on amd64**

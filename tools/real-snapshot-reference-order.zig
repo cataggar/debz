@@ -169,9 +169,13 @@ pub fn verifyPinnedArchive(package: Package, pin: paths.Pinned) !void {
     if (!eq(u8, &std.fmt.bytesToHex(actual, .lower), package.digest)) return error.ReferenceArchiveDigestChanged;
 }
 
+pub const script_profiles = [_][2][]const u8{
+    .{ "systemd", "259.5-0ubuntu3.4" },
+    .{ "udev", "259.5-0ubuntu3.4" },
+    .{ "sudo", "1.9.17p2-1ubuntu3.1" },
+};
 fn profileVersion(profile: []const u8) ?[]const u8 {
-    if (eq(u8, profile, "systemd") or eq(u8, profile, "udev")) return "259.5-0ubuntu3.4";
-    if (eq(u8, profile, "sudo")) return "1.9.17p2-1ubuntu3.1";
+    for (script_profiles) |entry| if (eq(u8, profile, entry[0])) return entry[1];
     return null;
 }
 pub const Cycle = enum {
@@ -431,6 +435,7 @@ const TestHooks = if (builtin.is_test) struct {
     run: ?*const fn (*anyopaque, []const []const u8) anyerror!?Result = null,
     runtime_unprotected: bool = false,
     runtime_digest: ?*const fn ([]const u8) ?[64]u8 = null,
+    assume_x86_64: bool = false,
 } else void;
 pub const Context = struct {
     a: A,
@@ -577,6 +582,8 @@ pub const Context = struct {
             return error.ReferenceDpkgOutputExceedsLimit;
     }
     fn capture(self: Context, command: []const []const u8, directory: []const u8, out: []const u8, err: []const u8, seconds: i64) !Result {
+        if (builtin.is_test) if (self.test_hooks) |hooks| if (hooks.run) |callback| if (try callback(hooks.state, command)) |result|
+            return .{ .code = result.code, .stdout = result.stdout[0..@min(result.stdout.len, maximum_probe_output)], .stderr = result.stderr[0..@min(result.stderr.len, maximum_probe_output)], .stdout_bytes = result.stdout.len, .stderr_bytes = result.stderr.len };
         const output = try paths.create(directory, out, 0o600, false);
         _ = linux.close(output);
         const errors = try paths.create(directory, err, 0o600, false);
@@ -1076,12 +1083,18 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn proveBaseCycle(ctx: Context, setpriv: []const u8) !void {
-    if (builtin.cpu.arch != .x86_64 or (try ctx.database(ctx.root)).len != 0) return error.CycleProofPrestate;
-    _ = try paths.protected(ctx.root, true);
-    const setpriv_pin = try paths.openProtected(setpriv, false);
+    const unit_proof = if (builtin.is_test) if (ctx.test_hooks) |hooks| hooks.assume_x86_64 else false else false;
+    if ((builtin.cpu.arch != .x86_64 and !unit_proof) or (try ctx.database(ctx.root)).len != 0) return error.CycleProofPrestate;
+    const unit_source = if (builtin.is_test) if (ctx.test_hooks) |hooks| hooks.runtime_unprotected else false else false;
+    if (!unit_source) _ = try paths.protected(ctx.root, true);
+    const setpriv_pin = try (if (unit_source) paths.openAbsolute(setpriv, false) else paths.openProtected(setpriv, false));
     defer setpriv_pin.close();
     const setpriv_bytes = try paths.readPinned(ctx.a, setpriv_pin, maximum_control_bytes);
-    if (!eq(u8, &hash(std.crypto.hash.sha2.Sha256, setpriv_bytes), "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993"))
+    var setpriv_digest = hash(std.crypto.hash.sha2.Sha256, setpriv_bytes);
+    if (builtin.is_test) if (ctx.test_hooks) |hooks| if (hooks.runtime_digest) |callback| if (callback(setpriv_bytes)) |provided| {
+        setpriv_digest = provided;
+    };
+    if (!eq(u8, &setpriv_digest, "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993"))
         return error.CycleProofRuntimeChanged;
     const cycle = try cyclePackages(ctx.a, try ctx.manifest(), "amd64", .base);
     const proof = try join(ctx.a, ctx.evidence, "base-cycle-proof");
@@ -1091,7 +1104,7 @@ pub fn proveBaseCycle(ctx: Context, setpriv: []const u8) !void {
     const seed = try join(ctx.a, proof, "seed");
     try ctx.checked(&.{ "cp", "-a", "--one-file-system", "--", ctx.root, seed }, 60);
     for ([_]usize{ 2, 3, 0, 1 }) |index| {
-        try verifyArchive(cycle[index]);
+        try ctx.archive(cycle[index]);
         try ctx.apply(try ctx.argvFor(seed, "none", "unpack", cycle[index], &.{}), proof, "unpack.stdout", "unpack.stderr");
     }
     for (cycle[2..]) |package| try ctx.apply(try ctx.argvFor(seed, "none", "configure", package, &.{}), proof, "unpack.stdout", "unpack.stderr");

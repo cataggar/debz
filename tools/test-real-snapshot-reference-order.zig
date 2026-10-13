@@ -27,13 +27,17 @@ const State = struct {
     captures: std.ArrayList(order.Prestate) = .empty,
     capture_states: std.ArrayList([]order.Fields) = .empty,
     cycle_calls: [3]usize = @splat(0),
-    mode: enum { normal, stall, cycles, predepends, probe_budget } = .normal,
+    mode: enum { normal, stall, cycles, predepends, probe_budget, resume_cycles, bridge } = .normal,
     phase: usize = 0,
     captured_status: []const u8 = "half-configured",
     companion_status: []const u8 = "install ok installed",
     companion_version: ?[]const u8 = null,
     extra_transition: ?[]const u8 = null,
+    after_status: ?[2][]const u8 = null,
     mutate_trigger: ?std.Io.Dir = null,
+    trigger_name: []const u8 = "new",
+    trigger_bytes: []const u8 = "unbound activation\n",
+    probe_override: ?struct { selector: []const u8, result: order.Result } = null,
     no_progress: bool = false,
     constant_unpacked: bool = false,
     bad_refusal: bool = false,
@@ -75,8 +79,11 @@ const State = struct {
     fn probe(pointer: *anyopaque, command: []const []const u8) !order.Result {
         const self = get(pointer);
         self.probe_count += 1;
+        if (self.probe_override) |override| if (eq(u8, command[6], override.selector)) return override.result;
         const selected = try self.package(command[6]);
         if (eq(u8, command[5], "probe_unpack")) {
+            if (self.mode == .bridge and self.phase == 0 and eq(u8, command[6], "systemd:amd64"))
+                return .{ .code = 1, .stdout = "pre-dependency problem", .stderr = "" };
             if (self.mode == .probe_budget) {
                 for (self.packages, 0..) |package_value, index| if (eq(u8, package_value.name, selected.name)) {
                     if (index + 1 < self.packages.len and !eq(u8, order.field((try self.row(self.packages[index + 1].name)).*, "status"), "install ok installed"))
@@ -89,8 +96,12 @@ const State = struct {
                 return .{ .code = 1, .stdout = "pre-dependency problem", .stderr = "" };
             return .{ .code = 0, .stdout = "", .stderr = "" };
         }
+        if (self.mode == .bridge) return if (self.phase == 0 and (eq(u8, command[6], "libc6:amd64") or eq(u8, command[6], "libgcc-s1:amd64")))
+            .{ .code = 1, .stdout = "dependency problems", .stderr = "" }
+        else
+            .{ .code = 0, .stdout = "", .stderr = "" };
         if (self.bad_refusal) return .{ .code = 1, .stdout = "dependency problems: another peer is not configured yet.", .stderr = "" };
-        if (self.mode == .stall or (self.mode == .cycles and
+        if (self.mode == .stall or ((self.mode == .cycles or self.mode == .resume_cycles) and
             (self.phase == 0 or eq(u8, selected.name, "libssl3t64") or eq(u8, selected.name, "openssl-provider-legacy") or
                 (eq(u8, selected.name, "systemd") and self.phase != 2))))
             return .{ .code = 1, .stdout = "dependency problems", .stderr = "" };
@@ -112,7 +123,8 @@ const State = struct {
             try self.set(selected.name, "status", "install ok installed");
             if (eq(u8, verb, "configure_openssl_cycle")) try self.set("openssl-provider-legacy", "status", "install ok installed");
             if (self.extra_transition) |name| try self.set(name, "status", if (eq(u8, verb, "configure_openssl_cycle")) "install ok unpacked" else "install ok installed");
-            if (self.mutate_trigger) |directory| try directory.writeFile(io, .{ .sub_path = "var/lib/dpkg/triggers/new", .data = "unbound activation\n" });
+            if (self.after_status) |changed| try self.set(changed[0], "status", changed[1]);
+            if (self.mutate_trigger) |directory| try directory.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(self.a, "var/lib/dpkg/triggers/{s}", .{self.trigger_name}), .data = self.trigger_bytes });
             return;
         }
         if (eq(u8, verb, "continue_prestate")) {
@@ -222,6 +234,21 @@ fn selectedCommands(a: A, state: State, verb: []const u8) ![][]const u8 {
     for (state.commands.items) |command| if (eq(u8, command[5], verb)) try names.append(a, command[6]);
     return names.toOwnedSlice(a);
 }
+fn expectCycleRefusal(result: anytype) !void {
+    if (result) |_| return error.AcceptedOriginalCycleRefusal else |err| if (!std.mem.startsWith(u8, @errorName(err), "Cycle")) return err;
+}
+fn expectOsRefusal(result: anytype) !void {
+    if (result) |_| return error.AcceptedOriginalOsRefusal else |err| for ([_][]const u8{ "ReferencePathRefused", "FileNotFound", "PathAlreadyExists" }) |name| {
+        if (eq(u8, @errorName(err), name)) return;
+    } else return err;
+}
+fn samePackage(left: order.Package, right: order.Package) bool {
+    return eq(u8, left.name, right.name) and eq(u8, left.version, right.version) and eq(u8, left.architecture, right.architecture) and
+        eq(u8, left.digest, right.digest) and left.size == right.size and eq(u8, left.archive, right.archive);
+}
+fn evidenceJson(a: A, root: []const u8, relative: []const u8) !std.json.Value {
+    return (try std.json.parseFromSlice(std.json.Value, a, try paths.readRootFile(a, root, relative, 4 * 1024 * 1024), .{})).value;
+}
 
 test "original manifest retains five-field TSV identity and all boundary refusals" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -326,7 +353,7 @@ test "original single-package launcher command refuses all unbound trigger and h
         selected.name = changed.name;
         selected.architecture = changed.arch;
         selected.version = changed.version;
-        if (order.dpkgCommand(a, launcher, "/dpkg", "/root", changed.arch, changed.profile, "continue_prestate", selected, &.{})) |_| return error.AcceptedUnboundContinuation else |_| {}
+        if (order.dpkgCommand(a, launcher, "/dpkg", "/root", changed.arch, changed.profile, "continue_prestate", selected, &.{})) |_| return error.AcceptedUnboundContinuation else |err| if (std.mem.indexOf(u8, @errorName(err), "Unauthorized") == null) return err;
     }
     for ([_][]const u8{ "systemd", "udev" }) |name| {
         var selected = package;
@@ -469,15 +496,19 @@ test "original full configured closure retains explicit unbound trigger closure 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var state = try simple(a, &.{"fixture"});
     var env: std.process.Environ.Map = .init(a);
-    var work = std.testing.tmpDir(.{ .iterate = true });
-    defer work.cleanup();
-    const ctx = state.context(try rootPath(a, work), &env);
-    try expectError(error.UnboundTriggerClosure, ctx.install(&.{}));
-    try expect(state.commands.items.len == 2);
-    try expectEqualStrings("unpack", state.commands.items[0][5]);
-    try expectEqualStrings("configure", state.commands.items[1][5]);
+    // The original oracle reported a constant unpacked database; the scheduler-maintained database must agree.
+    for ([_]bool{ false, true }) |constant_unpacked| {
+        var state = try simple(a, &.{"fixture"});
+        state.constant_unpacked = constant_unpacked;
+        var work = std.testing.tmpDir(.{ .iterate = true });
+        defer work.cleanup();
+        const ctx = state.context(try rootPath(a, work), &env);
+        try expectError(error.UnboundTriggerClosure, ctx.install(&.{}));
+        try expect(state.commands.items.len == 2);
+        try expectEqualStrings("unpack", state.commands.items[0][5]);
+        try expectEqualStrings("configure", state.commands.items[1][5]);
+    }
 }
 
 test "PreDepends retry preserves actual unpack order rather than original manifest order" {
@@ -1008,4 +1039,660 @@ test "actual independent install logs retain bytes but reject either original si
         defer log.close();
         try expect(log.metadata.size == 16777217);
     }
+}
+
+test "original no-follow database rejects symlinked ancestors" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const root = try rootPath(a, work);
+    try work.dir.createDirPath(io, "var/lib");
+    try work.dir.symLink(io, "/etc", "var/lib/dpkg", .{ .is_directory = true });
+    try expectOsRefusal(paths.readRootFile(a, root, "var/lib/dpkg/passwd", 1024 * 1024));
+    try work.dir.deleteFile(io, "var/lib/dpkg");
+    try work.dir.createDir(io, "var/lib/dpkg", .default_dir);
+    try work.dir.symLink(io, "/etc/passwd", "var/lib/dpkg/status", .{});
+    try expectOsRefusal(paths.readRootFile(a, root, "var/lib/dpkg/status", 1024 * 1024));
+}
+
+test "original reference paths reject mutable ancestry and dotdot" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const root = try rootPath(a, work);
+    const archive = try std.fmt.allocPrint(a, "{s}/archive", .{root});
+    try work.dir.writeFile(io, .{ .sub_path = "archive", .data = "signed bytes" });
+    try expectError(error.UnprotectedReferencePath, paths.protected(archive, false));
+    try expectError(error.NoncanonicalReferencePath, paths.openAbsolute(try std.fmt.allocPrint(a, "{s}/../etc/passwd", .{root}), false));
+    try expectError(error.NoncanonicalReferencePath, paths.readRootFile(a, root, "../etc/passwd", 1024));
+    try work.dir.symLink(io, archive, "link", .{});
+    try expectOsRefusal(paths.openAbsolute(try std.fmt.allocPrint(a, "{s}/link", .{root}), false));
+}
+
+test "original status read refuses duplicate malformed or redirected identity and accepts valueless fields" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const root = try rootPath(a, work);
+    const ctx: order.Context = .{ .a = a, .io = io, .environment = &env, .launcher = .{ .path = "", .runtime = "" }, .dpkg = "", .root = root, .cache = root, .evidence = root, .architecture = "amd64" };
+    try work.dir.createDirPath(io, "var/lib/dpkg");
+    const status = "Package: demo\nArchitecture: amd64\nVersion: 1\nStatus: install ok unpacked\nDescription: fixture\n more text\n\n";
+    const valueless = "Package: demo\nArchitecture: amd64\nVersion: 1\nStatus: install ok unpacked\nConffiles:\n /etc/demo.conf 0123456789abcdef\n\n";
+    for ([_][]const u8{ status, valueless }) |bytes| {
+        try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = bytes });
+        const records = try ctx.database(root);
+        try expect(records.len == 1);
+        try expectStrings(&.{ "demo", "amd64", "install ok unpacked", "1" }, &.{ order.field(records[0], "package"), order.field(records[0], "architecture"), order.field(records[0], "status"), order.field(records[0], "version") });
+    }
+    for ([_][]const u8{ "Priority:optional", "Bad Key: x", "Conffiles" }) |malformed| {
+        try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = try std.fmt.allocPrint(a, "Package: demo\nArchitecture: amd64\nVersion: 1\nStatus: install ok unpacked\n{s}\n\n", .{malformed}) });
+        try expectError(error.MalformedReferenceDatabaseField, ctx.database(root));
+    }
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = try replaceOne(a, status, "Package: demo", "Package: demo\npackage: other") });
+    try expectError(error.DuplicateReferenceDatabaseField, ctx.database(root));
+    try work.dir.deleteFile(io, "var/lib/dpkg/status");
+    try work.dir.symLink(io, "/etc/passwd", "var/lib/dpkg/status", .{});
+    try expectOsRefusal(ctx.database(root));
+}
+
+test "original launcher invocation stays single package and trigger verbs require a triggered script profile" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const root = try rootPath(a, work);
+    const launcher: order.Launcher = .{ .path = try std.fmt.allocPrint(a, "{s}/launcher", .{root}), .runtime = try std.fmt.allocPrint(a, "{s}/runtime", .{root}) };
+    const dpkg = try std.fmt.allocPrint(a, "{s}/dpkg", .{root});
+    const target = try std.fmt.allocPrint(a, "{s}/root", .{root});
+    const demo: order.Package = .{ .name = "demo", .version = "1", .architecture = "amd64", .digest = "a" ** 128, .size = 42, .archive = try std.fmt.allocPrint(a, "{s}/package.deb", .{root}) };
+    const command = try order.dpkgCommand(a, launcher, dpkg, target, "amd64", "none", "unpack", demo, &.{});
+    try expectStrings(&.{ "amd64", "none", "unpack", "demo:amd64" }, command[3..7]);
+    try expectEqualStrings(launcher.runtime, command[7]);
+    try expectStrings(&.{ demo.archive, demo.digest, "42" }, command[8..]);
+    for (command) |argument| try expect(!eq(u8, argument, "--pending"));
+    const sudo: order.Package = .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .architecture = "amd64", .digest = "a" ** 128, .size = 42, .archive = try std.fmt.allocPrint(a, "{s}/sudo.deb", .{root}) };
+    try expectStrings(&.{ "amd64", "sudo", "configure", "sudo:amd64" }, (try order.dpkgCommand(a, launcher, dpkg, target, "amd64", "sudo", "configure", sudo, &.{}))[3..7]);
+    for ([_][]const u8{ "sudo", "none" }) |profile|
+        try expectError(error.NoSingleScriptBinding, order.dpkgCommand(a, launcher, dpkg, target, "amd64", profile, "triggers_only", sudo, &.{}));
+    try expectError(error.NoSingleScriptBinding, order.dpkgCommand(a, launcher, dpkg, target, "amd64", "sudo", "triggers_pending", sudo, &.{}));
+    try expectError(error.SignedPackageRequired, order.dpkgCommand(a, launcher, dpkg, target, "amd64", "none", "configure", null, &.{}));
+    try expectError(error.MissingExactConfigureProfile, order.dpkgCommand(a, launcher, dpkg, target, "amd64", "none", "configure", sudo, &.{}));
+    for ([_][3][]const u8{ .{ "sudo", "different", "amd64" }, .{ "sudo", sudo.version, "all" }, .{ "not-sudo", sudo.version, "amd64" } }) |identity| {
+        var changed = sudo;
+        changed.name = identity[0];
+        changed.version = identity[1];
+        changed.architecture = identity[2];
+        try expectError(error.UnauthorizedReferenceScriptProfile, order.dpkgCommand(a, launcher, dpkg, target, "amd64", "sudo", "configure", changed, &.{}));
+    }
+    try expectError(error.UnauthorizedReferenceScriptProfile, order.dpkgCommand(a, launcher, dpkg, target, "amd64", "sudo", "probe_configure", sudo, &.{}));
+    try expectError(error.UnauthorizedReferenceScriptProfile, order.dpkgCommand(a, launcher, dpkg, target, "arm64", "sudo", "configure", sudo, &.{}));
+}
+
+test "original kbd base and OpenSSL cycle operations refuse each changed architecture profile selector and archive set" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const root = try rootPath(a, work);
+    const launcher: order.Launcher = .{ .path = try std.fmt.allocPrint(a, "{s}/launcher", .{root}), .runtime = try std.fmt.allocPrint(a, "{s}/runtime", .{root}) };
+    const dpkg = try std.fmt.allocPrint(a, "{s}/dpkg", .{root});
+    var kbd_work = std.testing.tmpDir(.{ .iterate = true });
+    defer kbd_work.cleanup();
+    var base_work = std.testing.tmpDir(.{ .iterate = true });
+    defer base_work.cleanup();
+    var openssl_work = std.testing.tmpDir(.{ .iterate = true });
+    defer openssl_work.cleanup();
+    const kbd = (try fixture(a, kbd_work.dir, .kbd)).packages;
+    const base = (try fixture(a, base_work.dir, .base)).packages;
+    const ssl = (try fixture(a, openssl_work.dir, .openssl)).packages;
+    const Change = struct { []const u8, []const u8, order.Package, []const order.Package };
+
+    try expectStrings(&.{ "amd64", "kbd_cycle", "break_kbd_cycle", "kbd:amd64" }, (try order.dpkgCommand(a, launcher, dpkg, root, "amd64", "kbd_cycle", "break_kbd_cycle", kbd[0], kbd))[3..7]);
+    const kbd_reordered = [_]order.Package{ kbd[0], kbd[2], kbd[1], kbd[3] };
+    for ([_]Change{
+        .{ "arm64", "kbd_cycle", kbd[0], kbd },
+        .{ "amd64", "none", kbd[0], kbd },
+        .{ "amd64", "kbd_cycle", kbd[1], kbd },
+        .{ "amd64", "kbd_cycle", kbd[0], kbd[0..3] },
+        .{ "amd64", "kbd_cycle", kbd[0], &kbd_reordered },
+    }) |changed| try expectCycleRefusal(order.dpkgCommand(a, launcher, dpkg, root, changed[0], changed[1], "break_kbd_cycle", changed[2], changed[3]));
+    const kbd_changed = try a.dupe(order.Package, kbd);
+    kbd_changed[0].digest = "0" ** 128;
+    try expectError(error.CycleIdentityChanged, order.cyclePackages(a, kbd_changed, "amd64", .kbd));
+
+    const base_command = try order.dpkgCommand(a, launcher, dpkg, root, "amd64", "libgcc_cycle", "break_base_cycle", base[1], base);
+    try expectStrings(&.{ "amd64", "libgcc_cycle", "break_base_cycle", "libgcc-s1:amd64" }, base_command[3..7]);
+    var base_archives: [4][]const u8 = undefined;
+    for (base, &base_archives) |package, *archive| archive.* = package.archive;
+    try expectStrings(&base_archives, base_command[8..]);
+    for ([_]Change{
+        .{ "arm64", "libgcc_cycle", base[1], base },
+        .{ "amd64", "none", base[1], base },
+        .{ "amd64", "libgcc_cycle", base[0], base },
+        .{ "amd64", "libgcc_cycle", base[1], base[0..2] },
+    }) |changed| try expectCycleRefusal(order.dpkgCommand(a, launcher, dpkg, root, changed[0], changed[1], "break_base_cycle", changed[2], changed[3]));
+    try expectError(error.CycleIdentityChanged, order.cyclePackages(a, base[0 .. base.len - 1], "amd64", .base));
+
+    try expectStrings(&.{ "amd64", "openssl_cycle", "configure_openssl_cycle", "libssl3t64:amd64" }, (try order.dpkgCommand(a, launcher, dpkg, root, "amd64", "openssl_cycle", "configure_openssl_cycle", ssl[0], ssl))[3..7]);
+    const ssl_rotated = [_]order.Package{ ssl[1], ssl[2], ssl[3], ssl[4], ssl[0] };
+    for ([_]Change{
+        .{ "arm64", "openssl_cycle", ssl[0], ssl },
+        .{ "amd64", "none", ssl[0], ssl },
+        .{ "amd64", "sudo", ssl[0], ssl },
+        .{ "amd64", "openssl_cycle", ssl[1], ssl },
+        .{ "amd64", "openssl_cycle", ssl[0], ssl[0..2] },
+        .{ "amd64", "openssl_cycle", ssl[0], &ssl_rotated },
+    }) |changed| try expectCycleRefusal(order.dpkgCommand(a, launcher, dpkg, root, changed[0], changed[1], "configure_openssl_cycle", changed[2], changed[3]));
+    const ssl_changed = try a.dupe(order.Package, ssl);
+    ssl_changed[0].digest = "0" ** 128;
+    try expectError(error.CycleIdentityChanged, order.cyclePackages(a, ssl_changed, "amd64", .openssl));
+}
+
+test "original kbd cycle refuses changed peers outside libc callbacks and pending activation before apply" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .kbd);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    _ = try ctx.verifyCycle(root, state.packages, .kbd);
+    for ([_][3][]const u8{
+        .{ "kbd", "depends", "unknown" },
+        .{ "kbd", "triggers-pending", "update-initramfs" },
+        .{ "console-setup-linux", "multi-arch", "same" },
+        .{ "console-setup", "pre-depends", "" },
+        .{ "console-setup", "status", "install ok installed" },
+        .{ "libc6", "status", "install ok unpacked" },
+    }) |change| {
+        const record = try state.row(change[0]);
+        const saved = try record.clone(a);
+        try record.put(a, change[1], .{ .string = change[2] });
+        try expectCycleRefusal(ctx.transition(root, root, state.packages, .kbd, "out", "err"));
+        record.* = saved;
+    }
+    for ([_][]const u8{ "kbd.postinst", "kbd:amd64.config", "kbd:amd64.triggers" }) |name| {
+        const path = try std.fmt.allocPrint(a, "var/lib/dpkg/info/{s}", .{name});
+        try work.dir.symLink(io, "/missing-unreviewed-callback", path, .{});
+        try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .kbd));
+        try work.dir.deleteFile(io, path);
+    }
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/kbd.triggers", .data = "activate update-initramfs\n" });
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .kbd));
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/kbd.triggers", .data = order.kbd_triggers });
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/triggers/Unincorp", .data = "update-initramfs kbd\n" });
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .kbd));
+    try expect(state.commands.items.len == 0);
+}
+
+test "original kbd success requires only its one real transition and unchanged trigger database" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .kbd);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    const saved = try state.clone(state.records);
+    const selected = try ctx.transition(root, root, state.packages, .kbd, "out", "err");
+    try expect(selected.len == 1 and samePackage(selected[0], state.packages[0]));
+    try expect(state.commands.items.len == 1);
+    try expectStrings(&.{ "break_kbd_cycle", "kbd:amd64" }, state.commands.items[0][5..7]);
+    state.records = try state.clone(saved);
+    state.extra_transition = "console-setup-linux";
+    try expectError(error.CycleNoProgress, ctx.transition(root, root, state.packages, .kbd, "out", "err"));
+    state.records = try state.clone(saved);
+    state.extra_transition = null;
+    state.mutate_trigger = work.dir;
+    state.trigger_name = "unexpected";
+    state.trigger_bytes = "";
+    try expectError(error.CycleNoProgress, ctx.transition(root, root, state.packages, .kbd, "out", "err"));
+}
+
+test "original signed base cycle graph and callback mutations refuse with their exact original reasons before apply" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .base);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    _ = try ctx.verifyCycle(root, state.packages, .base);
+    for ([_]struct { []const u8, []const u8, []const u8, anyerror }{
+        .{ "libc6", "depends", "another-package", error.CycleControlChanged },
+        .{ "libgcc-s1", "pre-depends", "libc6", error.CycleControlChanged },
+        .{ "gcc-16-base", "status", "install ok unpacked", error.CycleOutsideDependency },
+        .{ "gcc-16-base", "multi-arch", "foreign", error.CycleControlChanged },
+        .{ "libc-gconv-modules-extra", "multi-arch", "", error.CycleControlChanged },
+        .{ "libgcc-s1", "status", "install ok triggers-pending", error.CycleStateChanged },
+        .{ "libgcc-s1", "triggers-pending", "ldconfig", error.CycleCallbackChanged },
+    }) |change| {
+        const record = try state.row(change[0]);
+        const saved = try record.clone(a);
+        try record.put(a, change[1], .{ .string = change[2] });
+        try expectError(change[3], ctx.transition(root, root, state.packages, .base, "out", "err"));
+        record.* = saved;
+    }
+    for ([_][]const u8{ "libgcc-s1.postinst", "libgcc-s1:amd64.postinst" }) |name| {
+        const path = try std.fmt.allocPrint(a, "var/lib/dpkg/info/{s}", .{name});
+        try work.dir.symLink(io, "/does-not-exist", path, .{});
+        try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .base));
+        try work.dir.deleteFile(io, path);
+    }
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/libgcc-s1:amd64.triggers", .data = "activate-noawait another-handler\n" });
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .base));
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/libgcc-s1:amd64.triggers", .data = order.libgcc_triggers });
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/updates/0000", .data = "unincorporated state\n" });
+    try expectError(error.CycleStateChanged, ctx.verifyCycle(root, state.packages, .base));
+    try work.dir.deleteFile(io, "var/lib/dpkg/updates/0000");
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/triggers/Unincorp", .data = "ldconfig libc-bin\n" });
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .base));
+    try expect(state.commands.items.len == 0);
+}
+
+test "original base cycle transition requires exact progress not only successful exit" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .base);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    const saved = try state.clone(state.records);
+    const selected = try ctx.transition(root, root, state.packages, .base, "out", "err");
+    try expect(selected.len == 1 and samePackage(selected[0], state.packages[1]));
+    try expect(state.commands.items.len == 1);
+    try expectEqualStrings("break_base_cycle", state.commands.items[0][5]);
+    try expect((try evidenceJson(a, root, "base-cycle-after.json")).object.get("callbacks").?.array.items.len == 0);
+    state.records = try state.clone(saved);
+    state.extra_transition = "libc6";
+    try expectError(error.CycleNoProgress, ctx.transition(root, root, state.packages, .base, "out", "err"));
+}
+
+test "original OpenSSL cycle refuses graph callbacks triggers and outside state with exact reasons before apply" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .openssl);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    const verified = try ctx.verifyCycle(root, state.packages, .openssl);
+    try expectEqualStrings("same", order.field(verified.graph.get("libssl3t64").?.object, "multi_arch"));
+    try expectEqualStrings("foreign", order.field(verified.graph.get("openssl-provider-legacy").?.object, "multi_arch"));
+    for ([_]struct { []const u8, []const u8, []const u8, anyerror }{
+        .{ "libssl3t64", "depends", "unknown-package", error.CycleControlChanged },
+        .{ "openssl-provider-legacy", "pre-depends", "libssl3t64", error.CycleControlChanged },
+        .{ "libc6", "status", "install ok unpacked", error.CycleOutsideDependency },
+        .{ "libzstd1", "version", "other", error.CycleStateChanged },
+        .{ "zlib1g", "conflicts", "", error.CycleControlChanged },
+        .{ "openssl-provider-legacy", "multi-arch", "same", error.CycleControlChanged },
+        .{ "libssl3t64", "triggers-pending", "ldconfig", error.CycleCallbackChanged },
+        .{ "openssl-provider-legacy", "config-version", "other", error.CycleCallbackChanged },
+    }) |change| {
+        const record = try state.row(change[0]);
+        const saved = try record.clone(a);
+        try record.put(a, change[1], .{ .string = change[2] });
+        try expectError(change[3], ctx.transition(root, root, state.packages, .openssl, "out", "err"));
+        record.* = saved;
+    }
+    for ([_][]const u8{ "libssl3t64.postinst", "libssl3t64:amd64.postinst", "openssl-provider-legacy.postinst", "openssl-provider-legacy:amd64.config", "openssl-provider-legacy:amd64.triggers" }) |name| {
+        const path = try std.fmt.allocPrint(a, "var/lib/dpkg/info/{s}", .{name});
+        try work.dir.symLink(io, "/does-not-exist", path, .{});
+        try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .openssl));
+        try work.dir.deleteFile(io, path);
+    }
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/libssl3t64:amd64.triggers", .data = "activate ldconfig\n" });
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .openssl));
+    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/libssl3t64:amd64.triggers", .data = order.libgcc_triggers });
+    const members = try a.alloc(order.Member, state.controls[1].len + 1);
+    members[0] = .{ .name = "./postinst", .bytes = "callbac", .kind = '0' };
+    @memcpy(members[1..], state.controls[1]);
+    state.controls[1] = members;
+    try expectError(error.CycleCallbackChanged, ctx.verifyCycle(root, state.packages, .openssl));
+    try expect(state.commands.items.len == 0);
+}
+
+test "original OpenSSL transition requires both exact refusals and exact two package progress" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .openssl);
+    const root = try rootPath(a, work);
+    const ctx = state.context(root, &env);
+    const saved = try state.clone(state.records);
+    const selected = try ctx.transition(root, root, state.packages, .openssl, "out", "err");
+    try expect(selected.len == 2 and samePackage(selected[0], state.packages[0]) and samePackage(selected[1], state.packages[1]));
+    const after = try evidenceJson(a, root, "openssl-cycle-after.json");
+    try expect(after.object.get("callbacks").?.array.items.len == 0 and after.object.get("force").?.array.items.len == 0);
+    for ([_][]const u8{ "libssl3t64", "openssl-provider-legacy", "libc6" }) |name| {
+        state.records = try state.clone(saved);
+        state.after_status = .{ name, "install ok half-configured" };
+        try expectError(error.CycleNoProgress, ctx.transition(root, root, state.packages, .openssl, "out", "err"));
+    }
+    state.after_status = null;
+    state.records = try state.clone(saved);
+    state.mutate_trigger = work.dir;
+    state.trigger_name = "ldconfig";
+    state.trigger_bytes = "";
+    try expectError(error.CycleNoProgress, ctx.transition(root, root, state.packages, .openssl, "out", "err"));
+    state.mutate_trigger = null;
+    try work.dir.deleteFile(io, "var/lib/dpkg/triggers/ldconfig");
+    state.records = try state.clone(saved);
+    state.commands.clearRetainingCapacity();
+    for ([_]struct { []const u8, i32, []const u8 }{
+        .{ "libssl3t64:amd64", 0, "" },
+        .{ "libssl3t64:amd64", 1, "dependency problems: Package unknown-package is not configured yet." },
+        .{ "libssl3t64:amd64", 1, "dependency problems: Package openssl-provider-legacy:amd64 is not configured yet." },
+        .{ "openssl-provider-legacy:amd64", 1, "dependency problems: Package libssl3t64 is not configured yet." },
+        .{ "openssl-provider-legacy:amd64", 1, "dependency problems: Package unknown-package:amd64 is not configured yet." },
+    }) |response| {
+        state.probe_override = .{ .selector = response[0], .result = .{ .code = response[1], .stdout = response[2], .stderr = "" } };
+        try expectError(error.CycleProbeChanged, ctx.transition(root, root, state.packages, .openssl, "out", "err"));
+    }
+    try expect(state.commands.items.len == 0);
+}
+
+test "original three target capture continues only exact half-configured systemd and udev" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    for ([_][]const u8{ "half-configured", "unpacked", "installed" }) |captured_status| {
+        var work = std.testing.tmpDir(.{ .iterate = true });
+        defer work.cleanup();
+        const root = try rootPath(a, work);
+        var state = try simple(a, &.{ "sudo-rs", "systemd", "udev", "sudo" });
+        state.captured_status = captured_status;
+        var targets: [3]order.Prestate = undefined;
+        for ([_][]const u8{ "systemd", "udev", "sudo" }, &targets) |name, *target|
+            target.* = .{ .selector = try std.fmt.allocPrint(a, "{s}:amd64", .{name}), .status = if (eq(u8, name, "sudo")) "unpacked" else "half-configured", .destination = try std.fmt.allocPrint(a, "{s}/saved-{s}", .{ root, name }) };
+        const ctx = state.context(root, &env);
+        if (!eq(u8, captured_status, "half-configured")) {
+            try expectError(error.CapturedPrestateStateVersionChanged, ctx.install(&targets));
+            try expect((try selectedCommands(a, state, "continue_prestate")).len == 0);
+            continue;
+        }
+        try ctx.install(&targets);
+        try expectStrings(&.{ "systemd:amd64", "udev:amd64" }, try selectedCommands(a, state, "continue_prestate"));
+        for (state.commands.items) |command| {
+            if (eq(u8, command[5], "unpack")) continue;
+            if (eq(u8, command[6], "sudo-rs:amd64")) {
+                try expectStrings(&.{ "none", "configure" }, command[4..6]);
+            } else {
+                try expectEqualStrings("continue_prestate", command[5]);
+                try expect(eq(u8, command[6], "systemd:amd64") or eq(u8, command[6], "udev:amd64"));
+                try expectEqualStrings(command[6][0..std.mem.indexOfScalar(u8, command[6], ':').?], command[4]);
+            }
+        }
+        for ([_][2][]const u8{ .{ "systemd", "install ok half-configured" }, .{ "udev", "install ok half-configured" }, .{ "sudo", "install ok unpacked" } }) |expected| {
+            const selector = try std.fmt.allocPrint(a, "{s}:amd64", .{expected[0]});
+            const index = for (state.captures.items, 0..) |capture, i| {
+                if (eq(u8, capture.selector, selector)) break i;
+            } else return error.MissingOriginalCapture;
+            const snapshot = for (state.capture_states.items[index]) |record| {
+                if (eq(u8, order.field(record, "package"), expected[0])) break record;
+            } else return error.MissingOriginalCaptureRecord;
+            try expectEqualStrings(expected[1], order.field(snapshot, "status"));
+        }
+        try expectEqualStrings("install ok unpacked", order.field((try state.row("sudo")).*, "status"));
+    }
+}
+
+test "original OpenSSL cycle resumes single package capture and never repeats authority" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .openssl);
+    var base_work = std.testing.tmpDir(.{ .iterate = true });
+    defer base_work.cleanup();
+    const base = try fixture(a, base_work.dir, .base);
+    var package_list: std.ArrayList(order.Package) = .empty;
+    var record_list: std.ArrayList(order.Fields) = .empty;
+    try package_list.appendSlice(a, state.packages);
+    try record_list.appendSlice(a, state.records);
+    for (base.packages, base.records) |package, record| if (!eq(u8, package.name, "libc6")) {
+        try package_list.append(a, package);
+        try record_list.append(a, record);
+    };
+    const target = try simple(a, &.{"systemd"});
+    try package_list.appendSlice(a, target.packages);
+    try record_list.appendSlice(a, target.records);
+    state.packages = try package_list.toOwnedSlice(a);
+    state.records = try record_list.toOwnedSlice(a);
+    state.mode = .resume_cycles;
+    state.constant_unpacked = true;
+    const root = try rootPath(a, work);
+    var ctx = state.context(root, &env);
+    ctx.test_hooks.?.transition = State.transition;
+    try ctx.install(&.{.{ .selector = "systemd:amd64", .status = "half-configured", .destination = try std.fmt.allocPrint(a, "{s}/saved", .{root}) }});
+    try expect(state.cycle_calls[0] == 1 and state.cycle_calls[1] == 1 and state.captures.items.len == 1);
+    for (try selectedCommands(a, state, "configure")) |selector| try expect(!eq(u8, selector, "systemd:amd64"));
+    state.cycle_calls = @splat(0);
+    state.phase = 0;
+    state.mode = .stall;
+    try expectError(error.CycleNoProgress, ctx.install(&.{}));
+    try expect(state.cycle_calls[0] == 1 and state.cycle_calls[1] == 1);
+    const evidence = (try evidenceJson(a, root, "reference-no-progress.json")).object;
+    try expect(evidence.get("base_cycle_applied").?.bool and evidence.get("openssl_cycle_applied").?.bool);
+    for (evidence.get("deferred").?.array.items) |deferred| {
+        if (eq(u8, deferred.string, "systemd:amd64")) break;
+    } else return error.MissingOriginalDeferredTarget;
+    try expectEqualStrings("dependency problems", try decodePrefix(a, evidence.get("refusals").?.array.items[0].object.get("output_prefix_hex").?.string));
+}
+
+test "original base cycle break retries normal schedule without configuring prestate target" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env: std.process.Environ.Map = .init(a);
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var state = try fixture(a, work.dir, .base);
+    const target = try simple(a, &.{"systemd"});
+    state.packages = try std.mem.concat(a, order.Package, &.{ state.packages, target.packages });
+    state.records = try std.mem.concat(a, order.Fields, &.{ state.records, target.records });
+    state.mode = .bridge;
+    state.constant_unpacked = true;
+    const root = try rootPath(a, work);
+    var ctx = state.context(root, &env);
+    ctx.test_hooks.?.transition = State.transition;
+    try ctx.install(&.{.{ .selector = "systemd:amd64", .status = "half-configured", .destination = try std.fmt.allocPrint(a, "{s}/saved", .{root}) }});
+    try expect(state.cycle_calls[0] == 1 and state.captures.items.len == 1);
+    const configured = try selectedCommands(a, state, "configure");
+    for (configured) |selector| try expect(!eq(u8, selector, "libgcc-s1:amd64") and !eq(u8, selector, "systemd:amd64"));
+    for (configured) |selector| {
+        if (eq(u8, selector, "libc6:amd64")) break;
+    } else return error.MissingOriginalBridgeConfigure;
+}
+
+const oracle_postinst = "#!/bin/sh\nexit 0\n";
+const Oracle = struct {
+    a: A,
+    base: State,
+    image: []const u8,
+    library: []const u8,
+    stderr: []const u8,
+    returncode: i32,
+    configured: bool,
+    probes: usize = 0,
+    overrides: std.ArrayList([3][]const u8) = .empty,
+    fn get(pointer: *anyopaque) *Oracle {
+        return @ptrCast(@alignCast(pointer));
+    }
+    fn manifest(pointer: *anyopaque) ![]order.Package {
+        return get(pointer).base.packages;
+    }
+    fn database(pointer: *anyopaque, root: []const u8) ![]order.Fields {
+        const self = get(pointer);
+        if (eq(u8, root, self.image)) return self.a.alloc(order.Fields, 0);
+        const result = try self.base.clone(self.base.records);
+        for (self.overrides.items) |override| if (eq(u8, override[0], std.fs.path.basename(root))) for (result) |*record| {
+            if (eq(u8, order.field(record.*, "package"), override[1])) try record.put(self.a, "status", .{ .string = override[2] });
+        };
+        return result;
+    }
+    fn probe(pointer: *anyopaque, _: []const []const u8) !order.Result {
+        const self = get(pointer);
+        self.probes += 1;
+        return switch (self.probes) {
+            1, 2 => .{ .code = 1, .stdout = "dependency problems", .stderr = "" },
+            3 => .{ .code = 1, .stdout = "stage 11", .stderr = "" },
+            else => error.UnexpectedOriginalOracleProbe,
+        };
+    }
+    fn apply(_: *anyopaque, _: []const []const u8) !void {}
+    fn control(pointer: *anyopaque, selected: order.Package) ![]order.Member {
+        const self = get(pointer);
+        const members = try State.control(&self.base, selected);
+        if (!eq(u8, selected.name, "libc6")) return members;
+        const result = try self.a.alloc(order.Member, members.len + 1);
+        @memcpy(result[0..members.len], members);
+        result[members.len] = .{ .name = "./postinst", .bytes = oracle_postinst, .kind = '0' };
+        return result;
+    }
+    fn transition(pointer: *anyopaque, kind: order.Cycle) ![]order.Package {
+        const self = get(pointer);
+        try expect(kind == .base);
+        try self.overrides.append(self.a, .{ "candidate", "libgcc-s1", "install ok installed" });
+        return self.base.packages[1..2];
+    }
+    fn run(pointer: *anyopaque, command: []const []const u8) !?order.Result {
+        const self = get(pointer);
+        for ([_][]const u8{ "cp", "rm", "chmod" }) |actual| if (eq(u8, command[0], actual)) return null;
+        if (eq(u8, command[0], "mount") or eq(u8, command[0], "umount")) return .{ .code = 0, .stdout = "", .stderr = "" };
+        try expectEqualStrings("unshare", command[0]);
+        try expectStrings(&.{ "--no-triggers", "--configure", "--pending" }, command[command.len - 3 ..]);
+        const baseline = for (command[0 .. command.len - 1], 0..) |argument, index| {
+            if (eq(u8, argument, "chroot")) break command[index + 1];
+        } else return error.MissingOriginalOracleChroot;
+        if (self.configured) {
+            const relative = "usr/lib/x86_64-linux-gnu/libcap-ng.so.0";
+            try expectEqualStrings(self.library, try paths.readRootFile(self.a, baseline, relative, 26928));
+            try expect(!try paths.exists(self.image, relative));
+            try expect(!try paths.exists(try std.fmt.allocPrint(self.a, "{s}/candidate", .{std.fs.path.dirname(baseline).?}), relative));
+            try self.overrides.append(self.a, .{ "pending", "libgcc-s1", "install ok installed" });
+            try self.overrides.append(self.a, .{ "pending", "libc6", "install ok half-configured" });
+        }
+        return .{ .code = self.returncode, .stdout = "pending stdout witness", .stderr = self.stderr };
+    }
+    fn digest(bytes: []const u8) ?[64]u8 {
+        if (bytes.len == 26928 and std.mem.startsWith(u8, bytes, "unit signed libcap-ng") and std.mem.allEqual(u8, bytes["unit signed libcap-ng".len..], 0))
+            return "60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f".*;
+        if (eq(u8, bytes, "unit signed setpriv")) return "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993".*;
+        return null;
+    }
+};
+fn pendingOracle(a: A, work: std.testing.TmpDir, stderr: []const u8, returncode: i32, configured: bool) !void {
+    const root = try rootPath(a, work);
+    try work.dir.createDir(io, "image", .default_dir);
+    var image_dir = try work.dir.openDir(io, "image", .{});
+    defer image_dir.close(io);
+    const base = try fixture(a, image_dir, .base);
+    try work.dir.createDirPath(io, "image/usr/bin");
+    try work.dir.createDirPath(io, "image/usr/lib/x86_64-linux-gnu");
+    try work.dir.writeFile(io, .{ .sub_path = "image/var/lib/dpkg/info/libc6:amd64.postinst", .data = oracle_postinst });
+    try work.dir.createDir(io, "evidence", .default_dir);
+    try work.dir.createDir(io, "tools", .default_dir);
+    try work.dir.writeFile(io, .{ .sub_path = "tools/dpkg", .data = "unit dpkg" });
+    try work.dir.writeFile(io, .{ .sub_path = "tools/setpriv", .data = "unit signed setpriv" });
+    const library = try a.alloc(u8, 26928);
+    @memset(library, 0);
+    @memcpy(library[0.."unit signed libcap-ng".len], "unit signed libcap-ng");
+    try work.dir.writeFile(io, .{ .sub_path = "tools/libcap-ng.so.0.0.0", .data = library });
+    const tools = try std.fmt.allocPrint(a, "{s}/tools", .{root});
+    {
+        const pin = try paths.openAbsolute(try std.fmt.allocPrint(a, "{s}/libcap-ng.so.0.0.0", .{tools}), false);
+        defer pin.close();
+        _ = try paths.syscall(linux.fchmod(pin.fd, 0o644));
+    }
+    const image = try std.fmt.allocPrint(a, "{s}/image", .{root});
+    var oracle: Oracle = .{ .a = a, .base = base, .image = image, .library = library, .stderr = stderr, .returncode = returncode, .configured = configured };
+    var env: std.process.Environ.Map = .init(a);
+    try env.put("PATH", "/usr/bin:/bin");
+    const ctx: order.Context = .{
+        .a = a,
+        .io = io,
+        .environment = &env,
+        .launcher = .{ .path = try std.fmt.allocPrint(a, "{s}/launcher", .{tools}), .runtime = try std.fmt.allocPrint(a, "{s}/runtime", .{tools}) },
+        .dpkg = try std.fmt.allocPrint(a, "{s}/dpkg", .{tools}),
+        .root = image,
+        .cache = tools,
+        .evidence = try std.fmt.allocPrint(a, "{s}/evidence", .{root}),
+        .architecture = "amd64",
+        .test_hooks = .{ .state = &oracle, .manifest = Oracle.manifest, .database = Oracle.database, .probe = Oracle.probe, .apply = Oracle.apply, .archive = State.archive, .control = Oracle.control, .transition = Oracle.transition, .run = Oracle.run, .runtime_unprotected = true, .runtime_digest = Oracle.digest, .assume_x86_64 = true },
+    };
+    return order.proveBaseCycle(ctx, try std.fmt.allocPrint(a, "{s}/setpriv", .{tools}));
+}
+
+test "original pending oracle stages helper runtime without registering or widening candidate" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    try pendingOracle(a, work, "post-installation script: Permission denied", 1, true);
+    const comparison = (try evidenceJson(a, try rootPath(a, work), "evidence/base-cycle-proof/comparison.json")).object;
+    try expect(comparison.get("pending").?.array.items.len == 4);
+    try expect(!comparison.get("parity_claim").?.bool);
+    try expect(comparison.get("callbacks_executed").?.array.items.len == 0);
+    try expect(comparison.get("pending_setpriv_runtime").?.object.get("size").?.integer == 26928);
+}
+
+test "original pending loader refusal retains evidence but never counts as callback denial" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const stderr = "setpriv: error while loading shared libraries: libcap-ng.so.0: cannot open shared object file: No such file or directory\n";
+    try expectError(error.CycleProofCallbackChanged, pendingOracle(a, work, stderr, 127, false));
+    const proof = try std.fmt.allocPrint(a, "{s}/evidence/base-cycle-proof", .{try rootPath(a, work)});
+    try expectEqualStrings(stderr, try paths.readRootFile(a, proof, "pending.stderr", 65536));
+    try expectEqualStrings("pending stdout witness", try paths.readRootFile(a, proof, "pending.stdout", 65536));
+    const result = (try evidenceJson(a, proof, "pending-result.json")).object;
+    try expect(result.get("returncode").?.integer == 127 and !result.get("output_truncated").?.bool);
+    const status = (try evidenceJson(a, proof, "pending-status.json")).object;
+    try expectEqualStrings(try std.json.Stringify.valueAlloc(a, status.get("before").?, .{}), try std.json.Stringify.valueAlloc(a, status.get("after").?, .{}));
+    try expect(!try paths.exists(proof, "comparison.json"));
+}
+
+test "original pending oversized output is retained bounded and still refuses" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const stderr = try std.fmt.allocPrint(a, "post-installation script: Permission denied\n{s}", .{"x" ** 65536});
+    try expectError(error.CycleProofCallbackChanged, pendingOracle(a, work, stderr, 1, true));
+    const proof = try std.fmt.allocPrint(a, "{s}/evidence/base-cycle-proof", .{try rootPath(a, work)});
+    try expectEqualStrings(stderr[0..65536], try paths.readRootFile(a, proof, "pending.stderr", 65536));
+    const result = (try evidenceJson(a, proof, "pending-result.json")).object;
+    try expect(result.get("output_truncated").?.bool and result.get("stderr_bytes").?.integer == stderr.len);
+    try expect(!try paths.exists(proof, "comparison.json"));
 }

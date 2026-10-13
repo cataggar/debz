@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 pub const Pinned = struct {
@@ -103,6 +104,23 @@ fn protectedMetadata(info: linux.Statx, directory: bool) !void {
         return error.WrongReferenceFileType;
 }
 
+var test_owner_root: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {};
+fn protectedStat(fd: i32) !linux.Statx {
+    var info = try stat(fd);
+    if (builtin.is_test) if (test_owner_root) |root| {
+        // Unit fixtures cannot be root-owned: ownership is assumed, while modes beneath the fixture root stay authoritative.
+        var link: [32]u8 = undefined;
+        var target: [std.fs.max_path_bytes]u8 = undefined;
+        const length = try syscall(linux.readlink(try std.fmt.bufPrintZ(&link, "/proc/self/fd/{d}", .{fd}), &target, target.len));
+        const path = target[0..length];
+        info.uid = 0;
+        info.gid = 0;
+        if (!std.mem.eql(u8, path, root) and !(std.mem.startsWith(u8, path, root) and path.len > root.len and path[root.len] == '/'))
+            info.mode &= ~@as(u16, 0o022);
+    };
+    return info;
+}
+
 pub fn openProtected(path: []const u8, directory: bool) !Pinned {
     try absolute(path);
     var current: i32 = @intCast(try syscall(linux.open("/", .{
@@ -111,7 +129,7 @@ pub fn openProtected(path: []const u8, directory: bool) !Pinned {
         .CLOEXEC = true,
     }, 0)));
     errdefer _ = linux.close(current);
-    try protectedMetadata(try stat(current), true);
+    try protectedMetadata(try protectedStat(current), true);
     if (path.len > 1) {
         var parts = std.mem.splitScalar(u8, path[1..], '/');
         while (parts.next()) |part| {
@@ -119,7 +137,7 @@ pub fn openProtected(path: []const u8, directory: bool) !Pinned {
             const next = try component(current, part, !last or directory, .{ .ACCMODE = .RDONLY }, 0);
             _ = linux.close(current);
             current = next;
-            try protectedMetadata(try stat(current), !last or directory);
+            try protectedMetadata(try protectedStat(current), !last or directory);
         }
     } else if (!directory) return error.WrongReferenceFileType;
     return .{ .fd = current, .metadata = try stat(current) };
@@ -360,4 +378,99 @@ test "pinned reads detect metadata drift and all rooted descriptor duplicates re
     _ = try syscall(linux.fchmod(file.fd, changed_mode));
     try std.testing.expectError(error.ReferenceFileChanged, readPinned(std.testing.allocator, file, 64));
     try std.testing.expect(!try exists(root, "missing-parent/status"));
+}
+
+// Original protected-input observations, with fixture ownership assumed through test_owner_root.
+fn expectOsRefusal(result: anytype) !void {
+    if (result) |_| return error.AcceptedOriginalOsRefusal else |err| switch (err) {
+        error.ReferencePathRefused, error.FileNotFound, error.PathAlreadyExists => {},
+        else => return err,
+    }
+}
+
+test "original keyring refuses unprotected writable symlinked and wrong bytes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try work.dir.realPath(io, &buffer)];
+    const root_pin = try openAbsolute(root, true);
+    defer root_pin.close();
+    _ = try syscall(linux.fchmod(root_pin.fd, 0o700));
+    const payload = "reviewed fixture bytes";
+    try work.dir.writeFile(io, .{ .sub_path = "keyring", .data = payload });
+    const keyring = try std.fmt.allocPrint(a, "{s}/keyring", .{root});
+    const keyring_pin = try openAbsolute(keyring, false);
+    defer keyring_pin.close();
+    _ = try syscall(linux.fchmod(keyring_pin.fd, 0o644));
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &hash, .{});
+    const digest = std.fmt.bytesToHex(hash, .lower);
+    try std.testing.expectError(error.UnprotectedReferencePath, verifyKeyring(a, keyring, payload.len, &digest));
+    test_owner_root = root;
+    defer test_owner_root = null;
+    try std.testing.expectEqualStrings(&digest, &(try verifyKeyring(a, keyring, payload.len, &digest)));
+    try std.testing.expectError(error.UbuntuArchiveKeyringMemberPinMismatch, verifyKeyring(a, keyring, payload.len + 1, &digest));
+    try std.testing.expectError(error.UbuntuArchiveKeyringMemberPinMismatch, verifyKeyring(a, keyring, payload.len, "0" ** 64));
+    try work.dir.writeFile(io, .{ .sub_path = "keyring", .data = payload[0 .. payload.len - 1] ++ "?" });
+    try std.testing.expectError(error.UbuntuArchiveKeyringMemberPinMismatch, verifyKeyring(a, keyring, payload.len, &digest));
+    try work.dir.writeFile(io, .{ .sub_path = "keyring", .data = payload });
+    _ = try syscall(linux.fchmod(keyring_pin.fd, 0o666));
+    try std.testing.expectError(error.UnprotectedReferencePath, verifyKeyring(a, keyring, payload.len, &digest));
+    _ = try syscall(linux.fchmod(keyring_pin.fd, 0o644));
+    try work.dir.symLink(io, keyring, "linked", .{});
+    try expectOsRefusal(verifyKeyring(a, try std.fmt.allocPrint(a, "{s}/linked", .{root}), payload.len, &digest));
+    try work.dir.symLink(io, root, "linked-dir", .{ .is_directory = true });
+    try expectOsRefusal(verifyKeyring(a, try std.fmt.allocPrint(a, "{s}/linked-dir/keyring", .{root}), payload.len, &digest));
+    _ = try syscall(linux.fchmod(root_pin.fd, 0o777));
+    try std.testing.expectError(error.UnprotectedReferencePath, verifyKeyring(a, keyring, payload.len, &digest));
+}
+
+test "original compiler binds protected library ancestry without resolving input links" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try work.dir.realPath(io, &buffer)];
+    const root_pin = try openAbsolute(root, true);
+    defer root_pin.close();
+    _ = try syscall(linux.fchmod(root_pin.fd, 0o700));
+    try work.dir.writeFile(io, .{ .sub_path = "zig", .data = "#!/bin/sh\nexit 0\n" });
+    const compiler = try std.fmt.allocPrint(a, "{s}/zig", .{root});
+    const compiler_pin = try openAbsolute(compiler, false);
+    defer compiler_pin.close();
+    _ = try syscall(linux.fchmod(compiler_pin.fd, 0o755));
+    try work.dir.createDir(io, "lib", .default_dir);
+    const library = try std.fmt.allocPrint(a, "{s}/lib", .{root});
+    const library_pin = try openAbsolute(library, true);
+    defer library_pin.close();
+    _ = try syscall(linux.fchmod(library_pin.fd, 0o755));
+    try work.dir.writeFile(io, .{ .sub_path = "lib/std.zig", .data = "fixture" });
+    const source_pin = try openAbsolute(try std.fmt.allocPrint(a, "{s}/lib/std.zig", .{root}), false);
+    defer source_pin.close();
+    _ = try syscall(linux.fchmod(source_pin.fd, 0o644));
+    try std.testing.expectError(error.UnprotectedReferencePath, toolchain(a, io, compiler));
+    test_owner_root = root;
+    defer test_owner_root = null;
+    try std.testing.expectEqualStrings(library, try toolchain(a, io, compiler));
+    _ = try syscall(linux.fchmod(compiler_pin.fd, 0o777));
+    try std.testing.expectError(error.UnprotectedReferencePath, toolchain(a, io, compiler));
+    _ = try syscall(linux.fchmod(compiler_pin.fd, 0o755));
+    _ = try syscall(linux.fchmod(source_pin.fd, 0o666));
+    try std.testing.expectError(error.UnprotectedReferencePath, toolchain(a, io, compiler));
+    _ = try syscall(linux.fchmod(source_pin.fd, 0o644));
+    try work.dir.symLink(io, compiler, "lib/escape", .{});
+    try std.testing.expectError(error.ToolchainLibrarySymlinkEscapes, toolchain(a, io, compiler));
+    try work.dir.deleteFile(io, "lib/escape");
+    try work.dir.symLink(io, compiler, "linked-zig", .{});
+    try expectOsRefusal(toolchain(a, io, try std.fmt.allocPrint(a, "{s}/linked-zig", .{root})));
+    try std.Io.Dir.rename(work.dir, "lib", work.dir, "real-lib", io);
+    try work.dir.symLink(io, try std.fmt.allocPrint(a, "{s}/real-lib", .{root}), "lib", .{ .is_directory = true });
+    try expectOsRefusal(toolchain(a, io, compiler));
 }
