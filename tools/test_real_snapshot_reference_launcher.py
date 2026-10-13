@@ -804,6 +804,94 @@ class ReferenceLauncherTests(unittest.TestCase):
         report = json.loads((workspace / "runtime-preflight-proof.json").read_text())
         self.assertEqual(len(report["cases"]), 11)
 
+    def test_guest_mutations_reach_each_input_class_and_probe_admission_stays_private(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "debz_reference_protected_guest_fixture",
+            TOOLS / "test_real_snapshot_reference_protected.py",
+        )
+        assert spec and spec.loader
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        triplet = "x86_64-linux-gnu"
+        runtime = self.root / "runtime"
+        runtime.mkdir()
+        (runtime / "binding.json").write_text(json.dumps({"objects": [
+            {"name": "libc.so.6", "root_path": f"/usr/lib/{triplet}/libc.so.6"},
+        ]}))
+        regular = {"kind": "regular", "mode": 0o755, "size": 8, "sha256": "a" * 64, "target": ""}
+        guest = {"entries": [
+            {"path": f"/usr/lib/{triplet}/libc.so.6", "role": "library", "required": True,
+             "allowed": [regular]},
+            {"path": f"/usr/lib/{triplet}/libz.so.1.3.1", "role": "library", "required": True,
+             "allowed": [regular]},
+            {"path": "/usr/bin/sh", "role": "interpreter", "required": False,
+             "allowed": [{**regular, "kind": "symlink", "target": "dash"}]},
+        ]}
+        (runtime / "guest.json").write_text(json.dumps(guest))
+        workspace = self.root / "proof"
+        workspace.mkdir()
+        original = b"original"
+
+        def fresh(template: Path, destination: Path, name: str) -> Path:
+            root = destination / f"{name}-root"
+            for directory in ("usr/bin", "usr/sbin", f"usr/lib/{triplet}/gconv",
+                              "etc/ld.so.conf.d", "var/lib/dpkg"):
+                (root / directory).mkdir(parents=True, exist_ok=True)
+            (root / "var/lib/dpkg/status").write_bytes(b"")
+            for relative in ("usr/bin/tar", "usr/bin/dpkg-split", "usr/bin/rm", "usr/bin/dpkg-deb",
+                             f"usr/lib/{triplet}/libz.so.1.3.1"):
+                (root / relative).write_bytes(original)
+                (root / relative).chmod(0o755)
+            return root
+
+        expected = {f"guest-{case}": refusal for case, _, refusal in
+                    proof.guest_mutations(triplet, guest, json.loads((runtime / "binding.json").read_text()))}
+        args = proof.argparse.Namespace(
+            runtime=runtime, workspace=workspace, root_template=self.root,
+            launcher=self.root / "launcher", dpkg=self.root / "dpkg",
+            runtime_tool=self.root / "runtime-tool", architecture="amd64",
+            archive=self.root / "package.deb", archive_sha512="a" * 128, archive_size=42,
+        )
+        with (
+            mock.patch.object(proof, "fresh_root", side_effect=fresh),
+            mock.patch.object(proof, "protected_directory"),
+            mock.patch.object(proof, "operation",
+                              side_effect=lambda directory, name, *rest, **keywords: (1, expected[name])),
+            mock.patch.object(proof, "assert_teardown", return_value={}),
+            mock.patch.object(proof.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, b"", b"GuestSourceChanged; no dpkg or script executed",
+            )),
+        ):
+            proof.prove_guest(args, "a" * 64)
+            prefix = proof.guest_prefix(args, "profile-systemd", b"probe")
+        # The runtime-bound libc is never chosen as the guest-only library case.
+        self.assertEqual(expected["guest-library-altered"], "GuestDigestChanged")
+        changed = bytes([original[0] ^ 1]) + original[1:]
+        self.assertEqual((workspace / "guest-tar-altered-root/usr/bin/tar").read_bytes(), changed)
+        self.assertEqual(
+            (workspace / f"guest-library-altered-root/usr/lib/{triplet}/libz.so.1.3.1").read_bytes(), changed,
+        )
+        self.assertFalse((workspace / "guest-dpkg-split-missing-root/usr/bin/dpkg-split").exists())
+        self.assertEqual(os.readlink(workspace / "guest-rm-swapped-root/usr/bin/rm"), "tar")
+        self.assertEqual(os.readlink(workspace / "guest-interpreter-swapped-root/usr/bin/sh"), "bash")
+        self.assertEqual(
+            stat.S_IMODE((workspace / "guest-dpkg-deb-mode-root/usr/bin/dpkg-deb").stat().st_mode), 0o750,
+        )
+        self.assertTrue((workspace / "guest-dpkg-home-config-root/.dpkg.cfg").is_file())
+        self.assertTrue((workspace / f"guest-hwcaps-present-root/usr/lib/{triplet}/glibc-hwcaps").is_dir())
+        cache = (workspace / "guest-loader-cache-unbound-root/etc/ld.so.cache").read_bytes()
+        self.assertTrue(cache.startswith(b"glibc-ld.so.cache1.1"))
+        self.assertIn(b"/usr/local/lib/libc.so.6\0", cache)
+        report = json.loads((workspace / "guest-preflight-proof.json").read_text())
+        self.assertEqual(len(report["cases"]), 17)
+        self.assertTrue(all(not case["dpkg_started"] for case in report["cases"].values()))
+        # Only the test-private prefix admits the probe; the recorded binding is unchanged.
+        self.assertEqual(json.loads((runtime / "guest.json").read_text()), guest)
+        admitted = next(entry for entry in json.loads((prefix / "guest.json").read_text())["entries"]
+                        if entry["path"] == "/usr/bin/sh")["allowed"]
+        self.assertEqual([identity["kind"] for identity in admitted], ["symlink", "regular"])
+        self.assertEqual(admitted[1]["sha256"], hashlib.sha256(b"probe").hexdigest())
+
     def test_configured_closure_cannot_route_unbound_trigger_action(self) -> None:
         package = ORDER.Package("fixture", "1", "amd64", "a" * 128, 42,
                                 self.root / "fixture.deb")

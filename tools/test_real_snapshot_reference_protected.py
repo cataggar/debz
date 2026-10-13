@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -274,6 +275,145 @@ def profile_root(
     return root
 
 
+GUEST_MANIFEST = "guest.json"
+GUEST_MANIFEST_LIMIT = 2 * 1024 * 1024
+
+
+def guest_prefix(args: argparse.Namespace, name: str, probe: bytes) -> Path:
+    """A test-private runtime prefix whose guest binding admits the static
+    probe as /usr/bin/sh; production prefixes bind only the signed dash alias."""
+    prefix = args.workspace / f"{name}-prefix"
+    shutil.copytree(args.runtime, prefix)
+    record = json.loads(read_root_file(prefix, GUEST_MANIFEST, GUEST_MANIFEST_LIMIT))
+    entry = next(item for item in record["entries"] if item["path"] == "/usr/bin/sh")
+    entry["allowed"] = [*entry["allowed"], {
+        "kind": "regular", "mode": 0o755, "size": len(probe),
+        "sha256": hashlib.sha256(probe).hexdigest(), "target": "",
+        "package": "debz-reference-escape-probe", "version": "1",
+        "archive_sha512": hashlib.sha512(probe).hexdigest(), "member": "/usr/bin/sh",
+    }]
+    write_beneath(args.workspace, f"{prefix.name}/{GUEST_MANIFEST}",
+                  (json.dumps(record, indent=2) + "\n").encode(), 0o500, replace=True)
+    protected_directory(prefix)
+    return prefix
+
+
+def loader_cache(entries: list[tuple[str, str]]) -> bytes:
+    """A minimal glibc 1.1 loader cache mapping each soname to a path."""
+    strings = bytearray()
+    table = bytearray()
+    base = 48 + 24 * len(entries)
+    for key, value in entries:
+        offsets = []
+        for text in (key, value):
+            offsets.append(base + len(strings))
+            strings += text.encode() + b"\0"
+        table += struct.pack("<iIIIQ", 0x0303, offsets[0], offsets[1], 0, 0)
+    header = b"glibc-ld.so.cache1.1" + struct.pack("<IIB3xI3I", len(entries), len(strings), 2, 0, 0, 0, 0)
+    return header + bytes(table) + bytes(strings)
+
+
+def guest_mutations(triplet: str, guest: dict, runtime: dict) -> list[tuple[str, str, str]]:
+    """(case, mutated guest path, expected refusal) for each guest input class.
+    The loader and dpkg's own libraries are runtime-bound (prove_runtime), so
+    the library case alters a guest-only signed helper dependency."""
+    runtime_paths = {item["root_path"] for item in runtime["objects"] if item.get("root_path")}
+    library = next(
+        entry["path"] for entry in guest["entries"]
+        if entry["role"] == "library" and entry["required"] and entry["path"] not in runtime_paths
+        and any(identity["kind"] == "regular" for identity in entry["allowed"])
+    )
+    return [
+        ("tar-altered", "usr/bin/tar", "GuestDigestChanged"),
+        ("dpkg-split-missing", "usr/bin/dpkg-split", "MissingGuestBinding"),
+        ("rm-swapped", "usr/bin/rm", "GuestAliasChanged"),
+        ("dpkg-deb-mode", "usr/bin/dpkg-deb", "GuestMetadataChanged"),
+        ("interpreter-swapped", "usr/bin/sh", "GuestAliasChanged"),
+        ("library-altered", library.lstrip("/"), "GuestDigestChanged"),
+        ("path-shadow", "usr/sbin/tar", "ForbiddenGuestEntry"),
+        ("library-shadow", "usr/lib/libc.so.6", "ForbiddenGuestEntry"),
+        ("hwcaps-present", f"usr/lib/{triplet}/glibc-hwcaps", "ForbiddenGuestEntry"),
+        ("dpkg-home-config", ".dpkg.cfg", "ForbiddenGuestEntry"),
+        ("nss-unbound", f"usr/lib/{triplet}/libnss_unbound.so.2", "UnboundGuestEntry"),
+        ("nss-config-altered", "etc/nsswitch.conf", "GuestDigestChanged"),
+        ("gconv-unbound", f"usr/lib/{triplet}/gconv/UNBOUND.so", "UnboundGuestEntry"),
+        ("loader-config-unbound", "etc/ld.so.conf.d/unbound.conf", "UnboundGuestEntry"),
+        ("loader-cache-unbound", "etc/ld.so.cache", "UnboundGuestCacheEntry"),
+    ]
+
+
+def mutate_guest(root: Path, case: str, relative: str) -> None:
+    target = root / relative
+
+    def put(data: bytes, mode: int = 0o644, *, replace: bool = False) -> None:
+        # Anchor at the workspace so top-level guest paths have a parent.
+        write_beneath(root.parent, f"{root.name}/{relative}", data, mode, replace=replace)
+
+    if case.endswith("-missing"):
+        target.unlink()
+    elif case == "rm-swapped":
+        target.unlink()
+        target.symlink_to("tar")
+    elif case == "interpreter-swapped":
+        if os.path.lexists(target):
+            target.unlink()
+        target.symlink_to("bash")
+    elif case.endswith("-altered") and target.exists():
+        data = bytearray(target.read_bytes())
+        data[0] ^= 1
+        put(bytes(data), stat.S_IMODE(target.stat().st_mode), replace=True)
+    elif case.endswith("-mode"):
+        target.chmod(0o750)
+    elif case == "hwcaps-present":
+        target.mkdir(mode=0o755)
+    elif case == "loader-cache-unbound":
+        put(loader_cache([("libc.so.6", "/usr/local/lib/libc.so.6")]))
+    elif case == "nss-config-altered":
+        put(b"passwd: files unbound\n")
+    else:
+        put(b"unbound guest input\n")
+
+
+def prove_guest(args: argparse.Namespace, identity: str) -> None:
+    """Changed, missing, swapped, shadowing, unbound late-provider and
+    post-binding guest inputs each refuse before dpkg or any script runs."""
+    record = json.loads(read_root_file(args.runtime, GUEST_MANIFEST, GUEST_MANIFEST_LIMIT))
+    runtime = json.loads(read_root_file(args.runtime, "binding.json", 128 * 1024))
+    triplet = {"amd64": "x86_64-linux-gnu", "arm64": "aarch64-linux-gnu"}[args.architecture]
+    results = {}
+    for case, relative, expected in guest_mutations(triplet, record, runtime):
+        name = f"guest-{case}"
+        root = fresh_root(args.root_template, args.workspace, name)
+        mutate_guest(root, case, relative)
+        status, error = operation(
+            args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
+            args.architecture, args.archive, args.archive_sha512, args.archive_size, "unpack",
+        )
+        require(status, error, expected, name)
+        if (read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024) or
+                os.path.lexists(root / "usr/share/debz-reference-proof/marker")):
+            raise AssertionError(f"{name}: dpkg started despite guest refusal")
+        results[name] = {"path": f"/{relative}", "refusal": expected, "dpkg_started": False}
+    for relative in ("usr/bin/tar", "usr/bin/dpkg-deb"):
+        name = f"guest-{Path(relative).name}-postbinding"
+        root = fresh_root(args.root_template, args.workspace, name)
+        result = subprocess.run(
+            [str(args.runtime_tool), "prove-guest-postbinding", args.architecture,
+             str(args.runtime), str(root), identity, f"/{relative}"],
+            env=ORDER.oracle_environment(), capture_output=True, timeout=45, check=False,
+        )
+        if result.returncode != 0 or b"GuestSourceChanged; no dpkg or script executed" not in result.stderr:
+            raise AssertionError(f"{name}: guest post-binding drift proof failed: {result.stderr!r}")
+        if read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024):
+            raise AssertionError(f"{name}: guest post-binding proof mutated the package database")
+        results[name] = {"path": f"/{relative}", "refusal": "GuestSourceChanged", "dpkg_started": False,
+                         "teardown": assert_teardown(root)}
+    (args.workspace / "guest-preflight-proof.json").write_text(json.dumps({
+        "architecture": args.architecture, "original_archive_guest_bindings": record,
+        "cases": results,
+    }, indent=2) + "\n")
+
+
 def require_unchanged_profile(root: Path, profile: str, name: str) -> None:
     packages = ORDER.database_packages(root)
     if packages.get((profile, "amd64"), ("",))[0] != "install ok unpacked":
@@ -414,9 +554,10 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     for profile, view in PROFILE_VIEW_CHECKS.items():
         name = f"profile-{profile}"
         root = profile_root(args.root_template, args.workspace, name, profile, scripts[profile], probe)
+        prefix = guest_prefix(args, name, probe)
         with network_control(args.workspace, name, root, args.escape_probe) as inherited:
             status, error = operation(
-                args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
+                args.workspace, name, args.launcher, args.dpkg, prefix, root,
                 args.architecture, None, None, None, "configure",
                 inherited_fd=inherited, profile=profile, selector=f"{profile}:amd64",
             )
@@ -448,8 +589,9 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     ):
         bound = "systemd"
         root = profile_root(args.root_template, args.workspace, name, bound, script, probe, version=version)
+        prefix = guest_prefix(args, name, probe)
         status, error = operation(
-            args.workspace, name, args.launcher, args.dpkg, args.runtime, root, args.architecture,
+            args.workspace, name, args.launcher, args.dpkg, prefix, root, args.architecture,
             None, None, None, "configure", profile=profile, selector=selector,
         )
         require(status, error, expected, name)
@@ -525,6 +667,7 @@ def main() -> None:
         if archive_hash.hexdigest() != digest:
             raise ValueError("authenticated archive SHA512 differs")
     prove_runtime(args, identity)
+    prove_guest(args, identity)
     for name, verb in (("probe", "probe_unpack"), ("unpack", "unpack")):
         root = fresh_root(args.root_template, args.workspace, name)
         before_timestamps = {str(path): path.stat().st_mtime_ns for path in (root, root / "etc")}

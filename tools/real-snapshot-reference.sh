@@ -62,6 +62,7 @@ for path in (repository, repository / ".real-snapshot", workspace, cache):
 for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real-snapshot-reference-launcher.zig",
              repository / "tools/real-snapshot-reference-runtime.zig",
+             repository / "tools/real-snapshot-reference-guest.zig",
              repository / "tools/real-snapshot-reference-trigger.zig",
              repository / "src/private_network.zig",
              repository / "tools/real-snapshot-reference-order.py",
@@ -202,6 +203,7 @@ runtime="$workspace/reference-runtime"
 "$workspace/runtime-tool/bin/debz-reference-runtime" record \
   "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
 "$zig" build build-reference-trigger-authority -Doptimize=ReleaseSafe \
   --cache-dir "$workspace/reference-zig-cache" \
   --global-cache-dir "$workspace/reference-zig-global-cache" \

@@ -96,6 +96,7 @@ require_protected_file "$script_path"
 require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
+require_protected_file "$repository_root/tools/real-snapshot-reference-guest.zig"
 require_protected_file "$repository_root/src/private_network.zig"
 require_protected_file "$repository_root/zig-out/bin/debz-native-dpkg-reference"
 # The staged toolchain lives outside the fixed PATH above, so the caller names

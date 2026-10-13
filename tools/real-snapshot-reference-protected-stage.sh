@@ -84,6 +84,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 }
 for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
+  tools/real-snapshot-reference-guest.zig \
   tools/real-snapshot-reference-escape-probe.zig \
   src/private_network.zig src/fixtures/script_network_probe.zig \
   tools/prepare-native-dpkg.zig tools/real_snapshot_reference_paths.py; do
@@ -342,6 +343,7 @@ runtime=$workspace/reference-runtime
 "$workspace/build/runtime-tool/bin/debz-reference-runtime" record \
   "$architecture" "$lock" "$snapshot/cache" "$dpkg_prefix/usr/bin/dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
 if readelf -l "$probe" | grep -q 'program interpreter'; then
   echo "the escape probe must be static" >&2
   exit 1

@@ -2610,6 +2610,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/test_real_snapshot_reference_protected.py",
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/real-snapshot-reference-launcher.zig",
+    "tools/real-snapshot-reference-guest.zig",
     "tools/real-snapshot-reference-order.py",
     "src/private_network.zig",
     "src/fixtures/script_network_probe.zig",

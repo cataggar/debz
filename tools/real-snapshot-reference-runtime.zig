@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const guest = @import("real-snapshot-reference-guest.zig");
 
 pub const schema_id = "io.github.cataggar.debz.reference-runtime.v1";
 pub const mountpoint = "/.debz-reference-runtime";
@@ -159,6 +160,9 @@ pub const Bound = struct {
     inputs: std.ArrayList(Pinned) = .empty,
     root_files: std.ArrayList(Pinned) = .empty,
     aliases: std.ArrayList(Pinned) = .empty,
+    /// Signed guest helper/interpreter/loader/provider bindings recorded beside
+    /// binding.json; the launcher binds and verifies them in the guest root.
+    guest_source: []const u8 = "",
 
     pub fn deinit(self: *Bound) void {
         for (self.inputs.items) |input| _ = linux.close(input.fd);
@@ -169,6 +173,7 @@ pub const Bound = struct {
         self.root_files.deinit(self.allocator);
         self.aliases.deinit(self.allocator);
         self.objects.deinit(self.allocator);
+        if (self.guest_source.len != 0) self.allocator.free(self.guest_source);
         if (self.parsed) |*value| value.deinit();
     }
 
@@ -204,6 +209,9 @@ pub const Bound = struct {
         const source = try result.readInput(path, 128 * 1024);
         defer allocator.free(source);
         result.parsed = try std.json.parseFromSlice(Manifest, allocator, source, .{ .allocate = .alloc_always });
+        const guest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, guest.manifest_name });
+        defer allocator.free(guest_path);
+        result.guest_source = try result.readInput(guest_path, guest.maximum_manifest_bytes);
         const record = result.manifest();
         if (!std.mem.eql(u8, record.schema, schema_id) or record.version != 1 or
             !std.mem.eql(u8, record.architecture, architecture) or
@@ -363,7 +371,7 @@ fn directoryContents(fd: i32, bindings: []const Binding) !void {
             const end = std.mem.indexOfScalar(u8, names, 0) orelse return error.InvalidRuntimeDirectory;
             const name = names[0..end];
             if (!std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..")) {
-                if (!std.mem.eql(u8, name, "binding.json")) {
+                if (!std.mem.eql(u8, name, "binding.json") and !std.mem.eql(u8, name, guest.manifest_name)) {
                     const found = for (bindings) |binding| {
                         if (std.mem.eql(u8, name, binding.name)) break true;
                     } else false;
@@ -374,7 +382,7 @@ fn directoryContents(fd: i32, bindings: []const Binding) !void {
             offset += length;
         }
     }
-    if (count != bindings.len + 1) return error.MissingRuntimeObject;
+    if (count != bindings.len + 2) return error.MissingRuntimeObject;
 }
 
 pub fn populate(allocator: std.mem.Allocator, fd: i32, objects: []const Object) !void {
@@ -415,7 +423,7 @@ const Recorder = struct {
 
     fn payload(self: *Recorder, name: []const u8) !*const debz.deb_payload.Validation {
         if (self.payloads.getPtr(name)) |found| return found;
-        const package = self.lock.findIdentity(name, self.architecture) orelse return error.MissingRuntimePackage;
+        const package = self.lockPackage(name) orelse return error.MissingRuntimePackage;
         const origin = switch (package.origin) {
             .authenticated_repository => |value| value,
             .local_artifact => return error.UnsignedRuntimePackage,
@@ -453,6 +461,10 @@ const Recorder = struct {
         };
         try self.payloads.put(package.name, validation);
         return self.payloads.getPtr(package.name).?;
+    }
+
+    fn lockPackage(self: *const Recorder, name: []const u8) ?debz.exact_lock_v3.Package {
+        return self.lock.findIdentity(name, self.architecture) orelse self.lock.findIdentity(name, "all");
     }
 
     fn link(self: *Recorder, path: []const u8, target: []const u8) !void {
@@ -525,6 +537,361 @@ const Recorder = struct {
     }
 };
 
+/// Libraries that guest helpers, interpreters, tools and late providers load,
+/// each bound to the single signed package that ships it.
+const guest_libraries = [_]struct { name: []const u8, package: []const u8 }{
+    .{ .name = "libm.so.6", .package = "libc6" },
+    .{ .name = "libresolv.so.2", .package = "libc6" },
+    .{ .name = "libacl.so.1", .package = "libacl1" },
+    .{ .name = "libattr.so.1", .package = "libattr1" },
+    .{ .name = "libtinfo.so.6", .package = "libtinfo6" },
+    .{ .name = "libcrypt.so.1", .package = "libcrypt1" },
+    .{ .name = "libgcc_s.so.1", .package = "libgcc-s1" },
+    .{ .name = "libcrypto.so.3", .package = "libssl3t64" },
+    .{ .name = "libgmp.so.10", .package = "libgmp10" },
+};
+
+fn guestLibraryPackage(name: []const u8) ?[]const u8 {
+    for (runtime_libraries) |library| {
+        if (std.mem.eql(u8, library.name, name)) return library.package;
+    }
+    for (guest_libraries) |library| {
+        if (std.mem.eql(u8, library.name, name)) return library.package;
+    }
+    return null;
+}
+
+/// Executables that the guest resolves by PATH or shebang; each is bound with
+/// its complete ELF closure. Helpers are required in every reference root.
+const guest_executables = [_]struct { package: []const u8, path: []const u8, role: guest.Role, required: bool }{
+    .{ .package = "dpkg", .path = "usr/bin/dpkg-deb", .role = .helper, .required = true },
+    .{ .package = "dpkg", .path = "usr/bin/dpkg-split", .role = .helper, .required = true },
+    .{ .package = "tar", .path = "usr/bin/tar", .role = .helper, .required = true },
+    .{ .package = "dash", .path = "usr/bin/sh", .role = .interpreter, .required = false },
+    .{ .package = "bash", .path = "usr/bin/bash", .role = .interpreter, .required = false },
+    .{ .package = "perl-base", .path = "usr/bin/perl", .role = .interpreter, .required = false },
+    .{ .package = "libc-bin", .path = "usr/sbin/ldconfig", .role = .handler_tool, .required = false },
+};
+
+const GuestRecorder = struct {
+    base: *Recorder,
+    triplet: []const u8,
+    interpreter: []const u8,
+    /// The interpreter beneath its canonical /usr directory (no merged-usr alias).
+    loader_path: []const u8,
+    entries: std.ArrayList(guest.Entry) = .empty,
+    sonames: std.ArrayList([]const u8) = .empty,
+    visited: std.StringHashMap(bool),
+
+    const Member = struct { identity: guest.Identity, bytes: ?[]const u8 = null };
+
+    fn find(self: *const GuestRecorder, path: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.path, path)) return index;
+        }
+        return null;
+    }
+
+    fn sameIdentity(left: guest.Identity, right: guest.Identity) bool {
+        return left.kind == right.kind and left.mode == right.mode and left.size == right.size and
+            std.mem.eql(u8, left.sha256, right.sha256) and std.mem.eql(u8, left.target, right.target) and
+            std.mem.eql(u8, left.package orelse "", right.package orelse "") and
+            std.mem.eql(u8, left.member orelse "", right.member orelse "");
+    }
+
+    fn put(self: *GuestRecorder, path: []const u8, role: guest.Role, required: bool, identity: guest.Identity) !void {
+        const allocator = self.base.allocator;
+        if (!guest.canonicalPath(path)) {
+            std.log.err("reference guest path {s} is not canonical", .{path});
+            return error.InvalidGuestBinding;
+        }
+        if (self.find(path)) |index| {
+            const entry = &self.entries.items[index];
+            if (entry.role != role or entry.allowed.len == 0) return error.AmbiguousGuestBinding;
+            entry.required = entry.required or required;
+            for (entry.allowed) |previous| {
+                if (sameIdentity(previous, identity)) return;
+            }
+            const allowed = try allocator.alloc(guest.Identity, entry.allowed.len + 1);
+            @memcpy(allowed[0..entry.allowed.len], entry.allowed);
+            allowed[entry.allowed.len] = identity;
+            entry.allowed = allowed;
+            return;
+        }
+        try self.entries.append(allocator, .{
+            .path = path,
+            .role = role,
+            .required = required,
+            .allowed = try allocator.dupe(guest.Identity, &.{identity}),
+        });
+    }
+
+    /// A path that must stay absent unless another binding already owns it.
+    fn absent(self: *GuestRecorder, path: []const u8, role: guest.Role) !void {
+        if (self.find(path) != null) return;
+        try self.entries.append(self.base.allocator, .{ .path = path, .role = role });
+    }
+
+    fn member(self: *GuestRecorder, package_name: []const u8, path: []const u8) !Member {
+        const allocator = self.base.allocator;
+        const data = try self.base.payload(package_name);
+        const package = self.base.lockPackage(package_name) orelse return error.MissingRuntimePackage;
+        const entry = payloadEntry(data, path) orelse {
+            std.log.err("reference guest member {s}:/{s} is missing", .{ package_name, path });
+            return error.MissingGuestMember;
+        };
+        if (entry.uid != 0 or entry.gid != 0) return error.UnprotectedGuestMember;
+        var result: Member = .{ .identity = .{
+            .kind = .regular,
+            .package = package.name,
+            .version = package.version,
+            .archive_sha512 = try allocator.dupe(u8, &std.fmt.bytesToHex(
+                package.archive_identity.digests.sha512 orelse package.derived_sha512.?,
+                .lower,
+            )),
+            .member = try std.fmt.allocPrint(allocator, "/{s}", .{path}),
+        } };
+        switch (entry.kind) {
+            .regular, .hardlink => {
+                const source = if (entry.kind == .hardlink) entry.link_target orelse return error.UnsupportedGuestMember else path;
+                const primary = payloadEntry(data, source) orelse return error.MissingGuestMember;
+                if (primary.kind != .regular) return error.UnsupportedGuestMember;
+                const bytes = try data.regularPayloadBytes(source, guest.maximum_file_bytes);
+                result.identity.mode = primary.mode & 0o7777;
+                result.identity.size = bytes.len;
+                result.identity.sha256 = try digest(allocator, bytes);
+                result.bytes = bytes;
+            },
+            .symlink => {
+                result.identity.kind = .symlink;
+                result.identity.target = entry.link_literal.?;
+            },
+            .directory => {
+                result.identity.kind = .directory;
+                result.identity.mode = entry.mode & 0o7777;
+            },
+            .fifo => return error.UnsupportedGuestMember,
+        }
+        return result;
+    }
+
+    fn payloadEntry(data: *const Recorder.debz.deb_payload.Validation, path: []const u8) ?Recorder.debz.deb_payload.Entry {
+        for (data.data.entries) |candidate| {
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, candidate.path, "/"), path)) return candidate;
+        }
+        return null;
+    }
+
+    /// Binds a member and follows its in-package symlink chain to the ELF
+    /// file, then binds the loader and every NEEDED library recursively.
+    fn chain(self: *GuestRecorder, packages: []const []const u8, start: []const u8, role: guest.Role, required: bool) anyerror!void {
+        const allocator = self.base.allocator;
+        var path = start;
+        var depth: usize = 0;
+        while (depth < 16) : (depth += 1) {
+            if (self.visited.get(path)) |done| {
+                if (done or !required) return;
+            }
+            try self.visited.put(path, required);
+            const found = for (packages) |package_name| {
+                const data = try self.base.payload(package_name);
+                if (payloadEntry(data, path) != null) break try self.member(package_name, path);
+            } else {
+                std.log.err("reference guest member /{s} is missing", .{path});
+                return error.MissingGuestMember;
+            };
+            const absolute = try std.fmt.allocPrint(allocator, "/{s}", .{path});
+            try self.put(absolute, role, required, found.identity);
+            switch (found.identity.kind) {
+                .symlink => {
+                    var buffer: [4096]u8 = undefined;
+                    const resolved = try guest.resolveTarget(&buffer, absolute, found.identity.target);
+                    path = try allocator.dupe(u8, resolved[1..]);
+                },
+                .regular => return self.closure(found.bytes.?, required),
+                .directory => return error.UnsupportedGuestMember,
+            }
+        }
+        return error.CyclicGuestLink;
+    }
+
+    fn closure(self: *GuestRecorder, bytes: []const u8, required: bool) anyerror!void {
+        if (!std.mem.startsWith(u8, bytes, "\x7fELF")) return;
+        const elf = try inspectElf(self.base.allocator, bytes, self.base.architecture);
+        if (elf.interpreter) |interpreter| {
+            if (!std.mem.eql(u8, interpreter, self.interpreter)) {
+                std.log.err("reference guest interpreter {s} is unreviewed", .{interpreter});
+                return error.UnreviewedGuestInterpreter;
+            }
+            try self.chain(&.{"libc6"}, self.loader_path, .loader, required);
+        }
+        for (elf.needed) |name| try self.library(name, required);
+    }
+
+    fn library(self: *GuestRecorder, name: []const u8, required: bool) anyerror!void {
+        const allocator = self.base.allocator;
+        const loader = std.mem.eql(u8, name, std.fs.path.basename(self.interpreter));
+        const package_name = guestLibraryPackage(name) orelse {
+            std.log.err("reference guest library {s} is unreviewed", .{name});
+            return error.UnreviewedGuestLibrary;
+        };
+        for (self.sonames.items) |previous| {
+            if (std.mem.eql(u8, previous, name)) break;
+        } else try self.sonames.append(allocator, name);
+        const path = try std.fmt.allocPrint(allocator, "usr/lib/{s}/{s}", .{ self.triplet, name });
+        try self.chain(&.{package_name}, path, if (loader) .loader else .library, required);
+    }
+
+    /// Binds every member of `packages` at or beneath `directory`.
+    fn tree(self: *GuestRecorder, packages: []const []const u8, directory: []const u8, role: guest.Role) !void {
+        const allocator = self.base.allocator;
+        for (packages) |package_name| {
+            const data = try self.base.payload(package_name);
+            for (data.data.entries) |entry| {
+                const path = std.mem.trimEnd(u8, entry.path, "/");
+                if (!std.mem.eql(u8, path, directory) and !(std.mem.startsWith(u8, path, directory) and
+                    path.len > directory.len and path[directory.len] == '/'))
+                    continue;
+                const found = try self.member(package_name, path);
+                try self.put(try std.fmt.allocPrint(allocator, "/{s}", .{path}), role, false, found.identity);
+            }
+        }
+    }
+};
+
+/// Derives the guest binding from the original signed lock archives (and the
+/// hash-pinned Debian dpkg helpers staged beside the pinned dpkg).
+fn recordGuest(recorder: *Recorder, dpkg_path: []const u8, lock_sha256: []const u8, interpreter: []const u8) ![]const u8 {
+    const allocator = recorder.allocator;
+    const architecture = recorder.architecture;
+    const triplet = guest.triplet(architecture) orelse return error.UnsupportedRuntimeArchitecture;
+    if (!std.mem.startsWith(u8, interpreter, "/lib/") and !std.mem.startsWith(u8, interpreter, "/lib64/"))
+        return error.UnreviewedRuntimeInterpreter;
+    var self: GuestRecorder = .{
+        .base = recorder,
+        .triplet = triplet,
+        .interpreter = interpreter,
+        .loader_path = try std.fmt.allocPrint(allocator, "usr{s}", .{interpreter}),
+        .visited = std.StringHashMap(bool).init(allocator),
+    };
+    const amd64 = std.mem.eql(u8, architecture, "amd64");
+    for ([_][]const u8{ "bin", "sbin", "lib", "lib64" }) |name| {
+        if (!amd64 and std.mem.eql(u8, name, "lib64")) continue;
+        const found = try self.member("base-files", name);
+        try self.put(try std.fmt.allocPrint(allocator, "/{s}", .{name}), .alias, true, found.identity);
+    }
+    try self.chain(&.{"libc6"}, self.loader_path, .loader, true);
+    const pinned = std.fs.path.dirname(dpkg_path) orelse return error.InvalidRuntimePath;
+    for ([_][]const u8{ "dpkg-deb", "dpkg-split" }) |helper| {
+        const bytes = try readProtected(
+            allocator,
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ pinned, helper }),
+            maximum_object_bytes,
+        );
+        try self.put(try std.fmt.allocPrint(allocator, "/usr/bin/{s}", .{helper}), .helper, true, .{
+            .kind = .regular,
+            .mode = 0o755,
+            .size = bytes.len,
+            .sha256 = try digest(allocator, bytes),
+        });
+        try self.closure(bytes, true);
+    }
+    for (guest_executables) |executable| {
+        try self.chain(&.{executable.package}, executable.path, executable.role, executable.required);
+    }
+    // dpkg removes control extraction directories with rm: the coreutils-from-gnu
+    // alias in reference roots, or the GNU rm bytes staged in proof templates.
+    const gnurm = try self.member("gnu-coreutils", "usr/bin/gnurm");
+    try self.put("/usr/bin/rm", .helper, true, gnurm.identity);
+    try self.closure(gnurm.bytes.?, true);
+    try self.put("/usr/bin/rm", .helper, true, (try self.member("coreutils-from-gnu", "usr/bin/rm")).identity);
+    try self.chain(&.{"gnu-coreutils"}, "usr/bin/gnurm", .helper, false);
+    for ((try recorder.payload("dpkg")).data.entries) |entry| {
+        const path = std.mem.trimEnd(u8, entry.path, "/");
+        if (entry.kind == .directory or !(std.mem.startsWith(u8, path, "usr/bin/") or std.mem.startsWith(u8, path, "usr/sbin/")) or
+            self.visited.contains(path))
+            continue;
+        try self.chain(&.{"dpkg"}, path, .handler_tool, false);
+    }
+    // Late NSS: configuration, every libc6 provider, and loader-cache search.
+    for ([_][2][]const u8{
+        .{ "libc-bin", "usr/share/libc-bin/nsswitch.conf" },
+        .{ "systemd", "usr/share/factory/etc/nsswitch.conf" },
+    }) |source| {
+        const found = try self.member(source[0], source[1]);
+        try self.put("/etc/nsswitch.conf", .nss_config, false, found.identity);
+    }
+    const library_directory = try std.fmt.allocPrint(allocator, "usr/lib/{s}", .{triplet});
+    for ((try recorder.payload("libc6")).data.entries) |entry| {
+        const path = std.mem.trimEnd(u8, entry.path, "/");
+        if (!std.mem.startsWith(u8, path, library_directory) or path.len <= library_directory.len + 1 or
+            path[library_directory.len] != '/' or !std.mem.startsWith(u8, path[library_directory.len + 1 ..], "libnss_"))
+            continue;
+        const name = path[library_directory.len + 1 ..];
+        if (std.mem.indexOfScalar(u8, name, '/') != null) continue;
+        try self.sonames.append(allocator, name);
+        try self.chain(&.{"libc6"}, path, .nss_provider, false);
+    }
+    // Late gconv modules, configuration and cache, all from signed members.
+    const gconv = try std.fmt.allocPrint(allocator, "{s}/gconv", .{library_directory});
+    try self.tree(&.{ "libc6", "libc-gconv-modules-extra" }, gconv, .gconv);
+    // dpkg and loader configuration.
+    for ([_][3][]const u8{
+        .{ "dpkg", "etc/dpkg/dpkg.cfg", "dpkg_config" },
+        .{ "dpkg", "etc/dpkg/dpkg.cfg.d", "dpkg_config" },
+        .{ "libc-bin", "etc/ld.so.conf", "loader_config" },
+        .{ "libc-bin", "etc/ld.so.conf.d", "loader_config" },
+        .{ "libc6", "etc/ld.so.conf.d", "loader_config" },
+        .{ "libc-bin", "etc/ld.so.conf.d/libc.conf", "loader_config" },
+    }) |source| {
+        const found = try self.member(source[0], source[1]);
+        try self.put(
+            try std.fmt.allocPrint(allocator, "/{s}", .{source[1]}),
+            std.meta.stringToEnum(guest.Role, source[2]).?,
+            false,
+            found.identity,
+        );
+    }
+    const multiarch = try std.fmt.allocPrint(allocator, "etc/ld.so.conf.d/{s}.conf", .{triplet});
+    try self.put(try std.fmt.allocPrint(allocator, "/{s}", .{multiarch}), .loader_config, false, (try self.member("libc6", multiarch)).identity);
+    // Required absences: HOME configuration, PATH shadows ahead of /usr/bin,
+    // signature hooks, hwcaps subdirectories and loader search shadows.
+    try self.absent("/.dpkg.cfg", .dpkg_config);
+    try self.absent("/usr/bin/debsig-verify", .shadow);
+    try self.absent("/usr/sbin/debsig-verify", .shadow);
+    const bound_count = self.entries.items.len;
+    for (self.entries.items[0..bound_count]) |entry| {
+        if (!std.mem.startsWith(u8, entry.path, "/usr/bin/") or entry.allowed.len == 0) continue;
+        const shadow = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{entry.path["/usr/bin/".len..]});
+        if (guest.canonicalPath(shadow)) try self.absent(shadow, .shadow);
+    }
+    try self.absent(try std.fmt.allocPrint(allocator, "/{s}/glibc-hwcaps", .{library_directory}), .hwcaps);
+    try self.absent("/usr/lib/glibc-hwcaps", .hwcaps);
+    for (self.sonames.items) |name| {
+        try self.absent(try std.fmt.allocPrint(allocator, "/usr/lib/{s}", .{name}), .shadow);
+        if (amd64) try self.absent(try std.fmt.allocPrint(allocator, "/usr/lib64/{s}", .{name}), .shadow);
+    }
+    const absolute_directory = try std.fmt.allocPrint(allocator, "/{s}", .{library_directory});
+    const manifest: guest.Manifest = .{
+        .architecture = architecture,
+        .lock_sha256 = lock_sha256,
+        .library_directory = absolute_directory,
+        .sonames = self.sonames.items,
+        .cache_prefixes = &.{"libnss_"},
+        .scopes = &.{
+            .{ .directory = try std.fmt.allocPrint(allocator, "/{s}", .{gconv}), .prefix = "" },
+            .{ .directory = try std.fmt.allocPrint(allocator, "/{s}/gconv-modules.d", .{gconv}), .prefix = "" },
+            .{ .directory = "/etc/dpkg/dpkg.cfg.d", .prefix = "" },
+            .{ .directory = "/etc/ld.so.conf.d", .prefix = "", .suffix = ".conf" },
+            .{ .directory = absolute_directory, .prefix = "libnss_" },
+            .{ .directory = "/usr/lib", .prefix = "libnss_" },
+        },
+        .entries = self.entries.items,
+    };
+    try guest.validate(allocator, manifest, architecture, lock_sha256);
+    return std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -569,6 +936,37 @@ pub fn main(init: std.process.Init) !void {
         };
         return error.RuntimeDriftNotDetected;
     }
+    if (std.mem.eql(u8, command, "prove-guest-postbinding")) {
+        const architecture = args.next() orelse return error.InvalidRuntimeArguments;
+        const prefix = args.next() orelse return error.InvalidRuntimeArguments;
+        const root = args.next() orelse return error.InvalidRuntimeArguments;
+        const dpkg_hash = args.next() orelse return error.InvalidRuntimeArguments;
+        const path = args.next() orelse return error.InvalidRuntimeArguments;
+        if (args.next() != null or linux.getuid() != 0 or linux.getgid() != 0 or !guest.canonicalPath(path))
+            return error.InvalidRuntimeArguments;
+        var bound = try Bound.init(allocator, prefix, root, architecture, dpkg_hash);
+        defer bound.deinit();
+        var guest_bound = try guest.Bound.init(allocator, bound.guest_source, root, architecture, bound.manifest().lock_sha256);
+        defer guest_bound.deinit();
+        const filename = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ root, path }, 0);
+        const fd: i32 = @intCast(try syscall(linux.open(filename, .{
+            .ACCMODE = .RDWR,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0)));
+        defer _ = linux.close(fd);
+        var byte: [1]u8 = undefined;
+        if (try syscall(linux.pread(fd, &byte, 1, 0)) != 1) return error.GuestSourceChanged;
+        byte[0] ^= 1;
+        if (try syscall(linux.pwrite(fd, &byte, 1, 0)) != 1) return error.RuntimeWriteFailed;
+        _ = try syscall(linux.fsync(fd));
+        guest_bound.verify(root) catch |err| {
+            if (err != error.GuestSourceChanged) return err;
+            std.log.info("reference guest post-binding {s}: GuestSourceChanged; no dpkg or script executed", .{path});
+            return;
+        };
+        return error.GuestDriftNotDetected;
+    }
     if (!std.mem.eql(u8, command, "record")) return error.InvalidRuntimeArguments;
     const architecture = args.next() orelse return error.InvalidRuntimeArguments;
     const lock_path = args.next() orelse return error.InvalidRuntimeArguments;
@@ -608,6 +1006,7 @@ pub fn main(init: std.process.Init) !void {
     const executable = try inspectElf(allocator, dpkg_bytes, architecture);
     const interpreter = executable.interpreter orelse return error.MissingRuntimeInterpreter;
     const loader_name = std.fs.path.basename(interpreter);
+    const lock_sha256 = try digest(allocator, lock_bytes);
     try recorder.add(loader_name);
     try recorder.link("/lib", "usr/lib");
     if (std.mem.eql(u8, architecture, "amd64")) {
@@ -626,9 +1025,10 @@ pub fn main(init: std.process.Init) !void {
         for (elf.needed) |name| try recorder.add(name);
     }
     try validateClosure(allocator, recorder.objects.items, architecture);
+    const guest_json = try recordGuest(&recorder, dpkg_path, lock_sha256, interpreter);
     const manifest: Manifest = .{
         .architecture = architecture,
-        .lock_sha256 = try digest(allocator, lock_bytes),
+        .lock_sha256 = lock_sha256,
         .loader = loader_name,
         .objects = recorder.bindings.items,
         .links = recorder.links.items,
@@ -644,6 +1044,7 @@ pub fn main(init: std.process.Init) !void {
     defer _ = linux.close(directory.fd);
     for (recorder.objects.items) |object| try writeNew(allocator, directory.fd, object.name, object.bytes);
     try writeNew(allocator, directory.fd, "binding.json", json);
+    try writeNew(allocator, directory.fd, guest.manifest_name, guest_json);
     _ = try syscall(linux.fsync(directory.fd));
 }
 
@@ -1023,4 +1424,8 @@ test "reference runtime closure recursively refuses missing, unbound and archite
     fixtureInteger(u64, &loader, 208, 1);
     fixtureInteger(u64, &loader, 216, 1);
     try std.testing.expectError(error.InvalidRuntimeInterpreter, validateClosure(std.testing.allocator, &objects, "amd64"));
+}
+
+test {
+    _ = guest;
 }

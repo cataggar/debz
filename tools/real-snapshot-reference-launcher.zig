@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const private_network = @import("private_network");
 const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;
 const runtime = @import("real-snapshot-reference-runtime.zig");
+const guest = @import("real-snapshot-reference-guest.zig");
 
 const OpenHow = extern struct { flags: u64, mode: u64 = 0, resolve: u64 };
 const resolve_no_symlinks: u64 = 0x02 | 0x04;
@@ -951,6 +952,7 @@ const Child = struct {
     archive_mountpoint: Pinned,
     dpkg: Pinned,
     runtime: *const runtime.Bound,
+    guest: *const guest.Bound,
     runtime_mountpoints: RuntimeMountpoints,
     archive: ?Pinned,
     boot_id: ?[37]u8,
@@ -1373,6 +1375,10 @@ fn childMain(input: Child) noreturn {
         std.log.err("reference runtime before-chroot refusal: {s}", .{@errorName(err)});
         fail(status, 12, .STALE);
     };
+    child.guest.verify(child.options.root) catch |err| {
+        std.log.err("reference guest before-chroot refusal: {s}", .{@errorName(err)});
+        fail(status, 12, .STALE);
+    };
     if (child.options.archive) |path| {
         const reopened = openPinned(path, false) catch fail(status, 3, .STALE);
         if (!same(reopened.metadata, child.archive.?.metadata))
@@ -1388,6 +1394,10 @@ fn childMain(input: Child) noreturn {
     _ = linux.close(root.fd);
     child.runtime.verify("") catch |err| {
         std.log.err("reference runtime before-exec refusal: {s}", .{@errorName(err)});
+        fail(status, 12, .STALE);
+    };
+    child.guest.verify("") catch |err| {
+        std.log.err("reference guest before-exec refusal: {s}", .{@errorName(err)});
         fail(status, 12, .STALE);
     };
     const allocator = std.heap.page_allocator;
@@ -1534,6 +1544,19 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
 fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtime.Bound, mountpoints: RuntimeMountpoints) !u8 {
     const root = try protectedRoot(options.root);
     defer _ = linux.close(root.fd);
+    // Bind every guest helper, interpreter, loader, library, alias and late
+    // NSS/gconv/config/cache input to its signed original-archive identity.
+    var guest_bound = guest.Bound.init(
+        allocator,
+        bound.guest_source,
+        options.root,
+        options.architecture,
+        bound.manifest().lock_sha256,
+    ) catch |err| {
+        std.log.err("reference guest binding refused: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer guest_bound.deinit();
     const expected_dpkg = dpkg_digests[
         if (std.mem.eql(u8, options.architecture, "amd64"))
             @as(usize, 0)
@@ -1649,6 +1672,7 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         .archive_mountpoint = target,
         .dpkg = dpkg,
         .runtime = bound,
+        .guest = &guest_bound,
         .runtime_mountpoints = mountpoints,
         .archive = archive,
         .boot_id = boot_id,

@@ -124,6 +124,31 @@ successful snapshot. All privileged execution and eventual parity proofs
 remain restricted to disposable hosted runners. No full-root parity has been
 accepted from these source or diagnostic records.
 
+The launcher's guest binding (`guest.json`, see
+[integration roots](integration-roots.md)) now covers the script interpreter,
+`ldconfig`, the loader, its libraries and the late NSS/gconv/configuration
+search and absence inputs that a libc-bin handler would use. It does not
+authorize any trigger execution. The single signed handler executor (#265) is
+designed but not implemented, and it requires genuine hosted observations
+first:
+
+- one launcher verb per reviewed handler. The first is libc-bin, run as
+  `dpkg --no-triggers --triggers-only libc-bin:ARCH` and never `--pending`;
+- admission only when libc-bin is `triggers-pending` with exactly `ldconfig`,
+  every other package is `installed` or `triggers-awaited` on exactly
+  libc-bin, the update journal and unincorporated queue are empty, the
+  installed postinst and `triggers` bytes equal the digest-bound signed
+  members, and both the runtime and guest bindings verify;
+- unknown, mixed, recursive (newly activated), failed, cyclic and
+  no-progress (`CycleNoProgress`) states refuse;
+- `verify-transition` must accept the observed before/after status, and the
+  exact terminal status and trigger bytes are retained;
+- expectations come from the signed lock and the hosted reference
+  observations, never from a native root.
+
+Keep #265 open until hosted runs observe and admit that handler on both
+architectures.
+
 ## Installed `triggers` files
 
 dpkg 1.22.22 renames each control member into `info/` unchanged
