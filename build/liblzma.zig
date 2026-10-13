@@ -127,3 +127,47 @@ pub fn addStaticLibrary(
         .version = .{ .major = 5, .minor = 8, .patch = 3 },
     });
 }
+
+pub fn addStaticEncoderLibrary(
+    b: *std.Build,
+    xz: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const library = addStaticLibrary(b, xz, target, optimize);
+    for ([_][]const u8{
+        "HAVE_ENCODERS", "HAVE_ENCODER_LZMA1", "HAVE_ENCODER_LZMA2",
+        "HAVE_MF_HC3",   "HAVE_MF_HC4",        "HAVE_MF_BT2",
+        "HAVE_MF_BT3",   "HAVE_MF_BT4",
+    }) |definition| library.root_module.addCMacro(definition, "1");
+    library.root_module.addCSourceFiles(.{
+        .root = xz.path(""),
+        .files = &.{
+            "src/liblzma/common/alone_encoder.c",
+            "src/liblzma/common/block_buffer_encoder.c",
+            "src/liblzma/common/block_encoder.c",
+            "src/liblzma/common/block_header_encoder.c",
+            "src/liblzma/common/easy_buffer_encoder.c",
+            "src/liblzma/common/easy_encoder.c",
+            "src/liblzma/common/easy_encoder_memusage.c",
+            "src/liblzma/common/filter_buffer_encoder.c",
+            "src/liblzma/common/filter_encoder.c",
+            "src/liblzma/common/filter_flags_encoder.c",
+            "src/liblzma/common/index_encoder.c",
+            "src/liblzma/common/stream_buffer_encoder.c",
+            "src/liblzma/common/stream_encoder.c",
+            "src/liblzma/common/stream_flags_encoder.c",
+            "src/liblzma/common/vli_encoder.c",
+            "src/liblzma/lz/lz_encoder.c",
+            "src/liblzma/lz/lz_encoder_mf.c",
+            "src/liblzma/lzma/fastpos_table.c",
+            "src/liblzma/lzma/lzma_encoder.c",
+            "src/liblzma/lzma/lzma_encoder_optimum_fast.c",
+            "src/liblzma/lzma/lzma_encoder_optimum_normal.c",
+            "src/liblzma/lzma/lzma2_encoder.c",
+            "src/liblzma/rangecoder/price_table.c",
+        },
+        .flags = &.{"-std=c99"},
+    });
+    return library;
+}
