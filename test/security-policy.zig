@@ -176,6 +176,7 @@ test "security: actual reference diagnostic commands retain independent failure 
         \\architecture=arm64 lock=$workspace/original.lock cache=$workspace/original-cache
         \\reference_root=$workspace/reference-root reference_dpkg=$workspace/pinned-dpkg
         \\launcher=$workspace/launcher runtime=$workspace/runtime
+        \\order=$workspace/order-tool/bin/debz-reference-order
         \\
     ;
     try f.work.write("run-diagnostics", try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}\n", .{ prelude, production }));
