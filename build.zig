@@ -906,6 +906,17 @@ pub fn build(b: *std.Build) void {
     });
     const release_test_options = b.addOptions();
     release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));
+    const release_smoke_debz = b.addExecutable(.{
+        .name = "release-smoke-debz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/release-smoke-debz.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+        }),
+        .linkage = .static,
+    });
+    release_test_options.addOptionPath("smoke_debz", release_smoke_debz.getEmittedBin());
     release_policy_tests.root_module.addOptions("release_test_options", release_test_options);
     const run_release_policy_tests = b.addRunArtifact(release_policy_tests);
     run_release_policy_tests.setCwd(b.path("."));

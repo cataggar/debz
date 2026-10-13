@@ -27,12 +27,14 @@ input validation does not equate deflate implementations' compressed bytes.
 Tar member reading now uses the same native strict container decoder, with
 GNU long names, signed epochs, checksum/size bounds and original metadata
 refusals. Audit and smoke consume those original member bytes without Python
-archive decoding. `test-release-consumers` runs the native core and all fifteen
+archive decoding. `test-release-consumers` runs the native core and all sixteen
 actual consumer tests, without the giant unrelated GNU install rebuild.
 The twelve original cases retain their assertions; two added focused cases
 cover no-follow ancestry, output aliases and bounds, plus exact typed runtime
 and option refusal. A third checks the actual installed native tool can package
-itself without embedding the secret markers it detects. The real consumers exercise both compression
+itself without embedding the secret markers it detects. A fourth runs complete
+`verify --smoke` with a static host binary, which must leave only the four assets
+after the pinned directory check, and refuses an unrunnable host binary. The real consumers exercise both compression
 formats, full binary/archive checks and all four assets. Complete byte-level
 crosschecks retain the unchanged original implementation outside the repository.
 

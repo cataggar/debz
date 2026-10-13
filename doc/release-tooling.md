@@ -24,6 +24,9 @@ following links; staged files are private, uniquely named and durably renamed.
 Smoke creates a private owned extraction beside the archive, preserves original
 file/directory modes and nanosecond epochs, runs only matching-host binaries
 with `PATH=/no-host-interpreters` and a 60-second timeout, and cleans up on failure.
+`verify --smoke` audits all four archives and confirms the pinned asset
+directory is unchanged before smoking the host gzip archive, because that
+extraction briefly adds a directory beside the assets.
 Foreign binaries are audited, never executed.
 
 Release inputs are rejected when

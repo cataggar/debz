@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const support = @import("tooling-test-support.zig");
 const testing = std.testing;
 
@@ -694,6 +695,40 @@ test "release: complete x64/arm64 verification rejects forbidden sidecars and no
     const linked = try release(verify_args);
     defer linked.deinit();
     try linked.failsWith("non-regular entry");
+}
+
+test "release: verification smoke executes the host binary after confirming the pinned asset directory" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const host: ?[]const u8 = if (builtin.os.tag != .linux) null else switch (builtin.cpu.arch) {
+        .x86_64 => "linux-x64",
+        .aarch64 => "linux-arm64",
+        else => null,
+    };
+    const smoke_debz = try std.Io.Dir.cwd().readFileAlloc(support.io, @import("release_test_options").smoke_debz, f.arena.allocator(), .limited(64 * 1024 * 1024));
+    for ([_][]const u8{ "linux-x64", "linux-arm64" }) |platform| {
+        const prefix_path = try f.prefix(platform, if (std.mem.eql(u8, platform, "linux-x64")) 62 else 183);
+        if (host != null and std.mem.eql(u8, platform, host.?)) try f.write(platform, "bin/debz", smoke_debz);
+        const packaged = try f.package(prefix_path, try f.path("assets"), platform);
+        defer packaged.deinit();
+        try packaged.ok();
+    }
+    const verified = try release(&.{ "verify", "--tag", "v0.1.0", "--assets", try f.path("assets"), "--smoke" });
+    defer verified.deinit();
+    try verified.ok();
+    try support.contains(verified.stdout, "verified 4 release assets");
+    const assets = try f.work.directory.dir.openDir(support.io, "assets", .{ .iterate = true });
+    defer assets.close(support.io);
+    var iterator = assets.iterate();
+    var count: usize = 0;
+    while (try iterator.next(support.io)) |_| count += 1;
+    try testing.expectEqual(@as(usize, 4), count);
+    if (host == null) return;
+    try packageOk(&f, "x64", "linux-x64", "unrunnable");
+    try packageOk(&f, "arm", "linux-arm64", "unrunnable");
+    const unrunnable = try release(&.{ "verify", "--tag", "v0.1.0", "--assets", try f.path("unrunnable"), "--smoke" });
+    defer unrunnable.deinit();
+    try unrunnable.failsWith("native smoke failed for version");
 }
 
 test "release: no-follow prefix ancestry bounded files and atomic output aliases refuse without writes" {

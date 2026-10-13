@@ -1053,15 +1053,19 @@ fn orchestration(init: std.process.Init, args: []const []const u8) !void {
     }
     for (listing.members) |member| if (!expected.contains(member.name))
         return refuse("release assets are forbidden: {s}", .{member.name});
+    var host: ?struct { path: []const u8, archive: AuditedArchive } = null;
     for ([_]Platform{ .@"linux-x64", .@"linux-arm64" }) |platform| {
         for ([_]Format{ .@"tar.gz", .@"tar.xz" }) |format| {
             const archive_path = try std.fmt.allocPrint(allocator, "{s}/debz-{s}-{s}.{s}", .{ assets, version, @tagName(platform), @tagName(format) });
             const archive = try auditArchive(context, archive_path, version, platform, dependencies);
             if (options.smoke and platform == hostPlatform() and format == .@"tar.gz")
-                try smoke(context, archive_path, archive, version, init.environ_map);
+                host = .{ .path = archive_path, .archive = archive };
         }
     }
+    // Smoke extraction creates and removes a directory inside the pinned
+    // assets directory, so the audited listing identity is confirmed first.
     _ = try directory.metadata();
+    if (host) |audited| try smoke(context, audited.path, audited.archive, version, init.environ_map);
     try std.Io.File.stdout().writeStreamingAll(init.io, "verified 4 release assets\n");
 }
 
