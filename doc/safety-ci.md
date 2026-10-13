@@ -90,6 +90,62 @@ action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
 
+## Focused paid-runner tooling dispatch
+
+`tooling.yml` is a separate **validation-only** workflow, not a required PR,
+release, signed-root or native-cutover acceptance gate. Unlike
+`ci.yml -f run_full_matrix=false`, it does not also schedule privileged
+integration/security jobs or unrelated Actions/release/fuzz cohorts. Existing
+full PR and hosted root/reference gates are unchanged.
+
+The workflow must be registered on the repository's default branch before
+GitHub can dispatch it. Dispatch a branch containing the workflow and the
+actual candidate tooling targets, binding its full commit and tree:
+
+```sh
+candidate=fleet-candidate-branch
+head=$(git rev-parse "$candidate")
+tree=$(git rev-parse "$candidate^{tree}")
+gh workflow run tooling.yml --repo cataggar/debz --ref "$candidate" \
+  -f source_sha="$head" -f source_tree="$tree" \
+  -f selectors="test-integration-repository test-disposable-runtime" \
+  -f architecture=both -f optimize=both
+```
+
+`architecture` accepts `both`, `amd64`, or `arm64`; `optimize` accepts `both`,
+`Debug`, or `ReleaseSafe`. Each selected test has its own native
+architecture/mode row, so the example schedules eight useful paid rows. Runner
+labels are exactly `[self-hosted, Linux, X64, ubuntu2604]` and
+`[self-hosted, Linux, ARM64, ubuntu2604]`. Fork/PR/tag events cannot schedule
+paid rows. A hosted source planner requires the dispatch SHA, checked-out
+commit and supplied tree to agree, validates the actual candidate build-step
+inventory and source guards, then emits the immutable row plan.
+
+The reviewed pure selectors and their producer prerequisites are listed in
+`tools/tooling-fleet.mjs`. Current native fixtures, signing/archive/repository,
+dpkg preparation, Debian readiness, reference runtime, replay comparison and
+oracle-evidence tests are available. Vendor capture/derivation, reference
+order/paths and protected-observation parsing (`*-protected-pure`), release consumers
+and native policies are accepted only when their actual producer and test
+targets exist in the dispatched candidate; an unintegrated port fails planning,
+not a success-shaped fallback. `test`, `test-release`, `security-audit`,
+workload aggregates, root/reference execution and arbitrary build options
+are deliberately not selectors.
+
+Each paid row installs the same signature/attestation-verified, pinned Zig
+0.16.0 toolchain, checks its version before building, refuses root or a foreign
+runner architecture, and creates exclusive run/attempt/source/coordinate-local
+caches without restoring build caches. Only selected tooling producers are
+installed, both normally and at a custom prefix; their actual executable
+inventories, modes and hashes must match, without a guessed helper count.
+The real selected tests receive that custom prefix. Python and privileged
+host commands are poisoned on the test PATH. No host packages or interpreters
+are installed or removed; absolute-command/source policy remains a separate
+mandatory audit, so this lane alone is not complete no-host-Python acceptance.
+Exact bindings, commands, installed inventories and failure logs are retained
+as `tooling-SHA-SELECTOR-ARCH-MODE-ATTEMPT` artifacts. Their
+`acceptance: false` field cannot stand in for any mandatory full/hosted proof.
+
 The dispatch-only native snapshot job instead shares the small protected
 proof's root-owned bootstrap: the same size/SHA-256/minisign-pinned Zig and
 verified library tree, package-derived Ubuntu keyring and pinned dpkg. It
