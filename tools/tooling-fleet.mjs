@@ -25,6 +25,7 @@ export const selectors = Object.freeze({
   'test-real-snapshot-reference-runtime': ['build-reference-runtime'],
   'test-dpkg-oracle-evidence': ['build-dpkg-oracle-evidence'],
   'test-signed-proc-compare': ['build-signed-proc-compare'],
+  'test-vendor-snapshot-tools': ['build-vendor-snapshot-tools'],
   'test-real-snapshot-reference-order': ['build-reference-order'],
   'test-real-snapshot-reference-paths': ['build-reference-paths'],
   'test-release-consumers': ['build-release-tool'],
@@ -53,7 +54,7 @@ export function selectTargets(value, available) {
   requireValue(typeof value === 'string' && /^[a-z0-9 -]+$/.test(value),
     'selectors must be space-separated reviewed test names');
   const selected = value.trim().split(/ +/);
-  requireValue(selected.length <= 18 && new Set(selected).size === selected.length,
+  requireValue(selected.length <= Object.keys(selectors).length && new Set(selected).size === selected.length,
     'duplicate or excessive selectors');
   for (const selector of selected) {
     requireValue(Object.hasOwn(selectors, selector), `unreviewed tooling selector: ${selector}`);
@@ -195,7 +196,9 @@ export function runSelector(env, root) {
   requireValue(architecture === env.ARCHITECTURE, 'native runner architecture mismatch');
   planRows([env.SELECTOR], env.ARCHITECTURE, env.OPTIMIZE);
   requireValue(env.ARCHITECTURE !== 'both' && env.OPTIMIZE !== 'both', 'execution requires one exact matrix coordinate');
-  const selected = selectTargets(env.SELECTOR, stepNames(readFileSync(join(root, 'build.zig'), 'utf8')))[0];
+  const requested = selectTargets(env.SELECTOR, stepNames(readFileSync(join(root, 'build.zig'), 'utf8')));
+  requireValue(requested.length === 1, 'execution requires one exact tooling selector');
+  const selected = requested[0];
   requireValue(/^[1-9][0-9]*$/.test(env.GITHUB_RUN_ID ?? '')
     && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ATTEMPT ?? ''), 'missing exact run identity');
   const zig = findExecutable('zig', env.PATH);
@@ -211,7 +214,9 @@ export function runSelector(env, root) {
     source_sha: env.SOURCE_SHA, source_tree: env.SOURCE_TREE, selector: selected,
     architecture, optimize: env.OPTIMIZE, run_id: env.GITHUB_RUN_ID,
     run_attempt: env.GITHUB_RUN_ATTEMPT, compiler: zig, compiler_version: '0.16.0',
-    build_cache: 'fresh-exclusive-no-restore', acceptance: false, status: 'running',
+    build_cache: 'fresh-exclusive-no-restore',
+    execution: env.GITHUB_ACTIONS === 'true' ? 'github-actions' : 'local-validation',
+    acceptance: false, status: 'running',
   };
   writeFileSync(join(reports, 'binding.json'), `${JSON.stringify(report, null, 2)}\n`);
   try {

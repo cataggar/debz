@@ -5,7 +5,7 @@ import {
 import { arch } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { after, test } from 'node:test';
+import { after, mock, test } from 'node:test';
 import {
   auditWorkflow, bindSource, inventory, main, planRows, runSelector,
   selectors, selectTargets,
@@ -45,6 +45,7 @@ function fixture() {
     SELECTORS: 'test-integration-repository', SELECTOR: 'test-integration-repository',
     ARCHITECTURE: arch() === 'arm64' ? 'arm64' : 'amd64', OPTIMIZE: 'Debug',
     GITHUB_RUN_ID: '12', GITHUB_RUN_ATTEMPT: '1',
+    GITHUB_ACTIONS: 'false',
     GITHUB_OUTPUT: join(directory, '.cache', 'actions-output'),
   };
   mkdirSync(join(directory, '.cache', 'bin'), { recursive: true });
@@ -179,6 +180,18 @@ test('installed inventory enumerates actual tools and refuses links instead of g
   assert.throws(() => inventory(prefix), /regular executable/);
 });
 
+test('paid execution refuses root before creating caches or launching the compiler', () => {
+  const { directory, env } = fixture();
+  const uid = mock.method(process, 'getuid', () => 0);
+  try {
+    assert.throws(() => runSelector(env, directory), /refuses root/);
+    assert.ok(!existsSync(join(directory, '.cache/tooling-fleet')));
+    assert.ok(!existsSync(join(directory, '.cache/build-calls.jsonl')));
+  } finally {
+    uid.mock.restore();
+  }
+});
+
 test('actual executor binds compiler, fresh caches, installed/custom prefixes and exact selected tests', () => {
   const { directory, env } = fixture();
   runSelector(env, directory);
@@ -201,6 +214,7 @@ test('actual executor binds compiler, fresh caches, installed/custom prefixes an
     env.ARCHITECTURE, 'Debug', env.SELECTOR, 'reports/binding.json');
   const report = JSON.parse(readFileSync(reportPath, 'utf8'));
   assert.equal(report.status, 'success');
+  assert.equal(report.execution, 'local-validation');
   assert.equal(report.acceptance, false);
   assert.deepEqual(report.normal_install, report.custom_install);
   rmSync(join(directory, 'zig-out'), { recursive: true });
@@ -213,6 +227,8 @@ test('compiler mismatch, wrong architecture, build failure and post-build source
   assert.ok(!existsSync(join(compiler.directory, '.cache/tooling-fleet')));
   assert.throws(() => runSelector({ ...compiler.env,
     ARCHITECTURE: compiler.env.ARCHITECTURE === 'amd64' ? 'arm64' : 'amd64' }, compiler.directory), /architecture mismatch/);
+  assert.throws(() => runSelector({ ...compiler.env,
+    SELECTOR: 'test-integration-repository test-disposable-runtime' }, compiler.directory), /one exact tooling selector/);
   for (const variable of ['FAKE_ZIG_FAIL', 'FAKE_ZIG_DIRTY']) {
     const { directory, env } = fixture();
     assert.throws(() => runSelector({ ...env, [variable]: '1' }, directory));
