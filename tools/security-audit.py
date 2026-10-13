@@ -2124,6 +2124,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_release": ("test-workload-release", (
         "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests", "release_tool_tests",
+        "run_release_policy_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
@@ -4969,7 +4970,10 @@ def liblzma_decoder_configuration_failures(text: str) -> list[str]:
     return []
 
 
-NATIVE_RELEASE_CORE_PATHS = ("build.zig", "build/liblzma.zig", "tools/release.zig", "tools/release.py")
+NATIVE_RELEASE_CORE_PATHS = (
+    "build.zig", "build/liblzma.zig", "tools/release.zig", "tools/release.py",
+    "test/release-tooling.zig", "tools/test-release-install.sh",
+)
 
 
 def native_release_core_failures(texts: dict[str, str]) -> list[str]:
@@ -4978,7 +4982,8 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/release.zig")',
             "b.getInstallStep().dependOn(&install_release_tool.step);",
             "workload_release.dependOn(&release_tool_tests.step);",
-            'run_release_policy_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));',
+            'release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));',
+            'release_policy_tests.root_module.addOptions("release_test_options", release_test_options);',
             "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
             "const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);",
             "const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);",
@@ -4990,18 +4995,6 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             '"src/liblzma/rangecoder/price_table.c",',
             '"HAVE_ENCODER_LZMA1"',
             '"HAVE_ENCODER_LZMA2"',
-        ),
-        "tools/release.py": (
-            '"PATH": "/no-host-interpreters"',
-            "timeout=60,",
-            'return native_release("version", tag).decode().removesuffix("\\n")',
-            'native_release("check-elf", "--platform", platform, input=binary)',
-            'return json.loads(native_release("dry-run", "--tag", tag))',
-            '"encode-tar",',
-            'base64.b64encode(data).decode()',
-            'return native_release("compress-tar", "--format", archive_format, input=tar_data)',
-            'native_release("decode-tar", "--name", archive_path.name, input=archive_path.read_bytes())',
-            '"read-archive", "--name", archive_path.name, input=archive_path.read_bytes()',
         ),
         "tools/release.zig": (
             "pub fn parseTag(",
@@ -5017,10 +5010,11 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             "if (terminated and tag != 0)",
             'tarHeader("././@LongLink", 0, 0, name.len + 1, \'L\', true)',
             "const padding = (10240 - output.items.len % 10240) % 10240;",
-            "std.compress.flate.Compress.init(&writer, history, .gzip, .best)",
-            "output[8] = 2;",
+            "return compressTarLevel(allocator, input, format, 9);",
+            "std.compress.flate.Compress.init(&writer, history, .gzip, if (level == 1) .fastest else .best)",
+            "output[8] = if (level == 1) 4 else 2;",
             "output[9] = 255;",
-            "c.lzma_easy_encoder(&stream, 9, c.LZMA_CHECK_CRC64)",
+            "c.lzma_easy_encoder(&stream, level, c.LZMA_CHECK_CRC64)",
             "if (produced > maximum_compressed_bytes - output.items.len)",
             "if (input[3] != 0)",
             "if (!std.mem.allEqual(u8, input[4..8], 0))",
@@ -5038,20 +5032,93 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
     ]
-    python_source = texts.get("tools/release.py", "")
-    handoff = python_source.partition("def native_release(")[2].partition("\ndef parse_tag(")[0]
-    if any(token not in handoff for token in (
-        '"PATH": "/no-host-interpreters"', "timeout=60,", "stdout=subprocess.PIPE", "if result.returncode:",
-    )):
-        failures.append("tools/release.py: native helper interpreter refusal or bounded handoff is missing")
-    smoke = python_source.partition("def smoke_binary(")[2].partition("\ndef command_version(")[0]
-    if any(token not in smoke for token in (
-        "entries = archive_entries(archive_path)",
-        "os.utime(root / member.name, (member.mtime, member.mtime))",
-        '"PATH": "/no-host-interpreters"', "timeout=60,",
-    )):
-        failures.append("tools/release.py: native member smoke handoff, timestamps or bounded interpreter refusal is missing")
+    if texts.get("tools/release.py", ""):
+        failures.append("tools/release.py: retired Python release implementation was restored")
     native = texts.get("tools/release.zig", "")
+    member_body = native.partition("fn readTar(")[2].partition("pub fn validateStaticElf(")[0]
+    if any(token not in member_body for token in (
+        "if (checksum != try tarValue(header[148..156]))",
+        "if (signed_size < 0 or signed_size > tar.len - start)",
+        "if ((try seen.getOrPut(name)).found_existing)",
+        "if (mtime != first)",
+    )):
+        failures.append("tools/release.zig: actual tar member validation body binding is missing")
+    smoke_body = native.partition("fn smoke(")[2].partition("const Options")[0]
+    extraction_body = smoke_body.partition("const root = fs.Root.init(context.io, extraction);")[2].partition("var index = archive.entries.len;")[0]
+    timestamp_body = smoke_body.partition("if (entry.bytes != null) {")[2].partition("} else {")[0]
+    if any(token not in extraction_body for token in (
+        "for (archive.entries) |entry|", "try root.createRegularFile(path",
+        "try file.writeStreamingAll(context.io, bytes);",
+    )) or "try file.setTimestamps(context.io" not in timestamp_body:
+        failures.append("tools/release.zig: actual smoke extraction and file timestamp body binding is missing")
+    for start, end, tokens in (
+        ("fn orchestration(", "fn execute(", (
+            "try scanner.directory(try context.path(prefix)",
+            "try validateBinary(context, scanner.entries.items, root_name, platform, dependencies);",
+            "const tar = try buildTar(allocator, scanner.entries.items, epoch);",
+            "try publish(context, &scanner, paths[number], bytes[number]);",
+            "const archive = try auditArchive(context, archive_path, version, platform, dependencies);",
+            "if (options.smoke and platform == hostPlatform())",
+            'format == .@"tar.gz"',
+        )),
+        ("fn auditArchive(", "fn outputSafe(", (
+            "const tar = try decompressedTar(context.allocator, compressed, name);",
+            "readTar(context.allocator, tar)",
+            "try validatePayload(entry.name, bytes)",
+            "try buildTar(context.allocator, files.items, entries[0].mtime)",
+            "try validateBinary(context, files.items, root, platform, dependencies);",
+        )),
+        ("fn validateBinary(", "const AuditedArchive", (
+            "try validatePolicies(context.allocator, entries, root);",
+            "try validateStaticElf(context.allocator, try findFile(entries, root, \"bin/debz\"), platform);",
+            "try validateRuntime(context.allocator, try findFile(entries, root, \"share/debz/runtime-dependencies.json\"), dependencies);",
+        )),
+        ("const Scanner = struct", "fn validateBinary(", (
+            "self.context.root.pinDirectory(path)",
+            "try file.observeStableAlloc(self.context.allocator, maximum_tar_bytes - self.total)",
+            "if (self.count > maximum_entries)",
+            "if (depth > 128)",
+            "try validatePayload(name, observed.bytes);",
+            "for (self.files.items) |*pin| _ = try pin.metadata();",
+            "for (self.directories.items) |*pin| _ = try pin.metadata();",
+        )),
+        ("fn publish(", "fn hostPlatform(", (
+            "try outputSafe(self.context, self.path);",
+            "try self.scanner.unchanged();",
+            "try self.directory.?.metadata();",
+            "try context.root.stageFile(path",
+            ".durable = true",
+            "try staged.commit();",
+        )),
+        ("fn smoke(", "const Options", (
+            "for (archive.entries) |entry|",
+            "try root.createRegularFile(path",
+            "entry.mtime) * std.time.ns_per_s",
+            "try file.setTimestamps(context.io",
+            'try cleaned.put("PATH", "/no-host-interpreters");',
+            "std.process.run(context.allocator, context.io",
+            ".raw = .fromSeconds(60)",
+            "parent.deleteTree(context.io, directory_name)",
+        )),
+    ):
+        body = native.partition(start)[2].partition(end)[0]
+        if any(token not in body for token in tokens):
+            failures.append(f"tools/release.zig: actual native release consumer body binding is missing: {start}")
+    consumer = texts.get("test/release-tooling.zig", "")
+    for start, end in (("fn release(", "fn releaseFile("), ("fn releaseFile(", "fn packageOk(")):
+        body = consumer.partition(start)[2].partition(end)[0]
+        if any(token not in body for token in (
+            'argv[0] = @import("release_test_options").executable;',
+            'try environment.put("PATH", "/no-host-interpreters");',
+            ".environ_map = &environment,",
+        )):
+            failures.append("test/release-tooling.zig: actual native installed release handoff is missing")
+    if "python3" in consumer or "tools/release.py" in consumer:
+        failures.append("test/release-tooling.zig: retired interpreter release consumer was restored")
+    layout = texts.get("tools/test-release-install.sh", "")
+    if ('PATH=/no-host-interpreters "$release_tool" check-runtime' not in layout or
+            "--manifest \"$release_prefix/share/debz/runtime-dependencies.json\"" not in layout or "python3" in layout):
+        failures.append("tools/test-release-install.sh: actual native runtime check is missing")
     reader_command = native.partition('if (std.mem.eql(u8, args[1], "read-archive")) {')[2].partition("const compress = ")[0]
     if any(token not in reader_command for token in (
         "const tar = try decompressedTar(allocator, input, args[3]);",
@@ -5060,9 +5127,6 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
     )):
         failures.append("tools/release.zig: actual native archive reader command binding is missing")
     failures.extend(liblzma_decoder_configuration_failures(texts.get("build/liblzma.zig", "")))
-    for retired in ("SEMVER =", "def tar_info(", "def checked_elf_region(", "def checked_elf_address_end(", "struct.unpack_from(", "format=tarfile.GNU_FORMAT", "gzip.GzipFile(", "lzma.compress(", "zlib.decompressobj(", "lzma.LZMADecompressor(", "tarfile.open("):
-        if retired in texts.get("tools/release.py", ""):
-            failures.append("tools/release.py: retired release core implementation was restored")
     return failures
 
 

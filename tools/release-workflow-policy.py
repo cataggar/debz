@@ -79,7 +79,7 @@ def audit_release_core_bootstrap(ci: str, release: str) -> None:
             body = match.group(1) if match else ""
             install = body.find(GHR_ZIG_INSTALL)
             build = body.find("zig build build-release-tool -j2")
-            consumer = body.find("python3 tools/release.py")
+            consumer = body.find("zig-out/bin/debz-release")
             if name == "release-policy":
                 consumer = body.find("tools/release-workflow-policy.py")
             if (install < 0 or build < install + len(GHR_ZIG_INSTALL) or
@@ -509,13 +509,13 @@ def main() -> None:
         "fetch-depth: 0",
         "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main",
         'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main',
-        'python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version"',
+        'zig-out/bin/debz-release version "$GITHUB_REF_NAME" --zon build.zig.zon',
         '--expect "binary=$(release-root/bin/debz version)"',
         "-Doptimize=ReleaseSafe",
         '-Dversion="$VERSION"',
-        "python3 tools/release.py binary",
-        "python3 tools/release.py audit",
-        "python3 tools/release.py verify",
+        "zig-out/bin/debz-release binary",
+        "zig-out/bin/debz-release audit",
+        "zig-out/bin/debz-release verify",
         "--assets release-assets --smoke",
         "subject-path: release-assets/*.tar.gz",
         "subject-path: release-assets/*.tar.xz",
@@ -535,9 +535,9 @@ def main() -> None:
         if token not in release:
             FAILURES.append(f"release workflow is missing policy token: {token}")
     for token in (
-        "python3 tools/release.py binary",
-        "python3 tools/release.py audit",
-        "python3 tools/release.py verify",
+        "zig-out/bin/debz-release binary",
+        "zig-out/bin/debz-release audit",
+        "zig-out/bin/debz-release verify",
         "Required release dry-run exact verification",
     ):
         if token not in ci:

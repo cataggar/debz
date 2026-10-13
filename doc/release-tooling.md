@@ -2,23 +2,29 @@
 
 Copyright 2026 debz contributors. SPDX-License-Identifier: Apache-2.0.
 
-`tools/release.py` is an independently authored, network-free release packager
-and validator. Its tag parsing, four-asset plan, complete static ELF validation
-and canonical GNU tar encoder run in the installed Zig `debz-release` helper,
-with `PATH=/no-host-interpreters` and no Python fallback. Compression and strict
-container decoding also run in this helper: gzip uses Zig's best-level deflate
+The installed Zig `debz-release` is the complete, network-free release packager
+and validator. Tag parsing, four-asset planning, installed dependency/license
+and policy checks, bounded prefix scanning, atomic publication, complete static
+ELF validation, canonical GNU tar encoding, archive audit and native smoke all
+run in this executable, without a host interpreter or Python fallback.
+Compression and strict container decoding are native: gzip uses Zig's best-level deflate
 encoder with the original zero timestamp and stable header; XZ uses a separate
 encoder build from the already pinned upstream sources. The product retains its
 decoder-only library. Decoder CRC, completeness, trailing-data, input, output
 and memory limits are enforced before returning a tar payload.
 
-`DEBZ_RELEASE` selects the helper in a custom build prefix. Tar member reading
-also runs natively, preserving GNU long names and signed epochs while checking
+Build/test consumers bind the executable in the selected install prefix,
+including `--prefix` builds. Tar member reading preserves GNU long names and signed epochs while checking
 checksums, bounds, names, order, ownership, modes and timestamp equality. Audit
-and smoke use the returned original member bytes; they no longer open or decode
-the archive with Python. Python still adapts member metadata, validates runtime
-and policy inputs, and orchestrates packaging, publication and smoke execution.
-This bounded port does not complete Python retirement.
+and smoke use the original member bytes. The prefix scanner pins no-follow
+directories and stable regular files, limits the complete tree to 4,096 entries,
+128 directory levels and 256 MiB of file data, and rechecks pins before atomic
+publication. Output ancestry and preexisting aliases are checked without
+following links; staged files are private, uniquely named and durably renamed.
+Smoke creates a private owned extraction beside the archive, preserves original
+file/directory modes and nanosecond epochs, runs only matching-host binaries
+with `PATH=/no-host-interpreters` and a 60-second timeout, and cleans up on failure.
+Foreign binaries are audited, never executed.
 
 Release inputs are rejected when
 they contain links, generated artifacts, cache paths, common secret formats,
@@ -39,13 +45,13 @@ Typical CI usage:
 
 ```sh
 zig build build-release-tool
-python3 tools/release.py version v0.3.0 --expect zon=0.3.0 --expect binary=0.3.0
-python3 tools/release.py dry-run --tag v0.3.0
-python3 tools/release.py binary --tag v0.3.0 --platform linux-x64 \
+zig-out/bin/debz-release version v0.3.0 --zon build.zig.zon --expect binary=0.3.0
+zig-out/bin/debz-release dry-run --tag v0.3.0
+zig-out/bin/debz-release binary --tag v0.3.0 --platform linux-x64 \
   --prefix zig-out --epoch "$SOURCE_DATE_EPOCH" --output dist
-python3 tools/release.py audit --tag v0.3.0 \
+zig-out/bin/debz-release audit --tag v0.3.0 \
   --platform linux-x64 --archive dist/debz-0.3.0-linux-x64.tar.xz --smoke
-python3 tools/release.py verify --tag v0.3.0 --assets dist \
+zig-out/bin/debz-release verify --tag v0.3.0 --assets dist \
   --policy security/dependency-policy.json --smoke
 ```
 
@@ -55,12 +61,15 @@ version-checked Zig compiler before compiling the helper. The publication and
 dry-run verifier jobs have their own compiler installation and helper build;
 they do not assume an artifact or a helper left over from another job.
 
-Run the Zig-owned tooling tests with `zig build test-release` (or
+Run the bounded native core and actual packaging consumer tests with
+`zig build test-release-consumers -j2` in Debug and ReleaseSafe. This selector
+does not rebuild every normal GNU-installed tool. Full installation-layout
+qualification remains `zig build test-release` (or
 `zig build test-release -Doptimize=ReleaseSafe`). The
 [test inventory](tooling-test-inventory.md) maps the former Python cases to
 their Zig assertions. Packaging the same inputs twice in one controlled
 build environment produces byte-identical gzip and xz assets. Portable audit
-does not assume that different deflate, liblzma, or Python implementations emit identical
+does not assume that different deflate or liblzma implementations emit identical
 compressed bytes: it validates container integrity and canonical stable headers,
 then compares the decompressed tar payload with the canonical tar encoding.
 The native gzip producer can differ byte-for-byte from the former zlib encoder;

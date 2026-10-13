@@ -92,10 +92,46 @@ fn int(comptime T: type, buffer: *[256]u8, offset: usize, value: T) void {
 
 fn release(args: []const []const u8) !support.Result {
     var argv: [20][]const u8 = undefined;
-    argv[0] = "python3";
-    argv[1] = "tools/release.py";
-    for (args, 0..) |arg, index| argv[index + 2] = arg;
-    return support.run(argv[0 .. args.len + 2]);
+    argv[0] = @import("release_test_options").executable;
+    for (args, 0..) |arg, index| argv[index + 1] = arg;
+    var environment = std.process.Environ.Map.init(support.allocator);
+    defer environment.deinit();
+    try environment.put("PATH", "/no-host-interpreters");
+    const result = try std.process.run(support.allocator, support.io, .{
+        .argv = argv[0 .. args.len + 1],
+        .environ_map = &environment,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+    });
+    return .{
+        .code = switch (result.term) {
+            .exited => |code| code,
+            else => 255,
+        },
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+fn releaseFile(f: *Fixture, args: []const []const u8, input: []const u8, output: []const u8) !void {
+    const source = try std.Io.Dir.cwd().openFile(support.io, input, .{});
+    defer source.close(support.io);
+    const destination = try std.Io.Dir.cwd().createFile(support.io, output, .{});
+    defer destination.close(support.io);
+    var argv: [10][]const u8 = undefined;
+    argv[0] = @import("release_test_options").executable;
+    for (args, 0..) |arg, index| argv[index + 1] = arg;
+    var environment = std.process.Environ.Map.init(f.arena.allocator());
+    try environment.put("PATH", "/no-host-interpreters");
+    var child = try std.process.spawn(support.io, .{
+        .argv = argv[0 .. args.len + 1],
+        .environ_map = &environment,
+        .stdin = .{ .file = source },
+        .stdout = .{ .file = destination },
+    });
+    defer child.kill(support.io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(support.io));
 }
 
 fn packageOk(f: *Fixture, name: []const u8, arch: []const u8, output_name: []const u8) !void {
@@ -172,9 +208,7 @@ fn putOctal(header: *[512]u8, offset: usize, length: usize, number: usize) !void
 fn auditSyntheticTar(f: *Fixture, entries: []const TarEntry, expected: []const u8) !void {
     const bytes = try makeTar(f.arena.allocator(), entries);
     try f.work.write("synthetic.tar", bytes);
-    const compressed = try support.run(&.{ "gzip", "-n", "-9", try f.path("synthetic.tar") });
-    defer compressed.deinit();
-    try compressed.ok();
+    try releaseFile(f, &.{ "compress-tar", "--format", "tar.gz" }, try f.path("synthetic.tar"), try f.path("synthetic.tar.gz"));
     try checkAuditFailure(f, "synthetic.tar.gz", expected);
     try f.work.directory.dir.deleteFile(support.io, "synthetic.tar.gz");
 }
@@ -182,15 +216,7 @@ fn auditSyntheticTar(f: *Fixture, entries: []const TarEntry, expected: []const u
 fn decompressedArchive(f: *Fixture) ![]u8 {
     const path = try f.path("assets/debz-0.1.0-linux-x64.tar.gz");
     const output = try f.path("assets/debz-0.1.0-linux-x64.tar");
-    const uncompressed = try support.run(&.{
-        "python3",
-        "-c",
-        "import gzip, pathlib, sys\npathlib.Path(sys.argv[2]).write_bytes(gzip.open(sys.argv[1], 'rb').read())",
-        path,
-        output,
-    });
-    defer uncompressed.deinit();
-    try uncompressed.ok();
+    try releaseFile(f, &.{ "decode-tar", "--name", "fixture.tar.gz" }, path, output);
     return f.work.read("assets/debz-0.1.0-linux-x64.tar");
 }
 
@@ -214,21 +240,9 @@ fn compressTar(f: *Fixture, path: []const u8, bytes: []const u8, format: []const
     const relative = try std.fmt.allocPrint(f.arena.allocator(), "{s}.tar", .{path});
     try f.work.write(relative, bytes);
     const input = try f.path(relative);
-    if (std.mem.eql(u8, format, "gz")) {
-        const option = try std.fmt.allocPrint(f.arena.allocator(), "-{s}", .{level});
-        const result = try support.run(&.{ "gzip", "-n", option, input });
-        defer result.deinit();
-        try result.ok();
-        return f.path(try std.fmt.allocPrint(f.arena.allocator(), "{s}.gz", .{relative}));
-    }
-    const target = try f.path(try std.fmt.allocPrint(f.arena.allocator(), "{s}.xz", .{relative}));
-    const result = try support.run(&.{
-        "python3",                                                                                                                                                                            "-c",
-        "import lzma,pathlib,sys\nsource=pathlib.Path(sys.argv[1]).read_bytes()\npathlib.Path(sys.argv[2]).write_bytes(lzma.compress(source,format=lzma.FORMAT_XZ,preset=int(sys.argv[3])))", input,
-        target,                                                                                                                                                                               level,
-    });
-    defer result.deinit();
-    try result.ok();
+    const target = try f.path(try std.fmt.allocPrint(f.arena.allocator(), "{s}.{s}", .{ relative, format }));
+    const selected = if (std.mem.eql(u8, format, "gz")) "tar.gz" else "tar.xz";
+    try releaseFile(f, &.{ "compress-tar", "--format", selected, "--level", level }, input, target);
     return target;
 }
 
@@ -299,6 +313,20 @@ test "release: strict tags, version consistency, and exact four asset names" {
     try testing.expectEqual(@as(usize, 4), assets.len);
     try testing.expectEqualStrings("debz-0.1.0-linux-arm64.tar.gz", assets[0].string);
     try testing.expectEqualStrings("debz-0.1.0-linux-x64.tar.xz", assets[3].string);
+    var f = try Fixture.init();
+    defer f.deinit();
+    try f.work.write("metadata.zon", ".{ .version = \"0.1.0\", .name = .debz }");
+    const matched = try release(&.{ "version", "v0.1.0", "--zon", try f.path("metadata.zon") });
+    defer matched.deinit();
+    try matched.ok();
+    try f.work.write("metadata.zon", ".{ .version = \"0.1.1\" }");
+    const changed = try release(&.{ "version", "v0.1.0", "--zon", try f.path("metadata.zon") });
+    defer changed.deinit();
+    try changed.failsWith("version mismatch for zon");
+    try f.work.write("metadata.zon", ".{ .version = \"0.1.0\", .version = \"0.1.0\" }");
+    const ambiguous = try release(&.{ "version", "v0.1.0", "--zon", try f.path("metadata.zon") });
+    defer ambiguous.deinit();
+    try ambiguous.failsWith("invalid release ZON metadata");
 }
 
 test "release: deterministic gzip and xz archives retain canonical modes, installed policies, and runtime" {
@@ -666,4 +694,74 @@ test "release: complete x64/arm64 verification rejects forbidden sidecars and no
     const linked = try release(verify_args);
     defer linked.deinit();
     try linked.failsWith("non-regular entry");
+}
+
+test "release: no-follow prefix ancestry bounded files and atomic output aliases refuse without writes" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const prefix = try f.prefix("prefix", 62);
+    try f.work.directory.dir.symLink(support.io, "prefix", "prefix-alias", .{ .is_directory = true });
+    try checkBinaryFailure(&f, try f.path("prefix-alias"), "symlink");
+    try f.work.write("outside/sentinel", "untouched");
+    try f.work.directory.dir.symLink(support.io, "outside", "output-alias", .{ .is_directory = true });
+    const output_alias = try f.package(prefix, try f.path("output-alias"), "linux-x64");
+    defer output_alias.deinit();
+    try output_alias.failsWith("SymbolicLinkComponent");
+    try f.work.write("output/sentinel", "untouched");
+    try f.work.directory.dir.symLink(support.io, "sentinel", "output/" ++ root_name ++ ".tar.xz", .{});
+    const leaf_alias = try f.package(prefix, try f.path("output"), "linux-x64");
+    defer leaf_alias.deinit();
+    try leaf_alias.failsWith("non-regular entry or hardlink");
+    try testing.expectError(error.FileNotFound, f.work.directory.dir.statFile(support.io, "output/" ++ root_name ++ ".tar.gz", .{}));
+    const unchanged = try f.work.read("output/sentinel");
+    defer support.allocator.free(unchanged);
+    try testing.expectEqualStrings("untouched", unchanged);
+    try f.work.directory.dir.deleteFile(support.io, "output/" ++ root_name ++ ".tar.xz");
+    const link = try support.run(&.{ "ln", try f.path("output/sentinel"), try f.path("output/" ++ root_name ++ ".tar.gz") });
+    defer link.deinit();
+    try link.ok();
+    const hardlink = try f.package(prefix, try f.path("output"), "linux-x64");
+    defer hardlink.deinit();
+    try hardlink.failsWith("hardlink");
+    const oversized = try f.work.directory.dir.createFile(support.io, "prefix/share/debz/oversized", .{});
+    defer oversized.close(support.io);
+    try oversized.setLength(support.io, 256 * 1024 * 1024 + 1);
+    try checkBinaryFailure(&f, prefix, "FileTooLarge");
+}
+
+test "release: runtime checks are exact typed policy comparisons and invalid options do not publish" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const prefix = try f.prefix("prefix", 62);
+    const manifest = try f.path("prefix/share/debz/runtime-dependencies.json");
+    const valid = try release(&.{ "check-runtime", "--manifest", manifest });
+    defer valid.deinit();
+    try valid.ok();
+    const original = try f.source("security/runtime-dependencies.json");
+    const extra = try std.fmt.allocPrint(f.arena.allocator(), "{{\"unreviewed\":true,{s}", .{original[1..]});
+    try f.write("prefix", "share/debz/runtime-dependencies.json", extra);
+    const unreviewed = try release(&.{ "check-runtime", "--manifest", manifest });
+    defer unreviewed.deinit();
+    try unreviewed.failsWith("invalid installed runtime dependency manifest");
+    const unknown = try release(&.{
+        "binary",   "--tag",               "v0.1.0",  "--platform", "linux-x64", "--prefix", prefix,
+        "--output", try f.path("invalid"), "--epoch", "123",        "--smoke",
+    });
+    defer unknown.deinit();
+    try unknown.failsWith("invalid binary option");
+    try testing.expectError(error.FileNotFound, f.work.directory.dir.statFile(support.io, "invalid", .{}));
+}
+
+test "release: installed native tooling does not embed secret markers that prevent its own packaging" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const prefix = try f.prefix("prefix", 62);
+    const helper = try std.Io.Dir.cwd().readFileAlloc(support.io, @import("release_test_options").executable, f.arena.allocator(), .limited(64 * 1024 * 1024));
+    try f.write("prefix", "bin/debz-release", helper);
+    const packaged = try f.package(prefix, try f.path("assets"), "linux-x64");
+    defer packaged.deinit();
+    try packaged.ok();
+    const verified = try f.audit(try f.path("assets/" ++ root_name ++ ".tar.xz"), "linux-x64");
+    defer verified.deinit();
+    try verified.ok();
 }

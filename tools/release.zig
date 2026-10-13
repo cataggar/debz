@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debz = @import("debz");
+const fs = debz.root_fs;
 const c = @cImport({
     @cInclude("lzma.h");
 });
@@ -124,6 +125,11 @@ const Format = enum {
 };
 
 fn compressTar(allocator: std.mem.Allocator, input: []const u8, format: Format) ![]u8 {
+    return compressTarLevel(allocator, input, format, 9);
+}
+
+fn compressTarLevel(allocator: std.mem.Allocator, input: []const u8, format: Format, level: u32) ![]u8 {
+    if (level != 1 and level != 9) return refuse("tooling compression level must be 1 or 9", .{});
     if (input.len > maximum_tar_bytes) return refuse("release payload exceeds the bounded256MiB limit", .{});
     if (format == .@"tar.gz") {
         const bound = @min(maximum_compressed_bytes, input.len + input.len / 16 + 8192);
@@ -132,17 +138,17 @@ fn compressTar(allocator: std.mem.Allocator, input: []const u8, format: Format) 
         var writer = std.Io.Writer.fixed(output);
         const history = try allocator.alloc(u8, std.compress.flate.max_window_len);
         defer allocator.free(history);
-        var encoder = try std.compress.flate.Compress.init(&writer, history, .gzip, .best);
+        var encoder = try std.compress.flate.Compress.init(&writer, history, .gzip, if (level == 1) .fastest else .best);
         try encoder.writer.writeAll(input);
         try encoder.finish();
-        output[8] = 2;
+        output[8] = if (level == 1) 4 else 2;
         output[9] = 255;
         return allocator.realloc(output, writer.end);
     }
-    if (c.lzma_easy_encoder_memusage(9) > 1024 * 1024 * 1024)
+    if (c.lzma_easy_encoder_memusage(level) > 1024 * 1024 * 1024)
         return refuse("release XZ encoder exceeds its memory limit", .{});
     var stream = std.mem.zeroes(c.lzma_stream);
-    const initialized = c.lzma_easy_encoder(&stream, 9, c.LZMA_CHECK_CRC64);
+    const initialized = c.lzma_easy_encoder(&stream, level, c.LZMA_CHECK_CRC64);
     if (initialized != c.LZMA_OK) return refuse("release XZ encoder initialization failed: {d}", .{initialized});
     defer c.lzma_end(&stream);
     stream.next_in = input.ptr;
@@ -191,20 +197,20 @@ fn decompressedTar(allocator: std.mem.Allocator, input: []const u8, name: []cons
     };
 }
 
-fn tarNumber(field: []u8, value: i64) !void {
-    if (value < 0 or @as(u64, @intCast(value)) >= (@as(u64, 1) << @intCast(3 * (field.len - 1)))) {
-        @memset(field, if (value < 0) 0xff else 0);
-        std.mem.writeInt(i64, field[field.len - 8 ..][0..8], value, .big);
-        field[0] = if (value < 0) 0xff else 0x80;
+fn tarNumber(number_field: []u8, value: i64) !void {
+    if (value < 0 or @as(u64, @intCast(value)) >= (@as(u64, 1) << @intCast(3 * (number_field.len - 1)))) {
+        @memset(number_field, if (value < 0) 0xff else 0);
+        std.mem.writeInt(i64, number_field[number_field.len - 8 ..][0..8], value, .big);
+        number_field[0] = if (value < 0) 0xff else 0x80;
         return;
     }
-    @memset(field, '0');
-    field[field.len - 1] = 0;
+    @memset(number_field, '0');
+    number_field[number_field.len - 1] = 0;
     var remaining: u64 = @intCast(value);
-    var offset = field.len - 1;
+    var offset = number_field.len - 1;
     while (remaining != 0) {
         offset -= 1;
-        field[offset] = '0' + @as(u8, @intCast(remaining & 7));
+        number_field[offset] = '0' + @as(u8, @intCast(remaining & 7));
         remaining >>= 3;
     }
 }
@@ -299,15 +305,15 @@ pub fn buildTar(allocator: std.mem.Allocator, entries: []const Entry, epoch: i64
     return output.toOwnedSlice(allocator);
 }
 
-fn tarValue(field: []const u8) !i64 {
-    if (field.len == 0 or field.len > 12) return refuse("cannot read archive: invalid tar numeric field", .{});
-    if (field[0] == 0x80 or field[0] == 0xff) {
+fn tarValue(number_field: []const u8) !i64 {
+    if (number_field.len == 0 or number_field.len > 12) return refuse("cannot read archive: invalid tar numeric field", .{});
+    if (number_field[0] == 0x80 or number_field[0] == 0xff) {
         var value: i128 = 0;
-        for (field[1..]) |byte| value = value * 256 + byte;
-        if (field[0] == 0xff) value -= @as(i128, 1) << @intCast(8 * (field.len - 1));
+        for (number_field[1..]) |byte| value = value * 256 + byte;
+        if (number_field[0] == 0xff) value -= @as(i128, 1) << @intCast(8 * (number_field.len - 1));
         return std.math.cast(i64, value) orelse refuse("cannot read archive: tar numeric field exceeds signed64 bits", .{});
     }
-    const octal = std.mem.trim(u8, std.mem.sliceTo(field, 0), " ");
+    const octal = std.mem.trim(u8, std.mem.sliceTo(number_field, 0), " ");
     if (octal.len == 0) return 0;
     return std.fmt.parseInt(i64, octal, 8) catch refuse("cannot read archive: malformed tar numeric field", .{});
 }
@@ -500,10 +506,589 @@ pub fn validateStaticElf(allocator: std.mem.Allocator, binary: []const u8, platf
     }
 }
 
+const required_files = [_][]const u8{
+    "bin/debz",
+    "share/doc/debz/LICENSE",
+    "share/doc/debz/THIRD_PARTY_NOTICES",
+    "share/debz/digest-cutover-policy.json",
+    "share/debz/digest-inventory-v1.tsv",
+    "share/debz/digest-semantic-allowlist-v1.tsv",
+    "share/debz/legacy-cutover-policy.json",
+    "share/doc/debz/digest-cutover-policy.json",
+    "share/doc/debz/digest-inventory-v1.tsv",
+    "share/doc/debz/digest-semantic-allowlist-v1.tsv",
+    "share/doc/debz/legacy-cutover-policy.json",
+    "share/debz/runtime-dependencies.json",
+};
+
+fn forbiddenPath(name: []const u8) bool {
+    var components = std.mem.splitScalar(u8, name, '/');
+    while (components.next()) |component| {
+        for ([_][]const u8{ ".git", ".zig-cache", "zig-out", "__pycache__", ".pytest_cache", ".mypy_cache", ".worktrees" }) |part|
+            if (std.mem.eql(u8, component, part)) return true;
+    }
+    const extension = std.fs.path.extension(name);
+    for ([_][]const u8{ ".o", ".a", ".so", ".dll", ".dylib", ".exe", ".profraw", ".pyc" }) |suffix|
+        if (std.ascii.eqlIgnoreCase(extension, suffix)) return true;
+    return false;
+}
+
+fn validatePayload(name: []const u8, bytes: []const u8) !void {
+    if (forbiddenPath(name)) return refuse("forbidden generated/cache path: {s}", .{name});
+    var header_offset: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, header_offset, "-----BEGIN ")) |offset| {
+        const tail = bytes[offset + 11 ..];
+        // Keep the scanner's own executable free of complete credential markers.
+        for ([_][]const u8{
+            "PRIVATE KEY-----",
+            "RSA PRIVATE KEY-----",
+            "EC PRIVATE KEY-----",
+            "OPENSSH PRIVATE KEY-----",
+            "PGP PRIVATE KEY BLOCK-----",
+        }) |suffix| if (std.mem.startsWith(u8, tail, suffix))
+            return refuse("possible secret in release input: {s}", .{name});
+        header_offset = offset + 11;
+    }
+    for (bytes, 0..) |_, index| {
+        const tail = bytes[index..];
+        if (tail.len >= 20 and std.mem.startsWith(u8, tail, "AKIA")) {
+            const matches = for (tail[4..20]) |byte| {
+                if (!std.ascii.isDigit(byte) and !std.ascii.isUpper(byte)) break false;
+            } else true;
+            if (matches) return refuse("possible secret in release input: {s}", .{name});
+        }
+        if (tail.len >= 40 and std.mem.startsWith(u8, tail, "gh") and
+            std.mem.indexOfScalar(u8, "pousr", tail[2]) != null and tail[3] == '_')
+        {
+            const matches = for (tail[4..40]) |byte| {
+                if (!std.ascii.isAlphanumeric(byte)) break false;
+            } else true;
+            if (matches) return refuse("possible secret in release input: {s}", .{name});
+        }
+    }
+}
+
+const Library = struct { name: []const u8, version: []const u8, linkage: []const u8, license: []const u8 };
+const Runtime = struct {
+    schema_version: u32,
+    package: []const u8,
+    linux_release_runtime: struct {
+        binary_kind: []const u8,
+        libc: struct { implementation: []const u8, linkage: []const u8, expectation: []const u8 },
+        system_libraries: []const std.json.Value,
+        included_libraries: []Library,
+        fully_static: bool,
+    },
+};
+
+fn field(value: std.json.Value, name: []const u8) ?std.json.Value {
+    return if (value == .object) value.object.get(name) else null;
+}
+
+fn string(value: ?std.json.Value) ?[]const u8 {
+    const item = value orelse return null;
+    return if (item == .string) item.string else null;
+}
+
+fn hasString(value: std.json.Value, name: []const u8, expected: []const u8) bool {
+    return std.mem.eql(u8, string(field(value, name)) orelse return false, expected);
+}
+
+fn hasInteger(value: std.json.Value, name: []const u8, expected: i64) bool {
+    const item = field(value, name) orelse return false;
+    return item == .integer and item.integer == expected;
+}
+
+fn policyDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![]Library {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+        return refuse("invalid dependency policy", .{});
+    const allowed = field(parsed.value, "allowed_production_licenses") orelse return refuse("invalid dependency policy", .{});
+    const dependencies = field(parsed.value, "production_dependencies") orelse return refuse("invalid dependency policy", .{});
+    if (allowed != .array or dependencies != .array) return refuse("invalid dependency policy", .{});
+    if (dependencies.array.items.len == 0 or dependencies.array.items.len > 128)
+        return refuse("dependency policy has no production dependencies or exceeds its bound", .{});
+    const result = try allocator.alloc(Library, dependencies.array.items.len);
+    for (dependencies.array.items, result) |item, *library| {
+        const name = string(field(item, "name")) orelse return refuse("dependency is missing a name or license", .{});
+        const license = string(field(item, "license")) orelse return refuse("dependency is missing a name or license", .{});
+        if (name.len == 0 or license.len == 0) return refuse("dependency is missing a name or license", .{});
+        const permitted = for (allowed.array.items) |entry| {
+            if (entry != .string) return refuse("invalid dependency policy license list", .{});
+            if (std.mem.eql(u8, entry.string, license)) break true;
+        } else false;
+        if (!permitted) return refuse("{s}: license is not allowed", .{name});
+        const version = string(field(item, "version")) orelse string(field(item, "minimum_version")) orelse
+            return refuse("{s}: version is missing", .{name});
+        if (version.len == 0) return refuse("{s}: version is missing", .{name});
+        const linkage = string(field(item, "runtime_linkage")) orelse return refuse("{s}: runtime linkage is missing", .{name});
+        if (linkage.len == 0) return refuse("{s}: runtime linkage is missing", .{name});
+        // A minimum alone is not an installed version, just as in the original manifest validator.
+        library.* = .{ .name = name, .version = string(field(item, "version")) orelse "", .linkage = linkage, .license = license };
+    }
+    std.mem.sort(Library, result, {}, libraryLess);
+    return result;
+}
+
+fn libraryLess(_: void, left: Library, right: Library) bool {
+    return std.mem.lessThan(u8, left.name, right.name);
+}
+
+fn validateRuntime(allocator: std.mem.Allocator, bytes: []const u8, dependencies: []const Library) !void {
+    const parsed = std.json.parseFromSlice(Runtime, allocator, bytes, .{}) catch
+        return refuse("invalid installed runtime dependency manifest", .{});
+    const runtime = parsed.value;
+    const linux = runtime.linux_release_runtime;
+    std.mem.sort(Library, linux.included_libraries, {}, libraryLess);
+    var matches = runtime.schema_version == 1 and std.mem.eql(u8, runtime.package, "debz") and
+        std.mem.eql(u8, linux.binary_kind, "fully_static") and linux.fully_static and
+        std.mem.eql(u8, linux.libc.implementation, "musl") and std.mem.eql(u8, linux.libc.linkage, "static") and
+        std.mem.eql(u8, linux.libc.expectation, "musl and all required libraries are statically linked; no target-system shared libraries are required.") and
+        linux.system_libraries.len == 0 and linux.included_libraries.len == dependencies.len;
+    if (matches) for (linux.included_libraries, dependencies) |actual, expected| {
+        matches = matches and expected.version.len != 0 and std.mem.eql(u8, actual.name, expected.name) and
+            std.mem.eql(u8, actual.version, expected.version) and std.mem.eql(u8, actual.linkage, expected.linkage) and
+            std.mem.eql(u8, actual.license, expected.license);
+    };
+    if (!matches) return refuse("installed runtime dependency manifest differs from reviewed policy and static linkage model", .{});
+}
+
+fn findFile(entries: []const Entry, root: []const u8, relative: []const u8) ![]const u8 {
+    for (entries) |entry| {
+        if (entry.name.len == root.len + 1 + relative.len and std.mem.startsWith(u8, entry.name, root) and
+            entry.name[root.len] == '/' and std.mem.eql(u8, entry.name[root.len + 1 ..], relative))
+            return entry.bytes orelse refuse("required release path is not a regular file: {s}", .{relative});
+    }
+    return refuse("missing required files: {s}", .{relative});
+}
+
+fn validatePolicies(allocator: std.mem.Allocator, entries: []const Entry, root: []const u8) !void {
+    for ([_][]const u8{ "digest-cutover-policy.json", "digest-inventory-v1.tsv", "digest-semantic-allowlist-v1.tsv", "legacy-cutover-policy.json" }) |name| {
+        const data = try findFile(entries, root, try std.mem.concat(allocator, u8, &.{ "share/debz/", name }));
+        const documentation = try findFile(entries, root, try std.mem.concat(allocator, u8, &.{ "share/doc/debz/", name }));
+        if (!std.mem.eql(u8, data, documentation)) return refuse("installed {s} policy copies differ", .{name});
+        if (!std.mem.endsWith(u8, name, ".json")) continue;
+        const document = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch
+            return refuse("installed {s} policy is invalid JSON", .{name});
+        const digest = std.mem.startsWith(u8, name, "digest");
+        if (!hasString(document.value, "schema", if (digest)
+            "https://debz.dev/security/digest-cutover-policy-v3"
+        else
+            "https://debz.dev/schema/legacy-compatibility-policy-v1") or
+            !hasInteger(document.value, "version", if (digest) 3 else 1))
+            return refuse("installed {s} policy identity is invalid", .{name});
+        if (digest) {
+            if (!hasString(field(document.value, "inventory") orelse .null, "file", "security/digest-inventory-v1.tsv"))
+                return refuse("installed digest cutover policy inventory is invalid", .{});
+            if (!hasString(field(document.value, "semantic_allowlist_inventory") orelse .null, "file", "security/digest-semantic-allowlist-v1.tsv"))
+                return refuse("installed digest cutover semantic allowlist inventory is invalid", .{});
+        }
+    }
+}
+
+const Context = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: fs.Root,
+    cwd: []const u8,
+
+    fn path(self: Context, name: []const u8) !fs.Path {
+        const absolute = try std.fs.path.resolve(self.allocator, &.{ self.cwd, name });
+        if (absolute.len <= 1) return refuse("release path must not be the filesystem root", .{});
+        try validateArchiveName(absolute[1..]);
+        return .{ .text = absolute[1..] };
+    }
+
+    fn read(self: Context, name: []const u8, maximum: usize) ![]const u8 {
+        var pin = self.root.pinRegularFile(try self.path(name)) catch |err|
+            return refuse("cannot read regular release input {s}: {s}", .{ name, @errorName(err) });
+        defer pin.close();
+        const observed = try pin.observeStableAlloc(self.allocator, maximum);
+        return observed.bytes;
+    }
+};
+
+const Scanner = struct {
+    context: Context,
+    files: std.ArrayList(fs.PinnedRegularFile) = .empty,
+    directories: std.ArrayList(fs.PinnedDirectory) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
+    count: usize = 0,
+    total: usize = 0,
+
+    fn deinit(self: *Scanner) void {
+        for (self.files.items) |*pin| pin.close();
+        for (self.directories.items) |*pin| pin.close();
+        self.files.deinit(self.context.allocator);
+        self.directories.deinit(self.context.allocator);
+        self.entries.deinit(self.context.allocator);
+    }
+
+    fn directory(self: *Scanner, path: fs.Path, relative: []const u8, root_name: []const u8, depth: usize) !void {
+        if (depth > 128) return refuse("install prefix exceeds the directory depth limit", .{});
+        var pin = self.context.root.pinDirectory(path) catch |err|
+            return refuse("install prefix directory or symlink refused: {s}: {s}", .{ relative, @errorName(err) });
+        var retained = false;
+        errdefer if (!retained) pin.close();
+        const listing = try pin.observeAlloc(self.context.allocator, maximum_entries, maximum_entries * 255);
+        try self.directories.append(self.context.allocator, pin);
+        retained = true;
+        for (listing.members) |member| {
+            self.count += 1;
+            if (self.count > maximum_entries) return refuse("install prefix exceeds the entry limit", .{});
+            const name = if (relative.len == 0) member.name else try std.mem.concat(self.context.allocator, u8, &.{ relative, "/", member.name });
+            try validateArchiveName(name);
+            const child: fs.Path = .{ .text = try std.mem.concat(self.context.allocator, u8, &.{ path.text, "/", member.name }) };
+            const metadata = try self.context.root.metadata(child);
+            if (metadata.kind == .sym_link) return refuse("install prefix contains a symlink: {s}", .{name});
+            if (metadata.kind == .directory) {
+                try self.directory(child, name, root_name, depth + 1);
+                continue;
+            }
+            if (metadata.kind != .file) return refuse("install prefix contains a special file: {s}", .{name});
+            var file = try self.context.root.pinRegularFile(child);
+            var file_retained = false;
+            errdefer if (!file_retained) file.close();
+            const observed = try file.observeStableAlloc(self.context.allocator, maximum_tar_bytes - self.total);
+            self.total += observed.bytes.len;
+            try validatePayload(name, observed.bytes);
+            try self.files.append(self.context.allocator, file);
+            file_retained = true;
+            try self.entries.append(self.context.allocator, .{
+                .name = try std.mem.concat(self.context.allocator, u8, &.{ root_name, "/", name }),
+                .bytes = observed.bytes,
+                .mode = if (std.mem.eql(u8, name, "bin/debz")) 0o755 else 0o644,
+            });
+        }
+        _ = try pin.metadata();
+    }
+
+    fn unchanged(self: *Scanner) !void {
+        for (self.files.items) |*pin| _ = try pin.metadata();
+        for (self.directories.items) |*pin| _ = try pin.metadata();
+    }
+};
+
+fn validateBinary(context: Context, entries: []const Entry, root: []const u8, platform: Platform, dependencies: []const Library) !void {
+    for (required_files) |name| _ = try findFile(entries, root, name);
+    try validatePolicies(context.allocator, entries, root);
+    try validateStaticElf(context.allocator, try findFile(entries, root, "bin/debz"), platform);
+    try validateRuntime(context.allocator, try findFile(entries, root, "share/debz/runtime-dependencies.json"), dependencies);
+}
+
+const AuditedArchive = struct { entries: []ArchiveEntry, files: []Entry };
+
+fn auditArchive(context: Context, name: []const u8, version: []const u8, platform: Platform, dependencies: []const Library) !AuditedArchive {
+    const compressed = try context.read(name, maximum_compressed_bytes);
+    const tar = try decompressedTar(context.allocator, compressed, name);
+    const entries = readTar(context.allocator, tar) catch |err| {
+        std.log.err("release: cannot read archive {s}", .{name});
+        return err;
+    };
+    const root = try std.fmt.allocPrint(context.allocator, "debz-{s}-{s}", .{ version, @tagName(platform) });
+    var files: std.ArrayList(Entry) = .empty;
+    if (entries.len == 0) return refuse("archive has an unexpected top-level path: {s}", .{name});
+    for (entries) |entry| {
+        if (forbiddenPath(entry.name)) return refuse("forbidden archive path: {s}", .{entry.name});
+        if (entry.bytes) |bytes| try validatePayload(entry.name, bytes);
+        if (!std.mem.eql(u8, entry.name, root) and
+            !(std.mem.startsWith(u8, entry.name, root) and entry.name.len > root.len and entry.name[root.len] == '/'))
+            return refuse("archive has an unexpected top-level path: {s}", .{name});
+        if (entry.bytes != null) try files.append(context.allocator, .{ .name = entry.name, .bytes = entry.bytes, .mode = entry.mode });
+    }
+    for (required_files) |required_name| _ = try findFile(files.items, root, required_name);
+    for (entries) |entry| {
+        if (entry.name.len == root.len) continue;
+        const relative = entry.name[root.len + 1 ..];
+        var components = std.mem.splitScalar(u8, relative, '/');
+        const first = components.first();
+        if (!std.mem.eql(u8, first, "bin") and !std.mem.eql(u8, first, "lib") and !std.mem.eql(u8, first, "share"))
+            return refuse("unexpected install path in binary archive: {s}", .{entry.name});
+        if (entry.bytes != null and entry.mode == 0o755 and !std.mem.eql(u8, relative, "bin/debz"))
+            return refuse("unexpected executable in binary archive: {s}", .{entry.name});
+    }
+    const canonical = try buildTar(context.allocator, files.items, entries[0].mtime);
+    if (!std.mem.eql(u8, tar, canonical)) return refuse("decompressed tar payload is not canonical: {s}", .{name});
+    try validateBinary(context, files.items, root, platform, dependencies);
+    return .{ .entries = entries, .files = files.items };
+}
+
+fn outputSafe(context: Context, path: fs.Path) !void {
+    if (try context.root.metadataIfExists(path)) |metadata| {
+        if (metadata.kind != .file or metadata.link_count != 1)
+            return refuse("release output contains a non-regular entry or hardlink: {s}", .{path.text});
+    }
+}
+
+fn publish(context: Context, scanner: *Scanner, path: fs.Path, bytes: []const u8) !void {
+    try outputSafe(context, path);
+    var guard: struct {
+        context: Context,
+        scanner: *Scanner,
+        path: fs.Path,
+        directory: ?*fs.PinnedDirectory = null,
+        fn check(raw: *anyopaque, point: fs.PublishPoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (point != .before_rename) return;
+            try self.scanner.unchanged();
+            try outputSafe(self.context, self.path);
+            _ = try self.directory.?.metadata();
+        }
+    } = .{ .context = context, .scanner = scanner, .path = path };
+    var staged = try context.root.stageFile(path, .{
+        .permissions = .fromMode(0o644),
+        .durable = true,
+        .observer = .{ .context = &guard, .hitFn = @TypeOf(guard).check },
+    });
+    defer staged.deinit();
+    var directory = try context.root.pinDirectory(path.parent().?);
+    defer directory.close();
+    if ((try staged.parent.dir.stat(context.io)).inode != directory.initial.entry.inode)
+        return refuse("release output parent changed", .{});
+    guard.directory = &directory;
+    try staged.writeAll(bytes);
+    try scanner.unchanged();
+    try staged.commit();
+}
+
+fn hostPlatform() ?Platform {
+    if (builtin.os.tag != .linux) return null;
+    return switch (builtin.cpu.arch) {
+        .x86_64 => .@"linux-x64",
+        .aarch64 => .@"linux-arm64",
+        else => null,
+    };
+}
+
+fn smoke(context: Context, archive_path: []const u8, archive: AuditedArchive, version: []const u8, environment: *const std.process.Environ.Map) !void {
+    const parent_path = try context.path(std.fs.path.dirname(archive_path) orelse ".");
+    const directory_name = try std.fmt.allocPrint(context.allocator, ".debz-release-smoke-{x}", .{std.Io.Clock.awake.now(context.io).nanoseconds});
+    const extraction_path: fs.Path = .{ .text = try std.mem.concat(context.allocator, u8, &.{ parent_path.text, "/", directory_name }) };
+    try context.root.createDirectory(extraction_path, .fromMode(0o700));
+    var extraction = try context.root.openDirectory(extraction_path);
+    defer extraction.close(context.io);
+    var parent = try context.root.openDirectory(parent_path);
+    defer parent.close(context.io);
+    defer parent.deleteTree(context.io, directory_name) catch {};
+    const root = fs.Root.init(context.io, extraction);
+    for (archive.entries) |entry| {
+        const path: fs.Path = .{ .text = entry.name };
+        if (entry.bytes) |bytes| {
+            if (path.parent()) |directory| try root.createDirectoryPath(directory, .fromMode(0o755));
+            const file = try root.createRegularFile(path, .{ .permissions = .fromMode(entry.mode) });
+            defer file.close(context.io);
+            try file.writeStreamingAll(context.io, bytes);
+        } else try root.createDirectoryPath(path, .fromMode(entry.mode));
+    }
+    var index = archive.entries.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = archive.entries[index];
+        const timestamp: std.Io.Timestamp = .{ .nanoseconds = @as(i96, entry.mtime) * std.time.ns_per_s };
+        if (entry.bytes != null) {
+            const file = try root.openRegularFile(.{ .text = entry.name });
+            defer file.close(context.io);
+            try file.setTimestamps(context.io, .{ .access_timestamp = .{ .new = timestamp }, .modify_timestamp = .{ .new = timestamp } });
+        } else {
+            const directory = try root.openDirectory(.{ .text = entry.name });
+            defer directory.close(context.io);
+            const file: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
+            try file.setTimestamps(context.io, .{ .access_timestamp = .{ .new = timestamp }, .modify_timestamp = .{ .new = timestamp } });
+        }
+    }
+    for (archive.entries) |entry| {
+        const path: fs.Path = .{ .text = entry.name };
+        const metadata = try root.metadata(path);
+        if (metadata.permissions.toMode() & 0o7777 != entry.mode or
+            metadata.modified.nanoseconds != @as(i96, entry.mtime) * std.time.ns_per_s or
+            metadata.kind != (if (entry.bytes == null) std.Io.File.Kind.directory else std.Io.File.Kind.file))
+            return refuse("native smoke extracted metadata differs: {s}", .{entry.name});
+        if (entry.bytes) |bytes| {
+            var pin = try root.pinRegularFile(path);
+            defer pin.close();
+            const observed = try pin.observeStableAlloc(context.allocator, bytes.len);
+            if (!std.mem.eql(u8, observed.bytes, bytes))
+                return refuse("native smoke extracted bytes differ: {s}", .{entry.name});
+        }
+    }
+    var cleaned = try environment.clone(context.allocator);
+    defer cleaned.deinit();
+    try cleaned.put("PATH", "/no-host-interpreters");
+    const binary = try std.mem.concat(context.allocator, u8, &.{ "/", extraction_path.text, "/", archive.entries[0].name, "/bin/debz" });
+    for ([_]struct { argument: []const u8, expected: []const u8 }{
+        .{ .argument = "version", .expected = version },
+        .{ .argument = "-h", .expected = "debz <command> [options] [packages...]" },
+        .{ .argument = "--help", .expected = "debz <command> [options] [packages...]" },
+    }) |probe| {
+        const result = std.process.run(context.allocator, context.io, .{
+            .argv = &.{ binary, probe.argument },
+            .environ_map = &cleaned,
+            .stdout_limit = .limited(1024 * 1024),
+            .stderr_limit = .limited(1024 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+        }) catch |err| return refuse("native smoke failed for {s}: {s}", .{ probe.argument, @errorName(err) });
+        if (result.term != .exited or result.term.exited != 0 or
+            (std.mem.indexOf(u8, result.stdout, probe.expected) == null and std.mem.indexOf(u8, result.stderr, probe.expected) == null))
+            return refuse("native smoke failed for {s}: {s}{s}", .{ probe.argument, result.stdout, result.stderr });
+    }
+}
+
+const Options = struct {
+    tag: ?[]const u8 = null,
+    platform: ?Platform = null,
+    prefix: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    epoch: ?i64 = null,
+    archive: ?[]const u8 = null,
+    assets: ?[]const u8 = null,
+    manifest: ?[]const u8 = null,
+    policy: []const u8 = "security/dependency-policy.json",
+    smoke: bool = false,
+};
+
+fn required(value: ?[]const u8, comptime name: []const u8) ![]const u8 {
+    return value orelse refuse("missing required option --" ++ name, .{});
+}
+
+fn orchestration(init: std.process.Init, args: []const []const u8) !void {
+    const allocator = init.arena.allocator();
+    var options: Options = .{};
+    var seen = std.StringHashMap(void).init(allocator);
+    var index: usize = 2;
+    while (index < args.len) {
+        const name = args[index];
+        if ((try seen.getOrPut(name)).found_existing) return refuse("duplicate option: {s}", .{name});
+        if (std.mem.eql(u8, name, "--smoke")) {
+            options.smoke = true;
+            index += 1;
+            continue;
+        }
+        if (index + 1 >= args.len) return refuse("option requires a value: {s}", .{name});
+        const value = args[index + 1];
+        if (std.mem.eql(u8, name, "--tag")) options.tag = value else if (std.mem.eql(u8, name, "--platform"))
+            options.platform = try Platform.parse(value)
+        else if (std.mem.eql(u8, name, "--prefix")) options.prefix = value else if (std.mem.eql(u8, name, "--output"))
+            options.output = value
+        else if (std.mem.eql(u8, name, "--epoch")) options.epoch = std.fmt.parseInt(i64, value, 10) catch return refuse("invalid release epoch", .{}) else if (std.mem.eql(u8, name, "--archive"))
+            options.archive = value
+        else if (std.mem.eql(u8, name, "--assets")) options.assets = value else if (std.mem.eql(u8, name, "--manifest"))
+            options.manifest = value
+        else if (std.mem.eql(u8, name, "--policy")) options.policy = value else return refuse("unknown release option: {s}", .{name});
+        index += 2;
+    }
+    var system = try fs.openAbsoluteRoot(init.io, "/");
+    defer system.close();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator);
+    const context: Context = .{ .allocator = allocator, .io = init.io, .root = system.root, .cwd = cwd };
+    const dependencies = try policyDependencies(allocator, try context.read(options.policy, 1024 * 1024));
+    if (std.mem.eql(u8, args[1], "check-runtime")) {
+        if (options.tag != null or options.platform != null or options.prefix != null or options.output != null or options.epoch != null or
+            options.archive != null or options.assets != null or options.smoke) return refuse("check-runtime accepts only --manifest and --policy", .{});
+        try validateRuntime(allocator, try context.read(try required(options.manifest, "manifest"), 1024 * 1024), dependencies);
+        return;
+    }
+    const tag = try required(options.tag, "tag");
+    const version = parseTag(tag) catch return refuse("invalid release tag: {s}", .{tag});
+    if (std.mem.eql(u8, args[1], "binary")) {
+        if (options.archive != null or options.assets != null or options.manifest != null or options.smoke)
+            return refuse("invalid binary option", .{});
+        const platform = options.platform orelse return refuse("missing required option --platform", .{});
+        const prefix = try required(options.prefix, "prefix");
+        const output = try required(options.output, "output");
+        const epoch = options.epoch orelse return refuse("missing required option --epoch", .{});
+        const root_name = try std.fmt.allocPrint(allocator, "debz-{s}-{s}", .{ version, @tagName(platform) });
+        var scanner: Scanner = .{ .context = context };
+        defer scanner.deinit();
+        try scanner.directory(try context.path(prefix), "", root_name, 0);
+        try scanner.unchanged();
+        try validateBinary(context, scanner.entries.items, root_name, platform, dependencies);
+        const tar = try buildTar(allocator, scanner.entries.items, epoch);
+        const output_path = try context.path(output);
+        try context.root.createDirectoryPath(output_path, .fromMode(0o755));
+        const formats = [_]Format{ .@"tar.gz", .@"tar.xz" };
+        var bytes: [2][]const u8 = undefined;
+        var paths: [2]fs.Path = undefined;
+        for (formats, 0..) |format, number| {
+            paths[number] = .{ .text = try std.fmt.allocPrint(allocator, "{s}/{s}.{s}", .{ output_path.text, root_name, @tagName(format) }) };
+            try outputSafe(context, paths[number]);
+            bytes[number] = try compressTar(allocator, tar, format);
+        }
+        for (formats, 0..) |format, number| {
+            try publish(context, &scanner, paths[number], bytes[number]);
+            try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.allocPrint(allocator, "{s}/{s}.{s}\n", .{ std.mem.trimEnd(u8, output, "/"), root_name, @tagName(format) }));
+        }
+        return;
+    }
+    if (options.prefix != null or options.output != null or options.epoch != null or options.manifest != null)
+        return refuse("invalid audit or verify option", .{});
+    if (std.mem.eql(u8, args[1], "audit")) {
+        if (options.assets != null) return refuse("invalid audit option", .{});
+        const platform = options.platform orelse return refuse("missing required option --platform", .{});
+        const archive_path = try required(options.archive, "archive");
+        const archive = try auditArchive(context, archive_path, version, platform, dependencies);
+        if (options.smoke and platform == hostPlatform()) try smoke(context, archive_path, archive, version, init.environ_map);
+        try std.Io.File.stdout().writeStreamingAll(init.io, try std.fmt.allocPrint(allocator, "verified {s}\n", .{archive_path}));
+        return;
+    }
+    if (options.archive != null or options.platform != null) return refuse("invalid verify option", .{});
+    const assets = try required(options.assets, "assets");
+    var directory = try context.root.pinDirectory(try context.path(assets));
+    defer directory.close();
+    const listing = try directory.observeAlloc(allocator, maximum_entries, maximum_entries * 255);
+    var expected = std.StringHashMap(void).init(allocator);
+    for ([_]Platform{ .@"linux-x64", .@"linux-arm64" }) |platform|
+        for ([_]Format{ .@"tar.gz", .@"tar.xz" }) |format| {
+            try expected.put(try std.fmt.allocPrint(allocator, "debz-{s}-{s}.{s}", .{ version, @tagName(platform), @tagName(format) }), {});
+        };
+    for (listing.members) |member| {
+        const path: fs.Path = .{ .text = try std.mem.concat(allocator, u8, &.{ directory.path.text, "/", member.name }) };
+        if ((try context.root.metadata(path)).kind != .file)
+            return refuse("release assets contain a non-regular entry: {s}", .{member.name});
+    }
+    var iterator = expected.keyIterator();
+    while (iterator.next()) |name| {
+        const present = for (listing.members) |member| {
+            if (std.mem.eql(u8, member.name, name.*)) break true;
+        } else false;
+        if (!present) return refuse("release assets are missing: {s}", .{name.*});
+    }
+    for (listing.members) |member| if (!expected.contains(member.name))
+        return refuse("release assets are forbidden: {s}", .{member.name});
+    for ([_]Platform{ .@"linux-x64", .@"linux-arm64" }) |platform| {
+        for ([_]Format{ .@"tar.gz", .@"tar.xz" }) |format| {
+            const archive_path = try std.fmt.allocPrint(allocator, "{s}/debz-{s}-{s}.{s}", .{ assets, version, @tagName(platform), @tagName(format) });
+            const archive = try auditArchive(context, archive_path, version, platform, dependencies);
+            if (options.smoke and platform == hostPlatform() and format == .@"tar.gz")
+                try smoke(context, archive_path, archive, version, init.environ_map);
+        }
+    }
+    _ = try directory.metadata();
+    try std.Io.File.stdout().writeStreamingAll(init.io, "verified 4 release assets\n");
+}
+
 fn execute(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len < 2) return refuse("a release subcommand is required", .{});
+    if ((args.len == 2 and (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h"))) or
+        (args.len == 3 and (std.mem.eql(u8, args[2], "--help") or std.mem.eql(u8, args[2], "-h")) and
+            std.mem.indexOf(u8, "|version|dry-run|binary|audit|verify|check-runtime|", try std.fmt.allocPrint(allocator, "|{s}|", .{args[1]})) != null))
+    {
+        try std.Io.File.stdout().writeStreamingAll(init.io,
+            \\Deterministic, network-free release packaging and validation for debz.
+            \\usage: debz-release COMMAND [options]
+            \\  version TAG [--expect NAME=VERSION] [--zon FILE]
+            \\  dry-run --tag TAG
+            \\  binary --tag TAG --platform linux-x64|linux-arm64 --prefix DIR --output DIR --epoch INTEGER [--policy FILE]
+            \\  audit --tag TAG --platform linux-x64|linux-arm64 --archive FILE [--policy FILE] [--smoke]
+            \\  verify --tag TAG --assets DIR [--policy FILE] [--smoke]
+            \\  check-runtime --manifest FILE [--policy FILE]
+            \\
+        );
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "binary") or std.mem.eql(u8, args[1], "audit") or
+        std.mem.eql(u8, args[1], "verify") or std.mem.eql(u8, args[1], "check-runtime"))
+        return orchestration(init, args);
     if (std.mem.eql(u8, args[1], "read-archive")) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--name"))
             return refuse("read-archive requires --name and compressed binary stdin", .{});
@@ -526,12 +1111,16 @@ fn execute(init: std.process.Init) !void {
     const compress = std.mem.eql(u8, args[1], "compress-tar");
     const decompress = std.mem.eql(u8, args[1], "decode-tar");
     if (compress or decompress) {
-        if (args.len != 4 or !std.mem.eql(u8, args[2], if (compress) "--format" else "--name"))
+        if ((args.len != 4 and !(compress and args.len == 6 and std.mem.eql(u8, args[4], "--level"))) or
+            !std.mem.eql(u8, args[2], if (compress) "--format" else "--name"))
             return refuse("compression requires a selected format or archive name and binary stdin", .{});
         var reader = std.Io.File.stdin().reader(init.io, &.{});
         const input = try reader.interface.allocRemaining(allocator, .limited(if (compress) maximum_tar_bytes else maximum_compressed_bytes));
         const output = if (compress)
-            try compressTar(allocator, input, try Format.parse(args[3]))
+            try compressTarLevel(allocator, input, try Format.parse(args[3]), if (args.len == 6)
+                std.fmt.parseInt(u32, args[5], 10) catch return refuse("invalid tooling compression level", .{})
+            else
+                9)
         else
             try decompressedTar(allocator, input, args[3]);
         try std.Io.File.stdout().writeStreamingAll(init.io, output);
@@ -583,8 +1172,25 @@ fn execute(init: std.process.Init) !void {
     if (version_command) {
         var index: usize = 3;
         while (index < args.len) : (index += 2) {
+            if (std.mem.eql(u8, args[index], "--zon") and index + 1 < args.len) {
+                var system = try fs.openAbsoluteRoot(init.io, "/");
+                defer system.close();
+                const context: Context = .{
+                    .allocator = allocator,
+                    .io = init.io,
+                    .root = system.root,
+                    .cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
+                };
+                const source = try allocator.dupeZ(u8, try context.read(args[index + 1], 1024 * 1024));
+                const metadata = std.zon.parse.fromSliceAlloc(struct { version: []const u8 }, allocator, source, null, .{
+                    .ignore_unknown_fields = true,
+                }) catch return refuse("invalid release ZON metadata", .{});
+                if (!std.mem.eql(u8, metadata.version, version))
+                    return refuse("version mismatch for zon: {s} != {s}", .{ metadata.version, version });
+                continue;
+            }
             if (!std.mem.eql(u8, args[index], "--expect") or index + 1 >= args.len)
-                return refuse("version accepts only --expect NAME=VERSION", .{});
+                return refuse("version accepts only --expect NAME=VERSION or --zon FILE", .{});
             const expected = args[index + 1];
             const equals = std.mem.indexOfScalar(u8, expected, '=') orelse
                 return refuse("consistency value must be NAME=VERSION: {s}", .{expected});
@@ -779,7 +1385,35 @@ test "release member reader rejects checksum size ownership mode order duplicate
         const bytes = try std.mem.concat(allocator, u8, &.{ &first, &header, &([_]u8{0} ** 1024) });
         try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
     }
+
     const wrong_owner = try tarHeader("root/b", 0o644, 123, 0, '0', true);
     const bytes = try std.mem.concat(allocator, u8, &.{ &first, &wrong_owner, &([_]u8{0} ** 1024) });
     try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
+}
+
+test "release prefix scanner rejects changed files and replaced ancestors before publication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var work = std.testing.tmpDir(.{});
+    defer work.cleanup();
+    try work.dir.createDirPath(std.testing.io, "prefix/share");
+    try work.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/share/file", .data = "original" });
+    const cwd = try work.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    var system = try fs.openAbsoluteRoot(std.testing.io, "/");
+    defer system.close();
+    const context: Context = .{ .allocator = allocator, .io = std.testing.io, .root = system.root, .cwd = cwd };
+    var scanner: Scanner = .{ .context = context };
+    defer scanner.deinit();
+    try scanner.directory(try context.path("prefix"), "", "root", 0);
+    try scanner.unchanged();
+    try work.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/share/file", .data = "modified" });
+    try std.testing.expectError(error.PathChanged, scanner.unchanged());
+    var replacement: Scanner = .{ .context = context };
+    defer replacement.deinit();
+    try replacement.directory(try context.path("prefix"), "", "root", 0);
+    try work.dir.rename("prefix", work.dir, "old-prefix", std.testing.io);
+    try work.dir.createDirPath(std.testing.io, "prefix/share");
+    try work.dir.writeFile(std.testing.io, .{ .sub_path = "prefix/share/file", .data = "modified" });
+    try std.testing.expectError(error.PathChanged, replacement.unchanged());
 }

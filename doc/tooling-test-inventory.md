@@ -7,12 +7,14 @@ share one Zig test with independent mutations.
 
 ## Release (`tools/test_release.py`)
 
-The native `debz-release` core now owns tag parsing, the canonical four-asset
-plan, complete static ELF validation and original GNU tar serialization. The
-actual `tools/release.py` producer hands these operations to the emitted helper
-with `PATH=/no-host-interpreters`; `DEBZ_RELEASE` binds custom-prefix builds.
-Its original tag/plan/tar/ELF implementations are removed rather than retained
-as fallbacks. Native tests cover load/dynamic file and virtual mappings, overflow,
+The native `debz-release` owns the complete version/dry-run/binary/audit/verify
+CLI, dependency/license/runtime and installed-policy checks, bounded no-follow
+prefix scanning, safe atomic output and host-only smoke. Actual build, installed
+layout, CI and release workflow consumers bind the emitted native executable.
+Zig-owned tests bind custom install prefixes and launch every native command
+with `PATH=/no-host-interpreters`. Original Python implementations are removed
+rather than kept as fallbacks or mislabeled as historical dpkg references.
+Native tests cover load/dynamic file and virtual mappings, overflow,
 loader/shared-library refusals, long names and signed epochs.
 
 Compression and strict compressed-container decoding now also use the native
@@ -25,10 +27,12 @@ input validation does not equate deflate implementations' compressed bytes.
 Tar member reading now uses the same native strict container decoder, with
 GNU long names, signed epochs, checksum/size bounds and original metadata
 refusals. Audit and smoke consume those original member bytes without Python
-archive decoding. The remaining dependency/runtime/policy checks,
-metadata adapters, packaging/publication and smoke orchestration still use Python. This bounded
-core migration does not complete PY2 or no-host-Python release qualification.
-Existing twelve real release consumer cases still exercise both compression
+archive decoding. `test-release-consumers` runs the native core and all fifteen
+actual consumer tests, without the giant unrelated GNU install rebuild.
+The twelve original cases retain their assertions; two added focused cases
+cover no-follow ancestry, output aliases and bounds, plus exact typed runtime
+and option refusal. A third checks the actual installed native tool can package
+itself without embedding the secret markers it detects. The real consumers exercise both compression
 formats, full binary/archive checks and all four assets. Complete byte-level
 crosschecks retain the unchanged original implementation outside the repository.
 

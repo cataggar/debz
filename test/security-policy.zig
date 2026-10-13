@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 60), members);
+    try testing.expectEqual(@as(usize, 61), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1693,21 +1693,33 @@ test "security: actual release core consumes native tags plans ELF mappings and 
         "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
         "release_tool_module.linkLibrary(release_liblzma);",
     });
-    try nativeMutations(&f, "native-release-core", "tools/release.py", &.{
-        "return native_release(\"version\", tag).decode().removesuffix(\"\\n\")",
-        "native_release(\"check-elf\", \"--platform\", platform, input=binary)",
-        "return json.loads(native_release(\"dry-run\", \"--tag\", tag))",
-        "\"encode-tar\",",
-        "\"PATH\": \"/no-host-interpreters\"",
-        "return native_release(\"compress-tar\", \"--format\", archive_format, input=tar_data)",
-        "native_release(\"decode-tar\", \"--name\", archive_path.name, input=archive_path.read_bytes())",
-        "\"read-archive\", \"--name\", archive_path.name, input=archive_path.read_bytes()",
+    try nativeMutationsIn(&f, "native-release-core", "test/release-tooling.zig", "fn release(", "fn releaseFile(", &.{
+        "argv[0] = @import(\"release_test_options\").executable;",
+        "try environment.put(\"PATH\", \"/no-host-interpreters\");",
     });
-    try nativeMutationsIn(&f, "native-release-core", "tools/release.py", "def smoke_binary(", "def command_version(", &.{
-        "entries = archive_entries(archive_path)",
-        "os.utime(root / member.name, (member.mtime, member.mtime))",
-        "\"PATH\": \"/no-host-interpreters\"",
-        "timeout=60,",
+    try nativeMutationsIn(&f, "native-release-core", "tools/release.zig", "fn smoke(", "const Options", &.{
+        "for (archive.entries) |entry|",
+        "try file.setTimestamps(context.io",
+        "try cleaned.put(\"PATH\", \"/no-host-interpreters\");",
+        ".raw = .fromSeconds(60)",
+    });
+    try nativeMutationsIn(&f, "native-release-core", "tools/release.zig", "fn auditArchive(", "fn outputSafe(", &.{
+        "readTar(context.allocator, tar)",
+        "try validateBinary(context, files.items, root, platform, dependencies);",
+    });
+    try nativeMutationsIn(&f, "native-release-core", "tools/release.zig", "fn orchestration(", "fn execute(", &.{
+        "try scanner.directory(try context.path(prefix)",
+        "try validateBinary(context, scanner.entries.items, root_name, platform, dependencies);",
+        "try publish(context, &scanner, paths[number], bytes[number]);",
+        "if (options.smoke and platform == hostPlatform())",
+    });
+    try nativeMutationsIn(&f, "native-release-core", "tools/release.zig", "fn publish(", "fn hostPlatform(", &.{
+        "try self.scanner.unchanged();",
+        "try outputSafe(self.context, self.path);",
+        "try self.directory.?.metadata();",
+    });
+    try nativeMutations(&f, "native-release-core", "tools/test-release-install.sh", &.{
+        "PATH=/no-host-interpreters \"$release_tool\" check-runtime",
     });
     try nativeMutations(&f, "native-release-core", "tools/release.zig", &.{
         "if (file_mapping.? != virtual_mapping.?)",
@@ -1732,6 +1744,9 @@ test "security: actual release core consumes native tags plans ELF mappings and 
     const invalid = try nativeCheck(&f, "native-release-core", "build/liblzma.zig", encoder_in_product);
     defer invalid.deinit();
     try invalid.failsWith("reviewed single-threaded decoder configuration");
+    const restored = try nativeCheck(&f, "native-release-core", "tools/release.py", "#!/usr/bin/env python3\n");
+    defer restored.deinit();
+    try restored.failsWith("retired Python release implementation was restored");
 }
 
 test "security: native Debian readiness keeps pinned freshness, bounded input and actual closure handoffs" {

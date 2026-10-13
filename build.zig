@@ -336,7 +336,7 @@ pub fn build(b: *std.Build) void {
     const release_tool = b.addExecutable(.{ .name = "debz-release", .root_module = release_tool_module });
     const install_release_tool = b.addInstallArtifact(release_tool, .{});
     b.getInstallStep().dependOn(&install_release_tool.step);
-    b.step("build-release-tool", "Build native release tag, plan and static ELF validation").dependOn(&install_release_tool.step);
+    b.step("build-release-tool", "Build complete native release packager and validator").dependOn(&install_release_tool.step);
     const release_tool_tests = b.addRunArtifact(b.addTest(.{ .root_module = release_tool_module }));
     b.step("test-release-tool", "Test native release tags and complete static ELF mapping refusals").dependOn(&release_tool_tests.step);
     workload_release.dependOn(&release_tool_tests.step);
@@ -908,12 +908,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const release_test_options = b.addOptions();
+    release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));
+    release_policy_tests.root_module.addOptions("release_test_options", release_test_options);
     const run_release_policy_tests = b.addRunArtifact(release_policy_tests);
     run_release_policy_tests.setCwd(b.path("."));
-    run_release_policy_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));
     run_release_policy_tests.step.dependOn(&install_release_tool.step);
     release_test_step.dependOn(&release_tool_tests.step);
     release_test_step.dependOn(&run_release_policy_tests.step);
+    const release_consumer_step = b.step("test-release-consumers", "Run native release core and actual packaging consumers without rebuilding GNU install");
+    release_consumer_step.dependOn(&release_tool_tests.step);
+    release_consumer_step.dependOn(&run_release_policy_tests.step);
+    workload_release.dependOn(&run_release_policy_tests.step);
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),
         .target = target,
@@ -928,6 +934,8 @@ pub fn build(b: *std.Build) void {
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
+    install_layout_tests.addArg(b.getInstallPath(.bin, "debz-release"));
+    install_layout_tests.step.dependOn(&install_release_tool.step);
     release_test_step.dependOn(&install_layout_tests.step);
 
     const solver_tests = b.addTest(.{
