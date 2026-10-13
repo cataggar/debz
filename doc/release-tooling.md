@@ -55,7 +55,12 @@ zig-out/bin/debz-release verify --tag v0.3.0 --assets dist \
   --policy security/dependency-policy.json --smoke
 ```
 
-CI builds this host-native helper before every actual release consumer. Each
+CI builds this host-native helper before every actual release consumer. Every
+build that installs `debz-release`, including the default Debug
+`zig build build-release-tool`, compiles the packager and its XZ encoder
+ReleaseSafe regardless of `-Doptimize`: unoptimized level-9 gzip and XZ
+encoding of a complete release tree takes minutes per archive. The
+`test-release-tool` unit tests still follow `-Doptimize`. Each
 release job first verifies main ancestry, then installs the exactly pinned,
 version-checked Zig compiler before compiling the helper. The publication and
 dry-run verifier jobs have their own compiler installation and helper build;

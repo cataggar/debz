@@ -4,7 +4,7 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
 
 ## Operator checklist
 
-1. Build the native release packager with `zig build build-release-tool -j2`. Confirm the intended version is valid SemVer, matches parsed `build.zig.zon`, and does not already exist: `zig-out/bin/debz-release version v0.3.0 --zon build.zig.zon`.
+1. Build the native release packager with `zig build build-release-tool -j2`; the packager is always compiled ReleaseSafe, independent of `-Doptimize`. Confirm the intended version is valid SemVer, matches parsed `build.zig.zon`, and does not already exist: `zig-out/bin/debz-release version v0.3.0 --zon build.zig.zon`.
 2. Confirm the candidate commit is on current `origin/main`: `git fetch origin main --tags && git merge-base --is-ancestor HEAD origin/main && test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"`.
 3. Confirm all required CI checks are green, including setup-action unit/bundle, native, and bare-container lanes; both native build/test lanes; both `Required release dry-run` lanes; `Required release workflow policy`; required disposable-root integration; security audit; and fuzzing.
    The release workflow policy verifies an exact pinned and version-checked

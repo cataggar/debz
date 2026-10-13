@@ -322,18 +322,14 @@ pub fn build(b: *std.Build) void {
     b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals").dependOn(&debian_readiness_tests.step);
     workload_core.dependOn(&debian_readiness_tests.step);
 
-    const release_tool_module = b.createModule(.{
-        .root_source_file = b.path("tools/release.zig"),
-        .target = target,
-        .optimize = optimize,
+    const release_tool_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency);
+    // Unoptimized level-9 gzip/XZ encoding of a complete release tree takes
+    // minutes, so the installed packager and its encoder are always ReleaseSafe,
+    // including default Debug builds; unit tests still follow -Doptimize.
+    const release_tool = b.addExecutable(.{
+        .name = "debz-release",
+        .root_module = addReleaseToolModule(b, target, .ReleaseSafe, debz, xz_dependency),
     });
-    // The product keeps its decoder-only library; only release tooling encodes XZ.
-    const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
-    release_tool_module.addImport("debz", debz);
-    release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
-    release_tool_module.addCMacro("LZMA_API_STATIC", "1");
-    release_tool_module.linkLibrary(release_liblzma);
-    const release_tool = b.addExecutable(.{ .name = "debz-release", .root_module = release_tool_module });
     const install_release_tool = b.addInstallArtifact(release_tool, .{});
     b.getInstallStep().dependOn(&install_release_tool.step);
     b.step("build-release-tool", "Build complete native release packager and validator").dependOn(&install_release_tool.step);
@@ -2823,6 +2819,27 @@ fn addHelpFlagTests(
         help.expectStdErrEqual("");
         step.dependOn(&help.step);
     }
+}
+
+fn addReleaseToolModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    debz: *std.Build.Module,
+    xz_dependency: *std.Build.Dependency,
+) *std.Build.Module {
+    const release_tool_module = b.createModule(.{
+        .root_source_file = b.path("tools/release.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The product keeps its decoder-only library; only release tooling encodes XZ.
+    const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
+    release_tool_module.addImport("debz", debz);
+    release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    release_tool_module.addCMacro("LZMA_API_STATIC", "1");
+    release_tool_module.linkLibrary(release_liblzma);
+    return release_tool_module;
 }
 
 fn installReleaseFiles(

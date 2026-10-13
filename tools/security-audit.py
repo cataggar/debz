@@ -5034,6 +5034,14 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
     ]
     if texts.get("tools/release.py", ""):
         failures.append("tools/release.py: retired Python release implementation was restored")
+    build = texts.get("build.zig", "")
+    release_module = build.partition("\nfn addReleaseToolModule(")[2].partition("\n}\n")[0]
+    if (
+        ".root_module = addReleaseToolModule(b, target, .ReleaseSafe, debz, xz_dependency)," not in build
+        or ".optimize = optimize," not in release_module
+        or "liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);" not in release_module
+    ):
+        failures.append("build.zig: installed release packager and its XZ encoder must always be ReleaseSafe")
     native = texts.get("tools/release.zig", "")
     member_body = native.partition("fn readTar(")[2].partition("pub fn validateStaticElf(")[0]
     if any(token not in member_body for token in (

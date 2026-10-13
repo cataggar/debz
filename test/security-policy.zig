@@ -1744,6 +1744,18 @@ test "security: actual release core consumes native tags plans ELF mappings and 
     const invalid = try nativeCheck(&f, "native-release-core", "build/liblzma.zig", encoder_in_product);
     defer invalid.deinit();
     try invalid.failsWith("reviewed single-threaded decoder configuration");
+    try nativeMutationsIn(&f, "native-release-core", "build.zig", "fn addReleaseToolModule(", "fn installReleaseFiles(", &.{
+        ".optimize = optimize,",
+        "liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);",
+    });
+    const debug_packager = try f.replace(
+        try f.source("build.zig"),
+        ".root_module = addReleaseToolModule(b, target, .ReleaseSafe, debz, xz_dependency),",
+        ".root_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency),",
+    );
+    const unoptimized = try nativeCheck(&f, "native-release-core", "build.zig", debug_packager);
+    defer unoptimized.deinit();
+    try unoptimized.failsWith("installed release packager and its XZ encoder must always be ReleaseSafe");
     const restored = try nativeCheck(&f, "native-release-core", "tools/release.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python release implementation was restored");
