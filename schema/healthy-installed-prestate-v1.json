@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/healthy-installed-prestate-v1",
+  "title": "Healthy observed installed prestate, not archive or callback authority",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "authority", "observed"],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/healthy-installed-prestate-v1"},
+    "version": {"const": 1},
+    "authority": {"const": "healthy_installed_prestate"},
+    "observed": {
+      "$ref": "exact-closure-lock-v4.json#/$defs/baseline",
+      "description": "Observed local no-op facts retain their historical hash domain. A live verifier additionally requires healthy installed/config-files status, no pending/awaited triggers, and exact root/database identity."
+    }
+  }
+}

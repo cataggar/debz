@@ -101,10 +101,17 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !OwnedLock {
         return error.UnsupportedSchema;
     var archive_lock = try archives.decode(allocator, payload.archive_lock_json, maximum_document_bytes);
     errdefer archive_lock.deinit();
-    const facts = payload.installed_baseline;
+    try validateEvidence(allocator, payload.installed_baseline, archive_lock.lock);
+    const canonical = try encode(allocator, payload);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, bytes)) return error.NonCanonicalDocument;
+    return .{ .parsed = parsed, .archive_lock = archive_lock };
+}
+
+pub fn validateEvidence(allocator: std.mem.Allocator, facts: baseline.Evidence, archive_lock: archives.Lock) !void {
     if (facts.packages.len == 0 or
-        facts.packages.len > archives.maximum_packages -| archive_lock.lock.packages.len or
-        !std.mem.eql(u8, facts.native_architecture, archive_lock.lock.target_architecture) or
+        facts.packages.len > archives.maximum_packages -| archive_lock.packages.len or
+        !std.mem.eql(u8, facts.native_architecture, archive_lock.target_architecture) or
         facts.database_identity.value.len != 128)
         return error.InvalidInstalledBaseline;
     if (facts.root_path.len == 0 or facts.root_path[0] != '/' or
@@ -118,7 +125,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !OwnedLock {
     defer check_arena.deinit();
     const checking = check_arena.allocator();
     var archive_identities: std.StringHashMap(void) = .init(checking);
-    for (archive_lock.lock.packages) |package| {
+    for (archive_lock.packages) |package| {
         try archive_identities.put(try std.fmt.allocPrint(checking, "{s}\x00{s}", .{ package.name, package.architecture }), {});
     }
     for (facts.packages, 0..) |package, index| {
@@ -142,10 +149,6 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !OwnedLock {
                 return error.InvalidInstalledBaseline;
         }
     }
-    const canonical = try encode(allocator, payload);
-    defer allocator.free(canonical);
-    if (!std.mem.eql(u8, canonical, bytes)) return error.NonCanonicalDocument;
-    return .{ .parsed = parsed, .archive_lock = archive_lock };
 }
 
 pub fn hasSchema(allocator: std.mem.Allocator, bytes: []const u8) !bool {

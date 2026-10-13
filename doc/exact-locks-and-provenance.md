@@ -236,6 +236,50 @@ This native slice does
 not complete backend-neutral execution, SymCrypt short commands, durable
 auto-lock orchestration, or supported Noble amd64/arm64 live acceptance.
 
+**Healthy active-context planning (v5).** The typed production backend may
+explicitly borrow a verified `system_product_context.Context` for a planning
+workflow. This is not an ambient default in product API v1 or a standalone
+install authorization. The active source/keyring bytes, root, target
+architecture and active pointer are revalidated before refresh. Refresh uses
+the snapshot's in-memory keyring bytes and its configured acquisition bounds,
+not host `Signed-By` paths or unbounded replacement deadlines.
+
+The resulting
+[`exact-closure-lock-v5`](../schema/exact-closure-lock-v5.json) is explicitly
+`healthy_prestate_planning_only`. It binds the active configuration identity
+and immutable manifest digest, the unchanged canonical v3 authenticated archive
+closure, and a typed
+[`healthy-installed-prestate-v1`](../schema/healthy-installed-prestate-v1.json).
+All unchanged fully installed packages, including private packages and
+published retained versions, appear as exact installed facts. They are not
+omitted, assigned repository origins, downloaded or turned into callback
+authority. Holds are retained. Unrelated incomplete/reinstallation-required
+state, pending/awaited or unincorporated trigger work, changed package-database
+bytes, foreign root, source/keyring drift and changed active configuration
+refuse publication.
+Publication retains the original no-follow owned root/dpkg exclusions,
+whole-database SHA512, outside-database output check, durable publication and
+final pre-rename revalidation. The output directory and existing file must have
+the bound root's owner and must not be group/world writable. Existing output
+is never overwritten; identical canonical bytes may be reused only after a
+pinned, stable double read and configuration revalidation.
+This observation establishes status health and exact database prestate, not
+native payload, helper or callback admission; those remain separate executor
+obligations.
+At least one unchanged installed fact is required in this bounded generation.
+A solve changing every installed package refuses instead of silently dropping
+the active-context binding into archive-only output.
+
+This planning generation deliberately cannot be unwrapped into v3/v4 mutation
+or package-CAS authority. Historical execution and cache consumers refuse it.
+Historical v4 bytes, its installed-component restrictions and its explicit
+`InstalledBaselineExecutionUnsupported` fence are unchanged. **The #407/#68
+outcome is still incomplete:** a subsequent versioned execution contract must
+connect healthy facts to durable standalone auto-lock ownership, exact owned
+retry/recovery, per-operation results and native scoped host execution. Noble
+amd64/arm64 acceptance for both SymCrypt variants and the pre-mutation OpenSSL
+range-conflict witness remain required. This work does not add a #274 prerequisite.
+
 **Signed SHA256 with a derived SHA512.** Some signed archives, including
 Debian stable, publish only SHA256 in both
 Release and Packages. For those repositories debz accepts the signed SHA256

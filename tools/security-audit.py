@@ -2116,6 +2116,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_native": ("test-workload-native", (
         "native_dpkg_tests",
+        "run_healthy_prestate_tests",
         "run_native_program_corpus_tests", "native_outcome_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",

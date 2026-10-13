@@ -265,6 +265,8 @@ pub const exact_lock = @import("exact_lock.zig");
 pub const exact_lock_v2 = @import("exact_lock_v2.zig");
 pub const exact_lock_v3 = @import("exact_lock_v3.zig");
 pub const exact_lock_v4 = @import("exact_lock_v4.zig");
+pub const exact_lock_v5 = @import("exact_lock_v5.zig");
+pub const healthy_installed_prestate = @import("healthy_installed_prestate.zig");
 pub const installed_baseline = @import("installed_baseline.zig");
 pub const native_authorization = @import("native_authorization.zig");
 pub const native_program = @import("native_program.zig");
@@ -626,6 +628,8 @@ test "native_unpack.test.public runtime keeps fixture adapters private" {
 
 test {
     _ = @import("installed_baseline_component.zig");
+    _ = exact_lock_v5;
+    _ = healthy_installed_prestate;
     _ = @import("native_baseline_contract.zig");
     _ = deb_payload;
     _ = archive_application;
