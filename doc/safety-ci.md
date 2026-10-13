@@ -37,6 +37,10 @@ still require every shard to succeed: failure, cancellation, or an unexpected
 skip cannot pass. An opted-out dispatch intentionally skips the aggregators
 and is **not** evidence that the full matrix passed. Action checks, security
 audit, release checks, fuzzing, and `integration-required` still run.
+The boolean `run_native_recovery_cohort` input, defaulting to `false`, also
+selects the six native recovery jobs and `build-and-test-workload-native`
+without the rest of the matrix: the hosted four-cell (amd64/arm64 ×
+Debug/ReleaseSafe) recovery cohort. The aggregators stay skipped.
 
 The security audit enforces this inventory in three ways:
 
@@ -154,6 +158,16 @@ The snapshot, protected-reference, and ARM64 dpkg oracle lanes remain
 independently selected by their existing inputs. Omitting `run_full_matrix`
 or setting it to `true` retains full manual coverage, including
 `integration-full`.
+
+The dispatch-only `native-database-pair` job, selected by
+`run_native_database_pairs`, runs one matched #345 database-performance pair
+per disposable `ubuntu-24.04` or `ubuntu-24.04-arm` row through
+`tools/native-database-performance-hosted.sh`. Its comparison, control SHA,
+architecture, mode and series inputs are exact dispatch-only selectors. The
+audit refuses self-hosted or paid runners, hidden failures, unprotected tools,
+ownership transfer and any other use of the driver or of those inputs; see
+"Database capture performance evidence (#345)" in `integration-roots.md`.
+`ci.yml` now declares 16 of the 25 inputs GitHub permits per dispatch.
 
 The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
 gate selected by the `run_native_real_snapshot` dispatch input. It builds the

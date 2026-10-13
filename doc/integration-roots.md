@@ -58,44 +58,87 @@ Use an owned scratch directory and check the emitter's exit before publication.
 Update only that file's
 SHA-512 entry in `security/native-only-production-policy.json`, audit, and
 regenerate the corresponding `src/native_unpack.zig` digest-inventory row,
-then commit with the standard trailers. The driver verifies this exact original
+then commit with the standard trailers. The coordinator publishes that commit
+on its own measurement-only branch; the pair job fetches it **by SHA**.
+Regenerate the control whenever the candidate head changes. The driver verifies this exact original
 body and byte-identical surrounding source, and refuses every other
 source/policy difference. The new substitution test intentionally distinguishes
 the candidate's extra directory-identity checks from the old traversal;
 the control is measurement-only, not a releasable candidate. Do **not**
 compare a historical release or apply instrumentation to one side only.
-Generate full-history `git bundle create ... HEAD` bundles of that control and
-the candidate; the supplied HEADs are checked independently, not fetched into
-shared refs. For overhead pairs both bundles/HEADs are the exact candidate.
+The job generates full-history `git bundle create ... HEAD` bundles of that
+control and the candidate; the supplied HEADs are checked independently, not
+fetched into shared refs. For overhead pairs both bundles/HEADs are the exact
+candidate.
 
-Use the existing workflow's root-owned bundle bootstrap to create an
-orchestration checkout at
-`/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}0-$ARCH/checkout`,
-verify its HEAD equals the candidate, and copy both bundles as protected
-root-owned files inside its parent tree. Prerequisites are the same as
-`ubuntu-real-snapshot`; no privileged setup may run on a paid/shared runner.
-From that **protected candidate checkout**, execute:
+The dispatch-only `native-database-pair` job in `ci.yml` is the only workflow
+user of the driver. `run_native_database_pairs=true` selects it; each matrix
+row runs on its own fresh `ubuntu-24.04` (amd64) or `ubuntu-24.04-arm` (arm64)
+hosted runner, never a paid or self-hosted one:
 
-```sh
-bash tools/native-database-performance-hosted.sh \
-  "$ORCHESTRATOR" "$ARCH" "$MODE" capture "$ORDER" "$SAMPLE" \
-  "$CANDIDATE_SHA" "$CONTROL_SHA" \
-  "$ORCHESTRATOR/candidate.bundle" "$ORCHESTRATOR/control.bundle" \
-  https://snapshot.ubuntu.com/ubuntu/20261001T000000Z resolute
-```
+| Input | Choices (default first) | Selects |
+| --- | --- | --- |
+| `native_database_comparison` | `capture`, `overhead` | traversal A/B or telemetry off/on |
+| `native_database_control_sha` | empty or 40-hex SHA | `capture`: published control commit; `overhead`: empty or the candidate |
+| `native_database_architectures` | `["amd64","arm64"]`, `["amd64"]`, `["arm64"]` | architecture cells |
+| `native_database_modes` | `["Debug","ReleaseSafe"]`, `["Debug"]`, `["ReleaseSafe"]` | build-mode cells |
+| `native_database_series` | `["1-AB","2-BA","3-AB"]`, `["1-AB"]`, `["2-BA"]`, `["3-AB"]` | reviewed `SAMPLE-ORDER` pairs |
 
-The surrounding root-owned empty-environment launcher must explicitly retain
-the genuine `GITHUB_ACTIONS`, `RUNNER_ENVIRONMENT`, `GITHUB_SHA`,
-`GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_JOB` and `RUNNER_NAME`.
+Each row is one `SAMPLE-ORDER` pair of one architecture/mode cell, so both
+slots run sequentially on the **same runner** and no other benchmark job
+shares it. The job:
+
+1. checks out the full candidate history and requires a `github-hosted`
+   runner whose `RUNNER_ARCH` matches the row, driver-valid values and the
+   pinned snapshot inputs. `capture` requires a 40-hex control that differs
+   from the candidate; `overhead` accepts only an empty control or the
+   candidate;
+2. installs the `ubuntu-real-snapshot` prerequisites;
+3. bundles the candidate `HEAD` and, for `capture`, fetches the control by SHA
+   from this repository into a private bare repository and bundles it;
+4. uses the existing root-owned bundle bootstrap to create the mode-0700
+   orchestration tree
+   `/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}0-$ARCH`
+   with root-owned mode-0600 bundles, an fsck-verified non-shallow bare
+   repository and a checkout whose HEAD equals the candidate;
+5. from that **protected candidate checkout**, runs the driver through
+   `sudo -n env -i -C "$ORCHESTRATOR/checkout"`. This empty environment
+   retains only the genuine `GITHUB_ACTIONS`, `RUNNER_ENVIRONMENT`,
+   `GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_JOB`,
+   `GITHUB_WORKFLOW` and `RUNNER_NAME`, and invokes:
+
+   ```sh
+   bash "$ORCHESTRATOR/checkout/tools/native-database-performance-hosted.sh" \
+     "$ORCHESTRATOR" "$ARCH" "$MODE" "$COMPARISON" "$ORDER" "$SAMPLE" \
+     "$CANDIDATE_SHA" "$CONTROL_SHA" \
+     "$ORCHESTRATOR/candidate.bundle" "$ORCHESTRATOR/control.bundle" \
+     https://snapshot.ubuntu.com/ubuntu/20261001T000000Z resolute
+   ```
+
+6. always copies the bounded evidence, then always runs the existing bounded
+   descendant/mount check and named-tree cleanup before the upload.
+
 Select all four cells:
 `ARCH=amd64|arm64` × `MODE=Debug|ReleaseSafe`.
 `capture` executes accepted traversal/control A and scoped traversal/candidate B
-with common telemetry enabled. For logging/clock overhead, select `overhead`,
-set `CONTROL_SHA=CANDIDATE_SHA` and use the candidate bundle twice: A is off,
-B is on. Use reviewed interleaved orders `AB`, `BA`, `AB` with distinct
-`SAMPLE=1,2,3`; every pair must finish on the **same runner**, without concurrent
-benchmark jobs on that runner. Retain runner identity/load information and
-stratify pairs by runner, never present nonmatched jobs as a speedup.
+with common telemetry enabled. For logging/clock overhead, select `overhead`.
+The job then passes `CONTROL_SHA=CANDIDATE_SHA` and the candidate bundle twice:
+A is off, B is on. Use reviewed interleaved orders `AB`, `BA`, `AB` with distinct
+`SAMPLE=1,2,3`. Retain runner identity/load information and stratify pairs by
+runner. Never present nonmatched jobs as a speedup. The default selectors
+dispatch all 12 rows of one comparison:
+
+```sh
+gh workflow run ci.yml --ref "$CANDIDATE_REF" \
+  -f run_full_matrix=false -f run_native_database_pairs=true \
+  -f native_database_comparison=capture \
+  -f native_database_control_sha="$CONTROL_SHA"
+gh workflow run ci.yml --ref "$CANDIDATE_REF" \
+  -f run_full_matrix=false -f run_native_database_pairs=true \
+  -f native_database_comparison=overhead -f native_database_control_sha=
+```
+
+Jobs without their own dispatch selector still run on every dispatch.
 
 Each slot creates a new protected checkout/toolchain/cache/root, authenticates
 the original snapshot, builds the exact selected mode, executes the unchanged
@@ -107,16 +150,25 @@ for capture pairs, all six actual phase operation counts. Root/attempt/inode,
 program and evidence-document identities remain individually verified rather
 than falsely asserted byte-identical across distinct roots.
 
-Retain `pair-identity.txt`, both slot logs/results, `pair-result.txt`,
-`cross-slot-root-comparison.json`, and **both** named `native-upload` trees
-with their original indices. Always use the workflow's existing bounded
-descendant/mount check and named-tree cleanup, including the orchestration tree
-and the two slot trees recorded in `slot-A.txt`/`slot-B.txt`, even on failure.
-If staging fails before `native-upload` exists, also retain its original
-bounded `upload` staging diagnostics rather than making an empty substitute.
+Each row uploads `native-database-pair-COMPARISON-ARCH-MODE-SAMPLE-ORDER`
+(14-day retention; an empty upload fails). It contains `pair-step.txt`,
+`runner-disk.txt` and the driver's `pair-SAMPLE-COMPARISON-MODE/` directory,
+at most 256 MiB, with `pair-identity.txt`, both slot logs/results,
+`pair-result.txt` and `cross-slot-root-comparison.json`. It also contains
+**both** named `native-ci-RUN-ATTEMPT<SAMPLE><1|2>-ARCH/native-upload` trees,
+at most 512 MiB each, with their original indices. Each `slot-A.txt` or
+`slot-B.txt` record must name exactly its slot tree. If staging fails before
+`native-upload` exists, the row instead retains `collection-failure.txt` and
+the original bounded `upload` staging diagnostics as `staging/`, rather than
+an empty substitute. A missing pair directory is recorded in
+`pair-collection-failure.txt`. Even on failure, the workflow's existing
+bounded descendant/mount check and named-tree cleanup always remove the
+orchestration tree and the two slot trees. `cleanup-result.txt` records
+`cleanup_status`, and `SHA256SUMS` covers every retained file.
 The numeric slot namespace is not the workflow run-attempt: the genuine
 run-attempt is retained unchanged in every invocation's identity.
-One pair must fit the hosted job limit; do not relax the native 180-minute
+One pair must fit the hosted job limit: the pair step is bounded to
+300 minutes within the 360-minute job. Do not relax the native 180-minute
 install ceiling or reference bound to get a result.
 
 Review complete matched series and off/on overhead, direct monotonic capture,
@@ -129,17 +181,25 @@ generated 177-package metadata or an incomplete/refused install is not #345
 acceptance. Publication, hosted execution and issue closure remain coordinator
 decisions.
 
-The recovery selector in each **disposable hosted**, architecture-native
-protected checkout is:
+The four recovery cohorts do not need the full matrix:
 
 ```sh
-"$ZIG" build test-native-recovery \
-  -Dnative-reference-dpkg="$REFERENCE_DPKG" -Doptimize="$MODE" -j2 --summary all
+gh workflow run ci.yml --ref "$CANDIDATE_REF" \
+  -f run_full_matrix=false -f run_native_recovery_cohort=true
 ```
 
-Use that checkout's staged original toolchain/reference and owned `.tmp`
-directory for `TMPDIR`. Do not send this privileged full recovery selector
-to shared or paid runners; only the no-root focused unit selectors belong there.
+`run_native_recovery_cohort` (default false) additionally selects only the
+six `native-recovery-zig-*` shards and the four-row
+`build-and-test-workload-native` job, all on disposable `ubuntu-24.04` and
+`ubuntu-24.04-arm` runners. The shards run every `test-native-recovery`
+acceptance target and the Zig recovery unit target in Debug and ReleaseSafe
+with the pinned dpkg reference. `test-workload-native` runs the native
+execution journal/provenance, Zig recovery oracle and repository recovery unit
+tests in each architecture/mode.
+Together they make up the complete `test-native-recovery` aggregate for each
+of the four cells. Such a dispatch skips the `Build and test` aggregators, so
+review every selected row. Do not send these privileged recovery selectors to
+shared or paid runners; only the no-root focused unit selectors belong there.
 
 `zig build test-integration` builds a small deterministic repository, signs its
 `InRelease` with the existing synthetic test-only OpenPGP key, and drives the

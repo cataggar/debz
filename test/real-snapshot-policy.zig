@@ -1903,7 +1903,7 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
 }
 
 fn source(path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(support.io, path, support.allocator, .limited(128 * 1024));
+    return std.Io.Dir.cwd().readFileAlloc(support.io, path, support.allocator, .limited(512 * 1024));
 }
 
 test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bounds, cleanup, and comparison" {
@@ -1968,7 +1968,7 @@ test "snapshot: profiling selectors keep exact workload modes and refuse non-hos
     const workflow = try source(".github/workflows/ci.yml");
     defer support.allocator.free(workflow);
     const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n").?;
-    const end = std.mem.indexOfPos(u8, workflow, start, "  protected-reference:\n").?;
+    const end = std.mem.indexOfPos(u8, workflow, start, "  native-database-pair:\n").?;
     const job = workflow[start..end];
     for ([_][]const u8{
         "NATIVE_OPTIMIZE: ${{ inputs.native_snapshot_optimize }}",
@@ -1977,6 +1977,42 @@ test "snapshot: profiling selectors keep exact workload modes and refuse non-hos
         "DEBZ_NATIVE_PHASE_TELEMETRY=\"$NATIVE_TELEMETRY\"",
         "DEBZ_NATIVE_PERFORMANCE_EXPECT_PACKAGES=\"$NATIVE_EXPECTED_PACKAGES\"",
     }) |required| try support.contains(job, required);
+}
+
+test "snapshot: matched-pair CI job runs one hosted pair per runner with bounded evidence and named cleanup" {
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const start = std.mem.indexOf(u8, workflow, "  native-database-pair:\n") orelse return error.MissingPairJob;
+    const end = std.mem.indexOfPos(u8, workflow, start, "  protected-reference:\n") orelse return error.MissingProtectedReferenceJob;
+    const job = workflow[start..end];
+    for ([_][]const u8{
+        "if: github.event_name == 'workflow_dispatch' && inputs.run_native_database_pairs",
+        "runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}",
+        "pair: ${{ fromJSON(inputs.native_database_series) }}",
+        "ORCHESTRATOR: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}0-${{ matrix.architecture }}",
+        "fetch-depth: 0",
+        "test \"$RUNNER_ENVIRONMENT\" = github-hosted",
+        "\"$GITHUB_SERVER_URL/$GITHUB_REPOSITORY\" \"+$CONTROL_INPUT:refs/heads/control\"",
+        "git --git-dir=\"$tree/bare.git\" fsck --full --no-dangling",
+        "sudo -n env -i -C \"$ORCHESTRATOR/checkout\"",
+        "RUNNER_NAME=\"$RUNNER_NAME\"",
+        "bash \"$ORCHESTRATOR/checkout/tools/native-database-performance-hosted.sh\"",
+        "\"$ORCHESTRATOR\" \"$ARCHITECTURE\" \"$OPTIMIZE\" \"$COMPARISON\" \"${PAIR#*-}\" \"${PAIR%-*}\"",
+        "grep -Fxq \"tree=$slot\" \"$record\"",
+        "copy \"$slot/native-upload\" \"$output/${slot##*/}/native-upload\" $((512 * 1024 * 1024))",
+        "\"/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}${sample}2-$ARCHITECTURE\"",
+        "rm -rf --one-file-system -- \"$tree\"",
+        "name: native-database-pair-${{ inputs.native_database_comparison }}-${{ matrix.architecture }}-${{ matrix.optimize }}-${{ matrix.pair }}",
+        "if-no-files-found: error",
+    }) |required| try support.contains(job, required);
+    for ([_][2][]const u8{ .{ "AB", "1" }, .{ "BA", "2" }, .{ "AB", "3" } }) |pair| {
+        const label = try std.fmt.allocPrint(support.allocator, "'[\"{s}-{s}\"]'", .{ pair[1], pair[0] });
+        defer support.allocator.free(label);
+        try support.contains(workflow[0..start], label);
+        const valid = try support.run(&.{ "bash", "tools/native-database-performance-hosted.sh", "--validate-values", "arm64", "ReleaseSafe", "overhead", pair[0], pair[1] });
+        defer valid.deinit();
+        try valid.ok();
+    }
 }
 
 test "snapshot: performance consumer refuses a reduced closure before download or install" {
