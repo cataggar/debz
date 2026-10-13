@@ -81,6 +81,8 @@ timeout --signal=TERM --kill-after=5s 60s \
   /usr/bin/dpkg-deb --ctrl-tarfile "$source/var/lib/dpkg/producer-util-linux.deb" |
   /usr/bin/tar -xOf - ./postinst >"$workspace/evidence/util-linux-original-dpkg.postinst"
 cmp "$workspace/evidence/util-linux-original-native.postinst" "$workspace/evidence/util-linux-original-dpkg.postinst"
+bash tools/real-snapshot-util-linux-protected-source.sh "$zig" \
+  "$workspace/evidence/ubuntu-minimal.lock.json" "$cache" "$workspace/arm-util-linux-source"
 for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate bad-cache; do
   destination=$workspace/$name
   [[ ! -e "$destination" && ! -L "$destination" ]]

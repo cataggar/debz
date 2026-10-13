@@ -723,6 +723,59 @@ actual cached native/pinned-dpkg replay and the original five negative roots
 plus an altered cache-provider refusal. Full ARM installation and trigger
 closure remain separate acceptance gates.
 
+## ARM util-linux helper sources and the remaining execution refusal
+
+The next original ARM callback is util-linux `2.41.3-3ubuntu2.2` new-package
+`postinst ["configure", ""]`. Its complete original 2112-byte executable
+script is retained unchanged. **The production admission remains amd64-only.**
+Neither collecting its control member nor authenticating its helper sources
+is permission to execute it.
+
+`zig build build-arm64-util-linux-authority test-arm64-util-linux-authority -j2`
+builds the source-only `debz-arm-util-linux-authority` inspector. It binds a
+native-acquired full original lock to the compiled reviewed manifest's entire
+177-package ARM closure, original Release/signers and unchanged admission
+deadline. It size/SHA512-checks and fully models fifteen original archives,
+including init-system-helpers, perl-base, systemd/libsystemd-shared, the pager,
+fstrim units and their direct ELF library sources. It does not infer a helper
+grant from the amd64 `snapshot_udev` profile.
+
+The `source LOCK CAS OUTPUT` command records original archive-derived member
+identities. `compare LOCK CAS DPKG_EXTRACTED_ROOT OUTPUT` additionally compares
+those members with separate unprivileged `dpkg-deb --extract` results, arranged
+as `DPKG_EXTRACTED_ROOT/PACKAGE/...`. Both require absolute paths and exclusive
+outputs; `--protected` additionally requires protected root-owned source
+ancestors and members. The real Perl executable and `perl5.40.1` must be one
+original two-link inode, not two equal-byte copies, and the complete perl-base
+module tree rejects added entries. Source receipts explicitly report
+`callback_admitted: false` and `runtime_proved: false`.
+
+Protected ARM bash staging now acquires the full original ubuntu-minimal lock
+and runs the required fifteen-source native/independent comparison before
+making replay copies or mutating them. No package script runs during that
+source comparison. The original bash reference proof is still independent.
+Both source receipts are written exclusively into `bash-arm64/evidence/`
+and retained by the existing bounded protected-CI artifact collector.
+
+The untrimmed util-linux postinst registers more, invokes the real Perl
+deb-systemd-helper unmask/was-enabled/enable-or-update-state branches, and
+retains both systemd service-invoke branches. Even with
+`/run/systemd/system` absent, the genuine helper's initial enable branch invokes
+`systemctl --root=/ --system --preset-mode=enable-only preset fstrim.timer`
+when systemctl exists. Therefore absent-helper fixtures, an amd64 helper
+profile, or a pager-only replay cannot establish this authority.
+
+Still required before an ARM grant: independent protected observations of
+the original Perl module/late-loader inputs, systemctl preset behavior,
+unit/preset/helper state and cache bindings, then complete native versus
+pinned-dpkg pager and helper-state agreement under the original namespace,
+network, capability and descriptor confinement. All privileged proofs belong
+on disposable hosted ARM runners, never shared or paid hosts. Finally rerun
+authenticated native installation on a new original 177-package root and
+require `transaction-result verify`, every package installed and no pending
+triggers. The source receipt alone satisfies none of these runtime or
+whole-root acceptance conditions.
+
 ## Exact signed python3 preinst inert alternatives call
 
 The separate new-package `python3:amd64` `3.14.3-0ubuntu2`

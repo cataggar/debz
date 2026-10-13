@@ -351,6 +351,17 @@ separate pinned-dpkg configure, complete alternatives records/selectors and
 unchanged input inventories. This scoped proof is not whole-root parity,
 late-load/helper closure, an upgrade grant or Python-free acceptance.
 
+The ARM util-linux helper source inspector also consumes the existing
+reviewed full-closure digest directly, rather than hand-editing new archive
+pins or borrowing architecture-specific helper grants. It authenticates and
+fully models fifteen real archives and compares 797 selected original members,
+including the complete perl-base tree and its genuine two-link interpreter,
+against independent dpkg extraction. The signed-source stage requires these
+observations before replay copies/mutations. Its source receipts deliberately
+withhold callback/runtime permission; the original manifest, deadlines,
+signed source bundle and production ARM refusal remain unchanged. See the
+maintainer-script runner's separate ARM util-linux remaining-execution contract.
+
 Ownership-list pins bind the original data-tar member order, not a sorted
 path set. Less sealing and Python empty-fixture preparation validate those
 exact archive-derived bytes without rewriting the `.list` files. Reordering

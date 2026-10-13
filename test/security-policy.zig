@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 59), members);
+    try testing.expectEqual(@as(usize, 60), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2656,7 +2656,27 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "  \"-Darm64-util-linux-source-root=$source\" \\\n",
         "grep -Fx \"signed arm64 util-linux original archive source validated without callback admission or skips\" \"$workspace/evidence/util-linux-source-proof.txt\"\n",
         "cmp \"$workspace/evidence/util-linux-original-native.postinst\" \"$workspace/evidence/util-linux-original-dpkg.postinst\"\n",
+        "bash tools/real-snapshot-util-linux-protected-source.sh \"$zig\" \\\n",
     });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-util-linux-protected-source.sh", &.{
+        "evidence=${workspace%/arm-util-linux-source}/evidence\n",
+        "\"$inspector\" --protected source \"$lock\" \"$cache\" \"$evidence/util-linux-helper-native-source.json\"\n",
+        "\"$inspector\" --protected compare \"$lock\" \"$cache\" \"$workspace/extracted\" \"$evidence/util-linux-helper-independent-source.json\"\n",
+        "/usr/bin/dpkg-deb --extract \"$object\" \"$workspace/extracted/$package\"",
+        ".callback_admitted == false and .runtime_proved == false",
+    });
+    for ([_][]const u8{ "verifyLock", "source", "compareFile", "main" }) |name| {
+        const start = try std.fmt.allocPrint(f.arena.allocator(), "fn {s}(", .{name});
+        const tokens: []const []const u8 = if (std.mem.eql(u8, name, "verifyLock"))
+            &.{ "now >= deadline.integer", "repository.signer_fingerprints" }
+        else if (std.mem.eql(u8, name, "source"))
+            &.{ "try package.verifyArchive(bytes);", "try linkCount(&model, interpreter.path) != 2" }
+        else if (std.mem.eql(u8, name, "compareFile"))
+            &.{ "entry.device != target_entry.device or entry.inode != target_entry.inode", "if (model.findFile(child) == null)" }
+        else
+            &.{"try verifyLock(allocator, lock.lock, pin_bytes, now);"};
+        try nativeMutationsIn(&f, "protected-reference", "tools/real-snapshot-util-linux-authority.zig", start, "\n}\n", tokens);
+    }
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-reference.sh", &.{
         "        --force-depends --no-triggers --configure less\n",
     });

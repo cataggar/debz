@@ -1332,6 +1332,24 @@ pub fn build(b: *std.Build) void {
     }
     b.step("test-real-snapshot-arm64-util-linux-source-protected", "Require exact original signed ARM util-linux archive sources without callback admission")
         .dependOn(&run_arm64_util_linux_source_tests.step);
+    const arm64_util_linux_authority_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-util-linux-authority.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    arm64_util_linux_authority_module.addImport("debz", debz);
+    const arm64_util_linux_authority = b.addExecutable(.{
+        .name = "debz-arm-util-linux-authority",
+        .root_module = arm64_util_linux_authority_module,
+    });
+    b.step("build-arm64-util-linux-authority", "Build the original ARM helper/runtime source inspector, not callback permission")
+        .dependOn(&b.addInstallArtifact(arm64_util_linux_authority, .{}).step);
+    const arm64_util_linux_authority_tests = b.addTest(.{ .root_module = arm64_util_linux_authority_module });
+    const run_arm64_util_linux_authority_tests = b.addRunArtifact(arm64_util_linux_authority_tests);
+    b.step("test-arm64-util-linux-authority", "Test original ARM helper source binding and refusals without privileged execution")
+        .dependOn(&run_arm64_util_linux_authority_tests.step);
+    audit_step.dependOn(&run_arm64_util_linux_authority_tests.step);
+    workload_release.dependOn(&run_arm64_util_linux_authority_tests.step);
     const arm64_bash_source_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"native_unpack.test.protected signed arm64 bash source is validated before fixture mutation"},

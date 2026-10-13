@@ -2129,6 +2129,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_release": ("test-workload-release", (
         "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests",
+        "run_arm64_util_linux_authority_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
@@ -2629,6 +2630,8 @@ PROTECTED_REFERENCE_PATHS = (
     "src/native_alternatives.zig",
     "tools/real-snapshot-less-protected-stage.sh",
     "tools/real-snapshot-bash-protected-stage.sh",
+    "tools/real-snapshot-util-linux-protected-source.sh",
+    "tools/real-snapshot-util-linux-authority.zig",
     "tools/real-snapshot-less-reference.sh",
     "tools/real_snapshot_less_stage.py",
     "tools/real_snapshot_less_fixtures.py",
@@ -3328,6 +3331,57 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     util_source_guard = bash_stage.find('"$zig" build test-real-snapshot-arm64-util-linux-source-protected')
     if util_source_guard < 0 or copies < 0 or util_source_guard > copies:
         failures.append("protected ARM util-linux original source guard must execute before copies/mutations")
+    helper_source_guard = bash_stage.find('bash tools/real-snapshot-util-linux-protected-source.sh "$zig" \\\n')
+    if helper_source_guard < 0 or copies < 0 or helper_source_guard > copies:
+        failures.append("protected ARM helper original source comparison must execute before copies/mutations")
+    helper_source = texts.get("tools/real-snapshot-util-linux-protected-source.sh", "")
+    for invocation in (
+        "evidence=${workspace%/arm-util-linux-source}/evidence",
+        '"$inspector" --protected source "$lock" "$cache" "$evidence/util-linux-helper-native-source.json"',
+        '"$inspector" --protected compare "$lock" "$cache" "$workspace/extracted" "$evidence/util-linux-helper-independent-source.json"',
+    ):
+        if len(re.findall(r"(?m)^" + re.escape(invocation) + r"$", helper_source)) != 1:
+            failures.append(f"protected ARM helper original source lost required invocation: {invocation}")
+    for token in (
+        '/usr/bin/dpkg-deb --extract "$object" "$workspace/extracted/$package"',
+        '$(sha512sum "$object" | cut -d\' \' -f1) == "$digest"',
+        '.callback_admitted == false and .runtime_proved == false',
+        '.independent_extraction_compared == true',
+    ):
+        if token not in helper_source:
+            failures.append(f"protected ARM helper original source comparison lost {token}")
+    helper_inspector = texts.get("tools/real-snapshot-util-linux-authority.zig", "")
+    for name, tokens in (
+        ("verifyLock", (
+            'now >= deadline.integer',
+            'try closureDigest(lock)',
+            'repository.release_sha256',
+            'repository.signer_fingerprints',
+        )),
+        ("source", (
+            'try package.verifyArchive(bytes);',
+            'application.prepare(allocator, bytes',
+            'alias.kind != .hardlink',
+            'try linkCount(&model, interpreter.path) != 2',
+            'matchesSnapshotUtilLinuxPostinst(model.scriptBytes(postinst.*))',
+        )),
+        ("compareFile", (
+            'try pinned.observeStableAlloc(',
+            'entry.link_count != try linkCount(model, expected.path)',
+            'entry.device != target_entry.device or entry.inode != target_entry.inode',
+            'if (model.findFile(child) == null)',
+        )),
+        ("main", (
+            'try verifyLock(allocator, lock.lock, pin_bytes, now);',
+            'try protectedPath(host.root, args[offset + 1], false);',
+            'try report(allocator, lock.lock, cache.root',
+            '.overwrite = .fail_if_exists',
+        )),
+    ):
+        body = helper_inspector.partition(f"fn {name}(")[2].partition("\n}\n")[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"protected ARM helper original source function {name} lost {token}")
     for path, required in (
         ("tools/real_snapshot_less_stage.py", (
             '"util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad")',

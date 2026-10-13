@@ -491,7 +491,7 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                 )
                 rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
                 goals = (("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else
-                         ("dpkg", "bash", "dash", "util-linux", "libc-bin") if purpose == "arm64-bash" else ("dpkg",))
+                         ("dpkg", "bash", "dash", "util-linux", "libc-bin", "ubuntu-minimal") if purpose == "arm64-bash" else ("dpkg",))
                 self.assertEqual(len(rows), 2 * len(goals))
                 for index, package in enumerate(goals):
                     for offset, command in enumerate(("plan", "download")):

@@ -85,6 +85,8 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
   tools/real-snapshot-reference-escape-probe.zig \
+  tools/real-snapshot-util-linux-authority.zig \
+  tools/real-snapshot-util-linux-protected-source.sh \
   src/private_network.zig src/fixtures/script_network_probe.zig \
   tools/prepare-native-dpkg.zig tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
@@ -210,6 +212,14 @@ if [[ $purpose == arm64-less || $purpose == arm64-bash ]]; then
     debz_step "$package-download" download "$snapshot/root" --transaction-backend native --lock-input "$package_lock" "$package"
     authenticated_lock "$package_lock"
   done
+fi
+if [[ $purpose == arm64-bash ]]; then
+  # The full original closure, not the dpkg-only or control-only source lock,
+  # independently binds ARM Perl, systemctl and the helper library archives.
+  package_lock=$evidence/ubuntu-minimal.lock.json
+  debz_step "ubuntu-minimal-plan" plan "$snapshot/root" --transaction-backend native --lock-output "$package_lock" ubuntu-minimal
+  debz_step "ubuntu-minimal-download" download "$snapshot/root" --transaction-backend native --lock-input "$package_lock" ubuntu-minimal
+  authenticated_lock "$package_lock"
 fi
 
 template=$workspace/template
