@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 59), members);
+    try testing.expectEqual(@as(usize, 60), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2639,7 +2639,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
-        "  step native-outcome-build 0 \"\" \"${zenv[@]}\" \"$zig\" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2\n",
+        "  step native-outcome-build 0 \"\" \"${zenv[@]}\" \"$zig\" build build-native-outcome test-native-outcome \\\n    build-native-phase-summary test-native-phase-summary -Doptimize=\"$native_optimize\" -j2\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
         "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-postinst-protected \\\n",

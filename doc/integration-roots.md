@@ -1,5 +1,146 @@
 # Hermetic Debian-family integration roots
 
+## Database capture performance evidence (#345)
+
+The manual `ci.yml` native snapshot selector accepts
+`native_snapshot_optimize=Debug|ReleaseSafe`, `native_phase_telemetry=true|false`
+and `native_database_performance=true|false`. The last selector requires the
+complete **177-package** closure before download/install, not a smaller subset.
+Default behavior remains ReleaseSafe with diagnostics off and the original
+general closure bound. Both architectures continue to use disposable hosted
+Ubuntu runners, protected original inputs, fresh roots, the pinned independent
+dpkg reference, unchanged freshness/deadline/exec-audit checks and bounded
+evidence export. A stale signed Release still blocks all such runs.
+
+Coordinator-owned source/cohort selectors (not a matched timing experiment):
+
+```sh
+gh workflow run ci.yml --ref "$CANDIDATE_REF" \
+  -f run_full_matrix=false -f run_native_real_snapshot=true \
+  -f native_snapshot_optimize=Debug -f native_phase_telemetry=true \
+  -f native_database_performance=true -f run_protected_reference=false
+# Repeat with native_snapshot_optimize=ReleaseSafe.
+```
+
+Each selects `ubuntu-real-snapshot` for amd64/`ubuntu-24.04` and
+arm64/`ubuntu-24.04-arm`. Match the exact candidate/head, tree, original
+workflow/jobs/artifact bytes and build mode before interpreting a result.
+The installed `debz-native-phase-summary` consumes original `create.stderr`
+and `create-native-execution-progress.json`; its checked output is
+`create-native-phase-summary-v1.json`. The latter cannot replace the originals.
+`invocation-identity.txt` retains source/tree/binary/keyring/profile hashes,
+mode, telemetry selection and the expected package count.
+
+### Same-host paired recipe
+
+`tools/native-database-performance-hosted.sh` is a reusable **root-only,
+disposable GitHub-hosted** pair driver; it refuses shared/self-hosted/local
+execution. Its pure selector check and source-only control emitter may run in
+owned local worktrees. It does not dispatch workflows, publish refs,
+change production clocks, remove target Python or grant missing script authority.
+
+The coordinator prepares a common-instrumentation control from the complete
+candidate in another owned branch: restore only the original
+`captureDatabaseSnapshotInto` **body** from accepted
+`06af4d875cf036abd113e6d0e5ef640be6956309`, not the entire file or other authority
+changes. The source-only emitter preserves the candidate's surrounding source,
+four-argument signature and ignored test-observer parameter:
+
+```sh
+git show 06af4d875cf036abd113e6d0e5ef640be6956309:src/native_unpack.zig \
+  > .cache/original-native-unpack.zig
+bash tools/native-database-performance-hosted.sh --emit-control-source \
+  .cache/original-native-unpack.zig src/native_unpack.zig > .cache/control-native-unpack.zig &&
+  cp .cache/control-native-unpack.zig src/native_unpack.zig
+```
+
+Use an owned scratch directory and check the emitter's exit before publication.
+Update only that file's
+SHA-512 entry in `security/native-only-production-policy.json`, audit, and
+regenerate the corresponding `src/native_unpack.zig` digest-inventory row,
+then commit with the standard trailers. The driver verifies this exact original
+body and byte-identical surrounding source, and refuses every other
+source/policy difference. The new substitution test intentionally distinguishes
+the candidate's extra directory-identity checks from the old traversal;
+the control is measurement-only, not a releasable candidate. Do **not**
+compare a historical release or apply instrumentation to one side only.
+Generate full-history `git bundle create ... HEAD` bundles of that control and
+the candidate; the supplied HEADs are checked independently, not fetched into
+shared refs. For overhead pairs both bundles/HEADs are the exact candidate.
+
+Use the existing workflow's root-owned bundle bootstrap to create an
+orchestration checkout at
+`/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}0-$ARCH/checkout`,
+verify its HEAD equals the candidate, and copy both bundles as protected
+root-owned files inside its parent tree. Prerequisites are the same as
+`ubuntu-real-snapshot`; no privileged setup may run on a paid/shared runner.
+From that **protected candidate checkout**, execute:
+
+```sh
+bash tools/native-database-performance-hosted.sh \
+  "$ORCHESTRATOR" "$ARCH" "$MODE" capture "$ORDER" "$SAMPLE" \
+  "$CANDIDATE_SHA" "$CONTROL_SHA" \
+  "$ORCHESTRATOR/candidate.bundle" "$ORCHESTRATOR/control.bundle" \
+  https://snapshot.ubuntu.com/ubuntu/20261001T000000Z resolute
+```
+
+The surrounding root-owned empty-environment launcher must explicitly retain
+the genuine `GITHUB_ACTIONS`, `RUNNER_ENVIRONMENT`, `GITHUB_SHA`,
+`GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_JOB` and `RUNNER_NAME`.
+Select all four cells:
+`ARCH=amd64|arm64` × `MODE=Debug|ReleaseSafe`.
+`capture` executes accepted traversal/control A and scoped traversal/candidate B
+with common telemetry enabled. For logging/clock overhead, select `overhead`,
+set `CONTROL_SHA=CANDIDATE_SHA` and use the candidate bundle twice: A is off,
+B is on. Use reviewed interleaved orders `AB`, `BA`, `AB` with distinct
+`SAMPLE=1,2,3`; every pair must finish on the **same runner**, without concurrent
+benchmark jobs on that runner. Retain runner identity/load information and
+stratify pairs by runner, never present nonmatched jobs as a speedup.
+
+Each slot creates a new protected checkout/toolchain/cache/root, authenticates
+the original snapshot, builds the exact selected mode, executes the unchanged
+complete native wrapper plus independent full reference, and collects original
+root/coordination/script/provenance/exec evidence. The pair checks byte-equal
+locks and status, the existing full-root comparator, original generations,
+artifact/lock/final-state/trigger bindings, durable-record/recovery counts and,
+for capture pairs, all six actual phase operation counts. Root/attempt/inode,
+program and evidence-document identities remain individually verified rather
+than falsely asserted byte-identical across distinct roots.
+
+Retain `pair-identity.txt`, both slot logs/results, `pair-result.txt`,
+`cross-slot-root-comparison.json`, and **both** named `native-upload` trees
+with their original indices. Always use the workflow's existing bounded
+descendant/mount check and named-tree cleanup, including the orchestration tree
+and the two slot trees recorded in `slot-A.txt`/`slot-B.txt`, even on failure.
+If staging fails before `native-upload` exists, also retain its original
+bounded `upload` staging diagnostics rather than making an empty substitute.
+The numeric slot namespace is not the workflow run-attempt: the genuine
+run-attempt is retained unchanged in every invocation's identity.
+One pair must fit the hosted job limit; do not relax the native 180-minute
+install ceiling or reference bound to get a result.
+
+Review complete matched series and off/on overhead, direct monotonic capture,
+import/hash/fsync/serialization deltas and full install wall time, with no
+double-counting of nested timers. Retain actual original crash/restart,
+tampered/missing/stale/partial-database refusals from the same candidate's
+four architecture/mode `test-native-recovery` cohorts as well. Paired successful
+installs alone do not exercise every recovery boundary. Source readiness,
+generated 177-package metadata or an incomplete/refused install is not #345
+acceptance. Publication, hosted execution and issue closure remain coordinator
+decisions.
+
+The recovery selector in each **disposable hosted**, architecture-native
+protected checkout is:
+
+```sh
+"$ZIG" build test-native-recovery \
+  -Dnative-reference-dpkg="$REFERENCE_DPKG" -Doptimize="$MODE" -j2 --summary all
+```
+
+Use that checkout's staged original toolchain/reference and owned `.tmp`
+directory for `TMPDIR`. Do not send this privileged full recovery selector
+to shared or paid runners; only the no-root focused unit selectors belong there.
+
 `zig build test-integration` builds a small deterministic repository, signs its
 `InRelease` with the existing synthetic test-only OpenPGP key, and drives the
 production CLI against disposable cache, state, and dpkg roots under

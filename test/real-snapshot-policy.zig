@@ -16,6 +16,7 @@ const Scenario = struct {
     script_tools: bool = false,
     progress_limit_seconds: []const u8 = "",
     ceiling_seconds: []const u8 = "",
+    expected_package_count: []const u8 = "",
 };
 
 var fixture_compiled = false;
@@ -192,6 +193,8 @@ const Driver = struct {
         defer support.allocator.free(progress_limit);
         const ceiling = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_INSTALL_CEILING_SECONDS={s}", .{config.ceiling_seconds});
         defer support.allocator.free(ceiling);
+        const expected = try std.fmt.allocPrint(support.allocator, "DEBZ_NATIVE_PERFORMANCE_EXPECT_PACKAGES={s}", .{config.expected_package_count});
+        defer support.allocator.free(expected);
         const inherited = try support.run(&.{ "printenv", "PATH" });
         defer inherited.deinit();
         try inherited.ok();
@@ -200,9 +203,9 @@ const Driver = struct {
         const path = try std.fmt.allocPrint(support.allocator, "PATH={s}:{s}", .{ self.work.root, inherited_path });
         defer support.allocator.free(path);
         return support.runIn(&.{
-            "env",                                                                            key,                                                                             calls,                                                                           name,                                                                                     path,                                                                                        execve, injected,    progress_limit,  ceiling,
-            if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0", if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0", if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0", if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0", if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0", "bash", self.script, self.executable, uri,
-            "resolute",                                                                       self.arch,                                                                       self.workspace,
+            "env",                                                                            key,                                                                             calls,                                                                           name,                                                                                     path,                                                                                        execve, injected,    progress_limit,  ceiling, expected,
+            if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0", if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0", if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0", if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0", if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0", "bash", self.script, self.executable, uri,     "resolute",
+            self.arch,                                                                        self.workspace,
         }, .{ .path = self.work.root });
     }
 };
@@ -1933,6 +1936,119 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
         "artifact-summary.txt",
     }) |required| try support.contains(collector, required);
     try testing.expect(std.mem.indexOf(u8, workflow[0..start], "schedule:\n") != null);
+}
+
+test "snapshot: profiling selectors keep exact workload modes and refuse non-hosted execution" {
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        for ([_][]const u8{ "Debug", "ReleaseSafe" }) |mode| {
+            const valid = try support.run(&.{ "bash", "tools/native-database-performance-hosted.sh", "--validate-values", architecture, mode, "capture", "AB", "1" });
+            defer valid.deinit();
+            try valid.ok();
+        }
+    }
+    for ([_][]const u8{ "ReleaseFast", "release-safe", "" }) |mode| {
+        const invalid = try support.run(&.{ "bash", "tools/native-database-performance-hosted.sh", "--validate-values", "amd64", mode, "overhead", "BA", "2" });
+        defer invalid.deinit();
+        try testing.expect(invalid.code != 0);
+    }
+    for ([_][]const u8{ "", "177" }) |expected| {
+        const valid = try support.run(&.{ "bash", "tools/real-snapshot-acceptance.sh", "--validate-performance-values", "Debug", "1", expected });
+        defer valid.deinit();
+        try valid.ok();
+    }
+    for ([_][]const u8{ "175", "0177", "2000" }) |expected| {
+        const invalid = try support.run(&.{ "bash", "tools/real-snapshot-acceptance.sh", "--validate-performance-values", "Debug", "1", expected });
+        defer invalid.deinit();
+        try testing.expect(invalid.code != 0);
+    }
+    const refused = try support.run(&.{ "env", "GITHUB_ACTIONS=false", "RUNNER_ENVIRONMENT=self-hosted", "bash", "tools/native-database-performance-hosted.sh" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 2), refused.code);
+    try support.contains(refused.stderr, "requires a disposable GitHub-hosted root-owned orchestration checkout");
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n").?;
+    const end = std.mem.indexOfPos(u8, workflow, start, "  protected-reference:\n").?;
+    const job = workflow[start..end];
+    for ([_][]const u8{
+        "NATIVE_OPTIMIZE: ${{ inputs.native_snapshot_optimize }}",
+        "NATIVE_EXPECTED_PACKAGES: ${{ inputs.native_database_performance && '177' || '' }}",
+        "DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=\"$NATIVE_OPTIMIZE\"",
+        "DEBZ_NATIVE_PHASE_TELEMETRY=\"$NATIVE_TELEMETRY\"",
+        "DEBZ_NATIVE_PERFORMANCE_EXPECT_PACKAGES=\"$NATIVE_EXPECTED_PACKAGES\"",
+    }) |required| try support.contains(job, required);
+}
+
+test "snapshot: performance consumer refuses a reduced closure before download or install" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .expected_package_count = "177" });
+    defer refused.deinit();
+    try refused.failsWith("database performance requires all 177 packages, got");
+    try expectOperations(&f, &.{ "refresh", "plan" });
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/download.json"));
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create.json"));
+}
+
+test "snapshot: capture control changes only the original traversal body and refuses incomplete source" {
+    var work = try support.Work.init();
+    defer work.deinit();
+    const original =
+        \\pub const authority = "old authority";
+        \\fn captureDatabaseSnapshotInto(
+        \\    owned: Allocator,
+        \\    root: Root,
+        \\    options: Options,
+        \\) !package_database.Snapshot {
+        \\    return original_snapshot;
+        \\}
+        \\pub const progress = "old progress";
+    ++ "\n";
+    const candidate =
+        \\pub const authority = "common accepted authority";
+        \\fn captureDatabaseSnapshotInto(
+        \\    owned: Allocator,
+        \\    root: Root,
+        \\    options: Options,
+        \\    observer: ?DatabaseCaptureObserver,
+        \\) !package_database.Snapshot {
+        \\    _ = observer;
+        \\    return scoped_snapshot;
+        \\}
+        \\pub const progress = "common durable progress";
+    ++ "\n";
+    const expected =
+        \\pub const authority = "common accepted authority";
+        \\fn captureDatabaseSnapshotInto(
+        \\    owned: Allocator,
+        \\    root: Root,
+        \\    options: Options,
+        \\    observer: ?DatabaseCaptureObserver,
+        \\) !package_database.Snapshot {
+        \\    _ = observer;
+        \\    return original_snapshot;
+        \\}
+        \\pub const progress = "common durable progress";
+    ++ "\n";
+    try work.write("original.zig", original);
+    try work.write("candidate.zig", candidate);
+    const original_path = try work.path("original.zig");
+    defer support.allocator.free(original_path);
+    const candidate_path = try work.path("candidate.zig");
+    defer support.allocator.free(candidate_path);
+    const emitted = try support.run(&.{ "bash", "tools/native-database-performance-hosted.sh", "--emit-control-source", original_path, candidate_path });
+    defer emitted.deinit();
+    try emitted.ok();
+    try testing.expectEqualStrings(expected, emitted.stdout);
+    for ([_][]const u8{
+        "pub const no_capture = true;\n",
+        "fn captureDatabaseSnapshotInto(\n) !package_database.Snapshot {\n    return original_snapshot;\n",
+    }) |invalid| {
+        try work.write("original.zig", invalid);
+        const refused = try support.run(&.{ "bash", "tools/native-database-performance-hosted.sh", "--emit-control-source", original_path, candidate_path });
+        defer refused.deinit();
+        try testing.expect(refused.code != 0);
+    }
 }
 
 fn minutesAfter(text: []const u8, marker: []const u8) !u64 {

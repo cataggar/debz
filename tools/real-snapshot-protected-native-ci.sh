@@ -29,6 +29,7 @@ for relative in ("tools/real-snapshot-protected-native-ci.sh",
                  "tools/capture-vendor-state.py",
                  "tools/real_snapshot_reference_paths.py",
                  "zig-out/bin/debz-native-outcome",
+                 "zig-out/bin/debz-native-phase-summary",
                  "zig-out/bin/debz", "zig-out/bin/native-differential",
                  "zig-out/bin/real-snapshot-comparator"):
     protected(checkout / relative)
@@ -47,6 +48,17 @@ protected(Path(sys.argv[2]))
 PY
   mapfile -t inputs <"$tree/native-inputs.args"
   [[ ${#inputs[@]} == 3 ]]
+  python3 -I - "$checkout/tools" "$tree/native-optimize.txt" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import protected
+optimize_file = Path(sys.argv[2])
+protected(optimize_file)
+PY
+  mapfile -t optimize <"$tree/native-optimize.txt"
+  [[ ${#optimize[@]} == 1 && ( ${optimize[0]} == Debug || ${optimize[0]} == ReleaseSafe ) ]]
+  export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}
   export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}
   export ZIG_GLOBAL_CACHE_DIR=$tree/zig-global ZIG_LOCAL_CACHE_DIR=$checkout/.zig-cache
 fi
@@ -139,6 +151,7 @@ copy_optional "$tree/reference-dpkg/usr/bin/dpkg-deb" "$evidence/reference-dpkg-
 copy_optional "$tree/reference-dpkg/reference-receipt-v1.json" "$evidence/reference-receipt-v1.json"
 copy_optional "$tree/evidence" "$evidence/staging"
 copy_optional "$tree/native-inputs.args" "$evidence/native-inputs.args"
+copy_optional "$tree/native-optimize.txt" "$evidence/native-optimize.txt"
 python3 -I - "$checkout/tools" "$work/root" "$evidence" >"$evidence/native-coordination-capture.log" 2>&1 <<'PY' || coordination_status=$?
 import hashlib
 import json

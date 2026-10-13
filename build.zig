@@ -149,6 +149,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-outcome", "Test actual native outcome evidence and failure distinctions").dependOn(&native_outcome_tests.step);
     workload_native.dependOn(&native_outcome_tests.step);
 
+    const native_phase_summary_module = b.createModule(.{
+        .root_source_file = b.path("tools/native-phase-summary.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_phase_summary_module.addImport("debz", debz);
+    const native_phase_summary = b.addExecutable(.{
+        .name = "debz-native-phase-summary",
+        .root_module = native_phase_summary_module,
+    });
+    const install_native_phase_summary = b.addInstallArtifact(native_phase_summary, .{});
+    b.step("build-native-phase-summary", "Build the offline durable-progress telemetry verifier").dependOn(&install_native_phase_summary.step);
+    const run_native_phase_summary_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_phase_summary_module }));
+    b.step("test-native-phase-summary", "Verify monotonic progress bindings, restart counters and invalid evidence refusals").dependOn(&run_native_phase_summary_tests.step);
+    workload_native.dependOn(&run_native_phase_summary_tests.step);
+
     const native_action_empty_lock_module = b.createModule(.{
         .root_source_file = b.path("tools/native-action-empty-lock.zig"),
         .target = target,
@@ -720,6 +736,7 @@ pub fn build(b: *std.Build) void {
     );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
+    audit_step.dependOn(&run_native_phase_summary_tests.step);
     const write_digest_inventory_step = b.step(
         "write-digest-inventory",
         "Regenerate the digest cutover inventories",
@@ -1921,6 +1938,19 @@ pub fn build(b: *std.Build) void {
         phase_telemetry_step.dependOn(&run.step);
     }
     workload_native.dependOn(phase_telemetry_step);
+
+    const database_performance_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "native_unpack.test.scoped database capture refuses",
+            "native_unpack.test.materialization same-phase",
+            "native_recovery.test.phase telemetry",
+        },
+    }));
+    const database_performance_step = b.step("test-native-database-performance", "Run owned-root capture/reuse benchmarks and durable telemetry refusals (not full-root acceptance)");
+    database_performance_step.dependOn(&database_performance_tests.step);
+    database_performance_step.dependOn(phase_telemetry_step);
+    database_performance_step.dependOn(&run_native_phase_summary_tests.step);
 
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,

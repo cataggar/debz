@@ -77,15 +77,45 @@ Fsync measures actual file/directory synchronization through the root filesystem
 helpers; hashing covers package-database content and generation hashes, not
 archive/helper hashing. Aborted processes may have no final log line.
 
+The `native-phase-telemetry-v1` key/value protocol now additionally identifies
+`schema=https://debz.dev/schema/native-phase-telemetry-v1`, `version=1`,
+`clock=awake` and `published`. A published record binds the **already durable**
+canonical progress version, intent digest, record sequence, record digest and
+document digest through `progress_version`, `intent_sha256`,
+`progress_sequence`, `progress_record_sha256` and
+`progress_document_sha256`. The coordinates/stage/result must match that
+record. `attempt_end` is explicitly unpublished, with zero progress version
+and sequence and `-` digests; it is not a success or durable-state claim.
+The context-local diagnostic `sequence` remains distinct from the durable
+chain's sequence and resets on each recovery invocation.
+
+`zig build build-native-phase-summary test-native-phase-summary` builds/tests
+the no-interpreter offline verifier. Invoke
+`zig-out/bin/debz-native-phase-summary /absolute/create.stderr /absolute/progress.json`.
+It uses the production decoder to validate the original complete canonical
+chain, checks exact record bindings, rejects missing/duplicate/out-of-order
+records, wrong coordinates/intent/record/final-document digests, schema drift,
+backwards clocks/counters and mixed attempts, and reports separate invocation
+measurements plus original file SHA-256s. It does not combine clocks across
+process epochs or invocations. A crashed invocation can lack `attempt_end`;
+`all_invocations_finished` reports that rather than inventing its final totals.
+Phase times are inclusive; `maximum_record_gap_ns` is a measured interval
+between diagnostic observations, not an inferred action duration.
+
 These logs are neither durable checkpoints nor authority. They add no fields
 to frozen progress, intent, provenance, database or completion documents and
 never affect a deadline or permission to mutate. Recovery starts fresh counters
 and a fresh monotonic interval/invocation ID; a process restart changes the epoch. Compare
 deltas only within one invocation, not elapsed values across restarts.
-The elapsed timestamps are direct monotonic measurements in the opt-in
-diagnostic stream, **not timestamps added to native progress records**.
-Frozen durable progress schemas and canonical bytes remain unchanged;
-the progress-record timestamp follow-up in issue #345 is not implemented.
+The elapsed timestamps are direct monotonic observations of individually
+identified durable progress records, **not new fields in canonical recovery
+authority**. Frozen progress v1–v4, provenance and generation bytes remain
+unchanged. The profiling wrapper retains the original stderr, the exact
+receipt-retained progress document and the checked summary, fsyncs them and
+the evidence directory, and exports the usual original-evidence SHA-256 index.
+This establishes retained diagnostic provenance on a completed profiling run,
+not a guarantee that stderr survives a machine crash before that final sync.
+Missing diagnostics never authorize recovery and are not repaired or inferred.
 
 State recording borrows its immediately preceding imported database; detailed
 state materialization borrows the same-phase import of its outer capture.
@@ -106,7 +136,7 @@ during capture refuses rather than admitting bytes from a detached namespace.
 This is scoped traversal within one capture, not a retained generation cache,
 an atomic snapshot against another privileged writer, or deferred verification.
 
-The synthetic 1/175-package state-transition checks compare identical inputs
+The synthetic 1/175/177-package state-transition checks compare identical inputs
 against a seam that restores the removed capture/import. They establish fewer
 captures/imports/hashes with equal final generation, status, exact `status-old`,
 mutation and fsync counts; they do not measure a full install before/after.
@@ -118,6 +148,13 @@ controlled full-snapshot speedup evidence.
 `zig build test-native-phase-telemetry` checks configured logging in separate
 processes with the variable absent, disabled, a non-opt-in value and enabled;
 it also runs in the unprivileged native unit workload.
+`zig build test-native-database-performance -Doptimize=Debug -j2` (also
+`ReleaseSafe`) reuses those interleaved owned-root benchmarks, calibrates
+phase-counter clock overhead with telemetry off/on against identical
+177-package metadata, and runs directory-substitution, stale/missing database,
+post-apply drift, crash-ownership and durable-publication controls.
+These generated metadata fixtures have no vendor scripts or full root and
+cannot satisfy the controlled install or full telemetry/logging-overhead gate.
 
 Filesystem and database repair delegates to the existing
 [root mutation layer](root-mutation.md). Missing, corrupt, mismatched, or

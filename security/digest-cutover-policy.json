@@ -402,6 +402,15 @@
       ]
     },
     {
+      "id": "native-phase-durable-progress-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "The four exact profiling-wrapper checks bind diagnostic telemetry to frozen SHA256 native progress intent/record/document digests and its original retained receipt path. These are not package-content authority or recovery-format changes.",
+      "paths": [
+        "tools/real-snapshot-acceptance.sh"
+      ]
+    },
+    {
       "id": "refresh-repository-id-controls",
       "kind": "fixed_64_hex_assumption",
       "classification": "fixed_control_protocol",

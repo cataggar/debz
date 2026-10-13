@@ -22,6 +22,9 @@ readonly maximum_install_ceiling_seconds=$((180 * 60))
 readonly progress_sample_seconds=60
 readonly native_progress_log=var/lib/debz/native-execution-progress-v1.log
 readonly mutation_progress_log=var/lib/debz/root-mutation-v2.log
+readonly phase_telemetry=${DEBZ_NATIVE_PHASE_TELEMETRY:-0}
+readonly expected_packages=${DEBZ_NATIVE_PERFORMANCE_EXPECT_PACKAGES:-}
+readonly snapshot_optimize=${DEBZ_NATIVE_SNAPSHOT_OPTIMIZE:-ReleaseSafe}
 # Reviewed identities of the target root's /usr/bin/dpkg, dpkg-divert and
 # dpkg-statoverride, which maintainer scripts may run in reviewed argument
 # shapes; see "Native exec audit" in doc/integration-roots.md. Bytes, size and
@@ -41,6 +44,12 @@ validate_values() {
   [[ "$uri" == "$pinned_uri" ]]
   [[ "$suite" == "$pinned_suite" ]]
   [[ "$architecture" == amd64 || "$architecture" == arm64 ]]
+}
+
+validate_performance_values() {
+  [[ $1 == Debug || $1 == ReleaseSafe ]] &&
+    [[ $2 == 0 || $2 == 1 ]] &&
+    [[ -z $3 || $3 == 177 ]]
 }
 
 validate() {
@@ -590,11 +599,20 @@ if [[ ${1:-} == --validate-values ]]; then
   validate_values "$2" "$3" "$4"
   exit
 fi
+if [[ ${1:-} == --validate-performance-values ]]; then
+  [[ $# == 4 ]] || exit 2
+  validate_performance_values "$2" "$3" "$4"
+  exit "$?"
+fi
 if [[ ${1:-} == --progress-verdict ]]; then
   [[ $# == 5 ]] || { echo "usage: $0 --progress-verdict ELAPSED PROGRESSED LIMIT CEILING" >&2; exit 2; }
   progress_verdict "$2" "$3" "$4" "$5"
   exit
 fi
+validate_performance_values "$snapshot_optimize" "$phase_telemetry" "$expected_packages" || {
+  echo "invalid native database performance selectors" >&2
+  exit 2
+}
 if [[ ${1:-} == --validate ]]; then
   validate "$2" "$3" "$4"
   exit
@@ -705,6 +723,9 @@ fi
     "$(date -u +%s)" "${GITHUB_WORKFLOW:-local}" "${GITHUB_RUN_ID:-local}" \
     "${GITHUB_RUN_ATTEMPT:-local}" "${GITHUB_JOB:-local}"
   printf 'candidate_backend=native\nreference_backend=pinned-dpkg-oracle\n'
+  printf 'optimization_mode=%s\nphase_telemetry=%s\nexpected_packages=%s\n' \
+    "$snapshot_optimize" "$phase_telemetry" "${expected_packages:-unconstrained}"
+  printf 'source_tree=%s\n' "$(git -C "$(dirname "$0")/.." rev-parse HEAD^{tree})"
   printf 'repository_freshness=frozen_release_with_witnesses:%s:witnesses=resolute-updates,resolute-security:maximum_witness_age=%s\n' \
     "$frozen_release_sha256" "$maximum_release_age_seconds"
   printf 'program_sha256=%s\nkeyring_sha256=%s\n' \
@@ -909,7 +930,12 @@ run() {
     local retry_check=0
     local stderr_bytes
     stderr_bytes=$(stat -c '%s' "$evidence/$name.stderr")
-    if [[ "$name" == refresh || "$name" == download || "$name" == create ]] &&
+    if [[ "$name" == create && "$phase_telemetry" == 1 ]]; then
+      # Full syntax, ordering and canonical-record bindings are checked below;
+      # other stderr remains an error, even during profiling.
+      grep -Evq '^info: native_phase [^[:cntrl:]]+ schema=https://debz.dev/schema/native-phase-telemetry-v1 version=1 clock=awake published=(true|false) progress_version=[0-4] intent_sha256=([0-9a-f]{64}|-) progress_sequence=[0-9]+ progress_record_sha256=([0-9a-f]{64}|-) progress_document_sha256=([0-9a-f]{64}|-)$|^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} http_status=(429|500|502|503|504)$' \
+        "$evidence/$name.stderr" || retry_check=$?
+    elif [[ "$name" == refresh || "$name" == download || "$name" == create ]] &&
       (( stderr_bytes <= 4096 )); then
       grep -Evq '^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} http_status=(429|500|502|503|504)$' \
         "$evidence/$name.stderr" || retry_check=$?
@@ -975,6 +1001,10 @@ package_count=$(jq '.packages | length' "$lock")
 (( download_bytes <= max_download_bytes ))
 (( largest_package <= max_package_bytes ))
 (( package_count <= 2000 ))
+if [[ -n "$expected_packages" && "$package_count" != "$expected_packages" ]]; then
+  echo "database performance requires all $expected_packages packages, got $package_count" >&2
+  exit 1
+fi
 printf 'download_bytes=%s\nlargest_package_bytes=%s\npackage_count=%s\nmetadata_bytes=%s\n' \
   "$download_bytes" "$largest_package" "$package_count" "$metadata_bytes" \
   >"$evidence/bounds.txt"
@@ -986,6 +1016,26 @@ cp "$root/var/lib/debz/native-transaction-provenance-v2.json" \
   "$evidence/create-native-transaction-provenance-v2.json"
 cp "$root/var/lib/debz/root-operation-completion-v2.json" \
   "$evidence/create-root-operation-completion-v2.json"
+if [[ "$phase_telemetry" == 1 ]]; then
+  progress_member=$(jq -er '
+    [.evidence_files[] | select(.kind == "progress") | .path] |
+    if length == 1 then .[0] else error("one retained progress member required") end
+  ' "$evidence/create-native-transaction-provenance-v2.json")
+  [[ "$progress_member" =~ ^var/lib/debz/native-receipts-v1/[0-9a-f]{64}/[A-Za-z0-9._-]+$ ]] || {
+    echo "invalid retained native progress path" >&2
+    exit 1
+  }
+  cp "$root/$progress_member" "$evidence/create-native-execution-progress.json"
+  PATH=/no-host-interpreters "$(dirname "$debz")/debz-native-phase-summary" \
+    "$evidence/create.stderr" "$evidence/create-native-execution-progress.json" \
+    >"$evidence/create-native-phase-summary-v1.json"
+  jq -e '.all_invocations_finished == true and .durable_records > 0' \
+    "$evidence/create-native-phase-summary-v1.json" >/dev/null
+  sync -f "$evidence/create.stderr"
+  sync -f "$evidence/create-native-execution-progress.json"
+  sync -f "$evidence/create-native-phase-summary-v1.json"
+  sync -f "$evidence"
+fi
 cp "$root/var/lib/dpkg/status" "$evidence/status-after-create"
 device_claim=0
 grep -Fqx '/dev/null' "$root/var/lib/dpkg/info/"*.list || device_claim=$?

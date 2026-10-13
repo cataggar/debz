@@ -55,6 +55,15 @@ if [[ ${1:-} == --stage-native ]]; then
   shift
 fi
 readonly mode
+native_optimize=ReleaseSafe
+if [[ $mode == native-staging ]]; then
+  native_optimize=${DEBZ_NATIVE_SNAPSHOT_OPTIMIZE:-ReleaseSafe}
+  [[ $native_optimize == Debug || $native_optimize == ReleaseSafe ]] || {
+    echo "native snapshot optimization must be Debug or ReleaseSafe" >&2
+    exit 2
+  }
+fi
+readonly native_optimize
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
   echo "usage (as root, from the protected clone): $0 TREE ARCHITECTURE COMMIT" >&2
   exit 2
@@ -549,13 +558,14 @@ find zig-pkg "$tree/zig-global" -xdev -perm /0022 ! -type l -printf '%M %u:%g %p
 chmod -R go-w zig-pkg "$tree/zig-global"
 step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \
   "$checkout/zig-pkg" "$evidence/zig-pkg-manifest.txt"
-step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j2
+step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize="$native_optimize" -j2
 chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$checkout/zig-out"
 step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 
 stage_native_inputs() {
-  step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
-  step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2
+  step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize="$native_optimize" -j2
+  step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome \
+    build-native-phase-summary test-native-phase-summary -Doptimize="$native_optimize" -j2
   "$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \
     --download-archive "$tree/reference-dpkg.deb"
   dpkg-deb --extract "$tree/reference-dpkg.deb" "$tree/reference-dpkg"
@@ -566,6 +576,7 @@ stage_native_inputs() {
   install -d -o root -g root -m 0700 "$checkout/.real-snapshot"
   printf '%s\n' "$zig" "$tree/reference-dpkg/usr/bin/dpkg" "$staged_archive_keyring" \
     >"$tree/native-inputs.args"
+  printf '%s\n' "$native_optimize" >"$tree/native-optimize.txt"
   step native-tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 }
 if [[ $mode == native-staging ]]; then

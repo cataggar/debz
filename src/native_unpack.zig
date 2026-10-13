@@ -41561,9 +41561,13 @@ const StatePhaseMeasurement = struct {
 
 // Reproduce only the removed same-phase capture/import, not a second mutation.
 fn measureStatePhase(fixture: *Fixture, recapture: bool, detailed: bool) !StatePhaseMeasurement {
+    return measureStatePhaseConfigured(fixture, recapture, detailed, true);
+}
+
+fn measureStatePhaseConfigured(fixture: *Fixture, recapture: bool, detailed: bool, measured: bool) !StatePhaseMeasurement {
     const root = fixture.root();
     var telemetry = phase_telemetry.Context.init(testing.io, @splat(0));
-    telemetry.attach();
+    if (measured) telemetry.attach();
     defer telemetry.detach();
     const started = std.Io.Clock.awake.now(testing.io);
     var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
@@ -41684,7 +41688,7 @@ fn statePhaseFixture(fixture: *Fixture, owned: std.mem.Allocator, package_count:
 }
 
 test "native_unpack.test.materialization same-phase database reuse interleaves counters and exact state evidence" {
-    for ([_]usize{ 1, 175 }) |package_count| {
+    for ([_]usize{ 1, 175, 177 }) |package_count| {
         var expected: ?StatePhaseMeasurement = null;
         var before: ?StatePhaseMeasurement = null;
         for ([_]bool{ true, false, false, true, true, false }) |recapture| {
@@ -41725,6 +41729,35 @@ test "native_unpack.test.materialization same-phase database reuse interleaves c
                 hex(32, measured.status_old),
             });
         }
+    }
+}
+
+test "native_unpack.test.materialization same-phase telemetry overhead retains exact owned-root evidence" {
+    var expected: ?StatePhaseMeasurement = null;
+    for ([_]bool{ false, true, true, false, false, true }) |measured| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var fixture: Fixture = undefined;
+        try statePhaseFixture(&fixture, arena.allocator(), 177);
+        defer fixture.deinit();
+        const observed = try measureStatePhaseConfigured(&fixture, false, false, measured);
+        if (expected) |original| {
+            try testing.expectEqualDeep(original.generation, observed.generation);
+            try testing.expectEqual(original.status, observed.status);
+            try testing.expectEqual(original.status_old, observed.status_old);
+        } else expected = observed;
+        try testing.expectEqual(@as(u64, if (measured) 2 else 0), observed.capture.count);
+        try testing.expectEqual(@as(u64, if (measured) 2 else 0), observed.imported.count);
+        try testing.expectEqual(@as(u64, if (measured) 364 else 0), observed.hash.count);
+        try testing.expectEqual(@as(u64, if (measured) 1 else 0), observed.mutation.count);
+        try testing.expectEqual(@as(u64, if (measured) 45 else 0), observed.fsync.count);
+        std.debug.print("database-telemetry-calibration packages=177 telemetry={s} elapsed_ns={d} generation={s} status={s} status_old={s}\n", .{
+            if (measured) "enabled" else "disabled",
+            observed.elapsed_ns,
+            hex(32, observed.generation.sha256),
+            hex(32, observed.status),
+            hex(32, observed.status_old),
+        });
     }
 }
 

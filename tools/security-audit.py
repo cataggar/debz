@@ -2116,7 +2116,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_native": ("test-workload-native", (
         "native_dpkg_tests",
-        "run_native_program_corpus_tests", "native_outcome_tests",
+        "run_native_program_corpus_tests", "native_outcome_tests", "run_native_phase_summary_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",
@@ -2621,6 +2621,8 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference.sh",
     "tools/real_snapshot_reference_paths.py",
     "tools/real-snapshot-native-outcome.zig",
+    "tools/native-phase-summary.zig",
+    "tools/native-database-performance-hosted.sh",
     "tools/real-snapshot-python3-protected-stage.sh",
     "tools/real-snapshot-python3-reference.sh",
     "tools/real-snapshot-signed-proc-bindings.sh",
@@ -2771,7 +2773,11 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "  mode=native-staging\n",
     '[[ $mode == proof ]] || prefix=native-ci',
     'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
-    'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2',
+    'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome \\\n'
+    '    build-native-phase-summary test-native-phase-summary -Doptimize="$native_optimize" -j2',
+    'native_optimize=ReleaseSafe\nif [[ $mode == native-staging ]]; then\n'
+    '  native_optimize=${DEBZ_NATIVE_SNAPSHOT_OPTIMIZE:-ReleaseSafe}\n'
+    '  [[ $native_optimize == Debug || $native_optimize == ReleaseSafe ]]',
     '"$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \\\n'
     '    --receipt-from-archive "$tree/reference-dpkg.deb" --prefix "$tree/reference-dpkg"',
     'print(toolchain(Path(sys.argv[2])))',
@@ -2906,6 +2912,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
         "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
         "protected(Path(sys.argv[2]))",
+        "protected(optimize_file)",
+        'export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}',
         '"zig-out/bin/debz-native-outcome",',
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",

@@ -32,6 +32,22 @@ on:
         required: true
         type: boolean
         default: false
+      native_snapshot_optimize:
+        description: "Native snapshot build mode (the protected proof remains ReleaseSafe)"
+        required: true
+        type: choice
+        default: ReleaseSafe
+        options: [Debug, ReleaseSafe]
+      native_phase_telemetry:
+        description: "Retain monotonic native progress diagnostics and verify their durable-record bindings"
+        required: true
+        type: boolean
+        default: false
+      native_database_performance:
+        description: "Require the complete 177-package workload for matched database-performance measurements"
+        required: true
+        type: boolean
+        default: false
       run_protected_reference:
         description: "Stage root-owned inputs and run the protected pinned-dpkg reference proof on amd64 and arm64"
         required: true
@@ -2371,6 +2387,9 @@ jobs:
             runner: ubuntu-24.04-arm
     env:
       ARCHITECTURE: ${{ matrix.architecture }}
+      NATIVE_OPTIMIZE: ${{ inputs.native_snapshot_optimize }}
+      NATIVE_TELEMETRY: ${{ inputs.native_phase_telemetry && '1' || '0' }}
+      NATIVE_EXPECTED_PACKAGES: ${{ inputs.native_database_performance && '177' || '' }}
       PROTECTED_TREE: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -2397,6 +2416,7 @@ jobs:
           git bundle create "$bundle" HEAD
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
             GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            DEBZ_NATIVE_SNAPSHOT_OPTIMIZE="$NATIVE_OPTIMIZE" \
             bash -euo pipefail -c '
             tree=$1 architecture=$2 expected=$3 bundle=$4
             [[ $tree =~ ^/srv/debz-protected/native-ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
@@ -2431,6 +2451,8 @@ jobs:
             GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="$GITHUB_JOB" \
             GITHUB_WORKFLOW="$GITHUB_WORKFLOW" \
+            DEBZ_NATIVE_PHASE_TELEMETRY="$NATIVE_TELEMETRY" \
+            DEBZ_NATIVE_PERFORMANCE_EXPECT_PACKAGES="$NATIVE_EXPECTED_PACKAGES" \
             bash "$PROTECTED_TREE/checkout/tools/real-snapshot-protected-native-ci.sh" \
             native "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"
       - name: Install exact closure with pinned dpkg reference
