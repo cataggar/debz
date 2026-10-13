@@ -64,8 +64,9 @@ script evidence; they are not a free-form script-execution capability.
 
 `zig build build-reference-trigger-authority` installs
 `debz-reference-trigger-authority` at the requested prefix. It is a
-**diagnostic prerequisite producer, not a trigger executor or an admission
-grant**. The full ordering driver retains its unbound-trigger refusal.
+**diagnostic prerequisite producer and independent transition verifier, not a
+trigger executor or an admission grant**. Only the ordering driver and the
+launcher may run the one reviewed handler described below.
 
 `inspect-original ARCH LOCK CACHE` is unprivileged, reads descriptor/no-follow
 inputs without extracting or executing packages, and checks the independently
@@ -83,10 +84,10 @@ configured exact-version libc dependency, unchanged installed control bytes
 and modes, no alternate architecture-suffixed handler, exact NSS bytes and a
 bounded canonical trigger-directory inventory. It preserves the entire status
 source as base64, not a synthesized expected status. Even when these
-prerequisites pass, it emits `execution_authorized: false` and returns
-`UnboundTriggerRuntime`: immutable script/interpreter/helper mounts, PATH
-aliases, late NSS/dlopen/gconv presence/absence bindings, recursive pinned
-dpkg helpers and independent hosted handler execution remain mandatory.
+prerequisites pass, the probe itself never executes: it emits
+`execution_authorized: false`, returns `UnboundTriggerRuntime` and lists what
+remains unproven (the hosted proof at the final head, the unobserved arm64
+pre-handler state and every remaining selected handler).
 Unknown selectors, mixed state, changed dependencies or control bytes,
 unincorporated activations and substituted paths are typed refusals.
 
@@ -125,29 +126,72 @@ remain restricted to disposable hosted runners. No full-root parity has been
 accepted from these source or diagnostic records.
 
 The launcher's guest binding (`guest.json`, see
-[integration roots](integration-roots.md)) now covers the script interpreter,
+[integration roots](integration-roots.md)) covers the script interpreter,
 `ldconfig`, the loader, its libraries and the late NSS/gconv/configuration
-search and absence inputs that a libc-bin handler would use. It does not
-authorize any trigger execution. The single signed handler executor (#265) is
-designed but not implemented, and it requires genuine hosted observations
-first:
+search and absence inputs that a libc-bin handler uses.
 
-- one launcher verb per reviewed handler. The first is libc-bin, run as
-  `dpkg --no-triggers --triggers-only libc-bin:ARCH` and never `--pending`;
-- admission only when libc-bin is `triggers-pending` with exactly `ldconfig`,
-  every other package is `installed` or `triggers-awaited` on exactly
-  libc-bin, the update journal and unincorporated queue are empty, the
-  installed postinst and `triggers` bytes equal the digest-bound signed
-  members, and both the runtime and guest bindings verify;
-- unknown, mixed, recursive (newly activated), failed, cyclic and
-  no-progress (`CycleNoProgress`) states refuse;
-- `verify-transition` must accept the observed before/after status, and the
-  exact terminal status and trigger bytes are retained;
-- expectations come from the signed lock and the hosted reference
-  observations, never from a native root.
+### Single signed trigger handler (#265)
 
-Keep #265 open until hosted runs observe and admit that handler on both
-architectures.
+After the whole closure is configured with `--no-triggers`, the ordering
+driver settles at most one individually reviewed signed handler at a time and
+never uses `--pending`. Its expectations are the signed lock and the genuine
+amd64 pre-handler state that hosted run 38348813924 observed
+(`reference-trigger-authority.json`); none comes from a native root.
+
+- **Operation.** The launcher verb `trigger_libc_bin` runs pinned dpkg with
+  its common reference options plus exactly
+  `--no-triggers --triggers-only libc-bin:amd64`, with profile `none`, under
+  the bound runtime and guest binding. The driver builds that command
+  only for the exact signed libc-bin archive; any other selector, profile,
+  architecture or cycle archive refuses with `UnreviewedTriggerHandler`.
+- **Admission.** The driver re-extracts the signed control members (exact
+  member list, root-owned 0755 postinst and 0644 `triggers` by size and
+  digest, exact package identity and `Depends`). Through descriptor-rooted
+  no-follow reads it then requires an empty update journal, a protected
+  single-link status and the five observed trigger-database files byte- and
+  mode-exact (`File`, empty 0600 `Lock`, empty `Unincorp`, `ldconfig`,
+  `libc-upgrade`). The installed `libc-bin.postinst` and `libc-bin.triggers`
+  must equal the signed members, with no other libc-bin maintainer script
+  and no architecture-qualified copy. libc-bin must be the only libc-bin
+  record and `triggers-pending` on exactly `ldconfig`, with libc6 configured
+  at the signed version. Every other record must be `installed` without
+  awaited triggers or `Config-Version`, except the reviewed independent
+  `procps` `2:4.0.4-9ubuntu1` pending on exactly `/usr/lib/sysctl.d`. Inside the
+  chroot, immediately before exec, the launcher re-verifies the admitted
+  status records, the empty journal, the exact trigger database and the
+  installed controls against its own compiled pins. On any difference it
+  refuses with `ESTALE` before dpkg runs.
+- **Outcome.** The driver retains the exact before and after status and
+  state, then accepts only the one reviewed transition: libc-bin `installed`
+  with its `Triggers-Pending` line removed and every other byte unchanged.
+  Other outcomes refuse without independent verification, including
+  `CycleNoProgress`, `CyclicTriggerActivation`, `RecursiveTriggerActivation`
+  (also for leftover `Unincorp` activations), `ExternalTriggerCallback`,
+  `TriggerHandlerChanged`, `TriggerStateChanged`, `TriggerDatabaseChanged`
+  and `FailedTriggerHandler` (with `-failed.json`). The accepted pair must
+  then also pass `debz-reference-trigger-authority verify-transition amd64
+  BEFORE AFTER`, or the driver refuses with `IndependentTransitionRefused`.
+  Without that verifier it refuses with `IndependentTransitionUnavailable`
+  before the handler runs.
+- **Terminal evidence.** Any trigger refusal, and any pending or awaited
+  state left after the one handler, writes `reference-trigger-terminal.json`.
+  It holds the exact status, trigger-database, journal and pending packages'
+  control bytes, the attempts and `pending_operation_authorized: false`. With
+  the observed pins, procps then refuses as `UnreviewedTriggerHandler`, so
+  the protected amd64 reference still exits nonzero. Its `triggered` postinst
+  runs `sysctl -q --system` unless it detects systemd, a chroot or a
+  container, which would write host kernel settings, so it stays unreviewed.
+- **Handler review.** The signed libc-bin postinst runs, under `set -e`,
+  `ldconfig -r "$DPKG_ROOT/" || ldconfig --verbose -r "$DPKG_ROOT/"`. A first
+  failure is retried verbosely, and only a failed retry fails the handler.
+- **arm64.** No arm64 reference has reached its pre-handler state; in run
+  38348813924 the arm64 reference step was skipped after the native root
+  failed. arm64 therefore refuses with `UnreviewedTriggerHandler` before any
+  handler executes.
+
+Keep #265 open until a hosted run at the final head proves the libc-bin
+transition, and until every remaining selected handler (procps first) and the
+arm64 pre-handler state are reviewed and observed.
 
 ## Installed `triggers` files
 

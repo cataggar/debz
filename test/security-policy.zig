@@ -215,6 +215,8 @@ test "security: actual reference diagnostic commands retain independent failure 
         const events = try f.work.read("events");
         defer support.allocator.free(events);
         try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "authority:inspect-original arm64 {s}/original.lock {s}/original-cache", .{ f.work.root, f.work.root }));
+        // The one reviewed trigger handler may run only with the independent transition verifier.
+        try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "independent-order:tools/real-snapshot-reference-order.py --launcher {s}/launcher --runtime {s}/runtime --architecture arm64 --dpkg {s}/pinned-dpkg --root {s}/reference-root --trigger-authority {s}/trigger-authority-tool/bin/debz-reference-trigger-authority --cache {s}/original-cache --evidence {s}/evidence\n", .{ f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root, f.work.root }));
         const refused = case.order != 0;
         const observations_ok = case.source == 0 and case.native == 0 and case.reference == 0;
         try testing.expectEqual(refused, std.mem.indexOf(u8, events, "authority:probe-trigger-authority") != null);

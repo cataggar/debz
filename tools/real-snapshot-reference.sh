@@ -224,6 +224,7 @@ timeout --signal=TERM --kill-after=30s 40m \
   python3 tools/real-snapshot-reference-order.py \
     --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
+    --trigger-authority "$trigger_authority" \
     --cache "$cache" --evidence "$evidence" || reference_status=$?
 printf '%s\n' "$reference_status" >"$evidence/reference-install.exit-status"
 reference_mutation_status=0

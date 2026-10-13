@@ -719,10 +719,9 @@ pub fn main(init: std.process.Init) !void {
         .outcome = if (probing) "refused" else "source_inspected",
         .reason = "UnboundTriggerRuntime",
         .remaining = .{
-            "immutable canonical script/interpreter/helper mounts and PATH aliases",
-            "late NSS/dlopen/gconv search and optional-module presence/absence bindings",
-            "pinned dpkg-deb/dpkg-split/tar/rm recursive helper runtime",
-            "independent hosted single-handler outcomes and every remaining selected handler",
+            "hosted proof of the bound guest runtime and of the libc-bin single-handler transition at the final head",
+            "arm64 pre-handler trigger state (unobserved: no arm64 reference has reached it)",
+            "every remaining selected handler, procps /usr/lib/sysctl.d first; --pending stays unauthorized",
         },
     }, .{});
     try std.Io.File.stdout().writeStreamingAll(init.io, output);

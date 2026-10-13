@@ -74,7 +74,7 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
 };
 
 const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle, kbd_cycle };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle, break_kbd_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle, break_kbd_cycle, trigger_libc_bin };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -118,6 +118,35 @@ const kbd_cycle = [_]CycleBinding{
     base_cycle[0],
 };
 const kbd_triggers = "# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n";
+// The one reviewed signed trigger handler (#265) and the exact pre-handler
+// state that hosted run 38348813924 observed on amd64 after the closure was
+// configured with --no-triggers. No other handler or architecture is admitted.
+const libc_bin_trigger = struct {
+    const selector = "libc-bin:amd64";
+    const version = "2.43-2ubuntu2.4";
+    const depends = "libc6 (>> 2.43), libc6 (<< 2.44)";
+    const trigger = "ldconfig";
+    const postinst_size = 847;
+    const postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4";
+    const triggers_size = 440;
+    const triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4";
+};
+const IndependentPending = struct { name: []const u8, version: []const u8, trigger: []const u8 };
+const independent_pending = [_]IndependentPending{
+    .{ .name = "procps", .version = "2:4.0.4-9ubuntu1", .trigger = "/usr/lib/sysctl.d" },
+};
+const TriggerFile = struct { name: []const u8, size: usize, mode: u16, sha512: []const u8 };
+const reviewed_trigger_database = [_]TriggerFile{
+    .{ .name = "File", .size = 506, .mode = 0o644, .sha512 = "2e29346ce69bddb1a10d4ebb1e13a09f6fd083264b7af7d68abf2343968834cd48b1572ae0b7b2b6d3ef267b094394683dd3052547a7ed6b177e4774d83067f9" },
+    .{ .name = "Lock", .size = 0, .mode = 0o600, .sha512 = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e" },
+    .{ .name = "Unincorp", .size = 0, .mode = 0o644, .sha512 = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e" },
+    .{ .name = "ldconfig", .size = 9, .mode = 0o644, .sha512 = "bcfb72bee1c74357157290fdbce71b775e7d3a99ba26578b61183e0131eefaf1bf5677e4ba11064d4e5179f1a8d7957501ca70587bfc8cbff7021c8f31b52dea" },
+    .{ .name = "libc-upgrade", .size = 16, .mode = 0o644, .sha512 = "0ceb3fa2819b9a2d4d8bafb2c19869a52b47f026bc3d1917b4c9eb5d2f3d3428a2579567d3e4379f513b481efcb44f3675023171061550778e19697c12c96b67" },
+};
+const trigger_bound_keys = [_][]const u8{
+    "Package",          "Architecture",     "Version",        "Status", "Depends", "Pre-Depends",
+    "Triggers-Pending", "Triggers-Awaited", "Config-Version",
+};
 const CycleKind = enum { base, openssl, kbd };
 const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
 const cycle_graph_keys = [_][]const u8{
@@ -310,7 +339,7 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle or options.verb == .break_kbd_cycle;
+    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle or options.verb == .break_kbd_cycle or options.verb == .trigger_libc_bin;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
@@ -346,6 +375,9 @@ fn validateOptions(options: Options) !void {
     } else if (options.profile == .libgcc_cycle) {
         return error.InvalidCycleProfile;
     }
+    if (options.verb == .trigger_libc_bin and (options.profile != .none or architecture_index != 0 or
+        !std.mem.eql(u8, options.selector.?, libc_bin_trigger.selector)))
+        return error.InvalidTriggerProfile;
     if (options.selector) |selector| {
         if (selector.len == 0 or selector.len > 120 or
             std.mem.indexOfAny(u8, selector, "/ \t\n\x00") != null or selector[0] == '-')
@@ -766,6 +798,165 @@ fn verifyCycleAbsent(path: [:0]const u8) !void {
         return error.CycleCallbackChanged;
     }
     if (linux.errno(present) != .NOENT) return error.CycleCallbackChanged;
+}
+
+/// Admits only the reviewed pre-handler status: libc-bin pending exactly its
+/// own `ldconfig` interest, libc6 configured, the reviewed independent pending
+/// packages left untouched, and every other package installed without awaits.
+fn triggerStatusMatches(status: []const u8) !void {
+    var libc_bin = false;
+    var libc6 = false;
+    var independent = [_]bool{false} ** independent_pending.len;
+    var previous: []const u8 = "";
+    var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+    while (paragraphs.next()) |paragraph| {
+        if (paragraph.len == 0) continue;
+        var keys: [128][]const u8 = undefined;
+        var count: usize = 0;
+        var values = [_]?[]const u8{null} ** trigger_bound_keys.len;
+        var lines = std.mem.splitScalar(u8, paragraph, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == ' ' or line[0] == '\t') {
+                if (count == 0) return error.TriggerStatusMalformed;
+                for (trigger_bound_keys) |key| {
+                    if (std.ascii.eqlIgnoreCase(keys[count - 1], key)) return error.TriggerStatusMalformed;
+                }
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.TriggerStatusMalformed;
+            const rest = line[colon + 1 ..];
+            if (rest.len != 0 and rest[0] != ' ') return error.TriggerStatusMalformed;
+            if (count == keys.len) return error.TriggerStatusMalformed;
+            const key = line[0..colon];
+            for (keys[0..count]) |seen| {
+                if (std.ascii.eqlIgnoreCase(seen, key)) return error.TriggerStatusMalformed;
+            }
+            keys[count] = key;
+            count += 1;
+            for (trigger_bound_keys, 0..) |bound, index| {
+                if (std.ascii.eqlIgnoreCase(key, bound)) values[index] = if (rest.len == 0) rest else rest[1..];
+            }
+        }
+        const name = values[0] orelse return error.TriggerStatusMalformed;
+        const architecture = values[1] orelse return error.TriggerStatusMalformed;
+        const version = values[2] orelse return error.TriggerStatusMalformed;
+        const state = values[3] orelse return error.TriggerStatusMalformed;
+        // dpkg writes status sorted by name; this amd64 closure has one instance per name.
+        if (name.len == 0 or std.mem.order(u8, previous, name) != .lt) return error.DuplicateTriggerIdentity;
+        previous = name;
+        if (values[7] != null) return error.UnreviewedAwaitedTrigger;
+        if (values[8] != null) return error.TriggerStateChanged;
+        const pending = values[6];
+        if (std.mem.eql(u8, name, "libc-bin")) {
+            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, libc_bin_trigger.version) or
+                !std.mem.eql(u8, state, "install ok triggers-pending") or
+                !std.mem.eql(u8, values[4] orelse "", libc_bin_trigger.depends) or values[5] != null or
+                !std.mem.eql(u8, pending orelse "", libc_bin_trigger.trigger))
+                return error.TriggerHandlerStateChanged;
+            libc_bin = true;
+            continue;
+        }
+        const reviewed = for (independent_pending, 0..) |entry, index| {
+            if (std.mem.eql(u8, name, entry.name)) break index;
+        } else null;
+        if (reviewed) |index| {
+            const entry = independent_pending[index];
+            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, entry.version) or
+                !std.mem.eql(u8, state, "install ok triggers-pending") or
+                !std.mem.eql(u8, pending orelse "", entry.trigger))
+                return error.IndependentTriggerChanged;
+            independent[index] = true;
+            continue;
+        }
+        if (pending != null) return error.UnreviewedTriggerHandler;
+        if (!std.mem.eql(u8, state, "install ok installed")) return error.TriggerStateChanged;
+        if (std.mem.eql(u8, name, "libc6")) {
+            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, base_cycle[0].version))
+                return error.TriggerDependencyChanged;
+            libc6 = true;
+        }
+    }
+    if (!libc_bin) return error.TriggerHandlerStateChanged;
+    if (!libc6) return error.TriggerDependencyChanged;
+    if (!std.mem.allEqual(bool, &independent, true)) return error.IndependentTriggerChanged;
+}
+
+fn triggerDirectoryMatches(path: [:0]const u8, comptime names: []const TriggerFile) !void {
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true };
+    const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve_no_symlinks };
+    const fd: i32 = @intCast(try checked(linux.syscall4(
+        .openat2,
+        @bitCast(@as(isize, linux.AT.FDCWD)),
+        @intFromPtr(path.ptr),
+        @intFromPtr(&how),
+        @sizeOf(OpenHow),
+    )));
+    defer _ = linux.close(fd);
+    var seen = [_]bool{false} ** names.len;
+    var bytes: [2048]u8 = undefined;
+    while (true) {
+        const count = try checked(linux.syscall3(.getdents64, @bitCast(@as(isize, fd)), @intFromPtr(&bytes), bytes.len));
+        if (count == 0) break;
+        var offset: usize = 0;
+        while (offset < count) {
+            if (count - offset < 20) return error.TriggerDatabaseChanged;
+            const entry_size = std.mem.readInt(u16, bytes[offset + 16 ..][0..2], .little);
+            if (entry_size < 20 or entry_size > count - offset) return error.TriggerDatabaseChanged;
+            const name = std.mem.sliceTo(bytes[offset + 19 .. offset + entry_size], 0);
+            offset += entry_size;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const index = for (names, 0..) |expected, position| {
+                if (std.mem.eql(u8, name, expected.name)) break position;
+            } else return error.TriggerDatabaseChanged;
+            if (seen[index]) return error.TriggerDatabaseChanged;
+            seen[index] = true;
+        }
+    }
+    if (!std.mem.allEqual(bool, &seen, true)) return error.TriggerDatabaseChanged;
+}
+
+/// Re-verifies, inside the chroot and immediately before exec, the exact
+/// observed state for `dpkg --no-triggers --triggers-only libc-bin:amd64`.
+fn verifyTrigger() !void {
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    try triggerStatusMatches(bytes);
+    protectedAncestors("/var/lib/dpkg/updates/.trigger-check") catch return error.TriggerStateChanged;
+    emptyDirectory("/var/lib/dpkg/updates") catch return error.TriggerStateChanged;
+    protectedAncestors("/var/lib/dpkg/triggers/.trigger-check") catch return error.TriggerDatabaseChanged;
+    try triggerDirectoryMatches("/var/lib/dpkg/triggers", &reviewed_trigger_database);
+    inline for (reviewed_trigger_database) |entry| {
+        const pinned = openVerified(
+            "/var/lib/dpkg/triggers/" ++ entry.name,
+            std.crypto.hash.sha2.Sha512,
+            entry.sha512,
+            entry.size,
+            entry.size,
+        ) catch return error.TriggerDatabaseChanged;
+        _ = linux.close(pinned.fd);
+        if ((pinned.metadata.mode & 0o7777) != entry.mode) return error.TriggerDatabaseChanged;
+    }
+    inline for (.{
+        .{ "postinst", libc_bin_trigger.postinst_size, libc_bin_trigger.postinst_sha256, 0o755 },
+        .{ "triggers", libc_bin_trigger.triggers_size, libc_bin_trigger.triggers_sha256, 0o644 },
+    }) |control| {
+        const pinned = openVerified(
+            "/var/lib/dpkg/info/libc-bin." ++ control[0],
+            std.crypto.hash.sha2.Sha256,
+            control[2],
+            control[1],
+            control[1],
+        ) catch return error.TriggerHandlerChanged;
+        _ = linux.close(pinned.fd);
+        if ((pinned.metadata.mode & 0o7777) != control[3]) return error.TriggerHandlerChanged;
+        verifyCycleAbsent("/var/lib/dpkg/info/libc-bin:amd64." ++ control[0]) catch return error.TriggerHandlerChanged;
+    }
+    inline for (.{ "libc-bin", "libc-bin:amd64" }) |name| {
+        inline for (.{ "preinst", "prerm", "postrm", "config" }) |script| {
+            verifyCycleAbsent("/var/lib/dpkg/info/" ++ name ++ "." ++ script) catch return error.TriggerHandlerChanged;
+        }
+    }
 }
 fn protectedRoot(root: [:0]const u8) !Pinned {
     try protectedAncestors(root);
@@ -1424,6 +1615,11 @@ fn childMain(input: Child) noreturn {
             std.log.err("reference kbd cycle operation refused: {s}", .{@errorName(err)});
             fail(status, 11, .STALE);
         };
+    if (child.options.verb == .trigger_libc_bin)
+        verifyTrigger() catch |err| {
+            std.log.err("reference trigger operation refused: {s}", .{@errorName(err)});
+            fail(status, 11, .STALE);
+        };
     const archive_setup = mountArchive(child);
     if (archive_setup != .SUCCESS) fail(status, 5, archive_setup);
     const proc_setup = mountProc(child);
@@ -1445,6 +1641,7 @@ fn childMain(input: Child) noreturn {
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
         .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
         .break_kbd_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", "kbd:amd64", null },
+        .trigger_libc_bin => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--triggers-only", libc_bin_trigger.selector, null },
     };
     const loader_name = std.fmt.allocPrintSentinel(
         allocator,
@@ -1821,6 +2018,127 @@ test "reference kbd cycle operation never authorizes a console callback or anoth
     changed = options;
     changed.kbd_archives = null;
     try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+}
+
+const trigger_adduser_stanza = "Package: adduser\nStatus: install ok installed\nPriority: important\nArchitecture: all\n" ++
+    "Version: 3.153ubuntu1\nDepends: passwd\nConffiles:\n /etc/adduser.conf cc3493ecd2d09837ffdcc4b7cd13d0ef\n" ++
+    "Description: add and remove users and groups\n This package includes adduser and deluser.\n\n";
+const trigger_libc_bin_stanza = "Package: libc-bin\nEssential: yes\nStatus: install ok triggers-pending\nArchitecture: amd64\n" ++
+    "Multi-Arch: foreign\nVersion: 2.43-2ubuntu2.4\nDepends: libc6 (>> 2.43), libc6 (<< 2.44)\nSuggests: manpages\n" ++
+    "Conffiles:\n /etc/ld.so.conf 4317c6de8564b68d628c21efa96b37e4\nDescription: GNU C Library: Binaries\n" ++
+    "Triggers-Pending: ldconfig\nHomepage: https://www.gnu.org/software/libc/libc.html\n\n";
+const trigger_libc6_stanza = "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nMulti-Arch: same\n" ++
+    "Version: 2.43-2ubuntu2.4\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\n" ++
+    "Description: GNU C Library: Shared libraries\n\n";
+const trigger_procps_stanza = "Package: procps\nStatus: install ok triggers-pending\nArchitecture: amd64\n" ++
+    "Version: 2:4.0.4-9ubuntu1\nDepends: libc6 (>= 2.42)\nDescription: /proc file system utilities\n" ++
+    "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+const trigger_zlib1g_stanza = "Package: zlib1g\nStatus: install ok installed\nArchitecture: amd64\n" ++
+    "Version: 1:1.3.dfsg+really1.3.1-1ubuntu3.1\nDepends: libc6 (>= 2.14)\nDescription: compression library - runtime\n\n";
+const trigger_status_fixture = trigger_adduser_stanza ++ trigger_libc_bin_stanza ++ trigger_libc6_stanza ++
+    trigger_procps_stanza ++ trigger_zlib1g_stanza;
+
+test "reference trigger handler admits only the observed libc-bin pre-handler state" {
+    const allocator = std.testing.allocator;
+    try triggerStatusMatches(trigger_status_fixture);
+    const cases = [_]struct { before: []const u8, after: []const u8, err: anyerror }{
+        .{ .before = "Triggers-Pending: ldconfig\n", .after = "Triggers-Pending: ldconfig libc-upgrade\n", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Triggers-Pending: ldconfig\n", .after = "", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Version: 2.43-2ubuntu2.4\nDepends: libc6 (>>", .after = "Version: 2.43-2ubuntu2.5\nDepends: libc6 (>>", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Depends: libc6 (>> 2.43), libc6 (<< 2.44)\n", .after = "Depends: libc6 (>> 2.43)\n", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Depends: libc6 (>> 2.43), libc6 (<< 2.44)\n", .after = "Depends: libc6 (>> 2.43), libc6 (<< 2.44)\nPre-Depends: dash\n", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Essential: yes\nStatus: install ok triggers-pending\n", .after = "Essential: yes\nStatus: install ok triggers-awaited\n", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Triggers-Pending: ldconfig\n", .after = "Triggers-Pending: ldconfig\n other\n", .err = error.TriggerStatusMalformed },
+        .{ .before = "Depends: libc6 (>> 2.43), libc6 (<< 2.44)\n", .after = "Depends: libc6 (>> 2.43),\n libc6 (<< 2.44)\n", .err = error.TriggerStatusMalformed },
+        .{ .before = "Package: zlib1g\n", .after = "Package: zlib1g\npackage: zlib1g\n", .err = error.TriggerStatusMalformed },
+        .{ .before = "Priority: important\n", .after = "Priority:important\n", .err = error.TriggerStatusMalformed },
+        .{ .before = "Package: libc6\nStatus: install ok installed\n", .after = "Package: libc6\nStatus: install ok unpacked\n", .err = error.TriggerStateChanged },
+        .{ .before = "Version: 2.43-2ubuntu2.4\nDepends: libgcc-s1", .after = "Version: 2.43-2ubuntu2.5\nDepends: libgcc-s1", .err = error.TriggerDependencyChanged },
+        .{ .before = "Architecture: amd64\nMulti-Arch: same\n", .after = "Architecture: arm64\nMulti-Arch: same\n", .err = error.TriggerDependencyChanged },
+        .{ .before = trigger_libc6_stanza, .after = "", .err = error.TriggerDependencyChanged },
+        .{ .before = trigger_libc_bin_stanza, .after = "", .err = error.TriggerHandlerStateChanged },
+        .{ .before = "Triggers-Pending: /usr/lib/sysctl.d\n", .after = "Triggers-Pending: /usr/lib/sysctl.d /etc/sysctl.d\n", .err = error.IndependentTriggerChanged },
+        .{ .before = "Triggers-Pending: /usr/lib/sysctl.d\n", .after = "", .err = error.IndependentTriggerChanged },
+        .{ .before = trigger_procps_stanza, .after = "", .err = error.IndependentTriggerChanged },
+        .{ .before = "Description: compression library - runtime\n", .after = "Description: compression library - runtime\nTriggers-Pending: ldconfig\n", .err = error.UnreviewedTriggerHandler },
+        .{ .before = "Description: compression library - runtime\n", .after = "Description: compression library - runtime\nTriggers-Awaited: libc-bin\n", .err = error.UnreviewedAwaitedTrigger },
+        .{ .before = "Depends: passwd\n", .after = "Depends: passwd\nConfig-Version: 3.152\n", .err = error.TriggerStateChanged },
+        .{ .before = trigger_zlib1g_stanza, .after = trigger_libc6_stanza ++ trigger_zlib1g_stanza, .err = error.DuplicateTriggerIdentity },
+        .{ .before = trigger_procps_stanza, .after = trigger_procps_stanza ++ trigger_procps_stanza, .err = error.DuplicateTriggerIdentity },
+    };
+    for (cases) |case| {
+        try std.testing.expect(std.mem.indexOf(u8, trigger_status_fixture, case.before) != null);
+        const changed = try std.mem.replaceOwned(u8, allocator, trigger_status_fixture, case.before, case.after);
+        defer allocator.free(changed);
+        try std.testing.expectError(case.err, triggerStatusMatches(changed));
+    }
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(allocator);
+    try wide.appendSlice(allocator, "Package: adduser\n");
+    for (0..128) |index| try wide.print(allocator, "X-Field-{d}: value\n", .{index});
+    try std.testing.expectError(error.TriggerStatusMalformed, triggerStatusMatches(wide.items));
+}
+
+test "reference trigger operation is one signed handler, never --pending or another architecture" {
+    const options: Options = .{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
+        .architecture = "amd64",
+        .profile = .none,
+        .verb = .trigger_libc_bin,
+        .selector = "libc-bin:amd64",
+    };
+    try validateOptions(options);
+    var changed = options;
+    changed.architecture = "arm64";
+    try std.testing.expectError(error.InvalidTriggerProfile, validateOptions(changed));
+    for ([_][:0]const u8{ "procps:amd64", "libc-bin", "libc-bin:arm64", "--pending", "-a" }) |selector| {
+        changed = options;
+        changed.selector = selector;
+        try std.testing.expectError(error.InvalidTriggerProfile, validateOptions(changed));
+    }
+    changed = options;
+    changed.profile = .systemd;
+    try std.testing.expectError(error.InvalidTriggerProfile, validateOptions(changed));
+    changed = options;
+    changed.selector = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.archive = "/protected/libc-bin.deb";
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.kbd_archives = .{ "/protected/kbd", "/protected/linux", "/protected/console", "/protected/libc" };
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.verb = .configure;
+    try validateOptions(changed);
+    try std.testing.expect(std.meta.stringToEnum(Verb, "triggers_only") == null);
+    try std.testing.expect(std.meta.stringToEnum(Verb, "pending") == null);
+}
+
+test "reference trigger database inventory is exact" {
+    const io = std.testing.io;
+    const relative = try std.fmt.allocPrint(std.testing.allocator, ".cache/reference-trigger-{d}", .{linux.getpid()});
+    defer std.testing.allocator.free(relative);
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, relative) catch {};
+    defer cwd.deleteTree(io, relative) catch {};
+    try cwd.createDirPath(io, relative);
+    var opened = try cwd.openDir(io, relative, .{});
+    defer opened.close(io);
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try opened.realPath(io, &resolved);
+    const path = try std.testing.allocator.dupeZ(u8, resolved[0..length]);
+    defer std.testing.allocator.free(path);
+    const names = [_]TriggerFile{ reviewed_trigger_database[0], reviewed_trigger_database[3] };
+    try std.testing.expectError(error.TriggerDatabaseChanged, triggerDirectoryMatches(path, &names));
+    for ([_][*:0]const u8{ "File", "ldconfig" }) |name| {
+        _ = linux.close(@intCast(try checked(linux.openat(opened.handle, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644))));
+    }
+    try triggerDirectoryMatches(path, &names);
+    _ = linux.close(@intCast(try checked(linux.openat(opened.handle, "procps", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644))));
+    try std.testing.expectError(error.TriggerDatabaseChanged, triggerDirectoryMatches(path, &names));
 }
 
 test "reference OpenSSL operation cannot become a generic batch or proc profile" {

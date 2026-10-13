@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import contextlib
 import hashlib
@@ -13,11 +14,12 @@ from pathlib import Path
 import re
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import tarfile
 
-from real_snapshot_reference_paths import open_absolute, protected, read_root_file
+from real_snapshot_reference_paths import open_absolute, open_beneath, protected, read_root_file
 
 MAXIMUM_PACKAGES = 2000
 MAXIMUM_PROBES = 10000
@@ -168,6 +170,13 @@ def dpkg_command(
     launcher: Launcher, dpkg: Path, root: Path, architecture: str, profile: str,
     verb: str, package: Package | None = None, cycle: tuple[Package, ...] = (),
 ) -> list[str]:
+    if verb == "trigger_libc_bin":
+        if (architecture != LIBC_BIN_TRIGGER[2] or profile != "none" or cycle or package is None
+                or (package.name, package.version, package.architecture, package.size, package.digest)
+                != LIBC_BIN_TRIGGER):
+            raise TriggerRefusal("UnreviewedTriggerHandler: unauthorized trigger operation")
+        return [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, str(launcher.runtime)]
     if verb == "break_kbd_cycle":
         if (architecture != "amd64" or profile != KBD_CYCLE_PROFILE
             or len(cycle) != len(KBD_CYCLE) or package != cycle[0]
@@ -1008,9 +1017,445 @@ def capture_prestate(
         record.write(f"{package.selector}\t{expected}\t{destination}\n")
 
 
+# --- #265 single signed trigger handler (begin) ---------------------------------
+# After the closure is configured with --no-triggers, pinned dpkg settles one
+# individually reviewed signed handler at a time, never through --pending. Every
+# pin below is the genuine amd64 pre-handler state that hosted run 38348813924
+# observed (reference-trigger-authority.json); the launcher compiles the same pins
+# and re-verifies them inside the chroot immediately before exec. No expectation
+# is ever derived from the native root.
+
+
+class TriggerRefusal(RuntimeError):
+    """No authority to run, or to accept the outcome of, a trigger handler."""
+
+
+LIBC_BIN_TRIGGER = (
+    "libc-bin", "2.43-2ubuntu2.4", "amd64", 700954,
+    "350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f",
+)
+LIBC_BIN_DEPENDS = "libc6 (>> 2.43), libc6 (<< 2.44)"
+LIBC_BIN_MEMBERS = (".", "./conffiles", "./control", "./md5sums", "./postinst", "./triggers")
+LIBC_BIN_CONTROLS = {
+    "postinst": (847, 0o755, "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4"),
+    "triggers": (440, 0o644, "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4"),
+}
+INDEPENDENT_PENDING = {("procps", "amd64"): ("2:4.0.4-9ubuntu1", "/usr/lib/sysctl.d")}
+REVIEWED_TRIGGER_DATABASE = {
+    "File": (506, 0o644, "2e29346ce69bddb1a10d4ebb1e13a09f6fd083264b7af7d68abf2343968834cd48b1572ae0b7b2b6d3ef267b094394683dd3052547a7ed6b177e4774d83067f9"),
+    "Lock": (0, 0o600, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"),
+    "Unincorp": (0, 0o644, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"),
+    "ldconfig": (9, 0o644, "bcfb72bee1c74357157290fdbce71b775e7d3a99ba26578b61183e0131eefaf1bf5677e4ba11064d4e5179f1a8d7957501ca70587bfc8cbff7021c8f31b52dea"),
+    "libc-upgrade": (16, 0o644, "0ceb3fa2819b9a2d4d8bafb2c19869a52b47f026bc3d1917b4c9eb5d2f3d3428a2579567d3e4379f513b481efcb44f3675023171061550778e19697c12c96b67"),
+}
+TRIGGER_CONTROL_SUFFIXES = (*MAINTAINER_SCRIPTS, "triggers")
+MAXIMUM_TRIGGER_FILES = 64
+MAXIMUM_TRIGGER_CONTROLS = 16
+MAXIMUM_STATUS_BYTES = 4 * 1024 * 1024
+TRIGGER_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def trigger_file(directory: int, name: str, limit: int) -> dict:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError(f"trigger state is not a bounded regular file: {name}")
+        data = bytearray()
+        while len(data) <= limit:
+            block = os.read(fd, min(65536, limit + 1 - len(data)))
+            if not block:
+                break
+            data += block
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if len(data) != before.st_size or (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+        before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+    ):
+        raise ValueError(f"trigger state changed while reading: {name}")
+    return {
+        "size": len(data), "mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid,
+        "gid": before.st_gid, "nlink": before.st_nlink,
+        "sha256": hashlib.sha256(data).hexdigest(), "sha512": hashlib.sha512(data).hexdigest(),
+        "content_base64": base64.b64encode(bytes(data)).decode("ascii"),
+    }
+
+
+def trigger_directory(parent: int, name: str, owner: tuple[int, int]) -> int:
+    fd = os.open(name, TRIGGER_DIRECTORY, dir_fd=parent)
+    meta = os.fstat(fd)
+    if (meta.st_uid, meta.st_gid) != owner or stat.S_IMODE(meta.st_mode) & 0o022:
+        os.close(fd)
+        raise ValueError(f"unprotected trigger state directory: {name}")
+    return fd
+
+
+def trigger_entries(directory: int, label: str) -> dict[str, dict]:
+    names = sorted(os.listdir(directory))
+    if len(names) > MAXIMUM_TRIGGER_FILES:
+        raise ValueError(f"trigger state directory exceeds bound: {label}")
+    return {name: trigger_file(directory, name, MAXIMUM_CONTROL_BYTES) for name in names}
+
+
+def trigger_state(root: Path, controls: tuple[tuple[str, str], ...] = ()) -> dict:
+    """Bounded, descriptor-rooted bytes of every database input a handler can change."""
+    try:
+        root_fd = open_absolute(root, directory=True)
+        opened: list[int] = []
+        try:
+            meta = os.fstat(root_fd)
+            owner = meta.st_uid, meta.st_gid
+            database = open_beneath(root_fd, "var/lib", directory=True)
+            opened.append(database)
+            database = trigger_directory(database, "dpkg", owner)
+            opened.append(database)
+            status = trigger_file(database, "status", MAXIMUM_STATUS_BYTES)
+            state = {"owner": list(owner), "status": status}
+            for name in ("updates", "triggers"):
+                fd = trigger_directory(database, name, owner)
+                opened.append(fd)
+                state["trigger_database" if name == "triggers" else name] = trigger_entries(fd, name)
+            info = trigger_directory(database, "info", owner)
+            opened.append(info)
+            selected: dict[str, dict] = {}
+            for package, architecture in controls[:MAXIMUM_TRIGGER_CONTROLS]:
+                for prefix in (package, f"{package}:{architecture}"):
+                    for suffix in TRIGGER_CONTROL_SUFFIXES:
+                        name = f"{prefix}.{suffix}"
+                        try:
+                            os.stat(name, dir_fd=info, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        selected[name] = trigger_file(info, name, MAXIMUM_CONTROL_BYTES)
+            state["controls"] = selected
+            state["controls_truncated"] = len(controls) > MAXIMUM_TRIGGER_CONTROLS
+            return state
+        finally:
+            for fd in reversed(opened):
+                os.close(fd)
+            os.close(root_fd)
+    except (OSError, ValueError) as error:
+        raise TriggerRefusal(f"TriggerStateChanged: {error}") from error
+
+
+def status_bytes(state: dict) -> bytes:
+    return base64.b64decode(state["status"]["content_base64"], validate=True)
+
+
+def trigger_records(status: bytes) -> dict[tuple[str, str], dict[str, str]]:
+    try:
+        stanzas = control_fields(status)
+    except ValueError as error:
+        raise TriggerRefusal(f"TriggerStatusMalformed: {error}") from error
+    records: dict[tuple[str, str], dict[str, str]] = {}
+    for fields in stanzas:
+        key = fields.get("package", ""), fields.get("architecture", "")
+        if (not NAME.fullmatch(key[0]) or not NAME.fullmatch(key[1])
+                or not fields.get("version") or not fields.get("status")):
+            raise TriggerRefusal("TriggerStatusMalformed: incomplete package identity")
+        if key in records:
+            raise TriggerRefusal(f"DuplicateTriggerIdentity: {key[0]}:{key[1]}")
+        records[key] = fields
+    return records
+
+
+def signed_libc_bin_controls(package: Package) -> dict[str, bytes]:
+    try:
+        verify_archive(package)
+        result = subprocess.run(
+            ["dpkg-deb", "--ctrl-tarfile", str(package.archive)],
+            env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            check=True, timeout=30,
+        )
+        if len(result.stdout) > MAXIMUM_CONTROL_BYTES or result.stderr:
+            raise ValueError("oversized or noisy control archive")
+        signed: dict[str, bytes] = {}
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            members = archive.getmembers()
+            names = [member.name for member in members]
+            if sorted(names) != sorted(LIBC_BIN_MEMBERS):
+                raise ValueError(f"control members differ: {names}")
+            by_name = {member.name: member for member in members}
+            for name, (size, mode, digest) in LIBC_BIN_CONTROLS.items():
+                member = by_name[f"./{name}"]
+                handle = archive.extractfile(member) if member.isreg() else None
+                data = handle.read(size + 1) if handle is not None else b""
+                if (member.uid or member.gid or member.size != size or stat.S_IMODE(member.mode) != mode
+                        or len(data) != size or hashlib.sha256(data).hexdigest() != digest):
+                    raise ValueError(f"signed {name} differs")
+                signed[name] = data
+            control = archive.extractfile(by_name["./control"]) if by_name["./control"].isreg() else None
+            if control is None:
+                raise ValueError("missing control")
+            fields, = control_fields(control.read(MAXIMUM_PROBE_OUTPUT + 1))
+    except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
+        raise TriggerRefusal(f"TriggerHandlerChanged: signed libc-bin controls: {error}") from error
+    if ((fields.get("package"), fields.get("version"), fields.get("architecture"))
+            != (package.name, package.version, package.architecture)
+            or fields.get("depends", "") != LIBC_BIN_DEPENDS or fields.get("pre-depends", "")):
+        raise TriggerRefusal("TriggerDependencyChanged: signed libc-bin control fields differ")
+    return signed
+
+
+def admit_libc_bin_trigger(root: Path, packages: list[Package]) -> tuple[Package, dict]:
+    name, version, architecture, size, digest = LIBC_BIN_TRIGGER
+    matches = [package for package in packages if package.name == name]
+    if len(matches) != 1 or (
+        matches[0].version, matches[0].architecture, matches[0].size, matches[0].digest,
+    ) != (version, architecture, size, digest):
+        raise TriggerRefusal("UnreviewedTriggerHandler: libc-bin archive differs from the reviewed handler")
+    package = matches[0]
+    signed = signed_libc_bin_controls(package)
+    state = trigger_state(root, ((name, architecture),))
+    owner = tuple(state["owner"])
+    def protected_entry(entry: dict) -> bool:
+        return (entry["uid"], entry["gid"]) == owner and entry["nlink"] == 1 and not entry["mode"] & 0o022
+    if state["updates"]:
+        raise TriggerRefusal("TriggerStateChanged: unsettled database journal before the handler")
+    if not protected_entry(state["status"]):
+        raise TriggerRefusal("TriggerStateChanged: unprotected status database")
+    database = state["trigger_database"]
+    if set(database) != set(REVIEWED_TRIGGER_DATABASE) or any(
+        (database[entry]["size"], database[entry]["mode"], database[entry]["sha512"]) != pin
+        or not protected_entry(database[entry])
+        for entry, pin in REVIEWED_TRIGGER_DATABASE.items()
+    ):
+        raise TriggerRefusal("TriggerDatabaseChanged: trigger database differs from the reviewed pre-handler state")
+    controls = state["controls"]
+    if set(controls) != {f"{name}.{control}" for control in LIBC_BIN_CONTROLS} or any(
+        base64.b64decode(controls[f"{name}.{control}"]["content_base64"]) != signed[control]
+        or controls[f"{name}.{control}"]["mode"] != mode
+        or not protected_entry(controls[f"{name}.{control}"])
+        for control, (_, mode, _) in LIBC_BIN_CONTROLS.items()
+    ):
+        raise TriggerRefusal("TriggerHandlerChanged: installed libc-bin controls differ from the signed archive")
+    records = trigger_records(status_bytes(state))
+    if [key for key in records if key[0] == name] != [(name, architecture)]:
+        raise TriggerRefusal("MixedSelectedTriggerState: libc-bin:amd64 is not the one selected record")
+    independent = set()
+    for key, fields in records.items():
+        if "triggers-awaited" in fields:
+            raise TriggerRefusal(f"UnreviewedAwaitedTrigger: {key[0]}:{key[1]}")
+        if "config-version" in fields:
+            raise TriggerRefusal(f"TriggerStateChanged: {key[0]}:{key[1]} records a configuration version")
+        pending = fields.get("triggers-pending")
+        if key == (name, architecture):
+            if (fields["version"] != version or fields["status"] != "install ok triggers-pending"
+                    or fields.get("depends") != LIBC_BIN_DEPENDS or "pre-depends" in fields
+                    or pending != "ldconfig"):
+                raise TriggerRefusal("MixedSelectedTriggerState: libc-bin:amd64 is not pending exactly ldconfig")
+        elif key in INDEPENDENT_PENDING:
+            if (fields["version"], pending) != INDEPENDENT_PENDING[key] or fields["status"] != "install ok triggers-pending":
+                raise TriggerRefusal(f"IndependentTriggerChanged: {key[0]}:{key[1]}")
+            independent.add(key)
+        elif pending is not None:
+            raise TriggerRefusal(f"UnreviewedTriggerHandler: {key[0]}:{key[1]} ({pending})")
+        elif fields["status"] != "install ok installed":
+            raise TriggerRefusal(f"TriggerStateChanged: {key[0]}:{key[1]} is {fields['status']}")
+    if records.get(("libc6", architecture), {}).get("version") != BASE_CYCLE[0][1]:
+        raise TriggerRefusal("TriggerDependencyChanged: libc6:amd64 is not configured at the signed version")
+    if independent != set(INDEPENDENT_PENDING):
+        raise TriggerRefusal("IndependentTriggerChanged: reviewed independent pending handler missing")
+    return package, state
+
+
+def expected_libc_bin_status(before: bytes) -> bytes:
+    lines = before.decode("utf-8").split("\n")
+    starts = [index for index, line in enumerate(lines)
+              if line == "Package: libc-bin" and (index == 0 or lines[index - 1] == "")]
+    if len(starts) != 1:
+        raise TriggerRefusal("MixedSelectedTriggerState: no unique libc-bin stanza")
+    start = end = starts[0]
+    while end < len(lines) and lines[end]:
+        end += 1
+    stanza = lines[start:end]
+    if (stanza.count("Status: install ok triggers-pending") != 1
+            or stanza.count("Triggers-Pending: ldconfig") != 1 or "Architecture: amd64" not in stanza):
+        raise TriggerRefusal("MixedSelectedTriggerState: libc-bin stanza is not the reviewed pending record")
+    settled = ["Status: install ok installed" if line == "Status: install ok triggers-pending" else line
+               for line in stanza if line != "Triggers-Pending: ldconfig"]
+    return "\n".join(lines[:start] + settled + lines[end:]).encode("utf-8")
+
+
+def libc_bin_transition_refusal(before: dict, after: dict) -> str | None:
+    """Classifies everything but the one reviewed libc-bin transition."""
+    old = trigger_records(status_bytes(before))
+    try:
+        new = trigger_records(status_bytes(after))
+    except TriggerRefusal as error:
+        return f"TriggerDatabaseChanged: status after the handler: {error}"
+    selected = new.get(("libc-bin", "amd64"))
+    if selected is None:
+        return "TriggerDatabaseChanged: libc-bin:amd64 record vanished"
+    pending = selected.get("triggers-pending", "").split()
+    if selected["status"] != "install ok installed" or pending or "triggers-awaited" in selected:
+        if (status_bytes(after) == status_bytes(before) and not after["updates"]
+                and after["trigger_database"] == before["trigger_database"]):
+            return "CycleNoProgress: libc-bin:amd64 handler left the database unchanged"
+        if "ldconfig" in pending:
+            return "CyclicTriggerActivation: libc-bin:amd64 handler re-activated its own ldconfig interest"
+        if pending:
+            return "RecursiveTriggerActivation: libc-bin:amd64 left pending " + " ".join(pending[:8])
+        return f"TriggerDatabaseChanged: libc-bin:amd64 ended {selected['status']!r}"
+    if after["updates"]:
+        return "TriggerStateChanged: unsettled database journal after the handler"
+    if after["trigger_database"].get("Unincorp", {}).get("size"):
+        return "RecursiveTriggerActivation: the handler left unincorporated trigger activations"
+    if after["trigger_database"] != before["trigger_database"]:
+        return "TriggerDatabaseChanged: trigger interest database changed during the handler"
+    if after["controls"] != before["controls"]:
+        return "TriggerHandlerChanged: libc-bin controls changed during the handler"
+    if set(new) != set(old):
+        return "ExternalTriggerCallback: the handler added or removed package records"
+    for key, fields in old.items():
+        if key == ("libc-bin", "amd64"):
+            continue
+        current = new[key]
+        if (current.get("triggers-pending"), current.get("triggers-awaited")) != (
+            fields.get("triggers-pending"), fields.get("triggers-awaited"),
+        ):
+            return f"RecursiveTriggerActivation: {key[0]}:{key[1]} trigger state changed"
+        if current != fields:
+            return f"ExternalTriggerCallback: {key[0]}:{key[1]} changed"
+    if status_bytes(after) != expected_libc_bin_status(status_bytes(before)):
+        return "TriggerDatabaseChanged: status bytes differ from the one reviewed libc-bin transition"
+    return None
+
+
+def run_libc_bin_trigger(
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+    authority: Path | None, attempts: list[dict],
+) -> dict:
+    if authority is None:
+        raise TriggerRefusal(
+            "IndependentTransitionUnavailable: no independent trigger authority; libc-bin:amd64 not executed"
+        )
+    package, before = admit_libc_bin_trigger(root, packages)
+    command = dpkg_command(launcher, dpkg, root, architecture, "none", "trigger_libc_bin", package)
+    def path(suffix: str) -> Path:
+        return evidence / f"reference-trigger-libc-bin-{suffix}"
+    def record(phase: str, state: dict | None, **extra) -> None:
+        with path(f"{phase}.json").open("x") as output:
+            output.write(json.dumps({
+                "schema": "io.github.cataggar.debz.reference-trigger-handler.v1",
+                "selector": package.selector, "archive_sha512": package.digest,
+                "argv": command[3:], "postinst_argv": ["triggered", "ldconfig"],
+                "phase": phase, "state": state, **extra,
+            }, sort_keys=True) + "\n")
+    with path("before.status").open("xb") as output:
+        output.write(status_bytes(before))
+    record("before", before)
+    attempts.append({"selector": package.selector, "argv": command[3:], "outcome": "started"})
+    try:
+        apply(command, environment, stdout, stderr)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        attempts[-1]["outcome"] = "failed"
+        try:
+            failed, failure = trigger_state(root, (("libc-bin", "amd64"),)), None
+        except TriggerRefusal as unreadable:
+            failed, failure = None, str(unreadable)
+        record("failed", failed, error=str(error), state_error=failure)
+        raise TriggerRefusal(f"FailedTriggerHandler: libc-bin:amd64: {error}") from error
+    attempts[-1]["outcome"] = "refused"
+    after = trigger_state(root, (("libc-bin", "amd64"),))
+    with path("after.status").open("xb") as output:
+        output.write(status_bytes(after))
+    record("after", after)
+    reason = libc_bin_transition_refusal(before, after)
+    if reason is not None:
+        raise TriggerRefusal(reason)
+    try:
+        verified = subprocess.run(
+            [str(authority), "verify-transition", "amd64",
+             str(path("before.status")), str(path("after.status"))],
+            env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            check=False, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise TriggerRefusal(f"IndependentTransitionRefused: {error}") from error
+    with path("transition.json").open("x") as output:
+        output.write(json.dumps({
+            "schema": "io.github.cataggar.debz.reference-trigger-transition.v1",
+            "argv": ["verify-transition", "amd64", path("before.status").name, path("after.status").name],
+            "returncode": verified.returncode,
+            "stdout": verified.stdout[:MAXIMUM_PROBE_OUTPUT].decode("utf-8", errors="replace"),
+            "stderr": verified.stderr[:MAXIMUM_PROBE_OUTPUT].decode("utf-8", errors="replace"),
+        }, sort_keys=True) + "\n")
+    if verified.returncode:
+        raise TriggerRefusal(
+            "IndependentTransitionRefused: "
+            + verified.stderr[:512].decode("utf-8", errors="replace").strip()
+        )
+    attempts[-1]["outcome"] = "settled"
+    return after
+
+
+def retain_trigger_terminal(root: Path, evidence: Path, architecture: str,
+                            attempts: list[dict], reason: str) -> None:
+    state = trigger_state(root)
+    try:
+        records, parse_error = trigger_records(status_bytes(state)), None
+    except TriggerRefusal as error:
+        records, parse_error = {}, str(error)
+    selected = tuple(sorted(key for key, fields in records.items()
+                            if "triggers-pending" in fields or "triggers-awaited" in fields))
+    if selected:
+        with_controls = trigger_state(root, selected)
+        if with_controls["status"] != state["status"]:
+            raise ValueError("trigger state changed while retaining terminal evidence")
+        state = with_controls
+    with (evidence / "reference-trigger-terminal.json").open("x") as output:
+        output.write(json.dumps({
+            "schema": "io.github.cataggar.debz.reference-trigger-terminal.v1",
+            "architecture": architecture, "reason": reason, "attempts": attempts,
+            "accepted": [attempt["selector"] for attempt in attempts if attempt["outcome"] == "settled"],
+            "pending": [{"selector": f"{name}:{arch}", "status": records[(name, arch)]["status"],
+                         "triggers_pending": records[(name, arch)].get("triggers-pending", ""),
+                         "triggers_awaited": records[(name, arch)].get("triggers-awaited", "")}
+                        for name, arch in selected],
+            "status_parse_error": parse_error, "state": state,
+            "pending_operation_authorized": False,
+        }, sort_keys=True) + "\n")
+
+
+def process_triggers(
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+    authority: Path | None,
+) -> None:
+    attempts: list[dict] = []
+    try:
+        if architecture != "amd64":
+            raise TriggerRefusal(
+                f"UnreviewedTriggerHandler: no reviewed handler or observed pre-handler state for {architecture}"
+            )
+        run_libc_bin_trigger(launcher, dpkg, root, evidence, architecture, packages,
+                             environment, stdout, stderr, authority, attempts)
+        records = trigger_records(status_bytes(trigger_state(root)))
+        unsettled = sorted(f"{name}:{arch} ({fields.get('triggers-pending', fields['status'])})"
+                           for (name, arch), fields in records.items()
+                           if fields["status"] != "install ok installed" or "triggers-pending" in fields
+                           or "triggers-awaited" in fields)
+        if unsettled:
+            raise TriggerRefusal(
+                "UnreviewedTriggerHandler: " + ", ".join(unsettled[:20])
+                + ": no reviewed signed handler; --pending and multi-package trigger processing are not authorized"
+            )
+    except TriggerRefusal as refusal:
+        try:
+            retain_trigger_terminal(root, evidence, architecture, attempts, str(refusal))
+        except (OSError, ValueError, TriggerRefusal) as error:
+            refusal.add_note(f"terminal trigger evidence was not retained: {error}")
+        raise
+# --- #265 single signed trigger handler (end) -----------------------------------
+
+
 def install(
     launcher: Launcher, dpkg: Path, root: Path, cache: Path, evidence: Path,
     architecture: str, prestates: tuple[Prestate, ...] = (),
+    trigger_authority: Path | None = None,
 ) -> None:
     packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
     targets = {prestate.selector: prestate for prestate in prestates}
@@ -1171,11 +1616,8 @@ def install(
         raise RuntimeError("prestate package was never configured")
     if len(configured) != len(packages):
         raise ValueError("reference closure not fully configured")
-    raise RuntimeError(
-        "reference trigger closure refused: the launcher has no exact triggered "
-        "postinst identity/profile or single-package trigger operation; --pending "
-        "and multi-package ordering are not authorized"
-    )
+    process_triggers(launcher, dpkg, root, evidence, architecture, packages,
+                     environment, stdout, stderr, trigger_authority)
 
 
 def report(root: Path, cache: Path, evidence: Path) -> None:
@@ -1216,6 +1658,10 @@ def main() -> None:
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument(
+        "--trigger-authority", type=Path, metavar="DEBZ_REFERENCE_TRIGGER_AUTHORITY",
+        help="independent verifier of the one reviewed signed trigger handler transition",
+    )
+    parser.add_argument(
         "--prestate", type=parse_prestate, action="append", default=[],
         metavar="PACKAGE:ARCH=STATUS:DESTINATION",
         help="copy the root just before configuring PACKAGE, then stop after the last copy",
@@ -1233,6 +1679,10 @@ def main() -> None:
     protected(args.runtime, directory=True)
     protected(args.cache, directory=True)
     protected(args.evidence, directory=True)
+    if args.trigger_authority is not None:
+        if not args.trigger_authority.is_absolute() or args.prestate or args.prove_base_cycle is not None:
+            raise TriggerRefusal("IndependentTransitionUnavailable: invalid trigger authority request")
+        protected(args.trigger_authority)
     if args.prove_base_cycle is not None:
         if args.architecture != "amd64" or args.prestate:
             raise CycleRefusal("CycleProofPrestate: requires amd64 and no capture targets")
@@ -1241,7 +1691,7 @@ def main() -> None:
         return
     install(
         Launcher(args.launcher, args.runtime), args.dpkg, args.root, args.cache, args.evidence,
-        args.architecture, tuple(args.prestate),
+        args.architecture, tuple(args.prestate), args.trigger_authority,
     )
 
 

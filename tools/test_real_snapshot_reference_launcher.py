@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import hashlib
 import io
@@ -905,11 +906,279 @@ class ReferenceLauncherTests(unittest.TestCase):
                               return_value={("fixture", "amd64"): ("install ok unpacked", "1")}),
             mock.patch.object(ORDER, "apply") as applied,
         ):
-            with self.assertRaisesRegex(RuntimeError, "no exact triggered postinst identity"):
+            with self.assertRaisesRegex(ORDER.TriggerRefusal, "IndependentTransitionUnavailable"):
                 ORDER.install(self.launcher, self.root / "dpkg",
                               self.root, self.root / "cache", evidence, "amd64")
         self.assertEqual([args.args[0][5] for args in applied.call_args_list],
                          ["unpack", "configure"])
+
+    TRIGGER_STATUS = (
+        "Package: libc-bin\nEssential: yes\nStatus: install ok triggers-pending\nArchitecture: amd64\n"
+        "Version: 2.43-2ubuntu2.4\nDepends: libc6 (>> 2.43), libc6 (<< 2.44)\n"
+        "Description: synthetic unit fixture\n continuation\nTriggers-Pending: ldconfig\n\n"
+        "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n\n"
+        "Package: procps\nStatus: install ok triggers-pending\nArchitecture: amd64\n"
+        "Version: 2:4.0.4-9ubuntu1\nTriggers-Pending: /usr/lib/sysctl.d\n\n"
+        "Package: tzdata\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n"
+    )
+    TRIGGER_DATABASE = {"File": (b"/usr/lib/sysctl.d procps/noawait\n", 0o644), "Lock": (b"", 0o600),
+                        "Unincorp": (b"", 0o644), "ldconfig": (b"libc-bin\n", 0o644)}
+    TRIGGER_CONTROLS = {"postinst": (b"#!/bin/sh\nset -e\nldconfig\n", 0o755),
+                        "triggers": (b"interest-await ldconfig\n", 0o644)}
+
+    def trigger_fixture(self, name: str) -> tuple[Path, list]:
+        """Synthetic pins only: the genuine pins are compiled into the launcher too."""
+        self.enterContext(mock.patch.object(ORDER, "REVIEWED_TRIGGER_DATABASE", {
+            entry: (len(data), mode, hashlib.sha512(data).hexdigest())
+            for entry, (data, mode) in self.TRIGGER_DATABASE.items()}))
+        self.enterContext(mock.patch.object(ORDER, "LIBC_BIN_CONTROLS", {
+            control: (len(data), mode, hashlib.sha256(data).hexdigest())
+            for control, (data, mode) in self.TRIGGER_CONTROLS.items()}))
+        root = self.root / name
+        for relative in ("", "var", "var/lib", "var/lib/dpkg", "var/lib/dpkg/info",
+                         "var/lib/dpkg/triggers", "var/lib/dpkg/updates"):
+            (root / relative).mkdir(exist_ok=True)
+            (root / relative).chmod(0o755)
+        files = {"status": (self.TRIGGER_STATUS.encode(), 0o644),
+                 "info/procps.postinst": (b"#!/bin/sh\nsysctl -q --system || true\n", 0o755),
+                 "info/procps.triggers": (b"interest-noawait /usr/lib/sysctl.d\n", 0o644),
+                 **{f"triggers/{entry}": value for entry, value in self.TRIGGER_DATABASE.items()},
+                 **{f"info/libc-bin.{control}": value for control, value in self.TRIGGER_CONTROLS.items()}}
+        for relative, (data, mode) in files.items():
+            (root / "var/lib/dpkg" / relative).write_bytes(data)
+            (root / "var/lib/dpkg" / relative).chmod(mode)
+        package, version, architecture, size, digest = ORDER.LIBC_BIN_TRIGGER
+        return root, [ORDER.Package(package, version, architecture, digest, size, self.root / "libc-bin.deb")]
+
+    def trigger_control_tar(self, changes: dict) -> bytes:
+        members = {".": (None, 0o755), "./conffiles": (b"", 0o644), "./md5sums": (b"", 0o644),
+                   "./control": (b"Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n"
+                                 b"Depends: libc6 (>> 2.43), libc6 (<< 2.44)\n", 0o644),
+                   **{f"./{name}": value for name, value in self.TRIGGER_CONTROLS.items()}, **changes}
+        data = io.BytesIO()
+        with tarfile.open(fileobj=data, mode="w") as archive:
+            for name, (content, mode) in members.items():
+                member = tarfile.TarInfo(name)
+                member.mode = mode
+                if content is None:
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                else:
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+        return data.getvalue()
+
+    def test_trigger_command_is_only_the_reviewed_libc_bin_operation(self) -> None:
+        name, version, architecture, size, digest = ORDER.LIBC_BIN_TRIGGER
+        package = ORDER.Package(name, version, architecture, digest, size, self.root / "libc-bin.deb")
+        command = ORDER.dpkg_command(self.launcher, self.root / "dpkg", self.root,
+                                     "amd64", "none", "trigger_libc_bin", package)
+        self.assertEqual(command[3:], ["amd64", "none", "trigger_libc_bin", "libc-bin:amd64",
+                                       str(self.launcher.runtime)])
+        procps = ORDER.Package("procps", "2:4.0.4-9ubuntu1", "amd64", "b" * 128, 1, self.root / "procps.deb")
+        changed = ORDER.Package(name, version, architecture, "0" * 128, size, package.archive)
+        for arch, profile, selected, cycle in (
+            ("arm64", "none", package, ()), ("amd64", "systemd", package, ()), ("amd64", "none", procps, ()),
+            ("amd64", "none", changed, ()), ("amd64", "none", None, ()), ("amd64", "none", package, (package,)),
+        ):
+            with (self.subTest(arch=arch, profile=profile, selected=selected, cycle=len(cycle)),
+                  self.assertRaisesRegex(ORDER.TriggerRefusal, "UnreviewedTriggerHandler")):
+                ORDER.dpkg_command(self.launcher, self.root / "dpkg", self.root,
+                                   arch, profile, "trigger_libc_bin", selected, cycle)
+        # Both executors must admit the same observed pre-handler state.
+        launcher = (TOOLS / "real-snapshot-reference-launcher.zig").read_text()
+        for pin in (*(sha512 for _, _, sha512 in ORDER.REVIEWED_TRIGGER_DATABASE.values()),
+                    *(sha256 for _, _, sha256 in ORDER.LIBC_BIN_CONTROLS.values())):
+            self.assertIn(f'"{pin}"', launcher)
+
+    def test_trigger_admission_refuses_every_unreviewed_pre_handler_state(self) -> None:
+        status = self.TRIGGER_STATUS
+        libc6 = "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n"
+        procps = ("Package: procps\nStatus: install ok triggers-pending\nArchitecture: amd64\n"
+                  "Version: 2:4.0.4-9ubuntu1\nTriggers-Pending: /usr/lib/sysctl.d\n\n")
+        def database(relative: str, data: bytes):
+            return lambda root: (root / "var/lib/dpkg" / relative).write_bytes(data)
+        def replaced(old: str, new: str):
+            return database("status", status.replace(old, new, 1).encode())
+        def swapped(root: Path) -> None:
+            (root / "var/lib/dpkg/info/libc-bin.triggers").unlink()
+            (root / "var/lib/dpkg/info/libc-bin.triggers").symlink_to("procps.triggers")
+        name, version, architecture, size, digest = ORDER.LIBC_BIN_TRIGGER
+        foreign = [ORDER.Package(name, version, architecture, "0" * 128, size, self.root / "libc-bin.deb")]
+        cases = (
+            ("admitted", None, None, {}, None),
+            ("archive", None, foreign, {}, "UnreviewedTriggerHandler: libc-bin archive differs"),
+            ("member", None, None, {"./preinst": (b"#!/bin/sh\n", 0o755)}, "TriggerHandlerChanged: signed"),
+            ("mode", None, None, {"./postinst": (self.TRIGGER_CONTROLS["postinst"][0], 0o775)},
+             "TriggerHandlerChanged: signed"),
+            ("depends", None, None, {"./control": (b"Package: libc-bin\nVersion: 2.43-2ubuntu2.4\n"
+                                                    b"Architecture: amd64\nDepends: libc6\n", 0o644)},
+             "TriggerDependencyChanged"),
+            ("journal", database("updates/0000", b"Package: libc-bin\n"), None, {}, "TriggerStateChanged: unsettled"),
+            ("unincorporated", database("triggers/Unincorp", b"ldconfig libc-bin\n"), None, {}, "TriggerDatabaseChanged"),
+            ("interest", database("triggers/procps", b"x\n"), None, {}, "TriggerDatabaseChanged"),
+            ("installed", database("info/libc-bin.postinst", b"#!/bin/sh\nexit 0\n"), None, {}, "TriggerHandlerChanged"),
+            ("qualified", database("info/libc-bin:amd64.prerm", b""), None, {}, "TriggerHandlerChanged"),
+            ("swapped", swapped, None, {}, "TriggerStateChanged"),
+            ("writable", lambda root: (root / "var/lib/dpkg/status").chmod(0o664), None, {}, "TriggerStateChanged"),
+            ("linked", lambda root: os.link(root / "var/lib/dpkg/status", root / "var/lib/dpkg/status-old"),
+             None, {}, "TriggerStateChanged"),
+            ("malformed", database("status", b"Package: libc-bin\nStatus install\n\n"), None, {}, "TriggerStatusMalformed"),
+            ("duplicate", database("status", (status + procps).encode()), None, {}, "DuplicateTriggerIdentity"),
+            ("foreign", database("status", (status + libc6.replace("libc6", "libc-bin").replace("amd64", "arm64")
+                                            + "\n").encode()), None, {}, "MixedSelectedTriggerState"),
+            ("mixed", replaced("Triggers-Pending: ldconfig", "Triggers-Pending: ldconfig libc-upgrade"), None, {},
+             "MixedSelectedTriggerState"),
+            ("awaited", replaced("Version: 1\n", "Version: 1\nTriggers-Awaited: libc-bin\n"), None, {},
+             "UnreviewedAwaitedTrigger: tzdata:all"),
+            ("unreviewed", replaced("Version: 1\n", "Version: 1\nTriggers-Pending: /usr/share/man\n"), None, {},
+             "UnreviewedTriggerHandler: tzdata:all"),
+            ("configuring", replaced("Version: 1\n", "Version: 1\nConfig-Version: 1\n"), None, {},
+             "TriggerStateChanged: tzdata:all"),
+            ("unconfigured", replaced("tzdata\nStatus: install ok installed", "tzdata\nStatus: install ok half-configured"),
+             None, {}, "TriggerStateChanged: tzdata:all"),
+            ("independent", replaced("/usr/lib/sysctl.d", "/etc/sysctl.d"), None, {}, "IndependentTriggerChanged"),
+            ("absent", replaced(procps, ""), None, {}, "IndependentTriggerChanged: reviewed independent"),
+            ("dependency", replaced(libc6, libc6.replace("ubuntu2.4", "ubuntu2.5")), None, {}, "TriggerDependencyChanged"),
+        )
+        for label, mutate, packages, members, refusal in cases:
+            with self.subTest(label=label):
+                root, reviewed = self.trigger_fixture(label)
+                if mutate is not None:
+                    mutate(root)
+                control = self.trigger_control_tar(members)
+                with (mock.patch.object(ORDER, "verify_archive"),
+                      mock.patch.object(ORDER.subprocess, "run", side_effect=lambda command, **_:
+                                        subprocess.CompletedProcess(command, 0, control, b""))):
+                    if refusal is None:
+                        package, state = ORDER.admit_libc_bin_trigger(root, reviewed)
+                        self.assertEqual(package, reviewed[0])
+                        self.assertEqual(sorted(state["controls"]), ["libc-bin.postinst", "libc-bin.triggers"])
+                        continue
+                    with self.assertRaisesRegex(ORDER.TriggerRefusal, refusal):
+                        ORDER.admit_libc_bin_trigger(root, packages or reviewed)
+
+    def trigger_authorities(self) -> tuple[Path, Path, Path]:
+        record = self.root / "authority-argv"
+        accepting, refusing = self.root / "accepting-authority", self.root / "refusing-authority"
+        accepting.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{record}'\nexit 0\n")
+        refusing.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{record}'\necho 'error: TriggerStateChanged' >&2\nexit 1\n")
+        accepting.chmod(0o755)
+        refusing.chmod(0o755)
+        return accepting, refusing, record
+
+    def run_trigger_case(self, label: str, effect, architecture: str, authority: Path | None,
+                         refusal: str) -> tuple[Path, bytes, dict, mock.MagicMock]:
+        root, packages = self.trigger_fixture(label)
+        evidence = self.root / f"{label}-evidence"
+        evidence.mkdir()
+        before = (root / "var/lib/dpkg/status").read_bytes()
+        signed = {control: data for control, (data, _) in self.TRIGGER_CONTROLS.items()}
+        with (mock.patch.object(ORDER, "signed_libc_bin_controls", return_value=signed),
+              mock.patch.object(ORDER, "apply", side_effect=effect) as applied,
+              self.assertRaisesRegex(ORDER.TriggerRefusal, refusal)):
+            ORDER.process_triggers(self.launcher, self.root / "dpkg", root, evidence, architecture,
+                                   packages, {}, evidence / "out", evidence / "err", authority)
+        terminal = json.loads((evidence / "reference-trigger-terminal.json").read_text())
+        self.assertRegex(terminal["reason"], refusal)
+        self.assertFalse(terminal["pending_operation_authorized"])
+        return evidence, before, terminal, applied
+
+    @staticmethod
+    def settle_libc_bin(command: list[str], *_) -> None:
+        status = Path(command[1]) / "var/lib/dpkg/status"
+        replacement = status.with_name("status.new")
+        replacement.write_bytes(ORDER.expected_libc_bin_status(status.read_bytes()))
+        replacement.chmod(0o644)
+        os.replace(replacement, status)
+
+    def test_one_reviewed_trigger_handler_runs_once_then_unreviewed_pending_refuses(self) -> None:
+        accepting, refusing, record = self.trigger_authorities()
+        evidence, before, terminal, applied = self.run_trigger_case(
+            "verified", self.settle_libc_bin, "amd64", accepting,
+            r"UnreviewedTriggerHandler: procps:amd64 \(/usr/lib/sysctl.d\): no reviewed signed handler; "
+            r"--pending and multi-package trigger processing are not authorized")
+        self.assertEqual([call.args[0][3:] for call in applied.call_args_list],
+                         [["amd64", "none", "trigger_libc_bin", "libc-bin:amd64", str(self.launcher.runtime)]])
+        before_path = evidence / "reference-trigger-libc-bin-before.status"
+        after_path = evidence / "reference-trigger-libc-bin-after.status"
+        self.assertEqual(before_path.read_bytes(), before)
+        self.assertEqual(after_path.read_bytes(), ORDER.expected_libc_bin_status(before))
+        self.assertEqual(record.read_text().splitlines(),
+                         ["verify-transition", "amd64", str(before_path), str(after_path)])
+        self.assertEqual(json.loads((evidence / "reference-trigger-libc-bin-transition.json").read_text())["returncode"], 0)
+        self.assertEqual((terminal["accepted"], [entry["selector"] for entry in terminal["pending"]]),
+                         (["libc-bin:amd64"], ["procps:amd64"]))
+        retained = terminal["state"]["controls"]
+        self.assertEqual(sorted(retained), ["procps.postinst", "procps.triggers"])
+        self.assertEqual(base64.b64decode(retained["procps.triggers"]["content_base64"]),
+                         b"interest-noawait /usr/lib/sysctl.d\n")
+        record.unlink()
+        evidence, _, terminal, _ = self.run_trigger_case(
+            "refused", self.settle_libc_bin, "amd64", refusing,
+            "IndependentTransitionRefused: error: TriggerStateChanged")
+        self.assertEqual(json.loads((evidence / "reference-trigger-libc-bin-transition.json").read_text())["returncode"], 1)
+        self.assertEqual((terminal["accepted"], terminal["attempts"][0]["outcome"]), ([], "refused"))
+        record.unlink()
+        for label, architecture, authority, refusal in (
+            ("foreign", "arm64", accepting, "UnreviewedTriggerHandler: no reviewed handler or observed pre-handler state for arm64"),
+            ("unverified", "amd64", None, "IndependentTransitionUnavailable"),
+        ):
+            with self.subTest(label=label):
+                _, _, terminal, applied = self.run_trigger_case(label, self.settle_libc_bin, architecture,
+                                                                authority, refusal)
+                applied.assert_not_called()
+                self.assertEqual(terminal["attempts"], [])
+        self.assertFalse(record.exists())
+
+    def test_trigger_handler_outcomes_beyond_the_reviewed_transition_refuse_unverified(self) -> None:
+        accepting, _, record = self.trigger_authorities()
+        def rewrite(change):
+            def effect(command: list[str], *_) -> None:
+                dpkg = Path(command[1]) / "var/lib/dpkg"
+                before = (dpkg / "status").read_bytes()
+                change(dpkg, before, ORDER.expected_libc_bin_status(before))
+            return effect
+        def failed(command: list[str], *_) -> None:
+            raise subprocess.CalledProcessError(1, command[:1])
+        extra = b"Package: extra\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n"
+        cases = (
+            ("no-progress", rewrite(lambda dpkg, before, settled: None), "CycleNoProgress"),
+            ("cyclic", rewrite(lambda dpkg, before, settled: (dpkg / "triggers/Unincorp").write_bytes(
+                b"ldconfig libc-bin\n")), "CyclicTriggerActivation"),
+            ("recursive-self", rewrite(lambda dpkg, before, settled: (dpkg / "status").write_bytes(before.replace(
+                b"Triggers-Pending: ldconfig", b"Triggers-Pending: libc-upgrade"))),
+             "RecursiveTriggerActivation: libc-bin:amd64 left pending libc-upgrade"),
+            ("recursive-other", rewrite(lambda dpkg, before, settled: (dpkg / "status").write_bytes(settled.replace(
+                b"Version: 1\n", b"Version: 1\nTriggers-Pending: /usr/share/man\n"))),
+             "RecursiveTriggerActivation: tzdata:all"),
+            ("deferred", rewrite(lambda dpkg, before, settled: ((dpkg / "status").write_bytes(settled),
+                                                                (dpkg / "triggers/Unincorp").write_bytes(b"x\n"))),
+             "RecursiveTriggerActivation: the handler left unincorporated"),
+            ("external", rewrite(lambda dpkg, before, settled: (dpkg / "status").write_bytes(settled.replace(
+                b"Version: 1\n", b"Version: 2\n"))), "ExternalTriggerCallback: tzdata:all"),
+            ("added", rewrite(lambda dpkg, before, settled: (dpkg / "status").write_bytes(settled + extra)),
+             "ExternalTriggerCallback: the handler added"),
+            ("selected", rewrite(lambda dpkg, before, settled: (dpkg / "status").write_bytes(settled.replace(
+                b"Essential: yes\n", b""))), "TriggerDatabaseChanged: status bytes differ"),
+            ("journal", rewrite(lambda dpkg, before, settled: ((dpkg / "status").write_bytes(settled),
+                                                               (dpkg / "updates/0000").write_bytes(b"x"))),
+             "TriggerStateChanged: unsettled database journal"),
+            ("handler", rewrite(lambda dpkg, before, settled: ((dpkg / "status").write_bytes(settled),
+                                                               (dpkg / "info/libc-bin.postinst").write_bytes(b"#!/bin/sh\n"))),
+             "TriggerHandlerChanged"),
+            ("failed", failed, "FailedTriggerHandler: libc-bin:amd64"),
+        )
+        for label, effect, refusal in cases:
+            with self.subTest(label=label):
+                evidence, _, terminal, applied = self.run_trigger_case(label, effect, "amd64", accepting, refusal)
+                self.assertEqual(applied.call_count, 1)
+                self.assertEqual(terminal["accepted"], [])
+                outcome = "failed" if label == "failed" else "refused"
+                self.assertEqual(terminal["attempts"][0]["outcome"], outcome)
+                self.assertTrue((evidence / f"reference-trigger-libc-bin-{'failed.json' if label == 'failed' else 'after.status'}").is_file())
+                self.assertFalse((evidence / "reference-trigger-libc-bin-transition.json").exists())
+        self.assertFalse(record.exists())
 
     def test_dry_run_hands_child_only_write_only_append_output_fds(self) -> None:
         evidence = self.root / "evidence"
@@ -1074,7 +1343,9 @@ class ReferenceLauncherTests(unittest.TestCase):
             ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .break_kbd_cycle)\n        verifyCycle(.kbd)'),
             ("tools/real-snapshot-reference-order.py", 'before = verify_kbd_cycle(root, cycle)'),
             ("tools/real-snapshot-reference-order.py", 'expected[("kbd", "amd64")]["status"] = "install ok installed"'),
-            ("tools/real-snapshot-reference-order.py", '"reference trigger closure refused: the launcher has no exact triggered "'),
+            ("tools/real-snapshot-reference-order.py", '[str(authority), "verify-transition", "amd64",'),
+            ("tools/real-snapshot-reference-order.py", '": no reviewed signed handler; --pending and multi-package trigger processing are not authorized"'),
+            ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .trigger_libc_bin)\n        verifyTrigger() catch |err| {'),
         ):
             with self.subTest(path=path, token=token):
                 changed = dict(texts)
@@ -1618,7 +1889,7 @@ class ReferenceLauncherTests(unittest.TestCase):
                         ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                       self.root, self.root, "amd64", targets)
                     else:
-                        with self.assertRaisesRegex(RuntimeError, "reference trigger closure refused"):
+                        with self.assertRaisesRegex(ORDER.TriggerRefusal, "IndependentTransitionUnavailable"):
                             ORDER.install(self.launcher, self.root / "dpkg", self.root,
                                           self.root, self.root, "amd64", targets)
                 self.assertEqual(configured, ["sudo-rs"] if capture_requested else ["sudo", "sudo-rs"])

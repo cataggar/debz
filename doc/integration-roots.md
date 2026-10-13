@@ -940,7 +940,8 @@ contracts remain separate follow-ups.
 
 This is **not yet an executable full parity gate**: the closed launcher
 refuses `--configure --pending`, `--triggers-only --pending` and **also**
-single-package trigger actions. A disposable unprivileged dpkg 1.22.22
+every single-package trigger action except the one reviewed `libc-bin:amd64`
+handler (see [native triggers](native-triggers.md)). A disposable unprivileged dpkg 1.22.22
 two-listener fixture shows `--no-triggers --triggers-only listener-a` runs
 only A and leaves B pending; `--no-triggers --configure seed` runs only
 seed. Without `--no-triggers`, configuring seed also runs an unrelated
@@ -956,15 +957,17 @@ authorize arbitrary signed scripts.
 `tools/test_real_snapshot_reference_triggers.py` requires an explicitly
 selected, SHA256-checked pinned dpkg fixture and never runs as root.
 
-A safe later single-listener operation would have to bind the selected
+A safe single-listener operation has to bind the selected
 listener's **triggered** script bytes to the exact authenticated archive,
 verify the pinned installed script, status/trigger queue and version again
 in the launcher before exec, establish that no other script is invoked, and
-compare per-listener ordering and state with pinned dpkg. The current
+compare per-listener ordering and state with pinned dpkg. The reviewed
+`libc-bin:amd64` handler is the first such reference operation; its hosted
+proof and native comparison remain outstanding. The current
 launcher's normal configure path has an exact
 `["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
-profile for any of them. The Python command builder refuses all trigger
-verbs, including attempts to reuse those configure-only profiles. Until
+profile for any of them. The Python command builder refuses every other trigger
+verb, including attempts to reuse those configure-only profiles. Until
 these distinct identities and closure ordering are proved, finalization
 refuses rather than silently changing `--pending` behavior. Privileged
 namespace/archive-mount, death/timeout cleanup and
