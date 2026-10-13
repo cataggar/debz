@@ -552,6 +552,25 @@ pub fn build(b: *std.Build) void {
     reference_runtime_test_step.dependOn(&run_reference_runtime_tests.step);
     workload_core.dependOn(&run_reference_runtime_tests.step);
 
+    const reference_trigger_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-trigger.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_trigger_module.addImport("debz", debz);
+    const reference_trigger = b.addExecutable(.{
+        .name = "debz-reference-trigger-authority",
+        .root_module = reference_trigger_module,
+    });
+    const install_reference_trigger = b.addInstallArtifact(reference_trigger, .{});
+    b.step("build-reference-trigger-authority", "Build signed single-handler reference prerequisites without granting execution")
+        .dependOn(&install_reference_trigger.step);
+    const reference_trigger_tests = b.addTest(.{ .root_module = reference_trigger_module });
+    const run_reference_trigger_tests = b.addRunArtifact(reference_trigger_tests);
+    b.step("test-real-snapshot-reference-trigger-authority", "Test exact selected-handler state, independent transitions and late NSS refusals")
+        .dependOn(&run_reference_trigger_tests.step);
+    workload_core.dependOn(&run_reference_trigger_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,

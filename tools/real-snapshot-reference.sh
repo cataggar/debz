@@ -62,6 +62,7 @@ for path in (repository, repository / ".real-snapshot", workspace, cache):
 for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real-snapshot-reference-launcher.zig",
              repository / "tools/real-snapshot-reference-runtime.zig",
+             repository / "tools/real-snapshot-reference-trigger.zig",
              repository / "src/private_network.zig",
              repository / "tools/real-snapshot-reference-order.py",
              repository / "tools/real_snapshot_reference_paths.py",
@@ -201,11 +202,50 @@ runtime="$workspace/reference-runtime"
 "$workspace/runtime-tool/bin/debz-reference-runtime" record \
   "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+"$zig" build build-reference-trigger-authority -Doptimize=ReleaseSafe \
+  --cache-dir "$workspace/reference-zig-cache" \
+  --global-cache-dir "$workspace/reference-zig-global-cache" \
+  --prefix "$workspace/trigger-authority-tool"
+trigger_authority=$workspace/trigger-authority-tool/bin/debz-reference-trigger-authority
+source_authority_status=0
+"$trigger_authority" inspect-original "$architecture" "$lock" "$cache" \
+  >"$evidence/reference-trigger-original-source.json" \
+  2>"$evidence/reference-trigger-original-source.stderr" || source_authority_status=$?
+printf '%s\n' "$source_authority_status" >"$evidence/reference-trigger-original-source.exit-status"
+native_mutation_status=0
+"$trigger_authority" capture-mutations "$workspace/root" \
+  >"$evidence/native-mutating-tools-state.json" \
+  2>"$evidence/native-mutating-tools-state.stderr" || native_mutation_status=$?
+printf '%s\n' "$native_mutation_status" >"$evidence/native-mutating-tools-state.exit-status"
+reference_status=0
 timeout --signal=TERM --kill-after=30s 40m \
   python3 tools/real-snapshot-reference-order.py \
     --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
-    --cache "$cache" --evidence "$evidence"
+    --cache "$cache" --evidence "$evidence" || reference_status=$?
+printf '%s\n' "$reference_status" >"$evidence/reference-install.exit-status"
+reference_mutation_status=0
+"$trigger_authority" capture-mutations "$reference_root" \
+  >"$evidence/reference-mutating-tools-state.json" \
+  2>"$evidence/reference-mutating-tools-state.stderr" || reference_mutation_status=$?
+printf '%s\n' "$reference_mutation_status" >"$evidence/reference-mutating-tools-state.exit-status"
+if (( reference_status != 0 )); then
+  authority_status=0
+  "$trigger_authority" probe-trigger-authority \
+    "$architecture" "$lock" "$cache" "$reference_root" "libc-bin:$architecture" \
+    >"$evidence/reference-trigger-authority.json" \
+    2>"$evidence/reference-trigger-authority.stderr" || authority_status=$?
+  printf '%s\n' "$authority_status" >"$evidence/reference-trigger-authority.exit-status"
+  # Diagnostics must never replace the original independent refusal with success.
+  exit "$reference_status"
+fi
+(( source_authority_status == 0 && native_mutation_status == 0 && reference_mutation_status == 0 )) || {
+  echo "reference source or mutating-tool evidence prerequisite failed" >&2
+  exit 1
+}
+"$trigger_authority" compare-mutations \
+  "$evidence/reference-mutating-tools-state.json" "$evidence/native-mutating-tools-state.json" \
+  >"$evidence/mutating-tools-comparison.json" 2>"$evidence/mutating-tools-comparison.stderr"
 python3 tools/real-snapshot-reference-order.py \
   --report-only --architecture "$architecture" \
   --root "$reference_root" --cache "$cache" --evidence "$evidence"

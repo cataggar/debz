@@ -60,6 +60,70 @@ awaited state rather than claim that every package is installed. Dynamic
 script activations are constrained by bound trigger-handler identity and
 script evidence; they are not a free-form script-execution capability.
 
+## Protected reference prerequisites (#263, #265, #334)
+
+`zig build build-reference-trigger-authority` installs
+`debz-reference-trigger-authority` at the requested prefix. It is a
+**diagnostic prerequisite producer, not a trigger executor or an admission
+grant**. The full ordering driver retains its unbound-trigger refusal.
+
+`inspect-original ARCH LOCK CACHE` is unprivileged, reads descriptor/no-follow
+inputs without extracting or executing packages, and checks the independently
+authenticated original `libc-bin 2.43-2ubuntu2.4` archives separately for amd64
+and arm64. Their 847-byte postinst and 440-byte trigger member are digest- and
+mode-bound. Its output records exact authenticated dash, static ldconfig,
+libc, loader and default NSS members, dependency graph and proposed single
+`--no-triggers --triggers-only libc-bin:ARCH` operation. The original NSS
+configuration requires `files`, `dns`, `db` and `nis`; ELF `DT_NEEDED`
+enumeration alone does not authorize those late lookups.
+
+`probe-trigger-authority ARCH LOCK CACHE ROOT SELECTOR` additionally requires
+protected root-owned inputs, one exact `ldconfig` pending callback, the
+configured exact-version libc dependency, unchanged installed control bytes
+and modes, no alternate architecture-suffixed handler, exact NSS bytes and a
+bounded canonical trigger-directory inventory. It preserves the entire status
+source as base64, not a synthesized expected status. Even when these
+prerequisites pass, it emits `execution_authorized: false` and returns
+`UnboundTriggerRuntime`: immutable script/interpreter/helper mounts, PATH
+aliases, late NSS/dlopen/gconv presence/absence bindings, recursive pinned
+dpkg helpers and independent hosted handler execution remain mandatory.
+Unknown selectors, mixed state, changed dependencies or control bytes,
+unincorporated activations and substituted paths are typed refusals.
+
+`verify-transition ARCH BEFORE_STATUS AFTER_STATUS` checks *observed*
+single-handler status transitions: stable independent package/control fields,
+only the selected callback's pending removal and its legitimate awaited
+settlement, no external callback, and `CycleNoProgress` for an unchanged
+selected pending state. This is not a trigger-registry or filesystem parity
+claim, and neither input may be generated from native results as a reference
+expectation.
+
+`capture-mutations ROOT` reads four exact diversion/statoverride databases,
+including `-old` backups, as base64 plus their digests/modes and explicit
+absence, chrony's three live file/directory metadata records and the exact
+target account sources. It accepts legitimate non-root chrony ownership only
+at observed leaves beneath protected no-follow parents. It never resolves
+identities from the host, mutates the root, or declares parity.
+It also preserves exact status, trigger registrations (including any
+unincorporated queue), and status-update journal files, even for a refused
+independent root. Such observations are not an admission: the single-handler
+probe separately refuses nonempty queues and unsettled status updates.
+`compare-mutations REFERENCE_JSON NATIVE_JSON` validates the captures'
+base64/digest/presence consistency and byte-compares their independent
+database, backup, account and live-metadata observations. It rejects even
+absent-versus-empty backups and archive-mode-versus-live override differences.
+This comparison is mandatory only after a successful independent reference
+install; matching partial refused roots cannot masquerade as final parity.
+
+The actual protected `real-snapshot-reference.sh` consumer builds the tool
+with its already verified compiler, records original sources and native
+mutating-tool state, then records independent reference state even after an
+original install refusal. Its probe is diagnostic only; it preserves the
+original reference exit status and cannot turn failed installation into a
+successful snapshot. All privileged execution and eventual parity proofs
+remain restricted to disposable hosted runners. No full-root parity has been
+accepted from these source or diagnostic records.
+
 ## Installed `triggers` files
 
 dpkg 1.22.22 renames each control member into `info/` unchanged

@@ -2099,7 +2099,7 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_trigger_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests",
@@ -6487,6 +6487,98 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
             fail(f"{relative}: possible {description}")
 
 
+def reference_trigger_source_failures(source: str) -> list[str]:
+    production = source.split("\nconst before_fixture =", 1)[0]
+    scopes = {
+        "archive": ("fn packagePayload(", "fn controlMember(", (
+            ".authenticated_repository => |value| value,",
+            ".local_artifact => return error.UnsignedTriggerAuthorityPackage,",
+            "try package.verifyArchive(bytes);",
+        )),
+        "handler": ("pub fn verifySelectedArchive(", "pub fn parseStatus(", (
+            "std.mem.eql(u8, pin.architecture, architecture)",
+            "std.mem.eql(u8, package.architecture, architecture)",
+            "package.declared_size != pin.size",
+            "pin.sha512",
+            "package.origin != .authenticated_repository",
+        )),
+        "paths": ("fn verify(self: *Reader)", "\n};", (
+            "try self.openMetadata(input.path, input.directory)",
+            "try self.open(input.path, input.directory)",
+            "runtime.same(input.pinned.metadata, current.metadata)",
+            "for (self.absences.items)",
+        )),
+        "metadata": ("fn openMetadata(", "fn openUnprotected(", (
+            "runtime.openProtected(self.allocator, std.fs.path.dirname(path)",
+            "return self.openUnprotected(path, directory);",
+        )),
+        "transition": ("pub fn verifyTransition(", "pub fn nssModules(", (
+            "return error.CycleNoProgress;",
+            "try stableFields(old, current);",
+            "return error.ExternalTriggerCallback;",
+            "try withoutAwaited(",
+        )),
+        "capture": ("fn captureMutations(", "pub fn main(", (
+            ".protected = true",
+            "try reader.openMetadata(path, index != 0)",
+            "try reader.verify();",
+            ".observation_only = true",
+            ".parity_accepted = false",
+        )),
+        "consumer": ("pub fn main(", "\nconst before_fixture =", (
+            ".protected = probing",
+            "try verifySelectedArchive(selected, architecture);",
+            "try verifySelectedStatus(document, architecture, libc6.version);",
+            "return error.AmbiguousSelectedTriggerControl;",
+            'database = try databaseDirectory(&reader, path, "triggers", true);',
+            'if (updates.len != 0) return error.UnsettledTriggerStatusUpdates;',
+            "try reader.verify();",
+            ".execution_authorized = false,",
+            'if (probing) return error.UnboundTriggerRuntime;',
+            'try compareCaptures(allocator, reference.value, native.value);',
+        )),
+    }
+    failures = []
+    for name, (start, end, tokens) in scopes.items():
+        # main's end marker lies after production; retain it for scope extraction.
+        candidate = source if name == "consumer" else production
+        if candidate.count(start) != 1:
+            failures.append(f"reference trigger authority lost {name} scope")
+            continue
+        tail = candidate.split(start, 1)[1]
+        if end not in tail or any(token not in tail.split(end, 1)[0] for token in tokens):
+            failures.append(f"reference trigger authority lost scoped {name} refusal/binding")
+    if re.search(r"linux\.(?:execve|execveat|fork|clone)|std\.process\.run", production):
+        failures.append("reference trigger prerequisite producer must not execute packages")
+    return failures
+
+
+def reference_trigger_consumer_failures(source: str) -> list[str]:
+    failures = []
+    start = '"$zig" build build-reference-trigger-authority -Doptimize=ReleaseSafe'
+    end = '  --report-only --architecture "$architecture"'
+    if source.count(start) != 1 or end not in source:
+        return ["reference trigger producer/consumer scope is missing"]
+    body = source.split(start, 1)[1].split(end, 1)[0]
+    required = (
+        '--prefix "$workspace/trigger-authority-tool"',
+        '"$trigger_authority" inspect-original "$architecture" "$lock" "$cache"',
+        '"$trigger_authority" capture-mutations "$workspace/root"',
+        '--cache "$cache" --evidence "$evidence" || reference_status=$?',
+        '"$trigger_authority" capture-mutations "$reference_root"',
+        'if (( reference_status != 0 )); then',
+        '"$trigger_authority" probe-trigger-authority',
+        '"$architecture" "$lock" "$cache" "$reference_root" "libc-bin:$architecture"',
+        'exit "$reference_status"',
+        '(( source_authority_status == 0 && native_mutation_status == 0 && reference_mutation_status == 0 ))',
+        '"$trigger_authority" compare-mutations',
+        '"$evidence/reference-mutating-tools-state.json" "$evidence/native-mutating-tools-state.json"',
+    )
+    if any(token not in body for token in required):
+        failures.append("reference trigger diagnostic must preserve actual inputs, observations and original refusal")
+    return failures
+
+
 def main() -> int:
     files = tracked_files()
     audit_digest_cutover(files)
@@ -6494,6 +6586,12 @@ def main() -> int:
     audit_dependencies()
     audit_release_targets()
     audit_ci_pins()
+    for path, validator in (
+        ("tools/real-snapshot-reference-trigger.zig", reference_trigger_source_failures),
+        ("tools/real-snapshot-reference.sh", reference_trigger_consumer_failures),
+    ):
+        for failure in validator((ROOT / path).read_text()):
+            fail(f"{path}: {failure}")
     audit_composite_action_pins()
     audit_setup_action_dependencies()
     audit_download_action()
@@ -6526,6 +6624,10 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         return 2
     if kind == "action-pin":
         failures = action_pin_failures(text, "action.yml")
+    elif kind == "reference-trigger-source":
+        failures = reference_trigger_source_failures(text)
+    elif kind == "reference-trigger-consumer":
+        failures = reference_trigger_consumer_failures(text)
     elif kind == "native-only-candidate":
         import native_only_candidate
 

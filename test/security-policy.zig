@@ -97,6 +97,136 @@ test "security: commit-pinned composite actions reject floating refs" {
     try bad.failsWith("action.yml: actions/cache/restore is not commit-pinned");
 }
 
+test "security: selected reference prerequisites bind actual producers and preserve original refusal" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const source = try f.source("tools/real-snapshot-reference-trigger.zig");
+    const valid = try f.check("reference-trigger-source", source);
+    defer valid.deinit();
+    try valid.ok();
+    for ([_]struct { scope: []const u8, end: []const u8, token: []const u8 }{
+        .{ .scope = "fn packagePayload(", .end = "fn controlMember(", .token = "try package.verifyArchive(bytes);" },
+        .{ .scope = "pub fn verifySelectedArchive(", .end = "pub fn parseStatus(", .token = "package.declared_size != pin.size" },
+        .{ .scope = "fn verify(self: *Reader)", .end = "\n};", .token = "runtime.same(input.pinned.metadata, current.metadata)" },
+        .{ .scope = "pub fn verifyTransition(", .end = "pub fn nssModules(", .token = "return error.CycleNoProgress;" },
+        .{ .scope = "fn captureMutations(", .end = "pub fn main(", .token = ".protected = true" },
+        .{ .scope = "pub fn main(", .end = "\nconst before_fixture =", .token = ".execution_authorized = false," },
+    }) |mutation| {
+        const start = std.mem.indexOf(u8, source, mutation.scope).?;
+        const end = std.mem.indexOfPos(u8, source, start, mutation.end).?;
+        const body = source[start..end];
+        const changed = try f.replace(source, body, try f.replace(body, mutation.token, ""));
+        // A surviving copy in a unit test must not repair a poisoned production body.
+        const decoy = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n// {s}\n", .{ changed, mutation.token });
+        const refused = try f.check("reference-trigger-source", decoy);
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 1), refused.code);
+    }
+    const wrapper = try f.source("tools/real-snapshot-reference.sh");
+    const valid_wrapper = try f.check("reference-trigger-consumer", wrapper);
+    defer valid_wrapper.deinit();
+    try valid_wrapper.ok();
+    const changed_wrapper = try f.replace(wrapper, "exit \"$reference_status\"", "exit 0");
+    const refused_wrapper = try f.check("reference-trigger-consumer", changed_wrapper);
+    defer refused_wrapper.deinit();
+    try testing.expectEqual(@as(u8, 1), refused_wrapper.code);
+}
+
+test "security: actual reference diagnostic commands retain independent failure and require observations" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const wrapper = try f.source("tools/real-snapshot-reference.sh");
+    const start = std.mem.indexOf(u8, wrapper, "\"$zig\" build build-reference-trigger-authority").?;
+    const report_args = std.mem.indexOfPos(u8, wrapper, start, "  --report-only --architecture \"$architecture\"").?;
+    const end = std.mem.lastIndexOfScalar(u8, wrapper[0 .. report_args - 1], '\n').?;
+    const production = wrapper[start..end];
+    try f.work.write("trigger-authority-tool/bin/debz-reference-trigger-authority",
+        \\#!/bin/bash
+        \\printf 'authority:%s\n' "$*" >> "$workspace/events"
+        \\case "$1" in
+        \\  inspect-original) exit "$source_rc";;
+        \\  capture-mutations)
+        \\    if [[ "$2" == "$workspace/root" ]]; then exit "$native_rc"; fi
+        \\    exit "$reference_rc";;
+        \\  probe-trigger-authority) exit "$probe_rc";;
+        \\  compare-mutations) exit "$compare_rc";;
+        \\  *) exit 85;;
+        \\esac
+        \\
+    );
+    const order_double =
+        \\#!/bin/bash
+        \\printf 'independent-order:%s\n' "$*" >> "$workspace/events"
+        \\exit "$order_rc"
+        \\
+    ;
+    try f.work.write("python3", order_double);
+    try f.work.write("order-tool/bin/debz-reference-order", order_double);
+    const prelude =
+        \\set -euo pipefail
+        \\export workspace=$1 order_rc=$2 source_rc=$3 native_rc=$4 reference_rc=$5 compare_rc=$6 probe_rc=77
+        \\export PATH="$workspace:$PATH"
+        \\chmod 700 "$workspace/python3" "$workspace/order-tool/bin/debz-reference-order" "$workspace/trigger-authority-tool/bin/debz-reference-trigger-authority"
+        \\evidence=$workspace/evidence
+        \\mkdir -p "$evidence"
+        \\: > "$workspace/events"
+        \\zig=compiler_double
+        \\compiler_double() { printf 'compiler:%s\n' "$*" >> "$workspace/events"; }
+        \\timeout() { shift 3; "$@"; }
+        \\architecture=arm64 lock=$workspace/original.lock cache=$workspace/original-cache
+        \\reference_root=$workspace/reference-root reference_dpkg=$workspace/pinned-dpkg
+        \\launcher=$workspace/launcher runtime=$workspace/runtime
+        \\
+    ;
+    try f.work.write("run-diagnostics", try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}\n", .{ prelude, production }));
+    // Only command doubles run here; this tests the real wrapper, not package outcomes.
+    for ([_]struct { order: u8, source: u8 = 0, native: u8 = 0, reference: u8 = 0, compare: u8 = 0, expected: u8 }{
+        .{ .order = 46, .expected = 46 },
+        .{ .order = 46, .source = 15, .native = 23, .reference = 31, .expected = 46 },
+        .{ .order = 0, .source = 15, .expected = 1 },
+        .{ .order = 0, .native = 23, .expected = 1 },
+        .{ .order = 0, .reference = 31, .expected = 1 },
+        .{ .order = 0, .compare = 41, .expected = 41 },
+        .{ .order = 0, .expected = 0 },
+    }) |case| {
+        const result = try support.run(&.{
+            "bash",
+            try f.path("run-diagnostics"),
+            f.work.root,
+            try std.fmt.allocPrint(f.arena.allocator(), "{d}", .{case.order}),
+            try std.fmt.allocPrint(f.arena.allocator(), "{d}", .{case.source}),
+            try std.fmt.allocPrint(f.arena.allocator(), "{d}", .{case.native}),
+            try std.fmt.allocPrint(f.arena.allocator(), "{d}", .{case.reference}),
+            try std.fmt.allocPrint(f.arena.allocator(), "{d}", .{case.compare}),
+        });
+        defer result.deinit();
+        try testing.expectEqual(case.expected, result.code);
+        for ([_]struct { file: []const u8, status: u8 }{
+            .{ .file = "reference-install", .status = case.order },
+            .{ .file = "reference-trigger-original-source", .status = case.source },
+            .{ .file = "native-mutating-tools-state", .status = case.native },
+            .{ .file = "reference-mutating-tools-state", .status = case.reference },
+        }) |observation| {
+            const captured = try f.work.read(try std.fmt.allocPrint(f.arena.allocator(), "evidence/{s}.exit-status", .{observation.file}));
+            defer support.allocator.free(captured);
+            try testing.expectEqualStrings(try std.fmt.allocPrint(f.arena.allocator(), "{d}\n", .{observation.status}), captured);
+        }
+        const events = try f.work.read("events");
+        defer support.allocator.free(events);
+        try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "authority:inspect-original arm64 {s}/original.lock {s}/original-cache", .{ f.work.root, f.work.root }));
+        const refused = case.order != 0;
+        const observations_ok = case.source == 0 and case.native == 0 and case.reference == 0;
+        try testing.expectEqual(refused, std.mem.indexOf(u8, events, "authority:probe-trigger-authority") != null);
+        try testing.expectEqual(!refused and observations_ok, std.mem.indexOf(u8, events, "authority:compare-mutations") != null);
+        if (refused) {
+            const captured = try f.work.read("evidence/reference-trigger-authority.exit-status");
+            defer support.allocator.free(captured);
+            try testing.expectEqualStrings("77\n", captured);
+            try support.contains(events, try std.fmt.allocPrint(f.arena.allocator(), "authority:probe-trigger-authority arm64 {s}/original.lock {s}/original-cache {s}/reference-root libc-bin:arm64", .{ f.work.root, f.work.root, f.work.root }));
+        }
+    }
+}
+
 const ci_concurrency_block =
     \\concurrency:
     \\  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
@@ -936,7 +1066,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 59), members);
+    try testing.expectEqual(@as(usize, 60), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));

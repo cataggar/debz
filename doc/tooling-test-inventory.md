@@ -30,6 +30,21 @@ share one Zig test with independent mutations.
 
 ## Security (`tools/test_security_audit.py`)
 
+`test-real-snapshot-reference-trigger-authority` is a core workload member.
+Its native cases exercise exact-version/architecture/dependency and
+single-pending status validation, duplicate-field and duplicate-package
+refusal, genuine awaited-edge settlement, preserved unrelated pending
+handlers, external-callback and no-progress refusal, and explicit late NSS
+module obligations. Its real protected consumer preserves original failure
+exit codes and separately captures exact native/reference mutating-tool
+databases, backups, account sources and chrony metadata. These diagnostics
+do not admit a handler or complete independent reference/root acceptance;
+see [native trigger reference prerequisites](native-triggers.md).
+The security suite executes the actual bounded shell diagnostic region with
+command doubles: independent failures survive failed observations/probes,
+and successful ordering still requires every observation and comparison.
+These control-flow tests do not execute packages or supply reference outcomes.
+
 `zig build build-integration-archive` builds the required native producer for
 actual integration package and repository-descriptor ar/USTAR/gzip bytes.
 The Python archive encoders are removed, not kept as a fallback. Zig writes the
