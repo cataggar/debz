@@ -21531,6 +21531,16 @@ const LifecycleScriptOutcome = union(enum) {
     recovery_required,
 };
 
+/// An exited non-preinst script publishes the override database it leaves,
+/// even after a nonzero exit, to later phases and recovery checkpoints, like
+/// the diversion refresh. Preinst keeps the resolution its unpack used.
+fn scriptRefreshesStatOverrides(
+    outcome: LifecycleScriptOutcome,
+    kind: maintainer_script.Kind,
+) bool {
+    return outcome == .exited and kind != .preinst;
+}
+
 fn textListEqual(left: []const []const u8, right: []const []const u8) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b|
@@ -27003,17 +27013,13 @@ fn runLifecycleScript(
                 }
             }
             const disposition = nativeScriptDisposition(owned.outcome);
-            switch (disposition) {
-                .exited => |code| if (code == 0 and kind != .preinst) {
-                    _ = try refreshExecutionStatOverrides(
-                        execution,
-                        allocator,
-                        root,
-                        program.target_architecture,
-                    );
-                },
-                else => {},
-            }
+            if (scriptRefreshesStatOverrides(disposition, kind))
+                _ = try refreshExecutionStatOverrides(
+                    execution,
+                    allocator,
+                    root,
+                    program.target_architecture,
+                );
             return disposition;
         }
         if (try runtime.latest(recovery_action)) |record| {
@@ -27312,11 +27318,10 @@ fn runLifecycleScript(
             checkpoint_paths.items,
         );
     }
-    const successful_script = switch (report.outcome) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    const refresh_stat_overrides = successful_script and kind != .preinst;
+    const refresh_stat_overrides = scriptRefreshesStatOverrides(switch (report.outcome) {
+        .exited => |code| .{ .exited = code },
+        else => if (report.outcome.spawned()) .recovery_required else .not_started,
+    }, kind);
     if (snapshot_python3_preinst) switch (report.outcome) {
         .exited => |code| if (code == 0) {
             verifySnapshotPython3NullOutput(allocator, root) catch |err| {
@@ -35393,6 +35398,17 @@ test "native_unpack.test.statoverride tracking excludes unchanged administrator 
     defer testing.allocator.free(renamed_identity);
     try testing.expectEqual(@as(usize, 1), renamed_identity.len);
     try testing.expectEqualStrings("changed", renamed_identity[0]);
+}
+
+test "native_unpack.test.statoverride refresh follows every exited non-preinst script" {
+    for ([_]maintainer_script.Kind{ .postinst, .prerm, .postrm }) |kind| {
+        for ([_]u8{ 0, 1, 23, 255 }) |code|
+            try testing.expect(scriptRefreshesStatOverrides(.{ .exited = code }, kind));
+        try testing.expect(!scriptRefreshesStatOverrides(.not_started, kind));
+        try testing.expect(!scriptRefreshesStatOverrides(.recovery_required, kind));
+    }
+    for ([_]u8{ 0, 23 }) |code|
+        try testing.expect(!scriptRefreshesStatOverrides(.{ .exited = code }, .preinst));
 }
 
 test "native_unpack.test.statoverride identities are root-local and bounded" {

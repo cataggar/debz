@@ -124,6 +124,8 @@ pub fn installDpkgStatoverride(case: *support.Scenario, dpkg: []const u8) !void 
 pub const chrony_name = "statoverride-chrony";
 pub const chrony_targets = [_][]const u8{ "etc/chrony/chrony.keys", "var/lib/chrony", "var/log/chrony" };
 pub const admin_target = "opt/admin-statoverride";
+/// Fails the fixture postinst after its hook has added every chrony override.
+pub const chrony_failure = chrony_name ++ "@fixture:postinst:configure\n";
 const chrony_hook =
     \\if [ "$DPKG_MAINTSCRIPT_NAME" = postinst ] && [ "$1" = configure ]; then
     \\    if [ ! -f /chrony-account-created ]; then
@@ -241,9 +243,9 @@ pub fn verifyChangedChronyState(case: *support.Scenario) !void {
     return verifyChronyTargets(case, chrony_targets[0..1]);
 }
 
-fn verifyChronyTargets(case: *support.Scenario, targets: []const []const u8) !void {
+fn boundChronyTargets(case: *support.Scenario, targets: []const []const u8) !debz.native_recovery.OwnedManagedState {
     var managed = try settledChronyState(case);
-    defer managed.deinit();
+    errdefer managed.deinit();
     const stable = managed.document.stable orelse return error.MissingManagedState;
     for (targets) |target| {
         var found = false;
@@ -253,12 +255,25 @@ fn verifyChronyTargets(case: *support.Scenario, targets: []const []const u8) !vo
         }
         if (!found) return error.MissingChangedOverrideTarget;
     }
+    return managed;
+}
+
+fn verifyChronyTargets(case: *support.Scenario, targets: []const []const u8) !void {
+    var managed = try boundChronyTargets(case, targets);
+    defer managed.deinit();
     var dir = try foundation.guardedRoot(case.fixture.io, case.native_root);
     defer dir.close(case.fixture.io);
     _ = try debz.native_recovery.verifySettledManagedState(case.fixture.allocator, .init(case.fixture.io, dir), managed.document, .{
         .paths = &.{"etc/debz-native.conf"},
         .prefixes = &.{"var/lib/debz/"},
     });
+}
+
+/// A failed attempt retains the checkpoint taken after its failed postinst;
+/// settled live verification applies only to successful receipts.
+pub fn expectFailedChronyBinding(case: *support.Scenario) !void {
+    var managed = try boundChronyTargets(case, &chrony_targets);
+    managed.deinit();
 }
 
 fn genuineChronyLifecycle(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
@@ -325,6 +340,36 @@ fn genuineChangedChronyLifecycle(fixture: *foundation.Fixture, driver: []const u
     }
 }
 
+fn genuineFailedChronyLifecycle(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const first = try chronyArchive(fixture, arch, "1", "packages/statoverride-failed-chrony");
+    defer fixture.allocator.free(first);
+    const selected = [_]foundation.PackageIdentity{.{ .name = chrony_name, .architecture = arch }};
+    var case = try support.Scenario.init(fixture, "statoverride-genuine-chrony-failed", driver, dpkg, arch, false);
+    defer case.deinit();
+    try seedChrony(&case, dpkg, false);
+    try both(&case, support.failure, chrony_failure);
+    try case.phase(.{ .operation = "install", .archives = &.{first}, .packages = &selected, .recovery = true }, true);
+    try expectChronyMetadata(&case);
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+    if (!fixture.oracle_only) try expectFailedChronyBinding(&case);
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const marker = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, support.failure });
+        defer fixture.allocator.free(marker);
+        try fixture.dir.deleteFile(fixture.io, marker);
+    }
+    // The retry leaves the database unchanged, so it binds no override targets.
+    try case.phase(.{ .operation = "configure", .archives = &.{first}, .packages = &selected, .recovery = true }, false);
+    try expectChronyMetadata(&case);
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+    for ([_][]const u8{ "remove", "purge" }) |operation| {
+        try case.phase(.{ .operation = operation, .packages = &selected, .recovery = true }, false);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+    }
+}
+
 fn genuineToolRefresh(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const provider = "statoverride-refresh-provider";
     const consumer = "statoverride-refresh-consumer";
@@ -383,6 +428,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try genuineToolRefresh(fixture, driver, dpkg, arch);
     try genuineChronyLifecycle(fixture, driver, dpkg, arch);
     try genuineChangedChronyLifecycle(fixture, driver, dpkg, arch);
+    try genuineFailedChronyLifecycle(fixture, driver, dpkg, arch);
 
     const table = [_]struct {
         label: []const u8,

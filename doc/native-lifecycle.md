@@ -171,9 +171,14 @@ partially unpacked before this refusal. See the
 [pinned alternatives contract](dpkg-alternatives-reference.md).
 
 Statoverrides use file-backed target-root identities and are resolved before
-scripts. Preinst retains that resolution for its unpack. A successful
-non-preinst script refreshes changed override database bytes for later phases,
-using the target root's account files; a later invocation resolves anew.
+scripts. Preinst retains that resolution for its unpack. Every exited
+non-preinst script, including one that exits nonzero, refreshes changed
+override database bytes for later phases and recovery checkpoints, using the
+target root's account files; a later invocation resolves anew. If such a script
+leaves a malformed or unresolvable database, the result is
+`recovery_required` with `invalid_stat_override_update` instead of
+`script_failed`. Scripts that never start or end without exiting, such as by a
+signal or timeout, do not refresh.
 Recovery checkpoints live targets only for records created or changed by those
 scripts, leaving unchanged administrator overrides outside this added scope.
 Missing identities refuse before lifecycle mutation. See the
@@ -376,8 +381,11 @@ script-created files and a shipped directory, guarded reinstall, a payload
 upgrade with byte-stable maintainer scripts, and remove/purge. Additional
 upgrades genuinely change `postinst`/`postrm` bytes with no preinst/prerm and
 use `dpkg-statoverride` to change the key mode from 0640 to 0600, with and
-without durable recovery, followed by reinstall/remove/purge. The genuine
-diversion cases also cover postinst and prerm `--rename` moves and 210
+without durable recovery, followed by reinstall/remove/purge. A failed
+chrony-like postinst adds every override before exiting 23 under durable
+recovery; parity, exact database bytes and the retained checkpoint binding of
+all three targets are checked before a `configure` retry, remove and purge. The
+genuine diversion cases also cover postinst and prerm `--rename` moves and 210
 `prerm remove` additions owned by `coreutils-switch`.
 Both suites assert exact database and `-old` bytes. Use
 `-Dnative-reference-dpkg=/absolute/path/to/pinned/dpkg` for artifact-bound
