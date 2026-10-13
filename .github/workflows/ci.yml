@@ -2111,18 +2111,19 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
         run: |
-          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version v0.3.0 --expect "zon=$zon_version")
+          zig build build-release-tool -j2
+          version=$(zig-out/bin/debz-release version v0.3.0 --zon build.zig.zon)
+          zon_version=$version
           zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$version" release-install \
             --prefix "$PWD/.zig-cache/release-install"
-          python3 tools/release.py version v0.3.0 --expect "zon=$zon_version" \
+          zig-out/bin/debz-release version v0.3.0 --expect "zon=$zon_version" \
             --expect "binary=$(.zig-cache/release-install/bin/debz version)"
           epoch=$(git show -s --format=%ct HEAD)
-          python3 tools/release.py binary --tag v0.3.0 --platform "$PLATFORM" \
+          zig-out/bin/debz-release binary --tag v0.3.0 --platform "$PLATFORM" \
             --prefix .zig-cache/release-install --epoch "$epoch" \
             --output release-assets
           for format in tar.gz tar.xz; do
-            python3 tools/release.py audit --tag v0.3.0 \
+            zig-out/bin/debz-release audit --tag v0.3.0 \
               --platform "$PLATFORM" \
               --archive "release-assets/debz-0.3.0-$PLATFORM.$format" --smoke
           done
@@ -2187,9 +2188,21 @@ jobs:
           pattern: release-dry-run-*
           path: release-assets
           merge-multiple: true
-      - name: Verify exact four-archive dry-run
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Verify exact four-archive dry-run with native release core
         run: |
-          python3 tools/release.py verify --tag v0.3.0 \
+          zig build build-release-tool -j2
+          zig-out/bin/debz-release verify --tag v0.3.0 \
             --assets release-assets --smoke
 
   release-policy:
@@ -2200,8 +2213,21 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
       - name: Audit release workflow policy
-        run: tools/release-workflow-policy.py
+        run: |
+          zig build build-release-tool -j2
+          tools/release-workflow-policy.py
 
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)

@@ -27,7 +27,7 @@ workload command runs in exactly one job:
 | `build-and-test-workload-production` | `test-workload-production` (package family, production backend, required security and customize tests); pinned `test-native-triggers-zig` and `test-native-diversion-settlement-zig` |
 | `build-and-test-workload-apt-system` | `test-workload-apt-system` (system profile, apt system API/CLI/command/state/orchestrator and required orchestrator security tests); installed-CLI `test-apt-system-acceptance` in both modes; Debug privileged `test-apt-system` |
 | `build-and-test-workload-native` | `test-workload-native` (native alternatives, snapshot, differential, fixture, conffile, dpkg reference/evidence, SHA-512, trigger queue, lifecycle/trigger/settlement unit and recovery unit tests); pinned `test-native-materialization`, `test-native-conffiles`, `test-native-differential` and `test-native-lifecycle-zig`; `test-native-helper-namespace` |
-| `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal and the real-snapshot repin harness); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
+| `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal, real-snapshot repin harness, native release core and actual packaging consumers in both modes); `fuzz`; Debug `test-release` additionally checks installation layout; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
 
 Manual CI dispatches have a boolean `run_full_matrix` input, defaulting to
 `true`. Explicitly setting it to `false` skips all five workload jobs, all six
