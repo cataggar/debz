@@ -77,7 +77,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -111,7 +111,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -145,7 +145,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -179,7 +179,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -217,7 +217,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -251,7 +251,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -285,7 +285,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -319,7 +319,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         },
         {
           "form": "hex",
@@ -814,7 +814,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         }
       ],
       "digest": "sha256:86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993",
@@ -844,7 +844,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-reference-order.py"
+          "path": "tools/real-snapshot-reference-order.zig"
         }
       ],
       "digest": "sha256:60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f",

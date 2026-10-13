@@ -64,7 +64,7 @@ fn component(fd: i32, name: []const u8, directory: bool, flags: linux.O, mode: u
 
 pub fn openBeneath(root_fd: i32, path: []const u8, directory: bool) !Pinned {
     try relative(path);
-    var current: i32 = @intCast(try syscall(linux.dup(root_fd)));
+    var current: i32 = @intCast(try syscall(linux.fcntl(root_fd, linux.F.DUPFD_CLOEXEC, 0)));
     defer _ = linux.close(current);
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
@@ -90,7 +90,7 @@ pub fn openAbsolute(path: []const u8, directory: bool) !Pinned {
     }, 0)));
     defer _ = linux.close(root);
     if (path.len == 1 and directory) {
-        const fd: i32 = @intCast(try syscall(linux.dup(root)));
+        const fd: i32 = @intCast(try syscall(linux.fcntl(root, linux.F.DUPFD_CLOEXEC, 0)));
         return .{ .fd = fd, .metadata = try stat(fd) };
     }
     return openBeneath(root, path[1..], directory);
@@ -181,7 +181,10 @@ pub fn exists(root: []const u8, path: []const u8) !bool {
     const directory = try openAbsolute(root, true);
     defer directory.close();
     const parent = std.fs.path.dirname(path);
-    const pin = if (parent) |p| try openBeneath(directory.fd, p, true) else directory;
+    const pin = if (parent) |p| openBeneath(directory.fd, p, true) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    } else directory;
     defer if (parent != null) pin.close();
     var buffer: [256]u8 = undefined;
     const leaf = std.fs.path.basename(path);
@@ -316,4 +319,45 @@ test "descriptor-rooted paths reject traversals and aliases before reading" {
     try work.dir.symLink(io, "/etc/passwd", "leaf", .{});
     try std.testing.expectError(error.ReferencePathRefused, readRootFile(a, root, "leaf", 65536));
     try std.testing.expectError(error.InvalidReferenceDatabaseFile, readRootFile(a, root, "var/lib/dpkg/status", 1));
+}
+
+test "protected component metadata rejects either nonroot owner mutable ancestry or wrong type" {
+    var original = std.mem.zeroes(linux.Statx);
+    original.mode = 0o100644;
+    try protectedMetadata(original, false);
+    for (0..5) |mutation| {
+        var changed = original;
+        switch (mutation) {
+            0 => changed.uid = 1,
+            1 => changed.gid = 1,
+            2 => changed.mode |= 0o020,
+            3 => changed.mode |= 0o002,
+            4 => changed.mode = 0o040755,
+            else => unreachable,
+        }
+        try std.testing.expectError(if (mutation == 4) error.WrongReferenceFileType else error.UnprotectedReferencePath, protectedMetadata(changed, false));
+    }
+    original.mode = 0o040755;
+    try protectedMetadata(original, true);
+    try std.testing.expectError(error.WrongReferenceFileType, protectedMetadata(original, false));
+}
+
+test "pinned reads detect metadata drift and all rooted descriptor duplicates remain close on exec" {
+    var work = std.testing.tmpDir(.{ .iterate = true });
+    defer work.cleanup();
+    const io = std.testing.io;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const size = try work.dir.realPath(io, &buffer);
+    const root = buffer[0..size];
+    try work.dir.writeFile(io, .{ .sub_path = "status", .data = "unchanged\n" });
+    const directory = try openAbsolute(root, true);
+    defer directory.close();
+    const file = try openBeneath(directory.fd, "status", false);
+    defer file.close();
+    for ([_]i32{ directory.fd, file.fd }) |fd|
+        try std.testing.expect(try syscall(linux.fcntl(fd, linux.F.GETFD, 0)) & linux.FD_CLOEXEC != 0);
+    const changed_mode: u32 = if (file.metadata.mode & 0o777 == 0o600) 0o644 else 0o600;
+    _ = try syscall(linux.fchmod(file.fd, changed_mode));
+    try std.testing.expectError(error.ReferenceFileChanged, readPinned(std.testing.allocator, file, 64));
+    try std.testing.expect(!try exists(root, "missing-parent/status"));
 }

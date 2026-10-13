@@ -27,7 +27,7 @@ reference_protected_path() {
 
 reference_toolchain() (
   set -euo pipefail
-  local compiler=$1 library entry target kind
+  local compiler=$1 library entry target kind owner group mode
   [[ "$compiler" == /* ]] || {
     echo "an explicit absolute protected DEBZ_ZIG compiler is required" >&2
     return 2
@@ -36,20 +36,23 @@ reference_toolchain() (
   [[ -x "$compiler" ]] || return 2
   library=$(dirname -- "$compiler")/lib
   reference_protected_path "$library" directory
-  shopt -s globstar dotglob nullglob
-  for entry in "$library"/**; do
-    kind=file
-    if [[ -L "$entry" ]]; then
+  find -P "$library" -printf '%y:%U:%G:%m:%p\0' |
+  while IFS=: read -r -d '' kind owner group mode entry; do
+    if [[ "$kind" == l ]]; then
       target=$(realpath -e -- "$entry")
       [[ "$target" == "$library" || "$target" == "$library"/* ]] || {
         echo "toolchain library symlink escapes: $entry" >&2
         return 2
       }
+      kind=file
       [[ ! -d "$target" ]] || kind=directory
       reference_protected_path "$target" "$kind"
     else
-      [[ ! -d "$entry" ]] || kind=directory
-      reference_protected_path "$entry" "$kind"
+      [[ "$kind" == f || "$kind" == d ]] && [[ "$owner:$group" == 0:0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+        (( (8#$mode & 022) == 0 )) || {
+          echo "non-root or writable reference path: $entry (writable or non-root library member)" >&2
+          return 2
+        }
     fi
   done
   printf '%s\n' "$library"

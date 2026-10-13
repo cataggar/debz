@@ -984,9 +984,9 @@ class ReferenceLauncherTests(unittest.TestCase):
             ("tools/real-snapshot-reference-launcher.zig", 'if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))'),
             ("tools/real-snapshot-reference-launcher.zig", 'for (paths, kbd_cycle) |path, binding| {'),
             ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .break_kbd_cycle)\n        verifyCycle(.kbd)'),
-            ("tools/real-snapshot-reference-order.py", 'before = verify_kbd_cycle(root, cycle)'),
-            ("tools/real-snapshot-reference-order.py", 'expected[("kbd", "amd64")]["status"] = "install ok installed"'),
-            ("tools/real-snapshot-reference-order.py", '"reference trigger closure refused: the launcher has no exact triggered "'),
+            ("tools/real-snapshot-reference-order.zig", 'const before = try self.verifyCycle(root, cycle, kind);'),
+            ("tools/real-snapshot-reference-order.zig", 'const selected = if (kind == .openssl) cycle[0..2] else cycle[kind.selected()..][0..1];'),
+            ("tools/real-snapshot-reference-order.zig", 'pub const trigger_refusal = "reference trigger closure refused: the launcher has no exact triggered postinst identity/profile'),
         ):
             with self.subTest(path=path, token=token):
                 changed = dict(texts)

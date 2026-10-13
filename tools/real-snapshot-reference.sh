@@ -22,63 +22,40 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   echo "run the protected reference script from its checkout root" >&2
   exit 2
 }
-python3 -I - "$repository_root" "$workspace" "$reference_dpkg" "$lock" "$cache" "$zig" <<'PY'
-import os
-import stat
-import sys
-from pathlib import Path
-
-def protected(path, directory=False):
-    if not path.is_absolute() or any(
-        item in ("", ".", "..") for item in str(path).split("/")[1:]
-    ):
-        raise ValueError(f"noncanonical reference path: {path}")
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        for index, component in enumerate(path.parts[1:]):
-            last = index == len(path.parts) - 2
-            opened = os.open(
-                component, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
-                (os.O_DIRECTORY if not last or directory else 0),
-                dir_fd=fd,
-            )
-            os.close(fd)
-            fd = opened
-            info = os.fstat(fd)
-            if (info.st_uid != 0 or info.st_gid != 0 or
-                stat.S_IMODE(info.st_mode) & 0o022 or
-                ((not last or directory) and not stat.S_ISDIR(info.st_mode)) or
-                (last and not directory and not stat.S_ISREG(info.st_mode))):
-                raise ValueError(f"non-root or writable reference path: {path}")
-        return os.fstat(fd)
-    finally:
-        os.close(fd)
-
-repository, workspace, dpkg, lock, cache = map(Path, sys.argv[1:6])
-for path in (repository, repository / ".real-snapshot", workspace, cache):
-    result = protected(path, directory=True)
-    if path in (repository / ".real-snapshot", workspace) and result.st_mode & 0o7777 != 0o700:
-        raise ValueError(f"reference directory must be root-only 0700: {path}")
-for path in (repository / "tools/real-snapshot-reference.sh",
-             repository / "tools/real-snapshot-reference-launcher.zig",
-             repository / "tools/real-snapshot-reference-runtime.zig",
-             repository / "src/private_network.zig",
-             repository / "tools/real-snapshot-reference-order.py",
-             repository / "tools/real_snapshot_reference_paths.py",
-             repository / "tools/prepare-native-dpkg.zig",
-             repository / "zig-out/bin/debz-native-dpkg-reference",
-             repository / "tools/native-differential.py",
-             dpkg, lock, workspace / "evidence/create.json"):
-    protected(path)
-protected(workspace / "evidence", directory=True)
-protected(cache / "packages-v2/objects", directory=True)
-protected(repository / "tools/real_snapshot_reference_paths.py")
-sys.path.insert(0, str(repository / "tools"))
-from real_snapshot_reference_paths import toolchain
-if not sys.argv[6]:
-    raise ValueError("an explicit absolute protected DEBZ_ZIG compiler is required")
-toolchain(Path(sys.argv[6]))
-PY
+# Check the precompiler verifier itself before sourcing any repository code.
+current=/
+IFS=/ read -r -a components <<<"${repository_root#/}/tools/real-snapshot-reference-paths.sh"
+for component in "${components[@]}"; do
+  [[ -d "$current" && ! -L "$current" ]]
+  metadata=$(stat -c '%u:%g:%a' -- "$current")
+  [[ "$metadata" =~ ^0:0:[0-7]{3,4}$ ]] && (( (8#${metadata##*:} & 022) == 0 )) || {
+    echo "non-root or writable reference path: $current" >&2
+    exit 2
+  }
+  [[ -n "$component" && "$component" != . && "$component" != .. ]]
+  current="${current%/}/$component"
+done
+[[ -f "$current" && ! -L "$current" ]]
+metadata=$(stat -c '%u:%g:%a' -- "$current")
+[[ "$metadata" =~ ^0:0:[0-7]{3,4}$ ]] && (( (8#${metadata##*:} & 022) == 0 ))
+source "$current"
+for path in "$repository_root" "$repository_root/.real-snapshot" "$workspace" "$cache" \
+  "$workspace/evidence" "$cache/packages-v2/objects"; do
+  reference_protected_path "$path" directory
+done
+[[ $(stat -c '%a' "$repository_root/.real-snapshot") == 700 &&
+  $(stat -c '%a' "$workspace") == 700 ]]
+for path in build.zig build.zig.zon tools/real-snapshot-reference.sh tools/real-snapshot-reference-launcher.zig \
+  tools/real-snapshot-reference-runtime.zig src/private_network.zig \
+  tools/real-snapshot-reference-order.zig tools/real_snapshot_reference_paths.zig \
+  tools/prepare-native-dpkg.zig zig-out/bin/debz-native-dpkg-reference \
+  test/native_differential_cli.zig; do
+  reference_protected_path "$repository_root/$path" file
+done
+for path in "$reference_dpkg" "$lock" "$workspace/evidence/create.json"; do
+  reference_protected_path "$path" file
+done
+reference_toolchain "$zig" >/dev/null
 case "$workspace" in
   "$repository_root"/.real-snapshot/*) ;;
   *) echo "unsafe reference workspace" >&2; exit 2 ;;
@@ -201,12 +178,18 @@ runtime="$workspace/reference-runtime"
 "$workspace/runtime-tool/bin/debz-reference-runtime" record \
   "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+"$zig" build build-reference-order -Doptimize=ReleaseSafe -j2 \
+  --cache-dir "$workspace/reference-zig-cache" \
+  --global-cache-dir "$workspace/reference-zig-global-cache" \
+  --prefix "$workspace/order-tool"
+order=$workspace/order-tool/bin/debz-reference-order
+reference_protected_path "$order" file
 timeout --signal=TERM --kill-after=30s 40m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$order" \
     --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
     --cache "$cache" --evidence "$evidence"
-python3 tools/real-snapshot-reference-order.py \
+"$order" \
   --report-only --architecture "$architecture" \
   --root "$reference_root" --cache "$cache" --evidence "$evidence"
 grep -Eq '^ii  ubuntu-minimal(:[^ ]+)? ' "$evidence/reference-installed.txt"
@@ -222,6 +205,7 @@ fi
    ! -L "$reference_root/.debz-reference-archive" &&
    $(stat -c '%s' "$reference_root/.debz-reference-archive") == 0 ]]
 rm -- "$reference_root/.debz-reference-archive"
+reference_protected_path "$repository_root/zig-out/bin/native-differential" file
 zig-out/bin/native-differential capture \
   --root "$reference_root" \
   --exclude dev/null \

@@ -437,6 +437,32 @@ from the pinned util-linux; see below.
 
 #### Generated signed prestates
 
+`build-reference-order`, `build-reference-paths`, and
+`build-reference-protected` install the actual Zig ordering producer,
+descriptor-rooted path verifier, and protected proof driver in the requested
+build prefix. The order CLI retains `--dpkg`, `--root`, `--cache`, `--evidence`,
+`--launcher`, `--runtime`, `--architecture`, repeated
+`--prestate PACKAGE:ARCH=STATUS:DESTINATION`, `--prove-base-cycle SIGNED_SETPRIV`,
+and `--report-only`. It still requires the five-field signed archive TSV,
+at most 2000 packages, 10000 probes, 65536-byte probe output, 1 MiB controls,
+16 MiB install logs, and 512 MiB archives. Full installation deliberately
+ends with the explicit unbound-trigger-closure refusal; native ordering is
+not selected-trigger execution authority.
+
+Before invoking the compiler, protected consumers check every canonical
+ancestor and leaf of `real-snapshot-reference-paths.sh` for root ownership,
+non-writable modes and no symbolic links, then source it and invoke
+`reference_toolchain` on the explicit absolute compiler. Native
+`debz-reference-paths protected file|directory PATH`, `toolchain COMPILER`,
+and `keyring PATH SIZE SHA256` are post-bootstrap verification APIs, not a
+replacement for this precompiler boundary. Unprivileged original-input
+tests use `test-real-snapshot-reference-order`,
+`test-real-snapshot-reference-paths`, and
+`test-real-snapshot-reference-protected-pure`; genuine independent dpkg,
+noexec callback denial, network isolation and whole-root continuation
+remain separate `test-real-snapshot-reference-protected` proofs on
+disposable hosted root runners, without skips.
+
 `tools/real-snapshot-signed-proc-prestates.sh PINNED_DPKG WORKSPACE`
 manufactures the three before-script sources. Run it **as root on amd64**
 from the protected checkout root, after
@@ -445,37 +471,41 @@ closure into the same `WORKSPACE`. It reuses that closure and does not
 fetch anything. It:
 
 - verifies the pinned dpkg 1.22.22 binary and receipt, and the
-  exact systemd and udev (261.2-1ubuntu2), sudo (1.9.17p2-7ubuntu3),
-  sudo-rs (0.2.14-1ubuntu2) and util-linux versions. It binds the lock to
-  the authenticated `stonking` Release (SHA-256 `0b2bb351…`, signer
-  `f6ecb376…`) and to the sorted 175-package closure of name, version,
-  architecture, SHA-512 and size (`7773e7c4…`). It does not bind the lock
+  exact systemd and udev (259.5-0ubuntu3.4), sudo (1.9.17p2-1ubuntu3.1),
+  sudo-rs (0.2.13-0ubuntu1.2) and util-linux versions. It binds the lock to
+  the authenticated base, updates and security Releases (base SHA-256
+  `596ee4ce…`, signer `f6ecb376…`) and to the sorted signed closure of name,
+  version, architecture, SHA-512 and size (`5223cb19…`). It does not bind the lock
   document digest, which also covers the local keyring path. It then
   rehashes every locked archive by size and SHA-512;
 - bootstraps the same unregistered tool root as
   `tools/real-snapshot-reference.sh`, then lets **pinned dpkg** install the
   closure in the reviewed order with
-  `tools/real-snapshot-reference-order.py --prestate`. Non-target packages
+  the installed `debz-reference-order --prestate` producer. Non-target packages
   are configured in explicit batches, so no target is configured
   implicitly. Before systemd and udev are configured, the order tool binds
   each unchanged signed postinst `noexec`: dpkg records `half-configured`
   without running the script, and the root is copied at that point. sudo
   is copied while `unpacked`, after sudo-rs registered its alternatives;
 - checks each copy: root-owned mode 0700, an empty `proc`, the dpkg
-  status, the signed postinst and `usr/bin/dpkg` bytes, and no `setpriv`.
+  status, the signed postinst, `usr/bin/dpkg` and signed `setpriv` bytes.
 
-It then applies three reviewed normalizations:
+It preserves these reviewed fixture boundaries:
 
 - pinned dpkg writes `sudo.list` in extraction order, with symbolic links
-  last. The signed sudo binding pins the C-sorted list, so the script sorts
-  it and requires the pinned digest (2376 bytes, `92f90d6a…`). This proves
-  that only the order changed.
+  last. The signed sudo binding pins these unchanged bytes and requires
+  their digest (2376 bytes, `39fe94bd…`), without sorting or replacing the
+  list or changing its inode and timestamps.
 - udev's static-node permissions only adjust existing paths. `dev/kvm`,
   `dev/fuse` and `dev/snd/seq` are created as empty **regular files**,
   `root:root` 0600, never as device nodes, as in the recorded pinned proof.
 - util-linux is not yet unpacked in these states. The script therefore
-  extracts only its `usr/bin/setpriv` (SHA-256 `9e0d70d2…`) into
-  `WORKSPACE/reference-tools` for the pinned-dpkg proof sources.
+  extracts only its `usr/bin/setpriv` (SHA-256 `86965a01…`) into
+  `WORKSPACE/reference-tools` for the pinned-dpkg proof sources, together
+  with the exact independently authenticated libcap-ng runtime. The
+  original four-package `--configure --pending` oracle registers neither
+  helper package, and must actually attempt and deny the unchanged libc6
+  postinst under the read-only/noexec bind before its result is accepted.
 
 The prestates are disposable fixtures, not native installation results.
 The build tree is removed; `WORKSPACE/prestate-build/evidence` keeps the

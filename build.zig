@@ -300,6 +300,36 @@ pub fn build(b: *std.Build) void {
     const install_native_dpkg = b.addInstallArtifact(native_dpkg, .{});
     b.getInstallStep().dependOn(&install_native_dpkg.step);
     b.step("build-native-dpkg-reference", "Build pinned independent dpkg preparation and receipt tooling").dependOn(&install_native_dpkg.step);
+    const reference_paths_module = b.createModule(.{
+        .root_source_file = b.path("tools/real_snapshot_reference_paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_paths = b.addExecutable(.{ .name = "debz-reference-paths", .root_module = reference_paths_module });
+    const install_reference_paths = b.addInstallArtifact(reference_paths, .{});
+    b.getInstallStep().dependOn(&install_reference_paths.step);
+    b.step("build-reference-paths", "Build descriptor-rooted protected reference input verification").dependOn(&install_reference_paths.step);
+    const reference_paths_tests = b.addRunArtifact(b.addTest(.{ .root_module = reference_paths_module }));
+    b.step("test-real-snapshot-reference-paths", "Test actual no-follow protected reference path verification").dependOn(&reference_paths_tests.step);
+    workload_core.dependOn(&reference_paths_tests.step);
+    const reference_order_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_order = b.addExecutable(.{ .name = "debz-reference-order", .root_module = reference_order_module });
+    const install_reference_order = b.addInstallArtifact(reference_order, .{});
+    b.getInstallStep().dependOn(&install_reference_order.step);
+    b.step("build-reference-order", "Build actual pinned independent dpkg ordering and prestate producer").dependOn(&install_reference_order.step);
+    const reference_order_tests_module = b.createModule(.{
+        .root_source_file = b.path("tools/test-real-snapshot-reference-order.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_order_tests = b.addRunArtifact(b.addTest(.{ .root_module = reference_order_tests_module }));
+    reference_order_tests.setCwd(b.path("."));
+    b.step("test-real-snapshot-reference-order", "Test original reference dependency ordering and signed cycle refusals").dependOn(&reference_order_tests.step);
+    workload_core.dependOn(&reference_order_tests.step);
     const native_dpkg_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_dpkg_module }));
     workload_native.dependOn(&native_dpkg_tests.step);
     const native_dpkg_test_step = b.step("test-native-dpkg-reference", "Run actual native reference selection and preparation refusals");
@@ -720,6 +750,8 @@ pub fn build(b: *std.Build) void {
     );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
+    audit_step.dependOn(&reference_order_tests.step);
+    audit_step.dependOn(&reference_paths_tests.step);
     const write_digest_inventory_step = b.step(
         "write-digest-inventory",
         "Regenerate the digest cutover inventories",
@@ -840,9 +872,35 @@ pub fn build(b: *std.Build) void {
     });
     reference_escape_probe.root_module.addImport("network_probe", reference_network_probe_module);
     audit_step.dependOn(&reference_escape_probe.step);
-    const protected_reference = b.addSystemCommand(
-        &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },
-    );
+    const protected_reference_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const protected_reference_tool = b.addExecutable(.{
+        .name = "debz-reference-protected",
+        .root_module = protected_reference_module,
+    });
+    const install_protected_reference = b.addInstallArtifact(protected_reference_tool, .{});
+    const reference_order_test_options = b.addOptions();
+    reference_order_test_options.addOption([]const u8, "protected_reference", b.getInstallPath(.bin, "debz-reference-protected"));
+    reference_order_test_options.addOption([]const u8, "reference_order", b.getInstallPath(.bin, "debz-reference-order"));
+    reference_order_test_options.addOption([]const u8, "reference_paths", b.getInstallPath(.bin, "debz-reference-paths"));
+    reference_order_tests_module.addOptions("reference_order_test_options", reference_order_test_options);
+    reference_order_tests.step.dependOn(&install_protected_reference.step);
+    reference_order_tests.step.dependOn(&install_reference_order.step);
+    reference_order_tests.step.dependOn(&install_reference_paths.step);
+    b.getInstallStep().dependOn(&install_protected_reference.step);
+    b.step("build-reference-protected", "Build actual non-skipped protected independent dpkg proof driver")
+        .dependOn(&install_protected_reference.step);
+    const protected_reference_tests = b.addRunArtifact(b.addTest(.{ .root_module = protected_reference_module }));
+    b.step("test-real-snapshot-reference-protected-pure", "Test original protected proof observation parsing without root")
+        .dependOn(&protected_reference_tests.step);
+    audit_step.dependOn(&protected_reference_tests.step);
+    workload_core.dependOn(&protected_reference_tests.step);
+    const protected_reference = b.addRunArtifact(protected_reference_tool);
+    protected_reference.has_side_effects = true;
     protected_reference.addArgs(&.{
         "--launcher",
         b.option([]const u8, "reference-protected-launcher", "Root-owned protected ReleaseSafe launcher") orelse "",

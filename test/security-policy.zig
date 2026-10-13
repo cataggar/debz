@@ -936,7 +936,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 59), members);
+    try testing.expectEqual(@as(usize, 62), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2799,19 +2799,18 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    request.ifru.flags.UP = true;\n",
         "    if (applied != .SUCCESS) return applied;\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
-        "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
-        "                if not target.is_relative_to(library):\n",
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.zig", &.{
+        "    if (payload.len != size or !std.mem.eql(u8, &actual, digest))",
+        "                return error.ToolchainLibrarySymlinkEscapes;\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
         "  printf -- '-Dreference-protected-profile-scripts=%s\\n' \"$profiles\"\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/test_real_snapshot_reference_protected.py", &.{
-        "    profiles = prove_profiles(args, scripts)\n",
-        "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
-        "    \"udev\": (\"proc-pid-only\",),\n",
-        "            if control.returncode != 0 or control.stdout != expected:\n",
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected.zig", &.{
+        "        const profile_result = try self.proveProfiles(signed_scripts);\n",
+        "&.{ \"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\" } else &.{\"proc-pid-only\"}",
+        "observed.code == 0 and eq(u8, observed.stdout, \"DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\\n\")",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
@@ -2823,7 +2822,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     const workflow = try f.source(".github/workflows/ci.yml");
     const ci_script = try f.source("tools/real-snapshot-reference-protected-ci.sh");
-    const harness = try f.source("tools/test_real_snapshot_reference_protected.py");
+    const harness = try f.source("tools/real-snapshot-reference-protected.zig");
     const gate = "    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)\n";
     const stage = "      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n";
     for ([_]struct { path: []const u8, text: []const u8 }{
@@ -2837,7 +2836,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: amd64\n            runner: ubuntu-24.04\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE", "    timeout-minutes: 140\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE") },
         .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "trap collect EXIT\n", "trap collect EXIT\nexit 0\n") },
         .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "  -Doptimize=ReleaseSafe -j2 --summary all\n", "  -Doptimize=ReleaseSafe -j2 --summary all || true\n") },
-        .{ .path = "tools/test_real_snapshot_reference_protected.py", .text = try f.replace(harness, "    profiles = prove_profiles(args, scripts)\n", "    profiles = \"skipped\"\n    unittest.SkipTest\n") },
+        .{ .path = "tools/real-snapshot-reference-protected.zig", .text = try f.replace(harness, "        const profile_result = try self.proveProfiles(signed_scripts);\n", "        const profile_result = \"skipped\"; // SkipTest\n") },
     }) |mutation| {
         const refused = try nativeCheck(&f, "protected-reference", mutation.path, mutation.text);
         defer refused.deinit();
