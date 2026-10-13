@@ -276,6 +276,7 @@ runtime=$tools/reference-runtime
 "$tools/runtime-tool/bin/debz-reference-runtime" record \
   amd64 "$lock" "$cache" "$pinned" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
 
 # This oracle has only the four reviewed packages registered. Its one possible
 # libc6 callback is denied before exec; --pending is never used on the closure.
