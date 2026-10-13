@@ -142,12 +142,14 @@ current account files. Numeric-only records require no identity blobs.
 Managed observations separately track current override/account state across
 known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
-As in normal execution, successful non-preinst outcomes refresh the override
-database for later phases. Their checkpoints include the database and the
-root-local account inputs used by the refreshed records. Only override records
-created or changed at that boundary add their live targets to managed state;
-unchanged administrator overrides do not add targets. Dpkg's incidental rewrite
-of a numeric identity into an equivalent account name is not a target change.
+As in normal execution, every exited non-preinst outcome, including a nonzero
+exit, refreshes the override database for later phases; replaying a recorded
+exited outcome refreshes the same way. Their checkpoints include the database
+and the root-local account inputs used by the refreshed records. Only override
+records created or changed at that boundary add their live targets to managed
+state; unchanged administrator overrides do not add targets. Dpkg's incidental
+rewrite of a numeric identity into an equivalent account name is not a target
+change.
 The observation binds the actual no-follow kind, bytes and mode/uid/gid after genuine
 `dpkg-statoverride --update`, not an assumed copy of the record's metadata.
 Merged-/usr spellings are observed at their physical alias destination.
@@ -1007,7 +1009,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs 24
+`zig build test-native-recovery-zig-statoverride` runs 32
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -1015,14 +1017,20 @@ identity, stored-blob and owner drifts. The Zig runner checks exact persisted
 account/group bytes, archive-evicted core recovery, unchanged helper inode and
 bytes, pinned-dpkg filesystem/database/script parity or refusal without
 package mutation, terminal completion, and immutable repeated receipts.
+The six differing-script upgrades are described above.
 The five genuine chrony-shaped additions cover created and changed records at
 `after_script_outcome`, archive-evicted recovery, exact `statoverride` and
 `statoverride-old` bytes, untracked administrator override edits, and mode,
 owner and content drift refusals. Script-created targets are present in both
 the checkpoint and retained settled snapshot; the shared settled verifier
-accepts their captured state and refuses later metadata drift. Fixture scripts
-set deterministic regular-file timestamps before observation rather than
-normalizing differences in captured roots.
+accepts their captured state and refuses later metadata drift. Two more
+chrony cases fail the postinst with exit 23 after it adds every override and
+crash at `after_failure_outcome`; the checkpoint must bind all three targets.
+Without drift, recovery reaches `script_failed` with reference parity, exact
+database bytes and `failed_after_mutation` completion. A log-directory mode
+drift is refused as `managed_state_changed` without mutating the root. Fixture
+scripts set deterministic regular-file timestamps before observation rather
+than normalizing differences in captured roots.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
