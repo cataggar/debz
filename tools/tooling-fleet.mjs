@@ -28,6 +28,7 @@ export const selectors = Object.freeze({
   'test-vendor-snapshot-tools': ['build-vendor-snapshot-tools'],
   'test-real-snapshot-reference-order': ['build-reference-order'],
   'test-real-snapshot-reference-paths': ['build-reference-paths'],
+  'test-real-snapshot-reference-protected-pure': ['build-reference-protected'],
   'test-release-consumers': ['build-release-tool'],
   'test-release-workflow-policy': ['build-release-tool', 'build-release-workflow-policy'],
   'test-native-only-policy': ['build-security-audit'],

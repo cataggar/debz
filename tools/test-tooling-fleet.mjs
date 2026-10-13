@@ -85,6 +85,8 @@ test('both architectures and modes schedule distinct exact selector rows without
       ['self-hosted', 'Linux', row.architecture === 'amd64' ? 'X64' : 'ARM64', 'ubuntu2604']);
   }
   assert.equal(planRows(selected, 'arm64', 'ReleaseSafe').include.length, 2);
+  assert.deepEqual(selectTargets('test-real-snapshot-reference-protected-pure', available),
+    ['test-real-snapshot-reference-protected-pure']);
 });
 
 test('unknown, privileged, duplicate, injected and actually absent targets refuse before scheduling', () => {

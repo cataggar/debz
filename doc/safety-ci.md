@@ -124,7 +124,8 @@ inventory and source guards, then emits the immutable row plan.
 The reviewed pure selectors and their producer prerequisites are listed in
 `tools/tooling-fleet.mjs`. Current native fixtures, signing/archive/repository,
 dpkg preparation, Debian readiness, reference runtime, replay comparison and
-oracle-evidence tests are available. Vendor capture/derivation, reference order/paths, release consumers
+oracle-evidence tests are available. Vendor capture/derivation, reference
+order/paths and protected-observation parsing (`*-protected-pure`), release consumers
 and native policies are accepted only when their actual producer and test
 targets exist in the dispatched candidate; an unintegrated port fails planning,
 not a success-shaped fallback. `test`, `test-release`, `security-audit`,
