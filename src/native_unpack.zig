@@ -9530,65 +9530,59 @@ fn captureDatabaseSnapshotInto(
     options: package_database.Options,
     observer: ?DatabaseCaptureObserver,
 ) !package_database.Snapshot {
+    _ = observer;
     const limits = options.limits;
-    var database_pin = root.pinDirectory(try root_fs.Path.init(package_database.database_directory)) catch |err| switch (err) {
-        error.FileNotFound => return error.DatabaseStatusMissing,
-        else => return err,
-    };
-    defer database_pin.close();
-    const database_root = root_fs.Root.init(root.io, database_pin.dir);
 
     const status = (try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.status_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.status_path,
         limits.max_status_bytes,
     )) orelse return error.DatabaseStatusMissing;
     var snapshot: package_database.Snapshot = .{ .status = status };
     snapshot.status_old = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.status_old_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.status_old_path,
         limits.max_status_bytes,
     );
     snapshot.arch = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.arch_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.arch_path,
         limits.max_database_file_bytes,
     );
     snapshot.diversions = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.diversions_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.diversions_path,
         limits.max_database_file_bytes,
     );
     snapshot.statoverride = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.statoverride_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.statoverride_path,
         limits.max_database_file_bytes,
     );
     snapshot.triggers_file = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.triggers_file_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.triggers_file_path,
         limits.max_database_file_bytes,
     );
     snapshot.triggers_unincorp = try captureDatabaseFile(
         owned,
-        database_root,
-        package_database.triggers_unincorp_path,
+        root,
+        package_database.database_directory ++ "/" ++ package_database.triggers_unincorp_path,
         limits.max_database_file_bytes,
     );
     var named_triggers: std.ArrayList(package_database.NamedTriggerEntry) = .empty;
     defer named_triggers.deinit(owned);
-    var triggers_pin = try database_root.pinDirectory(try root_fs.Path.init(
-        package_database.triggers_directory,
+    var triggers_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.triggers_directory,
     ));
-    defer triggers_pin.close();
-    const triggers_root = root_fs.Root.init(root.io, triggers_pin.dir);
-    var triggers_iterator = triggers_pin.dir.iterate();
+    defer triggers_dir.close(root.io);
+    var triggers_iterator = triggers_dir.iterate();
     while (try triggers_iterator.next(root.io)) |entry| {
         if (std.mem.eql(u8, entry.name, "File") or
             std.mem.eql(u8, entry.name, "Unincorp") or
@@ -9597,10 +9591,19 @@ fn captureDatabaseSnapshotInto(
         if (named_triggers.items.len >= limits.max_named_trigger_files)
             return error.DatabaseCaptureLimit;
         const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.triggers_directory,
+                name,
+            },
+        );
         const file = (try captureDatabaseFile(
             owned,
-            triggers_root,
-            name,
+            root,
+            path,
             limits.max_database_file_bytes,
         )) orelse return error.DatabaseCaptureChanged;
         try named_triggers.append(owned, .{
@@ -9631,20 +9634,28 @@ fn captureDatabaseSnapshotInto(
 
     var info: std.ArrayList(package_database.InfoEntry) = .empty;
     defer info.deinit(owned);
-    var info_pin = try database_root.pinDirectory(try root_fs.Path.init(
-        package_database.info_directory,
+    var info_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.info_directory,
     ));
-    defer info_pin.close();
-    const info_root = root_fs.Root.init(root.io, info_pin.dir);
-    var info_iterator = info_pin.dir.iterate();
+    defer info_dir.close(root.io);
+    var info_iterator = info_dir.iterate();
     while (try info_iterator.next(root.io)) |entry| {
         if (info.items.len >= limits.max_info_entries)
             return error.DatabaseCaptureLimit;
         const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                name,
+            },
+        );
         const captured = (try captureDatabaseInfoFile(
             owned,
-            info_root,
-            name,
+            root,
+            path,
             limits.max_info_file_bytes,
         )) orelse return error.DatabaseCaptureChanged;
         try info.append(owned, .{
@@ -9669,20 +9680,28 @@ fn captureDatabaseSnapshotInto(
 
     var updates: std.ArrayList(package_database.UpdateEntry) = .empty;
     defer updates.deinit(owned);
-    var updates_pin = try database_root.pinDirectory(try root_fs.Path.init(
-        package_database.updates_directory,
+    var updates_dir = try root.openDirectory(try root_fs.Path.init(
+        package_database.database_directory ++ "/" ++ package_database.updates_directory,
     ));
-    defer updates_pin.close();
-    const updates_root = root_fs.Root.init(root.io, updates_pin.dir);
-    var updates_iterator = updates_pin.dir.iterate();
+    defer updates_dir.close(root.io);
+    var updates_iterator = updates_dir.iterate();
     while (try updates_iterator.next(root.io)) |entry| {
         if (updates.items.len >= limits.max_update_fragments)
             return error.DatabaseCaptureLimit;
         const name = try owned.dupe(u8, entry.name);
+        const path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}/{s}",
+            .{
+                package_database.database_directory,
+                package_database.updates_directory,
+                name,
+            },
+        );
         const file = (try captureDatabaseFile(
             owned,
-            updates_root,
-            name,
+            root,
+            path,
             limits.max_database_file_bytes,
         )) orelse return error.DatabaseCaptureChanged;
         try updates.append(owned, .{
@@ -9702,11 +9721,6 @@ fn captureDatabaseSnapshotInto(
         }
     }.less);
     snapshot.updates = try owned.dupe(package_database.UpdateEntry, updates.items);
-    if (observer) |hook| try hook.before_verify(hook.context, root);
-    _ = try updates_pin.metadata();
-    _ = try info_pin.metadata();
-    _ = try triggers_pin.metadata();
-    _ = try database_pin.metadata();
     return snapshot;
 }
 
