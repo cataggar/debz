@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-authorization-v1",
+  "title": "debz system install authorization v1",
+  "$comment": "The install subcommand itself is the authorization for the fixed system profile: it binds the request, the program, and the exact lock to one named execution generation with keep-existing conffiles and no interaction. A build that lacks that generation records the authorization and refuses before mutation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "version", "authority", "attempt_id", "command", "request_document_sha512",
+        "program_document_sha512", "lock", "backend", "conffile", "noninteractive", "execution_generation"
+      ],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-authorization-v1" },
+        "version": { "const": 1 },
+        "authority": { "const": "system_install_invocation" },
+        "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+        "command": { "$ref": "system-install-request-v1.json#/$defs/command" },
+        "request_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "program_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "lock": { "$ref": "system-install-request-v1.json#/$defs/lockReference" },
+        "backend": { "$ref": "system-install-request-v1.json#/$defs/backend" },
+        "conffile": { "const": "keep_existing" },
+        "noninteractive": { "const": true },
+        "execution_generation": { "const": "system-install-execution-v1" }
+      }
+    },
+    "digest_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+  }
+}

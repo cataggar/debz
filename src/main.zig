@@ -382,6 +382,7 @@ pub fn main(init: std.process.Init) !void {
         try runAptSystemRecovery(init, &args, stdout, stderr);
         return;
     }
+    if (std.mem.eql(u8, command, "install") and try runSystemInstall(init, stdout, stderr)) return;
     const operation = debz.parseOperation(command) orelse {
         try stderr.print("debz: unknown command '{s}'\n", .{command});
         try stderr.writeAll(root_help);
@@ -441,6 +442,58 @@ pub fn main(init: std.process.Init) !void {
         try stderr.flush();
         std.process.exit(@intFromEnum(result.exit_status));
     }
+}
+
+/// `debz install <package>` without product_api v1 options is the system
+/// profile; false keeps the explicit product_api form unchanged.
+fn runSystemInstall(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !bool {
+    const allocator = init.arena.allocator();
+    var arguments: std.ArrayList([]const u8) = .empty;
+    var iterator = init.minimal.args.iterate();
+    _ = iterator.next();
+    _ = iterator.next();
+    while (iterator.next()) |argument| try arguments.append(allocator, argument);
+    const invocation = switch (debz.system_install.route(arguments.items)) {
+        .product_api => return false,
+        .system => |value| value,
+        .usage => |refused| {
+            if (refused.output == .json) {
+                try render(allocator, stdout, stderr, .json, api.failure(.install, .usage, .invalid_request, refused.message));
+            } else {
+                try stderr.print("debz: {s}\n", .{refused.message});
+                try stderr.writeAll("Try 'debz install --help'.\n");
+            }
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        },
+    };
+    var result = if (backend_policy.select(runtimeMode(), invocation.backend, .product)) |kind|
+        try debz.system_install_command.execute(allocator, invocation, kind, .{
+            .legacy_execution_capable = !native_only_rehearsal,
+        })
+    else |err| switch (err) {
+        error.LegacyCapabilityRequired => try debz.system_install.refusal(
+            allocator,
+            invocation.package,
+            .recovery,
+            .legacy_recovery_release_required,
+            debz.legacy_compat.recovery_guidance,
+        ),
+        else => try debz.system_install.refusal(
+            allocator,
+            invocation.package,
+            .usage,
+            .invalid_request,
+            "the requested transaction backend is not available for the system profile; nothing was changed",
+        ),
+    };
+    defer result.deinit();
+    try debz.system_install.render(allocator, &result.value, invocation.output, stdout, stderr);
+    try stdout.flush();
+    try stderr.flush();
+    if (result.value.exit_status != 0) std.process.exit(result.value.exit_status);
+    return true;
 }
 
 fn detectHelpTopic(command: []const u8, args: *std.process.Args.Iterator) ?HelpTopic {
@@ -1550,7 +1603,21 @@ fn printOperationHelp(stdout: *std.Io.Writer, operation: api.Operation) !void {
     if (operation == .install)
         try stdout.writeAll("Native install result:\n  --native-result --json         Return receipt-bound or verified unchanged native evidence\n\n");
     try stdout.writeAll(common_options_help);
+    if (operation == .install) try stdout.writeAll(system_install_help);
 }
+
+const system_install_help =
+    \\
+    \\System profile:
+    \\  sudo debz install [--json] [-y] [--noninteractive] [--transaction-backend BACKEND]
+    \\                    [--deadline-ms MS] [--lock-wait-ms MS] <package>
+    \\  Without product options, installs one package into / from the active repository
+    \\  configuration ('sudo debz repo add'). Each run owns an attempt under
+    \\  /var/lib/debz/system-install and an exact lock under /var/lib/debz/locks; an
+    \\  interrupted attempt is adopted only by rerunning the same command. This build
+    \\  plans and authorizes but does not execute (exit 3; the exact lock is retained).
+    \\
+;
 
 fn operationDescription(operation: api.Operation) []const u8 {
     return switch (operation) {

@@ -9317,6 +9317,111 @@ fn historicalPlanningFence(allocator: std.mem.Allocator, lock: *const exact_lock
     try historical.requireExecutionAuthority();
 }
 
+test "production system install binds healthy private and held installed facts into the owned pending chain on both backends" {
+    const system_install = @import("system_install.zig");
+    const command = @import("system_install_command.zig");
+    const Crash = struct {
+        armed: ?system_install.CrashPoint,
+
+        fn hit(raw: ?*anyopaque, point: system_install.CrashPoint) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.armed != point) return;
+            self.armed = null;
+            return error.InjectedCrash;
+        }
+    };
+    for (std.enums.values(transaction_engine.Kind)) |kind| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        const status = installed_only_status ++
+            "Package: beta\nStatus: hold ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+        var fixture = try ProductionWorkflowFixture.initWithRepository(
+            allocator,
+            &directory,
+            status,
+            @embedFile("fixtures/native_baseline/InRelease"),
+            @embedFile("fixtures/native_baseline/Packages"),
+            @embedFile("fixtures/native_baseline/keyring.gpg"),
+        );
+        defer fixture.deinit();
+        try prepareBaselinePublicationLocks(&directory);
+        const context = try activateHealthyPlanningFixture(allocator, &fixture);
+        defer context.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = 1_788_796_860 };
+        var revalidation: command.Revalidation = .{ .context = context };
+        var planner: command.ProductionPlanner = .{ .backend = &backend, .context = context };
+        var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+        var crash: Crash = .{ .armed = .after_lock_publication };
+        const runner: system_install.Engine = .{
+            .io = std.testing.io,
+            .authority = try command.authorityOf(allocator, context, fixture.install_root, &revalidation),
+            .planner = planner.interface(),
+            .observer = .{ .context = &crash, .hitFn = Crash.hit },
+            .locks = locks.interface(),
+        };
+
+        var interrupted = try runner.run(std.testing.allocator, .{ .package = "alpha" }, kind);
+        defer interrupted.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, interrupted.exitStatus());
+        const attempt_id = interrupted.value.attempt_id.?;
+        var blocked = try runner.run(std.testing.allocator, .{ .package = "beta" }, kind);
+        defer blocked.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, blocked.exitStatus());
+        try std.testing.expectEqualSlices(u8, &attempt_id, &blocked.value.attempt_id.?);
+
+        var result = try runner.run(std.testing.allocator, .{ .package = "alpha" }, kind);
+        defer result.deinit();
+        const value = &result.value;
+        try std.testing.expectEqual(api.ExitStatus.unavailable, result.exitStatus());
+        try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, value.outcome);
+        try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, value.diagnostics[0].id);
+        try std.testing.expect(value.resumed and !value.changed);
+        try std.testing.expectEqualSlices(u8, &attempt_id, &value.attempt_id.?);
+        const lock_shown = value.lock.?;
+        try std.testing.expect(std.mem.startsWith(u8, lock_shown, "/var/lib/debz/locks/install-"));
+        try std.testing.expect(std.mem.startsWith(u8, value.summary, "alpha is planned and authorized by exact lock "));
+        try std.testing.expect(std.mem.endsWith(u8, value.summary, system_install.pending_execution_message));
+
+        const shown_plan = value.plan.?;
+        try std.testing.expectEqual(@as(usize, 1), shown_plan.archives.len);
+        try std.testing.expectEqualStrings("alpha", shown_plan.archives[0].package);
+        try std.testing.expectEqual(system_install.ArchiveClass.signed_sha512, shown_plan.archives[0].archive_authentication);
+        try std.testing.expect(shown_plan.archives[0].derived_sha512 == null);
+        try std.testing.expectEqual(system_install.InstalledOrigin.installed_package_database, shown_plan.installed.origin);
+        try std.testing.expectEqual(@as(u64, 2), shown_plan.installed.fact_count);
+        try std.testing.expectEqual(@as(usize, 1), shown_plan.installed.held.len);
+        try std.testing.expectEqualStrings("beta", shown_plan.installed.held[0].name);
+        try std.testing.expectEqual(@as(usize, 1), shown_plan.repositories.len);
+        try std.testing.expectEqualSlices(u8, &context.snapshot().configuration.repositories[0].id.bytes, &shown_plan.repositories[0].id);
+
+        const lock_file = try std.fs.path.join(allocator, &.{ fixture.install_root, lock_shown });
+        var lock = try readProductLock(allocator, std.testing.io, lock_file, kind);
+        defer lock.deinit();
+        try std.testing.expect(lock == .active_install);
+        try std.testing.expectEqualSlices(u8, &context.snapshot().manifest.digest_sha256, &lock.active_install.context().manifest_sha256);
+        const observed = lock.active_install.evidence().observed;
+        try std.testing.expectEqual(@as(usize, 2), observed.packages.len);
+        try std.testing.expectEqual(dpkg_status.Want.hold, observed.packages[0].selection);
+        for (lock.active_install.archive_lock.lock.packages) |locked|
+            try std.testing.expectEqualStrings("alpha", locked.name);
+        try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, historicalPlanningFence(allocator, &lock.active_install));
+
+        var again = try runner.run(std.testing.allocator, .{ .package = "alpha" }, kind);
+        defer again.deinit();
+        try std.testing.expectEqual(api.ExitStatus.unavailable, again.exitStatus());
+        try std.testing.expect(!again.value.resumed);
+        try std.testing.expect(!std.mem.eql(u8, &attempt_id, &again.value.attempt_id.?));
+
+        const installed_after = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+        try std.testing.expectEqualStrings(status, installed_after);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.record_path, .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ system_install.active_path, .{}));
+    }
+}
+
 test "production healthy installed prestate refuses root health drift and foreign active trust without publishing" {
     for ([_]enum { unhealthy, unincorp, all_changed, prestate_drift, source_drift, key_drift, architecture_drift, owned_work, foreign_context }{ .unhealthy, .unincorp, .all_changed, .prestate_drift, .source_drift, .key_drift, .architecture_drift, .owned_work, .foreign_context }) |scenario| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

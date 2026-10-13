@@ -126,13 +126,15 @@ and this configuration view neither reinterprets nor adopts them. A projected
 context must stay within its callback's lifetime; `validate()` rechecks that
 borrowed authority too.
 
-This completes configuration/context preparation only. The short SymCrypt
-install command, durable auto-lock, evidence-bearing product results and
-exact owned retry are not wired to this view yet. In particular, the existing
-exact-lock builder refuses retained installed packages with no authenticated
-origin in the current repository set (`RetainedPackageUnavailable`); resolving
-that healthy-system baseline boundary must not silently drop retained state
-or invent archive/signature authority. The reproduced blocker is tracked in
+This completes configuration/context preparation. The
+[short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1)
+now consumes this view for planning, durable auto-lock ownership, versioned
+per-operation evidence and exact owned retry; its execution generation is not
+available yet. The explicit product exact-lock builder still refuses retained
+installed packages with no authenticated origin in the current repository set
+(`RetainedPackageUnavailable`). The short profile instead binds them as healthy
+installed facts in exact-closure-lock v5, without dropping retained state or
+inventing archive/signature authority. The remaining work is tracked in
 [#407](https://github.com/cataggar/debz/issues/407).
 
 ## Architecture and manifest

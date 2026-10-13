@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-progress-v1",
+  "title": "debz system install attempt progress v1",
+  "$comment": "Replaced in place; each generation chains the SHA-512 of its predecessor document. Phases advance reserved -> lock_bound -> authorized -> executing -> recovery_required; reserved, lock_bound, authorized, and executing may instead settle as terminal. recovery_required and terminal are final.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": { "$ref": "#/$defs/payload" },
+    "digest_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+  },
+  "$defs": {
+    "phase": { "enum": ["reserved", "lock_bound", "authorized", "executing", "recovery_required", "terminal"] },
+    "exitStatus": { "enum": [0, 2, 3, 4, 5, 6, 7, 8, 70] },
+    "errorId": {
+      "enum": [
+        "unsupported_api_version", "invalid_request", "confirmation_required", "conffile_policy_required",
+        "configuration_required", "repository_authentication_failed", "offline_cache_miss", "planning_failed",
+        "download_failed", "transaction_backend_unavailable", "transaction_failed", "recovery_failed",
+        "root_operation_conflict", "root_operation_recovery_required", "legacy_recovery_release_required",
+        "lock_verification_failed", "internal_error"
+      ]
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "changed", "exit_status", "message"],
+      "properties": {
+        "outcome": { "enum": ["completed", "rejected", "refused_before_mutation", "abandoned_before_mutation"] },
+        "changed": { "type": "boolean" },
+        "exit_status": { "$ref": "#/$defs/exitStatus" },
+        "id": { "$ref": "#/$defs/errorId" },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "oneOf": [
+        {
+          "properties": { "outcome": { "const": "completed" }, "exit_status": { "const": 0 } },
+          "not": { "required": ["id"] }
+        },
+        {
+          "required": ["id"],
+          "properties": {
+            "outcome": { "enum": ["rejected", "refused_before_mutation", "abandoned_before_mutation"] },
+            "changed": { "const": false },
+            "exit_status": { "not": { "const": 0 } }
+          }
+        }
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "attempt_id", "generation", "request_document_sha512", "phase"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-progress-v1" },
+        "version": { "const": 1 },
+        "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "previous_progress_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "request_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "phase": { "$ref": "#/$defs/phase" },
+        "lock": { "$ref": "system-install-request-v1.json#/$defs/lockReference" },
+        "program_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "authorization_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "terminal": { "$ref": "#/$defs/terminal" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "generation": { "const": 1 } } },
+          "then": { "not": { "required": ["previous_progress_sha512"] } },
+          "else": { "required": ["previous_progress_sha512"] }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "reserved" } } },
+          "then": {
+            "properties": { "generation": { "const": 1 } },
+            "not": { "anyOf": [
+              { "required": ["lock"] }, { "required": ["program_document_sha512"] },
+              { "required": ["authorization_document_sha512"] }, { "required": ["terminal"] }, { "required": ["reason"] }
+            ] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "lock_bound" } } },
+          "then": {
+            "required": ["lock"],
+            "not": { "anyOf": [
+              { "required": ["program_document_sha512"] }, { "required": ["authorization_document_sha512"] },
+              { "required": ["terminal"] }, { "required": ["reason"] }
+            ] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "enum": ["authorized", "executing"] } } },
+          "then": {
+            "required": ["lock", "program_document_sha512", "authorization_document_sha512"],
+            "not": { "anyOf": [{ "required": ["terminal"] }, { "required": ["reason"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "recovery_required" } } },
+          "then": {
+            "required": ["lock", "program_document_sha512", "authorization_document_sha512", "reason"],
+            "not": { "required": ["terminal"] }
+          }
+        },
+        {
+          "if": { "properties": { "phase": { "const": "terminal" } } },
+          "then": {
+            "required": ["terminal"],
+            "not": { "required": ["reason"] },
+            "dependentRequired": {
+              "authorization_document_sha512": ["program_document_sha512"],
+              "program_document_sha512": ["lock"]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

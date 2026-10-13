@@ -369,10 +369,23 @@ root lock and durable no-follow publication. `debz.system_product_context`
 provides a typed read-only resolver with root-local cache/state/lock defaults,
 target-metadata architecture, source/key/manifest revalidation and active-work
 refusal. This is an independently useful #68 preparation slice, not the
-simple system installation feature: durable auto-lock/owned retry/product
-evidence and scoped standalone execution are still unwired, and existing
-exact locks require authenticated origins for every retained installed
-package. See [typed system product context](target-apt-config.md#typed-system-product-context).
+simple system installation feature. Existing explicit exact locks still
+require authenticated origins for every retained installed package. See
+[typed system product context](target-apt-config.md#typed-system-product-context).
+
+`debz.system_install` and `debz.system_install_command` add the short
+`sudo debz install PACKAGE` system profile on top of that context. The command
+runs in the private root projection. A durable owner lock and the shared
+root-operation guard serialize each attempt. An unsettled attempt is adopted
+only by its exact command before any refresh or replan. The planner publishes
+an attempt-owned healthy exact-closure-lock v5. Versioned
+request/progress/program/authorization/receipt/recovery documents and a
+`system-install-result-v1` record each operation. Healthy private and held
+installed facts carry no archive origin. Native planning admits only signed or
+authenticated-derived SHA-512 archive identities. No build provides the
+execution generation yet: an authorized attempt refuses before mutation and
+retains its lock. See
+[short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1).
 
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 

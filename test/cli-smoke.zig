@@ -470,3 +470,53 @@ test "CLI smoke explicit-root queries native configuration recovery and confirma
         try support.contains(result.stdout, "\"exit_status\":2");
     }
 }
+
+test "CLI smoke short system install profile refuses usage and privilege before work" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const help = try f.check("install --help", 0, "System profile:", null);
+    defer help.deinit();
+    try empty(help.stderr);
+    try support.contains(help.stdout, "sudo debz install [--json] [-y] [--noninteractive]");
+    for ([_][]const u8{
+        "install --json one two",
+        "install --json pkg=1",
+        "install --json demo --deadline-ms 0",
+        "install --json demo --lock-wait-ms 86400001",
+        "install --json demo --transaction-backend other",
+        "install --json demo --transaction-backend",
+        "install --json demo -y --assume-yes",
+    }) |arguments| {
+        const result = try f.check(arguments, 2, "\"id\":\"invalid_request\"", null);
+        defer result.deinit();
+        try empty(result.stderr);
+        try oneLine(result.stdout);
+        try support.contains(result.stdout, "\"operation\":\"install\"");
+        try support.contains(result.stdout, "nothing was changed");
+    }
+    const human = try f.check("install one two", 2, null, "debz: the system profile installs exactly one package; nothing was changed");
+    defer human.deinit();
+    try empty(human.stdout);
+    try support.contains(human.stderr, "Try 'debz install --help'.");
+    if (std.os.linux.geteuid() == 0) return;
+    for ([_][]const u8{
+        "install --json demo",
+        "install --json -y --noninteractive --transaction-backend native --deadline-ms 5000 --lock-wait-ms 0 demo",
+    }) |arguments| {
+        const result = try f.check(arguments, 3, "\"schema\":\"https://debz.dev/schema/system-install-result-v1\"", null);
+        defer result.deinit();
+        try empty(result.stderr);
+        try oneLine(result.stdout);
+        const value = try document(&f, result.stdout);
+        try integerField(value, "exit_status", 3);
+        try stringField(value, "outcome", "rejected");
+        try booleanField(value, "changed", false);
+        try stringField(value, "package", "demo");
+        try support.contains(result.stdout, "\"id\":\"transaction_backend_unavailable\"");
+        try support.contains(result.stdout, "requires root privilege");
+    }
+    const unprivileged = try f.check("install demo", 3, null, "install: system install requires root privilege (run with sudo); nothing was changed");
+    defer unprivileged.deinit();
+    try empty(unprivileged.stdout);
+    try support.contains(unprivileged.stderr, "debz[transaction_backend_unavailable]:");
+}

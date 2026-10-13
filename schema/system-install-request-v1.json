@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-request-v1",
+  "title": "debz short system-profile install request v1: what was asked, never the solved closure",
+  "$comment": "Every system-install evidence document is an envelope: payload plus digest_sha512, the SHA-512 of the canonical payload (compact, declaration-ordered, absent optional fields omitted). The Zig decoder additionally requires the whole document to be canonical and enforces cross-field rules.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": { "$ref": "#/$defs/payload" },
+    "digest_sha512": { "$ref": "#/$defs/sha512" }
+  },
+  "$defs": {
+    "sha512": { "type": "string", "pattern": "^[0-9a-f]{128}$" },
+    "attemptId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "backend": { "enum": ["legacy_dpkg", "native"] },
+    "package": { "type": "string", "minLength": 2, "maxLength": 255, "pattern": "^[a-z0-9][a-z0-9+.-]+$" },
+    "command": {
+      "type": "string",
+      "pattern": "^debz install --transaction-backend (legacy_dpkg|native) [a-z0-9][a-z0-9+.-]+$",
+      "description": "The normalized invocation. An unsettled attempt is adopted only by a rerun of this exact request."
+    },
+    "absolutePath": { "type": "string", "pattern": "^/" },
+    "lockReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "document_sha512"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^var/lib/debz/locks/install-[0-9a-f]{32}\\.json$",
+          "description": "Root-relative path of the attempt's exact-closure-lock v5; the hexadecimal name is the owning attempt_id."
+        },
+        "document_sha512": { "$ref": "#/$defs/sha512", "description": "SHA-512 of the exact lock file bytes." }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "root", "cache_path", "state_path", "locks_path", "evidence_path", "architecture", "conffile", "noninteractive"],
+      "properties": {
+        "name": { "const": "system_default" },
+        "root": { "$ref": "#/$defs/absolutePath" },
+        "cache_path": { "$ref": "#/$defs/absolutePath" },
+        "state_path": { "$ref": "#/$defs/absolutePath" },
+        "locks_path": { "$ref": "#/$defs/absolutePath" },
+        "evidence_path": { "$ref": "#/$defs/absolutePath" },
+        "architecture": { "type": "string", "minLength": 1 },
+        "conffile": { "const": "keep_existing" },
+        "noninteractive": { "const": true }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "attempt_id", "operation", "package", "backend", "profile", "command", "request_sha512"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-request-v1" },
+        "version": { "const": 1 },
+        "attempt_id": { "$ref": "#/$defs/attemptId" },
+        "operation": { "const": "install" },
+        "package": { "$ref": "#/$defs/package" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "command": { "$ref": "#/$defs/command" },
+        "request_sha512": {
+          "$ref": "#/$defs/sha512",
+          "description": "SHA-512 over a fixed domain, the package, the backend, and the root. It binds what was asked; refresh and replanning never change it."
+        }
+      }
+    }
+  }
+}
