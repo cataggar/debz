@@ -685,6 +685,275 @@ fn runInvocationCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []c
     try statoverride.expectNoUnpackStatOverrideInput(&case);
 }
 
+/// A maintainer script that ends itself with a signal fails exactly like one
+/// that exits nonzero (lib/dpkg/subproc.c:139-157). In `preinst`, a fresh
+/// install's preinst adds override records and is then terminated: dpkg runs
+/// `postrm abort-install`, exits 1 and keeps the records. In `postrm`, an
+/// upgrade's old postrm adds records and is then killed: dpkg runs the new
+/// `postrm failed-upgrade` and completes the upgrade (src/main/script.c:328-392).
+/// Native crashes just after persisting the signalled outcome, and
+/// archive-evicted recovery must end like dpkg. `postrm_forged` rewrites that
+/// outcome as a clean exit and reseals it; the journal still binds the
+/// signalled outcome, so recovery must refuse without mutating the root.
+const SignalCase = enum { preinst, postrm, postrm_forged };
+
+fn canonicalJson(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try std.json.Stringify.value(value, .{ .whitespace = .minified }, &output.writer);
+    try output.writer.writeByte('\n');
+    return output.toOwnedSlice();
+}
+
+/// Returns the root-relative path of the one persisted script outcome under
+/// `root` that records a signal. It must be `kind`'s own `signal`, not a
+/// termination that native imposed.
+fn signaledOutcome(fixture: *foundation.Fixture, root: []const u8, kind: debz.maintainer_script.Kind, signal: u32) ![]u8 {
+    const directory = try process.rootPath(fixture, root, "var/lib/debz");
+    defer fixture.allocator.free(directory);
+    var dir = try fixture.dir.openDir(fixture.io, directory, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(fixture.io);
+    var iterator = dir.iterate();
+    var found: ?[]u8 = null;
+    errdefer if (found) |path| fixture.allocator.free(path);
+    while (try iterator.next(fixture.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, debz.native_recovery.script_outcome_prefix)) continue;
+        if (entry.kind != .file) return error.WrongScriptOutcome;
+        const path = try std.fmt.allocPrint(fixture.allocator, "var/lib/debz/{s}", .{entry.name});
+        var kept = false;
+        defer if (!kept) fixture.allocator.free(path);
+        const bytes = try process.rootBytes(fixture, root, path);
+        defer fixture.allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(debz.native_recovery.ScriptOutcome, fixture.allocator, bytes, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        const outcome = parsed.value;
+        if (outcome.disposition != .signaled) continue;
+        if (found != null) return error.AmbiguousSignaledOutcome;
+        if (outcome.kind != kind or (outcome.signal orelse 0) != signal or outcome.exit_code != null or
+            !outcome.spawned or outcome.terminated_process_group or outcome.escalated_to_kill)
+        {
+            std.debug.print("{s}: {s} signal {?d} exit {?d} spawned {} group {} escalated {}, expected {s} signal {d}\n", .{
+                path,                             @tagName(outcome.kind),    outcome.signal, outcome.exit_code, outcome.spawned,
+                outcome.terminated_process_group, outcome.escalated_to_kill, @tagName(kind), signal,
+            });
+            return error.WrongSignaledOutcome;
+        }
+        kept = true;
+        found = path;
+    }
+    return found orelse error.MissingSignaledOutcome;
+}
+
+/// Rewrites the signalled outcome at `path` in place as a sealed, canonical
+/// exit 0 and returns the forged bytes.
+fn forgeExitedOutcome(fixture: *foundation.Fixture, root: []const u8, path: []const u8) ![]u8 {
+    const bytes = try process.rootBytes(fixture, root, path);
+    defer fixture.allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(debz.native_recovery.ScriptOutcome, fixture.allocator, bytes, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    const original = try canonicalJson(fixture.allocator, parsed.value);
+    defer fixture.allocator.free(original);
+    // Only the claimed termination may differ from what native wrote.
+    if (!std.mem.eql(u8, bytes, original)) return error.NonCanonicalScriptOutcome;
+    var forged = parsed.value;
+    forged.disposition = .exited;
+    forged.exit_code = 0;
+    forged.signal = null;
+    debz.native_recovery.sealScriptOutcome(&forged);
+    try debz.native_recovery.validateScriptOutcome(forged);
+    const encoded = try canonicalJson(fixture.allocator, forged);
+    errdefer fixture.allocator.free(encoded);
+    const location = try process.rootPath(fixture, root, path);
+    defer fixture.allocator.free(location);
+    try fixture.write(location, encoded, 0o600);
+    return encoded;
+}
+
+/// A blocked recovery leaves the captured root, the bytes at `paths` and the
+/// pending operation exactly as they were.
+fn expectBlockedUnchanged(
+    fixture: *foundation.Fixture,
+    root: []const u8,
+    name: []const u8,
+    report: process.Report,
+    before: []const u8,
+    paths: []const []const u8,
+    contents: []const []const u8,
+) !void {
+    if (!std.mem.eql(u8, report.outcome, "recovery_required") and !std.mem.eql(u8, report.outcome, "refused")) {
+        std.debug.print("{s}: recovery was not blocked: {s}: {s}\n", .{ name, report.outcome, report.detail });
+        return error.BlockedRecoveryAccepted;
+    }
+    const after = try foundation.capture(fixture.allocator, fixture.io, root);
+    defer fixture.allocator.free(after);
+    if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+    for (paths, contents) |path, expected| {
+        const observed = try process.rootBytes(fixture, root, path);
+        defer fixture.allocator.free(observed);
+        if (!std.mem.eql(u8, observed, expected)) return error.BlockedRecoveryMutatedRoot;
+    }
+    const pending = try process.rootBytes(fixture, root, operation_path);
+    fixture.allocator.free(pending);
+    try process.rootAbsent(fixture, root, completion_path);
+}
+
+fn runSignalCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, kind: SignalCase) !void {
+    const name = switch (kind) {
+        .preinst => "statoverride-signal-preinst",
+        .postrm => "statoverride-signal-postrm",
+        .postrm_forged => "statoverride-signal-postrm-forged",
+    };
+    const install = kind == .preinst;
+    const operation = if (install) "install" else "upgrade";
+    const package_workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(package_workspace);
+    const first = try statoverride.signalEditArchive(fixture, arch, "1", package_workspace);
+    defer fixture.allocator.free(first);
+    const second = try statoverride.signalEditArchive(fixture, arch, "2", package_workspace);
+    defer fixture.allocator.free(second);
+    const archives = [_][]const u8{if (install) first else second};
+    const selected = [_]foundation.PackageIdentity{.{ .name = statoverride.name, .architecture = arch }};
+
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seed(&case, "");
+    try installDpkgStatoverride(&case, dpkg);
+    // Records only, so no file metadata changes and only the signal decides.
+    try statoverride.replace(&case, statoverride.edit_marker, if (install) "preinst:install\n" else "postrm:upgrade\n");
+    try statoverride.both(&case, statoverride.signal_marker, if (install) "preinst:install TERM\n" else "postrm:upgrade KILL\n");
+    if (!install) try case.seed(first);
+
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = operation,
+        .archives = &archives,
+        .packages = &selected,
+        .triggers = false,
+    }, reference_log) != @intFromBool(install)) return error.UnexpectedReferenceOutcome;
+    const reference_output = try support.path(fixture.allocator, reference_log, "reference.log");
+    defer fixture.allocator.free(reference_output);
+    const output = try support.read(fixture, reference_output, 1024 * 1024);
+    defer fixture.allocator.free(output);
+    try statoverride.expectReports(name, output, if (install)
+        &.{statoverride.terminated_report}
+    else
+        &.{ statoverride.killed_report, statoverride.fallback_report });
+
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = operation,
+        .archives = &archives,
+        .packages = &selected,
+        .crash_at = if (install) "after_failure_outcome" else "after_upgrade_postrm_outcome",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    try statoverride.expectEditApplied(&case);
+    try statoverride.expectSignalSent(&case);
+    const outcome_path = try signaledOutcome(fixture, case.native_root, if (install) .preinst else .postrm, if (install) 15 else 9);
+    defer fixture.allocator.free(outcome_path);
+    for ([_][]const u8{ first, second }) |path| {
+        try fixture.dir.deleteFile(fixture.io, path[fixture.path.len + 1 ..]);
+        try support.absent(fixture, path[fixture.path.len + 1 ..]);
+    }
+    const forged = if (kind == .postrm_forged) try forgeExitedOutcome(fixture, case.native_root, outcome_path) else null;
+    defer if (forged) |bytes| fixture.allocator.free(bytes);
+
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const database_before = try process.rootBytes(fixture, case.native_root, "var/lib/dpkg/statoverride");
+    defer fixture.allocator.free(database_before);
+    const status_before = try process.rootBytes(fixture, case.native_root, "var/lib/dpkg/status");
+    defer fixture.allocator.free(status_before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+
+    if (forged) |forged_bytes| {
+        const paths = [_][]const u8{ "var/lib/dpkg/statoverride", "var/lib/dpkg/status", outcome_path };
+        const contents = [_][]const u8{ database_before, status_before, forged_bytes };
+        try expectBlockedUnchanged(fixture, case.native_root, name, report.value, before, &paths, &contents);
+        const repeat_log = try support.path(fixture.allocator, name, "recover-again");
+        defer fixture.allocator.free(repeat_log);
+        var repeated = (try process.invoke(fixture, driver, case.native_root, arch, repeat_log, .{
+            .operation = "recover",
+            .triggers = false,
+            .caller_owned = true,
+            .isolated_helper = true,
+            .core_product = true,
+        })) orelse return error.MissingRecoveryReport;
+        defer repeated.deinit();
+        try expectBlockedUnchanged(fixture, case.native_root, name, repeated.value, before, &paths, &contents);
+        std.debug.print("statoverride signal postrm-forged: blocked as {s} ({s})\n", .{ report.value.outcome, report.value.detail });
+        return;
+    }
+
+    try process.same(report.value.outcome, if (install) "script_failed" else "applied");
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    defer fixture.allocator.free(comparison);
+    try fixture.directory(comparison);
+    try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+    if (!install) {
+        try statoverride.expectObserved(&case, statoverride.base ++ "/mode", statoverride.packaged_mode);
+        try statoverride.expectObserved(&case, statoverride.conffile_path, statoverride.packaged_conffile);
+    }
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+    try statoverride.expectNoUnpackStatOverrideInput(&case);
+    const proof_path = try process.reportProvenancePath(report.value.provenance_path);
+    var proof = try process.rootDocument(fixture, case.native_root, proof_path);
+    defer proof.deinit();
+    try process.same(try process.text(proof.value, "attempt_id"), report.value.attempt_id orelse return error.MissingRecoveryProof);
+    var completion = try process.rootDocument(fixture, case.native_root, completion_path);
+    defer completion.deinit();
+    try process.same(try process.text(completion.value, "outcome"), if (install) "failed_after_mutation" else "succeeded");
+    try process.same(try process.text(completion.value, "attempt_id"), try process.text(proof.value, "attempt_id"));
+    try process.rootAbsent(fixture, case.native_root, operation_path);
+    try process.rootAbsent(fixture, case.native_root, intent_path);
+    const completion_before = try process.rootBytes(fixture, case.native_root, completion_path);
+    defer fixture.allocator.free(completion_before);
+    const settled = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(settled);
+    const repeat_log = try support.path(fixture.allocator, name, "recover-again");
+    defer fixture.allocator.free(repeat_log);
+    var repeated = (try process.invoke(fixture, driver, case.native_root, arch, repeat_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer repeated.deinit();
+    try process.same(repeated.value.outcome, "applied");
+    const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(after);
+    if (!std.mem.eql(u8, settled, after)) return error.RepeatedRecoveryMutatedRoot;
+    const completion_after = try process.rootBytes(fixture, case.native_root, completion_path);
+    defer fixture.allocator.free(completion_after);
+    if (!std.mem.eql(u8, completion_before, completion_after)) return error.RepeatedRecoveryReplacedReceipt;
+    std.debug.print("statoverride signal {s}: recovered as {s}\n", .{ @tagName(kind), report.value.outcome });
+}
+
 fn runChronyCase(
     fixture: *foundation.Fixture,
     driver: []const u8,
@@ -1060,6 +1329,8 @@ pub fn main(init: std.process.Init) !void {
         try runInvocationCase(&fixture, driver, reference.executable, reference.architecture, kind);
         std.debug.print("statoverride invocation {s}: recovered or blocked\n", .{@tagName(kind)});
     }
+    for (std.meta.tags(SignalCase)) |kind|
+        try runSignalCase(&fixture, driver, reference.executable, reference.architecture, kind);
     for (cases) |entry| {
         try runCase(&fixture, driver, reference.executable, reference.architecture, entry);
         std.debug.print("statoverride {s}/{s}: recovered or blocked\n", .{ entry.operation, entry.boundary });

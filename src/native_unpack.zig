@@ -19141,7 +19141,7 @@ fn lifecycleProcessTriggers(
                 .program_sha256 = program.digest_sha256,
             },
             .exited => |value| value,
-            .not_started => 255,
+            .signaled, .not_started => 255,
         };
         if (code != 0) {
             const failed = try lifecycleCompleteTriggerHandler(
@@ -19161,7 +19161,10 @@ fn lifecycleProcessTriggers(
             if (lifecycleMaterializationFailure(failed)) |failure| return failure;
             return .{
                 .outcome = .trigger_failed,
-                .detail = "triggered_postinst",
+                .detail = if (outcome == .signaled)
+                    "triggered_postinst_signaled"
+                else
+                    "triggered_postinst",
                 .program_sha256 = program.digest_sha256,
             };
         }
@@ -21832,20 +21835,68 @@ fn clearLifecycleScriptRecord(
 
 const LifecycleScriptOutcome = union(enum) {
     exited: u8,
+    /// The script's own signalled termination. dpkg fails it like a nonzero
+    /// exit; terminations the runner imposed stay `recovery_required`.
+    signaled: u32,
     not_started,
     recovery_required,
 };
 
-/// An exited non-preinst script publishes the override database it leaves,
-/// even after a nonzero exit, to later phases and recovery checkpoints, like
-/// the diversion refresh. Unpack data steps never see the refresh: they apply
-/// the input their invocation bound (`captureUnpackStatOverrides`). Preinst
-/// keeps the resolution its unpack used until the next refresh.
+/// dpkg's `subproc_check` sends a script killed by its own signal down the
+/// failure path of a nonzero exit, so its outcome is known. Every stop the
+/// runner imposed stays unknown (`maintainer_script.ownTerminationSignal`).
+fn lifecycleLaunchOutcome(report: maintainer_script.Report) LifecycleScriptOutcome {
+    return switch (report.outcome) {
+        .exited => |code| .{ .exited = code },
+        else => if (report.ownSignal()) |signal|
+            .{ .signaled = signal }
+        else if (report.outcome.spawned())
+            .recovery_required
+        else
+            .not_started,
+    };
+}
+
+/// Journal result of the `.outcome` stage: a signalled script ended with a
+/// known outcome, and only `.completed` carries success or failure.
+fn lifecycleOutcomeResult(outcome: LifecycleScriptOutcome) native_recovery.Result {
+    return switch (outcome) {
+        .exited, .signaled => .exited,
+        .not_started => .not_started,
+        .recovery_required => .recovery_required,
+    };
+}
+
+fn lifecycleCompletedResult(outcome: LifecycleScriptOutcome) native_recovery.Result {
+    return switch (outcome) {
+        .exited => |code| if (code == 0) .succeeded else .failed,
+        .signaled => .failed,
+        .not_started => .not_started,
+        .recovery_required => .recovery_required,
+    };
+}
+
+/// Static result detail naming a script killed by its own signal.
+fn signaledScriptDetail(kind: maintainer_script.Kind) []const u8 {
+    return switch (kind) {
+        .preinst => "preinst_signaled",
+        .postinst => "postinst_signaled",
+        .prerm => "prerm_signaled",
+        .postrm => "postrm_signaled",
+    };
+}
+
+/// A non-preinst script that ended with a known outcome publishes the
+/// override database it leaves, even after a nonzero exit or its own signal
+/// (dpkg handles both identically), to later phases and recovery checkpoints,
+/// like the diversion refresh. Unpack data steps never see the refresh: they
+/// apply the input their invocation bound (`captureUnpackStatOverrides`).
+/// Preinst keeps the resolution its unpack used until the next refresh.
 fn scriptRefreshesStatOverrides(
     outcome: LifecycleScriptOutcome,
     kind: maintainer_script.Kind,
 ) bool {
-    return outcome == .exited and kind != .preinst;
+    return (outcome == .exited or outcome == .signaled) and kind != .preinst;
 }
 
 fn textListEqual(left: []const []const u8, right: []const []const u8) bool {
@@ -21886,12 +21937,29 @@ fn nativeScriptDisposition(
             .not_started
         else
             .recovery_required,
-        .signaled,
+        .signaled => if (native_recovery.ownScriptSignal(outcome)) |signal|
+            .{ .signaled = signal }
+        else
+            .recovery_required,
         .timed_out,
         .cancelled,
         .output_limit_exceeded,
         => .recovery_required,
     };
+}
+
+/// A journal that already settled an invocation as unknown keeps it unknown,
+/// so an own signal persisted before such signals settled like a nonzero exit
+/// is never reread as a known failure.
+fn journaledScriptDisposition(
+    outcome: native_recovery.ScriptOutcome,
+    latest: ?native_recovery.Record,
+) LifecycleScriptOutcome {
+    if (latest) |record| {
+        if (record.stage != .in_flight and record.result == .recovery_required)
+            return .recovery_required;
+    }
+    return nativeScriptDisposition(outcome);
 }
 
 fn hexBytesAlloc(
@@ -27199,34 +27267,20 @@ fn runLifecycleScript(
                 );
                 return .recovery_required;
             }
+            const disposition = journaledScriptDisposition(owned.outcome, latest_record);
             {
                 const record = latest_record;
                 if (record.stage == .in_flight) {
                     try runtime.append(
                         recovery_action,
                         .outcome,
-                        switch (owned.outcome.disposition) {
-                            .exited => .exited,
-                            else => if (!owned.outcome.spawned)
-                                .not_started
-                            else
-                                .recovery_required,
-                        },
+                        lifecycleOutcomeResult(disposition),
                         owned.outcome.digest_sha256,
                     );
                     try runtime.append(
                         recovery_action,
                         .completed,
-                        switch (owned.outcome.disposition) {
-                            .exited => if (owned.outcome.exit_code == 0)
-                                .succeeded
-                            else
-                                .failed,
-                            else => if (!owned.outcome.spawned)
-                                .not_started
-                            else
-                                .recovery_required,
-                        },
+                        lifecycleCompletedResult(disposition),
                         managed_checkpoint_sha256 orelse
                             return error.InvalidManagedState,
                     );
@@ -27234,16 +27288,7 @@ fn runLifecycleScript(
                     try runtime.append(
                         recovery_action,
                         .completed,
-                        switch (owned.outcome.disposition) {
-                            .exited => if (owned.outcome.exit_code == 0)
-                                .succeeded
-                            else
-                                .failed,
-                            else => if (!owned.outcome.spawned)
-                                .not_started
-                            else
-                                .recovery_required,
-                        },
+                        lifecycleCompletedResult(disposition),
                         managed_checkpoint_sha256 orelse
                             return error.InvalidManagedState,
                     );
@@ -27275,7 +27320,6 @@ fn runLifecycleScript(
                 );
                 defer allocator.free(observed_active);
                 if (std.mem.eql(u8, observed_active, expected_active)) {
-                    const disposition = nativeScriptDisposition(owned.outcome);
                     const terminal_record = switch (disposition) {
                         .exited => |code| try lifecycleScriptRecordBytes(
                             allocator,
@@ -27288,6 +27332,18 @@ fn runLifecycleScript(
                             arguments,
                             "exited",
                             code,
+                        ),
+                        .signaled => try lifecycleScriptRecordBytes(
+                            allocator,
+                            program.*,
+                            sequence,
+                            package,
+                            kind,
+                            source,
+                            script_sha256,
+                            arguments,
+                            "signaled",
+                            null,
                         ),
                         .not_started => try lifecycleScriptRecordBytes(
                             allocator,
@@ -27319,7 +27375,6 @@ fn runLifecycleScript(
                     );
                 }
             }
-            const disposition = nativeScriptDisposition(owned.outcome);
             if (scriptRefreshesStatOverrides(disposition, kind))
                 _ = try refreshExecutionStatOverrides(
                     execution,
@@ -27625,10 +27680,8 @@ fn runLifecycleScript(
             checkpoint_paths.items,
         );
     }
-    const refresh_stat_overrides = scriptRefreshesStatOverrides(switch (report.outcome) {
-        .exited => |code| .{ .exited = code },
-        else => if (report.outcome.spawned()) .recovery_required else .not_started,
-    }, kind);
+    const launch_outcome = lifecycleLaunchOutcome(report);
+    const refresh_stat_overrides = scriptRefreshesStatOverrides(launch_outcome, kind);
     if (snapshot_python3_preinst) switch (report.outcome) {
         .exited => |code| if (code == 0) {
             verifySnapshotPython3NullOutput(allocator, root) catch |err| {
@@ -27728,13 +27781,7 @@ fn runLifecycleScript(
         try runtime.append(
             recovery_action,
             .outcome,
-            switch (report.outcome) {
-                .exited => .exited,
-                else => if (report.outcome.spawned())
-                    .recovery_required
-                else
-                    .not_started,
-            },
+            lifecycleOutcomeResult(launch_outcome),
             native_outcome.?.digest_sha256,
         );
         if (execution.phase_steps != null and arguments.len != 0) {
@@ -27771,11 +27818,12 @@ fn runLifecycleScript(
             return err;
         };
     }
-    const code = switch (report.outcome) {
+    // The script's own signal settles like a nonzero exit without a code.
+    const code: ?u8 = switch (launch_outcome) {
         .exited => |value| value,
-        else => if (!report.outcome.spawned())
-            255
-        else {
+        .signaled => null,
+        .not_started => 255,
+        .recovery_required => {
             try attempt.requireRecovery(allocator, .script);
             return .recovery_required;
         },
@@ -27789,7 +27837,7 @@ fn runLifecycleScript(
         source,
         script_sha256,
         arguments,
-        "exited",
+        if (code == null) "signaled" else "exited",
         code,
     );
     defer allocator.free(observed_record);
@@ -27823,7 +27871,7 @@ fn runLifecycleScript(
         try runtime.append(
             recovery_action,
             .completed,
-            if (code == 0) .succeeded else .failed,
+            if ((code orelse 1) == 0) .succeeded else .failed,
             managed_checkpoint_sha256 orelse
                 if (native_outcome) |value| value.digest_sha256 else null,
         );
@@ -27836,8 +27884,7 @@ fn runLifecycleScript(
                 runtime.crash.hit(.after_upgrade_pre_rollback_compensation_completed);
         }
     }
-    if (!report.outcome.spawned()) return .not_started;
-    return .{ .exited = code };
+    return launch_outcome;
 }
 
 const PostUnpackScript = struct {
@@ -27884,6 +27931,8 @@ const PostUnpackHook = struct {
     primary_failed: bool = false,
     unwind_succeeded: bool = false,
     failed_compensation: ?u32 = null,
+    /// The own signal of the script whose failure required the rollback.
+    failure_signal: ?u32 = null,
     diversion_failure: ?native_diversion.UpdateError = null,
 };
 
@@ -27914,7 +27963,7 @@ fn recoveredPostUnpackOutcome(
         arguments,
     )) return error.InvalidScriptOutcome;
     ordinal.* += 1;
-    return nativeScriptDisposition(outcome.outcome);
+    return journaledScriptDisposition(outcome.outcome, latest);
 }
 
 fn resumeRolledBackUnpack(
@@ -27938,8 +27987,10 @@ fn resumeRolledBackUnpack(
         call.script_sha256,
         call.arguments,
     ) orelse return null;
+    var failure_signal: ?u32 = null;
     switch (primary) {
         .exited => |code| if (code == 0) return null,
+        .signaled => |signal| failure_signal = signal,
         .not_started => {},
         .recovery_required => return error.InvalidScriptOutcome,
     }
@@ -27954,9 +28005,13 @@ fn resumeRolledBackUnpack(
         ) orelse return null;
         switch (outcome) {
             .exited => |code| if (code == 0 and call.failure.resume_after_unwind) return null,
-            .not_started => {},
+            .signaled, .not_started => {},
             .recovery_required => return error.InvalidScriptOutcome,
         }
+        if (call.failure.resume_after_unwind) failure_signal = switch (outcome) {
+            .signaled => |signal| signal,
+            else => null,
+        };
     }
     const rollback_after = call.failure.rollback_after_compensations orelse 0;
     if (rollback_after > call.failure.compensations.len) return error.InvalidLifecycleProgram;
@@ -27972,7 +28027,7 @@ fn resumeRolledBackUnpack(
         ) orelse return null;
         const code: u8 = switch (outcome) {
             .exited => |value| value,
-            .not_started => 255,
+            .signaled, .not_started => 255,
             .recovery_required => return error.InvalidScriptOutcome,
         };
         if (code != 0) {
@@ -27988,6 +28043,7 @@ fn resumeRolledBackUnpack(
     context.fired = true;
     context.rollback_required = true;
     context.failed_compensation = failed_compensation;
+    context.failure_signal = failure_signal;
     return .{ .outcome = .rolled_back, .detail = "recovered_unpack_rollback" };
 }
 
@@ -28035,6 +28091,10 @@ fn postUnpackHook(
     };
     const code = switch (primary) {
         .exited => |value| value,
+        .signaled => |signal| blk: {
+            context.failure_signal = signal;
+            break :blk 255;
+        },
         .not_started => 255,
         .recovery_required => {
             context.unknown_outcome = true;
@@ -28068,7 +28128,7 @@ fn postUnpackHook(
         };
         const unwind_code = switch (unwind_outcome) {
             .exited => |value| value,
-            .not_started => 255,
+            .signaled, .not_started => 255,
             .recovery_required => {
                 context.unknown_outcome = true;
                 return error.SimulatedCrash;
@@ -28078,8 +28138,15 @@ fn postUnpackHook(
             context.script.call.failure.resume_after_unwind)
         {
             context.unwind_succeeded = true;
+            context.failure_signal = null;
             return;
         }
+        // A failed fallback, not the primary it replaced, decides the failure.
+        if (context.script.call.failure.resume_after_unwind)
+            context.failure_signal = switch (unwind_outcome) {
+                .signaled => |signal| signal,
+                else => null,
+            };
     }
     const rollback_after =
         context.script.call.failure.rollback_after_compensations orelse 0;
@@ -28113,7 +28180,7 @@ fn postUnpackHook(
         };
         const compensation_code = switch (outcome) {
             .exited => |value| value,
-            .not_started => 255,
+            .signaled, .not_started => 255,
             .recovery_required => {
                 context.unknown_outcome = true;
                 return error.SimulatedCrash;
@@ -29602,10 +29669,14 @@ fn completedRouteScriptCode(
         source,
         expected,
         arguments,
-    ) or outcome.outcome.disposition != .exited or
-        outcome.outcome.exit_code == null)
-        return error.InvalidScriptOutcome;
-    const code = outcome.outcome.exit_code.?;
+    )) return error.InvalidScriptOutcome;
+    // The script's own signal completed as a failure without an exit status.
+    const code: u8 = switch (nativeScriptDisposition(outcome.outcome)) {
+        .exited => outcome.outcome.exit_code orelse
+            return error.InvalidScriptOutcome,
+        .signaled => 255,
+        .not_started, .recovery_required => return error.InvalidScriptOutcome,
+    };
     const expected_result: native_recovery.Result =
         if (code == 0) .succeeded else .failed;
     if (record.result != expected_result)
@@ -29941,7 +30012,8 @@ fn classifyActiveScriptBeforeMutationRecovery(
             }, active.kind, std.meta.stringToEnum(native_program.ScriptSource, outcome.source) orelse
                 return error.InvalidScriptOutcome, active.script_sha256, active.arguments))
             return error.InvalidScriptOutcome;
-        if (nativeScriptDisposition(outcome) == .recovery_required) return .outcome_unknown;
+        if (journaledScriptDisposition(outcome, try runtime.latest(action)) == .recovery_required)
+            return .outcome_unknown;
         return .{ .known_outcome = action };
     }
     const bytes = try root.readFileAlloc(
@@ -30009,7 +30081,8 @@ fn classifyActiveScriptBeforeMutationRecovery(
             active.script.script_sha256,
             active.script.arguments,
         )) return error.InvalidScriptOutcome;
-        if (nativeScriptDisposition(outcome.outcome) == .recovery_required) return .outcome_unknown;
+        if (journaledScriptDisposition(outcome.outcome, record) == .recovery_required)
+            return .outcome_unknown;
         return .{ .known_outcome = record.action };
     }
     if (record.stage != .in_flight) return error.InvalidScriptOutcome;
@@ -34449,7 +34522,7 @@ fn executeLifecycleProgramWithRequest(
                                         break :rollback_compensations;
                                     }
                                 },
-                                .not_started => {
+                                .signaled, .not_started => {
                                     failed_compensation = @intCast(
                                         compensation_index,
                                     );
@@ -34589,7 +34662,10 @@ fn executeLifecycleProgramWithRequest(
                     );
                     return .{
                         .outcome = .script_failed,
-                        .detail = "postrm",
+                        .detail = if (hook_context.failure_signal != null)
+                            signaledScriptDetail(.postrm)
+                        else
+                            "postrm",
                         .program_sha256 = program.digest_sha256,
                     };
                 }
@@ -35002,10 +35078,16 @@ fn executeLifecycleProgramWithRequest(
                     .program_sha256 = program.digest_sha256,
                 },
                 .exited => |value| value,
-                .not_started => 255,
+                .signaled, .not_started => 255,
             };
             if (code == 0) continue;
 
+            // dpkg reports the script whose failure decides the step: a
+            // failed fallback replaces its primary, a cleanup never does.
+            var failure_signal: ?u32 = switch (outcome) {
+                .signaled => |signal| signal,
+                else => null,
+            };
             var unwind_succeeded = call.failure.unwind == null;
             if (call.failure.unwind) |unwind| {
                 const unwind_outcome = try runLifecycleScript(
@@ -35032,8 +35114,13 @@ fn executeLifecycleProgramWithRequest(
                         .program_sha256 = program.digest_sha256,
                     },
                     .exited => |value| value == 0,
-                    .not_started => false,
+                    .signaled, .not_started => false,
                 };
+                if (call.failure.resume_after_unwind)
+                    failure_signal = switch (unwind_outcome) {
+                        .signaled => |signal| signal,
+                        else => null,
+                    };
             }
 
             const upgrading = call.arguments.len != 0 and
@@ -35078,7 +35165,7 @@ fn executeLifecycleProgramWithRequest(
                         failed_compensation = compensation;
                         break :compensations;
                     },
-                    .not_started => {
+                    .signaled, .not_started => {
                         failed_compensation = compensation;
                         break :compensations;
                     },
@@ -35345,7 +35432,7 @@ fn executeLifecycleProgramWithRequest(
                 if (lifecycleMaterializationFailure(restored)) |failure|
                     return failure;
             }
-            if (outcome == .exited and call.kind == .postrm and
+            if ((outcome == .exited or outcome == .signaled) and call.kind == .postrm and
                 call.source == .installed_package and
                 call.arguments.len == 1 and
                 std.mem.eql(u8, call.arguments[0], "remove") and
@@ -35374,7 +35461,10 @@ fn executeLifecycleProgramWithRequest(
             );
             return .{
                 .outcome = .script_failed,
-                .detail = @tagName(call.kind),
+                .detail = if (failure_signal != null)
+                    signaledScriptDetail(call.kind)
+                else
+                    @tagName(call.kind),
                 .program_sha256 = program.digest_sha256,
             };
         },
@@ -35733,15 +35823,69 @@ test "native_unpack.test.statoverride tracking excludes unchanged administrator 
     try testing.expectEqualStrings("changed", renamed_identity[0]);
 }
 
-test "native_unpack.test.statoverride refresh follows every exited non-preinst script" {
+test "native_unpack.test.statoverride refresh follows every known non-preinst outcome" {
     for ([_]maintainer_script.Kind{ .postinst, .prerm, .postrm }) |kind| {
         for ([_]u8{ 0, 1, 23, 255 }) |code|
             try testing.expect(scriptRefreshesStatOverrides(.{ .exited = code }, kind));
+        // dpkg handles a script's own signal exactly like a nonzero exit.
+        for ([_]u32{ 9, 15 }) |signal|
+            try testing.expect(scriptRefreshesStatOverrides(.{ .signaled = signal }, kind));
         try testing.expect(!scriptRefreshesStatOverrides(.not_started, kind));
         try testing.expect(!scriptRefreshesStatOverrides(.recovery_required, kind));
     }
     for ([_]u8{ 0, 23 }) |code|
         try testing.expect(!scriptRefreshesStatOverrides(.{ .exited = code }, .preinst));
+    try testing.expect(!scriptRefreshesStatOverrides(.{ .signaled = 15 }, .preinst));
+}
+
+test "native_unpack.test.own script signals settle like dpkg failures and runner stops stay unknown" {
+    var outcome: native_recovery.ScriptOutcome = undefined;
+    outcome.disposition = .signaled;
+    outcome.exit_code = null;
+    outcome.signal = 15;
+    outcome.spawned = true;
+    outcome.terminated_process_group = false;
+    outcome.escalated_to_kill = false;
+    try testing.expectEqual(LifecycleScriptOutcome{ .signaled = 15 }, nativeScriptDisposition(outcome));
+    try testing.expectEqual(native_recovery.Result.exited, lifecycleOutcomeResult(.{ .signaled = 15 }));
+    try testing.expectEqual(native_recovery.Result.failed, lifecycleCompletedResult(.{ .signaled = 15 }));
+    try testing.expectEqual(native_recovery.Result.failed, lifecycleCompletedResult(.{ .exited = 23 }));
+    try testing.expectEqual(native_recovery.Result.succeeded, lifecycleCompletedResult(.{ .exited = 0 }));
+    try testing.expectEqualStrings("prerm_signaled", signaledScriptDetail(.prerm));
+
+    const record = struct {
+        fn of(stage: native_recovery.Stage, result: native_recovery.Result) native_recovery.Record {
+            return .{
+                .sequence = 1,
+                .action = .{ .kind = .script, .program_step = 1, .substep = 0, .ordinal = 0 },
+                .stage = stage,
+                .result = result,
+                .previous_sha256 = @splat(0),
+                .digest_sha256 = @splat(0),
+            };
+        }
+    }.of;
+    try testing.expectEqual(LifecycleScriptOutcome{ .signaled = 15 }, journaledScriptDisposition(outcome, record(.in_flight, .none)));
+    try testing.expectEqual(LifecycleScriptOutcome{ .signaled = 15 }, journaledScriptDisposition(outcome, record(.outcome, .exited)));
+    try testing.expectEqual(LifecycleScriptOutcome{ .signaled = 15 }, journaledScriptDisposition(outcome, record(.completed, .failed)));
+    // A journal that settled the signal as unknown keeps it unknown.
+    try testing.expectEqual(LifecycleScriptOutcome.recovery_required, journaledScriptDisposition(outcome, record(.outcome, .recovery_required)));
+    try testing.expectEqual(LifecycleScriptOutcome.recovery_required, journaledScriptDisposition(outcome, record(.completed, .recovery_required)));
+
+    // Stops the runner imposed are never the script's own signal.
+    outcome.terminated_process_group = true;
+    try testing.expectEqual(LifecycleScriptOutcome.recovery_required, nativeScriptDisposition(outcome));
+    outcome.terminated_process_group = false;
+    outcome.escalated_to_kill = true;
+    try testing.expectEqual(LifecycleScriptOutcome.recovery_required, nativeScriptDisposition(outcome));
+    outcome.escalated_to_kill = false;
+    outcome.signal = 31;
+    try testing.expectEqual(LifecycleScriptOutcome.recovery_required, nativeScriptDisposition(outcome));
+    outcome.signal = 15;
+    for ([_]native_recovery.ScriptDisposition{ .timed_out, .cancelled, .output_limit_exceeded }) |disposition| {
+        outcome.disposition = disposition;
+        try testing.expectEqual(LifecycleScriptOutcome.recovery_required, nativeScriptDisposition(outcome));
+    }
 }
 
 test "native_unpack.test.statoverride identities are root-local and bounded" {

@@ -142,9 +142,9 @@ current account files. Numeric-only records require no identity blobs.
 Managed observations separately track current override/account state across
 known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
-As in normal execution, every exited non-preinst outcome, including a nonzero
-exit, refreshes the override database for later phases; replaying a recorded
-exited outcome refreshes the same way. Their checkpoints include the database
+As in normal execution, every known non-preinst outcome, including a nonzero
+exit or the script's own signal, refreshes the override database for later
+phases; replaying such a recorded outcome refreshes the same way. Their checkpoints include the database
 and the root-local account inputs used by the refreshed records. Only override
 records created or changed at that boundary add their live targets to managed
 state; unchanged administrator overrides do not add targets. Dpkg's incidental
@@ -403,6 +403,14 @@ of one root or change persisted action identities.
 | `script_in_flight` without an outcome | `script_outcome_unknown`; preserve evidence and block mutation. |
 | Exact recorded launcher outcome | Consume the original outcome once, without rerunning the script. |
 | Continuation checkpoint | Follow the recorded compiler branch and native phase state. |
+
+A script killed by its own signal has a known outcome: its `outcome` record is
+`exited`, its `completed` record is `failed`, and its terminal lifecycle record
+is `signaled` with no exit code. The retained `script_outcome` keeps the
+`signaled` disposition and number. A signal the runner sent, `SIGSYS`, a
+timeout, cancellation or the output limit stays `recovery_required`. A journal
+that already recorded an invocation as `recovery_required` keeps it unknown on
+replay, so an older journal is never reread as a known failure.
 
 The signed python3 install-only preinst has an additional exact witness
 before an exit-0 outcome can be persisted: its initially empty, pinned
@@ -1035,7 +1043,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs 39
+`zig build test-native-recovery-zig-statoverride` runs 42
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -1069,6 +1077,16 @@ exists, and at the old prerm outcome with a scriptless provider: the input
 predates the prerm's live database edit. A single-invocation upgrade crashes
 at the old prerm outcome without persisting an input. Recovered roots match
 dpkg's metadata and exact database bytes and retain no input.
+Three signal cases have a script add override records and then end itself
+with a signal. A fresh install's preinst sends itself `SIGTERM` and crashes
+at `after_failure_outcome`; an upgrade's old postrm sends itself `SIGKILL`
+and crashes at `after_upgrade_postrm_outcome`. The persisted outcome must be
+`signaled` with that number and no runner-imposed stop. Archive-evicted
+recovery must reach `script_failed` or `applied` with reference parity, exact
+database bytes, dpkg's `killed by signal` report and, for the postrm, its
+new-package fallback notice. A copy of the postrm crash rewrites the outcome
+as a resealed, canonical exit 0; recovery must stay blocked without changing
+the root, its database or the pending operation.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
@@ -2306,8 +2324,8 @@ changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
 `test/native_recovery_publication.zig::cases/runCase` (14 distinct named
 publication/metadata/release/restore seams and a rollback-release control);
 `SO` = `test/native_recovery_statoverride.zig::InvocationCase/runInvocationCase`
-through `test-native-recovery-zig-statoverride` (the per-invocation
-statoverride input crash children);
+and `SignalCase/runSignalCase` through `test-native-recovery-zig-statoverride`
+(the per-invocation statoverride input and own-signal crash children);
 all are
 `test/native_recovery_*.zig` process drivers, not library unit tests. Rows
 with several drivers name a representative real case, not every family of
@@ -2359,7 +2377,7 @@ operations using that selector.
 | `after_upgrade_postrm_route_publication` | O/J/D: route contract durable, cache/checkpoint owed; R or Q on drift | V #23/#27 |
 | `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, prior managed route slot still absent; R or Q on changed/missing cache, checkpoint or contract | VR `cache-refresh` |
 | `after_upgrade_postrm_route_checkpoint` | O/J/D: contract/cache/transient managed checkpoint bind unpack and old-postrm script steps; R or Q on changed/missing cache, checkpoint or contract | VR `route-checkpoint` |
-| `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R | V #24/#28/#58 |
+| `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R | V #24/#28/#58, SO `postrm` |
 | `after_upgrade_unwind_outcome` | O/J/D: unwind outcome durable, no replay; R | V #59/#60 |
 | `after_upgrade_pre_rollback_compensation_outcome` | O/J/D: compensation outcome durable; R | V #61 |
 | `after_upgrade_postrm_marker_cleared` | O/J/D: script marker cleared only after known outcome; R | V #71/#72 |
@@ -2368,7 +2386,7 @@ operations using that selector.
 | `after_upgrade_pre_rollback_compensation_completed` | O/J/D: completed compensation; R | V #77 |
 | `during_known_unpack_rollback` | O/M/J: original failed attempt, rollback journal owed; R or durable Q | V #64, final-gaps |
 | `after_known_unpack_rollback` | O/M/J: known rollback complete, no fresh install; R | V #65 |
-| `after_failure_outcome` | O/J/P: failed outcome retained, exact failed state/receipt; R | A, H, C, V |
+| `after_failure_outcome` | O/J/P: failed outcome retained, exact failed state/receipt; R | A, H, C, V, SO `preinst` |
 | `after_script_failure_state` | O/J: half-configured failure state durable; R | H |
 | `after_trigger_outcome` | O/J/T: known trigger outcome/events, no re-execution; R | H, N, L, V |
 | `after_deferred_trigger_queue_incorporation` | O/J/T: awaited queue emptied, receiver status publication owed; R without repeating removal postrm | RM `queue-incorporation` |

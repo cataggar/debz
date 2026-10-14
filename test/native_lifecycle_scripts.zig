@@ -10,8 +10,20 @@ fn selected(name: []const u8, arch: []const u8) [1]foundation.PackageIdentity {
 }
 
 fn failures(case: *support.Scenario, markers: []const []const u8) !void {
+    return markerFile(case, support.failure, markers);
+}
+
+/// `/lifecycle-signal` lines read `<package>@<version>:<script>:<argument>
+/// <SIGNAL>`: the matching script sends itself that signal (`signalHook`).
+const signal_marker = "lifecycle-signal";
+
+fn signals(case: *support.Scenario, markers: []const []const u8) !void {
+    return markerFile(case, signal_marker, markers);
+}
+
+fn markerFile(case: *support.Scenario, basename: []const u8, markers: []const []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
-        const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, support.failure });
+        const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, basename });
         defer case.fixture.allocator.free(relative);
         if (markers.len == 0) {
             support.absent(case.fixture, relative) catch |err| {
@@ -117,6 +129,150 @@ fn runScriptFailures(fixture: *foundation.Fixture, driver: []const u8, dpkg: []c
         try case.seed(first);
         try failures(&case, entry.markers);
         try case.phase(.{ .operation = entry.operation, .packages = &identities }, true);
+    }
+}
+
+/// Sends the running script the signal its `/lifecycle-signal` line names.
+/// `exit 99` only runs if the signal could not end the script, which the
+/// reference log then shows instead of dpkg's "killed by signal" report.
+fn signalHook(fixture: *foundation.Fixture, version: []const u8) ![]u8 {
+    return std.fmt.allocPrint(fixture.allocator,
+        \\if [ -f /{s} ]; then
+        \\    while IFS=' ' read -r signal_at signal_name; do
+        \\        if [ "$signal_at" = "{s}@{s}:$DPKG_MAINTSCRIPT_NAME:$1" ]; then
+        \\            kill -s "$signal_name" $$
+        \\            exit 99
+        \\        fi
+        \\    done < /{s}
+        \\fi
+        \\
+    , .{ signal_marker, package, version, signal_marker });
+}
+
+const terminated = "subprocess was killed by signal (Terminated)";
+const killed = "subprocess was killed by signal (Killed)";
+const exit_23 = "subprocess returned error exit status 23";
+const fallback = "trying script from the new package instead ...";
+
+/// The reference dpkg must have reported every `needles` line
+/// (lib/dpkg/subproc.c:139-157, src/main/script.c:366), so a parity pass
+/// cannot come from scripts that merely exited.
+fn expectReferenceLog(case: *support.Scenario, operation: []const u8, needles: []const []const u8) !void {
+    const log = try support.lastReferenceLog(case, operation);
+    defer case.fixture.allocator.free(log);
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, log, needle) != null) continue;
+        std.debug.print("{s}/{s}: reference log lacks \"{s}\":\n{s}\n", .{ case.name, operation, needle, log[0..@min(log.len, 8_000)] });
+        return error.MissingReferenceReport;
+    }
+}
+
+/// Native names the script whose failure decided the operation, and marks
+/// one that its own signal ended.
+fn expectNativeDetail(case: *support.Scenario, operation: []const u8, detail: []const u8) !void {
+    if (case.fixture.oracle_only) return;
+    const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{d}-{s}/native.report.json", .{ case.name, case.index - 1, operation });
+    defer case.fixture.allocator.free(relative);
+    const bytes = try support.read(case.fixture, relative, 64 * 1024);
+    defer case.fixture.allocator.free(bytes);
+    const parsed = try std.json.parseFromSlice(support.Report, case.fixture.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.outcome, "script_failed") and std.mem.eql(u8, parsed.value.detail, detail)) return;
+    std.debug.print("{s}/{s}: native {s}: {s}, expected script_failed: {s}\n", .{
+        case.name, operation, parsed.value.outcome, parsed.value.detail, detail,
+    });
+    return error.WrongNativeFailureDetail;
+}
+
+/// A script killed by a signal fails exactly like one exiting nonzero
+/// (lib/dpkg/subproc.c:139-157): an old script under `maintscript_fallback`
+/// only warns before the new package's script runs instead
+/// (src/main/script.c:360-388), and every other call unwinds through the same
+/// cleanups (src/main/cleanup.c). Each row is the signal twin of a
+/// `runScriptFailures` row; the scripts signal themselves.
+fn runScriptSignals(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const identities = selected(package, arch);
+    const first_hook = try signalHook(fixture, "1");
+    defer fixture.allocator.free(first_hook);
+    const second_hook = try signalHook(fixture, "2");
+    defer fixture.allocator.free(second_hook);
+    const first = try support.makePackage(fixture, arch, "1", package, "packages/script-signals", .{
+        .scripts = .{ .before_failure = first_hook },
+    });
+    defer fixture.allocator.free(first);
+    const second = try support.makePackage(fixture, arch, "2", package, "packages/script-signals", .{
+        .scripts = .{ .before_failure = second_hook },
+    });
+    defer fixture.allocator.free(second);
+    {
+        var case = try support.Scenario.init(fixture, "script-fresh-preinst-signal", driver, dpkg, arch, false);
+        defer case.deinit();
+        try signals(&case, &.{package ++ "@1:preinst:install TERM"});
+        try case.phase(.{ .operation = "install", .archives = &.{first}, .packages = &identities }, true);
+        try expectReferenceLog(&case, "install", &.{terminated});
+        try verifyTrace(&case, package ++ "@1:postrm\t");
+        try expectNativeDetail(&case, "install", "preinst_signaled");
+    }
+
+    const upgrades = [_]struct {
+        name: []const u8,
+        signals: []const []const u8,
+        failures: []const []const u8 = &.{},
+        rollback: bool = false,
+        reported: []const []const u8,
+        /// Native's failure detail; null when the upgrade succeeds.
+        detail: ?[]const u8,
+    }{
+        .{ .name = "old-prerm", .signals = &.{package ++ "@1:prerm:upgrade TERM"}, .reported = &.{ terminated, fallback }, .detail = null },
+        .{ .name = "failed-upgrade-prerm", .signals = &.{ package ++ "@1:prerm:upgrade KILL", package ++ "@2:prerm:failed-upgrade TERM" }, .reported = &.{ killed, terminated }, .detail = "prerm_signaled" },
+        // The failed fallback, not the signalled old script, decides the failure.
+        .{ .name = "failed-upgrade-prerm-exit", .signals = &.{package ++ "@1:prerm:upgrade TERM"}, .failures = &.{package ++ "@2:prerm:failed-upgrade"}, .reported = &.{ terminated, exit_23 }, .detail = "prerm" },
+        .{ .name = "new-preinst", .signals = &.{package ++ "@2:preinst:upgrade KILL"}, .reported = &.{killed}, .detail = "preinst_signaled" },
+        .{ .name = "abort-upgrade-postinst", .signals = &.{ package ++ "@2:preinst:upgrade TERM", package ++ "@1:postinst:abort-upgrade KILL" }, .reported = &.{ terminated, killed }, .detail = "preinst_signaled" },
+        .{ .name = "old-postrm", .signals = &.{package ++ "@1:postrm:upgrade TERM"}, .reported = &.{ terminated, fallback }, .detail = null },
+        .{ .name = "failed-upgrade-postrm", .signals = &.{ package ++ "@1:postrm:upgrade TERM", package ++ "@2:postrm:failed-upgrade KILL" }, .rollback = true, .reported = &.{ terminated, killed }, .detail = "postrm_signaled" },
+        .{ .name = "failed-upgrade-postrm-exit", .signals = &.{package ++ "@1:postrm:upgrade KILL"}, .failures = &.{package ++ "@2:postrm:failed-upgrade"}, .rollback = true, .reported = &.{ killed, exit_23 }, .detail = "postrm" },
+        .{ .name = "abort-upgrade-preinst", .signals = &.{ package ++ "@1:postrm:upgrade TERM", package ++ "@2:postrm:failed-upgrade TERM", package ++ "@1:preinst:abort-upgrade KILL" }, .rollback = true, .reported = &.{ terminated, killed }, .detail = "postrm_signaled" },
+        .{ .name = "abort-upgrade-postrm", .signals = &.{ package ++ "@1:postrm:upgrade KILL", package ++ "@2:postrm:failed-upgrade TERM", package ++ "@2:postrm:abort-upgrade KILL" }, .rollback = true, .reported = &.{ killed, terminated }, .detail = "postrm_signaled" },
+        .{ .name = "new-postinst", .signals = &.{package ++ "@2:postinst:configure TERM"}, .reported = &.{terminated}, .detail = "postinst_signaled" },
+    };
+    for (upgrades) |entry| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "script-upgrade-{s}-signal", .{entry.name});
+        defer fixture.allocator.free(label);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+        defer case.deinit();
+        try case.seed(first);
+        try signals(&case, entry.signals);
+        try failures(&case, entry.failures);
+        try case.phase(.{
+            .operation = "upgrade",
+            .archives = &.{second},
+            .packages = &identities,
+            .rollback_links = if (entry.rollback) &.{foundation.payload ++ "/current"} else &.{},
+        }, entry.detail != null);
+        try expectReferenceLog(&case, "upgrade", entry.reported);
+        if (entry.detail) |detail| try expectNativeDetail(&case, "upgrade", detail);
+        if (std.mem.eql(u8, entry.name, "new-postinst")) {
+            try statusContains(&case, "Status: install ok half-configured");
+            try signals(&case, &.{});
+            try case.phase(.{ .operation = "configure", .archives = &.{second}, .packages = &identities }, false);
+        }
+    }
+    for ([_]struct { name: []const u8, operation: []const u8, signals: []const []const u8, reported: []const []const u8, detail: []const u8 }{
+        .{ .name = "remove-prerm", .operation = "remove", .signals = &.{package ++ "@1:prerm:remove TERM"}, .reported = &.{terminated}, .detail = "prerm_signaled" },
+        .{ .name = "remove-abort-remove", .operation = "remove", .signals = &.{ package ++ "@1:prerm:remove KILL", package ++ "@1:postinst:abort-remove TERM" }, .reported = &.{ killed, terminated }, .detail = "prerm_signaled" },
+        .{ .name = "remove-postrm", .operation = "remove", .signals = &.{package ++ "@1:postrm:remove TERM"}, .reported = &.{terminated}, .detail = "postrm_signaled" },
+        .{ .name = "purge-postrm", .operation = "purge", .signals = &.{package ++ "@1:postrm:purge KILL"}, .reported = &.{killed}, .detail = "postrm_signaled" },
+    }) |entry| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "script-{s}-signal", .{entry.name});
+        defer fixture.allocator.free(label);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+        defer case.deinit();
+        try case.seed(first);
+        try signals(&case, entry.signals);
+        try case.phase(.{ .operation = entry.operation, .packages = &identities }, true);
+        try expectReferenceLog(&case, entry.operation, entry.reported);
+        try expectNativeDetail(&case, entry.operation, entry.detail);
     }
 }
 
@@ -264,6 +420,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     const second = try support.makePackage(fixture, arch, "2", package, "packages/script-flows", .{});
     defer fixture.allocator.free(second);
     try runScriptFailures(fixture, driver, dpkg, arch, first, second);
+    try runScriptSignals(fixture, driver, dpkg, arch);
     try runDependencies(fixture, driver, dpkg, arch);
     try runBootstrap(fixture, driver, dpkg, arch);
     try runCallerUmask(fixture, driver, dpkg, arch);

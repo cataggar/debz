@@ -2527,7 +2527,9 @@ fn recordedScriptSnapshot(
     defer outcome.deinit();
     if (!std.mem.eql(u8, &outcome.outcome.intent_sha256, &document.intent_sha256) or
         !std.meta.eql(outcome.outcome.action, snapshot.action) or
-        (outcome.outcome.disposition != .exited and outcome.outcome.spawned))
+        (outcome.outcome.disposition != .exited and
+            ownScriptSignal(outcome.outcome) == null and
+            outcome.outcome.spawned))
         return error.InvalidManagedState;
     var progress = try readProgress(allocator, root);
     defer progress.deinit();
@@ -3007,6 +3009,18 @@ pub const ScriptOutcome = struct {
     issued_descendant_sweep: bool,
     digest_sha256: Digest,
 };
+
+/// The signal of a spawned script's own termination, which settles like a
+/// nonzero exit (`maintainer_script.ownTerminationSignal`).
+pub fn ownScriptSignal(outcome: ScriptOutcome) ?u32 {
+    if (outcome.disposition != .signaled or !outcome.spawned) return null;
+    const signal = outcome.signal orelse return null;
+    return if (maintainer_script.ownTerminationSignal(
+        signal,
+        outcome.terminated_process_group,
+        outcome.escalated_to_kill,
+    )) signal else null;
+}
 
 pub const OwnedScriptOutcome = struct {
     outcome: ScriptOutcome,
@@ -3741,6 +3755,9 @@ test "native_recovery.test.script checkpoints bind outcome and latest invocation
         wrong_completion,
         newer_invocation,
         cancelled,
+        own_signal,
+        runner_signal,
+        seccomp_signal,
     };
     for (std.enums.values(Case)) |case| {
         var temporary = testing.tmpDir(.{ .iterate = true });
@@ -3775,6 +3792,16 @@ test "native_recovery.test.script checkpoints bind outcome and latest invocation
             outcome.exit_code = null;
             outcome.terminated_process_group = true;
         }
+        if (case == .own_signal or case == .runner_signal or case == .seccomp_signal) {
+            outcome.disposition = .signaled;
+            outcome.exit_code = null;
+            outcome.signal = if (case == .seccomp_signal) 31 else 15;
+            outcome.terminated_process_group = case == .runner_signal;
+            try testing.expectEqual(
+                if (case == .own_signal) @as(?u32, 15) else null,
+                ownScriptSignal(outcome),
+            );
+        }
         sealScriptOutcome(&outcome);
         if (case != .missing) try publishScriptOutcome(testing.allocator, root, outcome);
         if (case != .in_flight)
@@ -3791,7 +3818,7 @@ test "native_recovery.test.script checkpoints bind outcome and latest invocation
             try appendProgress(testing.allocator, root, intent, newer, .prepared, .none, null);
             try appendProgress(testing.allocator, root, intent, newer, .in_flight, .none, null);
         }
-        if (case == .in_flight or case == .outcome or case == .completed) {
+        if (case == .in_flight or case == .outcome or case == .completed or case == .own_signal) {
             try testing.expectEqual(action, (try recordedTransientScriptAction(testing.allocator, root, intent)).?);
         } else try testing.expectError(error.InvalidManagedState, recordedTransientScriptAction(testing.allocator, root, intent));
     }

@@ -44,6 +44,23 @@ const edit_hook =
     \\
 ;
 
+/// `/statoverride-edit-signal` holds `<script>:<argument> <SIGNAL>`: after
+/// `edit_hook`, the matching script moves the marker aside and sends itself
+/// that signal. `exit 45` only runs if the signal could not end the script.
+pub const signal_marker = "statoverride-edit-signal";
+pub const signal_done = "statoverride-edit-signalled";
+const signal_hook =
+    \\if [ -f /statoverride-edit-signal ]; then
+    \\    IFS=' ' read -r signal_at signal_name < /statoverride-edit-signal
+    \\    if [ "$signal_at" = "$DPKG_MAINTSCRIPT_NAME:$1" ]; then
+    \\        /stato-mv /statoverride-edit-signal /statoverride-edit-signalled || exit 44
+    \\        kill -s "$signal_name" $$
+    \\        exit 45
+    \\    fi
+    \\fi
+    \\
+;
+
 pub fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
     return archiveAt(fixture, arch, version, "packages/statoverride");
 }
@@ -55,6 +72,12 @@ pub fn archiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []cons
 /// The lifecycle package whose maintainer scripts also honour `edit_marker`.
 pub fn editArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
     return archiveWithHook(fixture, arch, version, workspace, hook ++ edit_hook);
+}
+
+/// The lifecycle package whose scripts honour `edit_marker`, then
+/// `signal_marker`.
+pub fn signalEditArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
+    return archiveWithHook(fixture, arch, version, workspace, hook ++ edit_hook ++ signal_hook);
 }
 
 fn archiveWithHook(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8, scripts_hook: []const u8) ![]u8 {
@@ -545,6 +568,110 @@ fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg
     }
 }
 
+/// How pinned dpkg reports a script it ran that was ended by SIGTERM or
+/// SIGKILL (lib/dpkg/subproc.c:149-152, `strsignal` in the C locale).
+pub const terminated_report = "killed by signal (Terminated)";
+pub const killed_report = "killed by signal (Killed)";
+/// The notice dpkg prints before running the new package's script after the
+/// old one failed (src/main/script.c:366).
+pub const fallback_report = "trying script from the new package instead ...";
+
+/// Both roots must have sent the signal exactly once.
+pub fn expectSignalSent(case: *support.Scenario) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const done = try support.readOptionalCaseFile(case, side, signal_done);
+        defer if (done) |bytes| case.fixture.allocator.free(bytes);
+        const pending = try support.readOptionalCaseFile(case, side, signal_marker);
+        defer if (pending) |bytes| case.fixture.allocator.free(bytes);
+        if (done == null or pending != null) return error.StatoverrideSignalNotObserved;
+    }
+}
+
+/// The reference dpkg output must contain every one of `reports`.
+pub fn expectReports(label: []const u8, log: []const u8, reports: []const []const u8) !void {
+    var missing = false;
+    for (reports) |report| {
+        if (std.mem.indexOf(u8, log, report) != null) continue;
+        std.debug.print("{s}: reference log lacks \"{s}\"\n", .{ label, report });
+        missing = true;
+    }
+    if (!missing) return;
+    std.debug.print("{s}: reference log:\n{s}\n", .{ label, log[0..@min(log.len, 8_000)] });
+    return error.MissingReferenceReport;
+}
+
+/// Both roots must have sent the signal exactly once, and the reference dpkg
+/// must report it as the script's signal, so a script that merely exited
+/// cannot pass as a signalled one.
+pub fn expectSignalled(case: *support.Scenario, operation: []const u8, reports: []const []const u8) !void {
+    try expectSignalSent(case);
+    const log = try support.lastReferenceLog(case, operation);
+    defer case.fixture.allocator.free(log);
+    const label = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}", .{ case.name, operation });
+    defer case.fixture.allocator.free(label);
+    try expectReports(label, log, reports);
+}
+
+/// dpkg fails a script killed by a signal exactly like one exiting nonzero
+/// (lib/dpkg/subproc.c:139-157). An old script that applies `--update`
+/// overrides and is then killed leaves them applied, and its new package's
+/// `failed-upgrade` fallback lets the upgrade continue
+/// (src/main/script.c:360-388) with the invocation's single statoverride
+/// resolution, so each row ends like its exited counterpart in
+/// `genuineInvocationEdits`.
+fn genuineSignaledInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const first = try signalEditArchive(fixture, arch, "1", "packages/statoverride-edit-signal");
+    defer fixture.allocator.free(first);
+    const second = try signalEditArchive(fixture, arch, "2", "packages/statoverride-edit-signal");
+    defer fixture.allocator.free(second);
+    const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    for ([_]struct {
+        label: []const u8,
+        at: []const u8,
+        signal: []const u8,
+        report: []const u8,
+        mode: Expected,
+    }{
+        // Extraction keeps the resolution read before the old prerm.
+        .{ .label = "old-prerm-update-signaled", .at = "prerm:upgrade", .signal = "TERM", .report = terminated_report, .mode = packaged_mode },
+        // The old postrm runs after extraction, so its `--update` reaches the new file.
+        .{ .label = "old-postrm-update-signaled", .at = "postrm:upgrade", .signal = "KILL", .report = killed_report, .mode = overridden_mode },
+    }) |entry| {
+        for ([_]bool{ false, true }) |recovery| {
+            const label = try std.fmt.allocPrint(fixture.allocator, "statoverride-invocation-{s}{s}", .{
+                entry.label, if (recovery) "-recovery" else "",
+            });
+            defer fixture.allocator.free(label);
+            var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+            defer case.deinit();
+            try seed(&case, "");
+            try installDpkgStatoverride(&case, dpkg);
+            const edit = try std.fmt.allocPrint(fixture.allocator, "{s} --update --update\n", .{entry.at});
+            defer fixture.allocator.free(edit);
+            try replace(&case, edit_marker, edit);
+            const signal = try std.fmt.allocPrint(fixture.allocator, "{s} {s}\n", .{ entry.at, entry.signal });
+            defer fixture.allocator.free(signal);
+            try both(&case, signal_marker, signal);
+            try case.seed(first);
+            try case.phase(.{ .operation = "upgrade", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
+            try expectEditApplied(&case);
+            // Both old scripts run under `maintscript_fallback`.
+            try expectSignalled(&case, "upgrade", &.{ entry.report, fallback_report });
+            try expectObserved(&case, base ++ "/mode", entry.mode);
+            try expectObserved(&case, conffile_path, updated_conffile);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+            try expectNoUnpackStatOverrideInput(&case);
+            // The next invocation reads the edited database.
+            try case.phase(.{ .operation = "reinstall", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
+            try expectObserved(&case, base ++ "/mode", overridden_mode);
+            try expectObserved(&case, conffile_path, updated_conffile);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+        }
+    }
+}
+
 pub const invocation_provider = "statoverride-invocation-provider";
 pub const invocation_target = base ++ "/introduced";
 
@@ -851,6 +978,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
 
     try genuineToolRefresh(fixture, driver, dpkg, arch);
     try genuineInvocationEdits(fixture, driver, dpkg, arch);
+    try genuineSignaledInvocationEdits(fixture, driver, dpkg, arch);
     try genuinePersistedInvocation(fixture, driver, dpkg, arch);
     try genuineConffileAdministratorMode(fixture, driver, dpkg, arch, first, second);
     try genuineBatchInvocation(fixture, driver, dpkg, arch, first, second);

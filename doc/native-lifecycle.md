@@ -175,14 +175,16 @@ applies the resolution its invocation read before its first step: the first
 invocation's is frozen before any script, and a later one is read live. Scripts
 inside an invocation never change its data or staged conffile metadata, and
 configure copies the installed conffile's owner and mode instead of re-reading
-overrides. Every exited non-preinst script, including one that exits nonzero,
-refreshes the tracked override state for recovery checkpoints, using the target
-root's account files; the next unpack invocation reads the database afresh.
+overrides. Every non-preinst script with a known outcome refreshes the tracked
+override state for recovery checkpoints, using the target root's account
+files: one that exits, even nonzero, or is killed by its own signal, which
+dpkg handles exactly like a nonzero exit. The next unpack invocation reads the
+database afresh.
 If such a script
 leaves a malformed or unresolvable database, the result is
 `recovery_required` with `invalid_stat_override_update` instead of
-`script_failed`. Scripts that never start or end without exiting, such as by a
-signal or timeout, do not refresh.
+`script_failed`. Scripts that never start, and scripts the runner stops, such
+as on timeout, cancellation or the output limit, do not refresh.
 Recovery checkpoints live targets only for records created or changed by those
 scripts, leaving unchanged administrator overrides outside this added scope.
 The old `postrm upgrade` and its new `failed-upgrade` fallback run after the
@@ -270,6 +272,24 @@ permission to roll back arbitrary script side effects. Before any script can
 run, durable evidence must identify the invocation as in flight. An outcome
 that was not durably observed blocks further mutation rather than retrying the
 script, declaring success, or falling back to legacy execution.
+
+A script killed by its own signal fails like a nonzero exit, as dpkg's
+`subproc_check` reports either one the same way. An old `prerm upgrade` or
+`postrm upgrade` falls back to the new package's `failed-upgrade` script,
+every other failed call unwinds through the same cleanup, and the diversion,
+override and database effects persist. The result detail names the signal,
+such as `prerm_signaled` or `triggered_postinst_signaled`, and the retained
+script outcome keeps its number. A termination the runner imposed, such as on
+timeout, cancellation, the output limit or a setup failure, still requires
+recovery even when the script is reaped as signalled. Four cases keep a
+divergence:
+
+- `SIGSYS` stays unknown because the seccomp policy kills with it.
+- A script behind the `update-alternatives` boundary stays unknown.
+- A snapshot `/proc` script runs as PID 1 of its namespace and cannot kill
+  itself.
+- A script that signals its process group, such as with `kill 0`, also kills
+  dpkg, which shares that group. Native runs each script in its own group.
 
 Already-absent remove/purge is a narrow fixture exception: authorization v1
 cannot represent an absent-package action. Under the same real root lock, this

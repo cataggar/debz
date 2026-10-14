@@ -971,6 +971,19 @@ pub const Report = struct {
         };
     }
 
+    /// The signal of a termination the runner did not impose
+    /// (`ownTerminationSignal`).
+    pub fn ownSignal(self: Report) ?u32 {
+        return switch (self.outcome) {
+            .signaled => |signal| if (ownTerminationSignal(
+                signal,
+                self.terminated_process_group,
+                self.escalated_to_kill,
+            )) signal else null,
+            else => null,
+        };
+    }
+
     pub fn deinit(self: *Report) void {
         const allocator = self.allocator;
         self.arena.deinit();
@@ -978,6 +991,21 @@ pub const Report = struct {
         self.* = undefined;
     }
 };
+
+/// Whether a `signaled` outcome is the script's own termination, which
+/// dpkg's `subproc_check` fails exactly like a nonzero exit. A leader the
+/// runner signalled is never the script's own, `SIGSYS` stays unattributed
+/// because the seccomp policy kills with it, and a value outside the Linux
+/// signal range is no termination signal at all.
+pub fn ownTerminationSignal(
+    signal: u32,
+    terminated_process_group: bool,
+    escalated_to_kill: bool,
+) bool {
+    return signal >= 1 and signal <= 64 and
+        signal != @intFromEnum(linux.SIG.SYS) and
+        !terminated_process_group and !escalated_to_kill;
+}
 
 /// Runs one maintainer script. Rejected requests never spawn a process and are
 /// reported with an exact `rejected` outcome instead of an untyped error.
@@ -2770,18 +2798,12 @@ fn supervise(
     const escalated = finalized.escalated;
     const issued_sweep = finalized.issued_sweep;
 
-    const outcome: LaunchOutcome = if (setup) |failure|
-        .{ .setup_failed = failure }
-    else if (cancelled)
-        .cancelled
-    else if (timed_out)
-        .timed_out
-    else if (limit_exceeded)
-        .output_limit_exceeded
-    else if (reaped) |status|
-        terminationOf(status)
-    else
-        .{ .setup_failed = .{ .stage = .wait } };
+    const outcome = classifyLaunch(.{
+        .setup = setup,
+        .cancelled = cancelled,
+        .timed_out = timed_out,
+        .limit_exceeded = limit_exceeded,
+    }, reaped);
 
     var execution: Execution = .{
         .outcome = outcome,
@@ -2805,6 +2827,26 @@ fn terminationOf(status: u32) LaunchOutcome {
     if (linux.W.IFSIGNALED(status)) return .{ .signaled = @intFromEnum(linux.W.TERMSIG(status)) };
     if (linux.W.IFSTOPPED(status)) return .{ .signaled = @intFromEnum(linux.W.STOPSIG(status)) };
     return .{ .signaled = status };
+}
+
+/// Why the supervision loop stopped before the leader exited on its own.
+const LaunchStop = struct {
+    setup: ?SetupFailure = null,
+    cancelled: bool = false,
+    timed_out: bool = false,
+    limit_exceeded: bool = false,
+};
+
+/// A stop the runner imposed outranks the reaped status: the runner's own
+/// `SIGTERM` or `SIGKILL` is reaped as `WIFSIGNALED` and must never read as
+/// the script's own signal.
+fn classifyLaunch(stop: LaunchStop, reaped: ?u32) LaunchOutcome {
+    if (stop.setup) |failure| return .{ .setup_failed = failure };
+    if (stop.cancelled) return .cancelled;
+    if (stop.timed_out) return .timed_out;
+    if (stop.limit_exceeded) return .output_limit_exceeded;
+    if (reaped) |status| return terminationOf(status);
+    return .{ .setup_failed = .{ .stage = .wait } };
 }
 
 const group_poll_interval_ms = 5;
@@ -4012,6 +4054,9 @@ test "maintainer_script.test.system launcher reports a script terminated by a si
     try testing.expectEqual(@as(u32, 9), report.outcome.signaled);
     try testing.expect(report.outcome.spawned());
     try testing.expect(!report.succeeded());
+    try testing.expect(!report.terminated_process_group);
+    try testing.expect(!report.escalated_to_kill);
+    try testing.expectEqual(@as(?u32, 9), report.ownSignal());
 }
 
 test "maintainer_script.test.system launcher terminates the script process tree on timeout" {
@@ -4276,6 +4321,54 @@ test "maintainer_script.test.finalization never signals a group after reaping it
     });
     // The detach policy must never signal descendants.
     try expectTrace(&.{ .term_leader, .kill_leader, .reap }, &detached_running);
+}
+
+test "maintainer_script.test.runner-imposed stops never read as the script's own signal" {
+    const term: u32 = @intFromEnum(linux.SIG.TERM);
+    const kill: u32 = @intFromEnum(linux.SIG.KILL);
+    const stops = [_]LaunchStop{
+        .{ .setup = .{ .stage = .wait, .errno = 4 } },
+        .{ .cancelled = true },
+        .{ .timed_out = true },
+        .{ .limit_exceeded = true },
+        // A stop that races the script's own exit still wins.
+        .{ .cancelled = true, .timed_out = true, .limit_exceeded = true },
+    };
+    const expected = [_]std.meta.Tag(LaunchOutcome){
+        .setup_failed, .cancelled, .timed_out, .output_limit_exceeded, .cancelled,
+    };
+    for (stops, expected) |stop, tag| {
+        for ([_]?u32{ term, kill, 0, 23 << 8, null }) |reaped| {
+            const outcome = classifyLaunch(stop, reaped);
+            try testing.expectEqual(tag, std.meta.activeTag(outcome));
+        }
+    }
+    try testing.expectEqual(term, classifyLaunch(.{}, term).signaled);
+    try testing.expectEqual(kill, classifyLaunch(.{}, kill).signaled);
+    try testing.expectEqual(@as(u8, 23), classifyLaunch(.{}, 23 << 8).exited);
+
+    // The runner's own TERM, and its KILL escalation, are reaped as
+    // WIFSIGNALED while a stop reason is set and mark the evidence.
+    const plan: Finalization = .{ .leader_exited = false, .sweep = true, .grace_ms = 50, .poll_ms = 10 };
+    for ([_]struct { probes: usize, status: u32 }{
+        .{ .probes = 2, .status = term },
+        .{ .probes = 1_000, .status = kill },
+    }) |entry| {
+        var operations: RecordingGroupOperations = .{ .running_probes = entry.probes, .status = entry.status };
+        const finalized = finalizeGroup(&operations, plan);
+        try testing.expect(linux.W.IFSIGNALED(finalized.status.?));
+        try testing.expectEqual(.timed_out, std.meta.activeTag(classifyLaunch(.{ .timed_out = true }, finalized.status)));
+        try testing.expect(!ownTerminationSignal(entry.status, finalized.terminated, finalized.escalated));
+    }
+
+    try testing.expect(ownTerminationSignal(term, false, false));
+    try testing.expect(ownTerminationSignal(kill, false, false));
+    try testing.expect(ownTerminationSignal(@intFromEnum(linux.SIG.INT), false, false));
+    try testing.expect(!ownTerminationSignal(term, true, false));
+    try testing.expect(!ownTerminationSignal(kill, true, true));
+    try testing.expect(!ownTerminationSignal(@intFromEnum(linux.SIG.SYS), false, false));
+    try testing.expect(!ownTerminationSignal(0, false, false));
+    try testing.expect(!ownTerminationSignal(0xffff, false, false));
 }
 
 test "maintainer_script.test.system launcher fails closed when output exceeds the limit" {
