@@ -27,7 +27,13 @@ pub fn main(init: std.process.Init) !void {
     telemetry.start(.hash).end();
     try std.testing.expectEqual(@as(u64, if (enabled) 1 else 0), context.measurement(.hash).count);
     try std.testing.expectEqual(@as(usize, 0), log_count);
-    telemetry.progress("database", 7, 2, 3, "completed", "applied");
+    telemetry.progressPublished("database", 7, 2, 3, "completed", "applied", .{
+        .version = 4,
+        .intent_sha256 = @splat('a'),
+        .sequence = 9,
+        .record_sha256 = @splat('b'),
+        .document_sha256 = @splat('c'),
+    });
     try std.testing.expectEqual(@as(u64, if (enabled) 1 else 0), context.sequence);
     try std.testing.expectEqual(@as(usize, if (enabled) 1 else 0), log_count);
     if (enabled) {
@@ -35,8 +41,17 @@ pub fn main(init: std.process.Init) !void {
         try std.testing.expect(std.mem.startsWith(u8, line, "native_phase attempt="));
         try std.testing.expect(std.mem.indexOf(u8, line, "kind=database program_step=7 substep=2 ordinal=3 stage=completed result=applied elapsed_ns=") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "hash_count=1 ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "schema=" ++ telemetry.schema_id ++ " version=1 clock=awake published=true progress_version=4") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "progress_sequence=9 progress_record_sha256=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "intent_sha256=" ++ ("a" ** 64) ++
+            " progress_sequence=9 progress_record_sha256=" ++ ("b" ** 64) ++
+            " progress_document_sha256=" ++ ("c" ** 64)) != null);
     }
     context.detach();
     try std.testing.expectEqual(@as(usize, if (enabled) 2 else 0), log_count);
-    if (enabled) try std.testing.expect(std.mem.indexOf(u8, log_buffer[0..log_length], "kind=attempt_end ") != null);
+    if (enabled) {
+        const line = log_buffer[0..log_length];
+        try std.testing.expect(std.mem.indexOf(u8, line, "kind=attempt_end ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "published=false progress_version=0 intent_sha256=-") != null);
+    }
 }

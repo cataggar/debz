@@ -1073,6 +1073,28 @@ class ProtectedInputTests(unittest.TestCase):
             values[0] &= ~0o022
         return os.stat_result(values)
 
+    def test_performance_pair_checks_directory_checkout_and_regular_original_bundles(self) -> None:
+        source = (TOOLS / "native-database-performance-hosted.sh").read_text()
+        command = 'python3 -I - "$checkout/tools" "$checkout" "$candidate_bundle" "$control_bundle" <<\'PY\'\n'
+        body = source.split(command, 1)[1].split("\nPY\n", 1)[0]
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        bundles = [self.root / "candidate.bundle", self.root / "control.bundle"]
+        for bundle in bundles:
+            bundle.write_bytes(b"original bundle fixture")
+        arguments = ["-", str(TOOLS), str(checkout), *(str(bundle) for bundle in bundles)]
+        with mock.patch.object(sys, "argv", arguments), \
+                mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            exec(compile(body, "performance-pair-protected-inputs", "exec"), {})
+            bundles[0].chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                exec(compile(body, "performance-pair-protected-inputs", "exec"), {})
+            bundles[0].chmod(0o644)
+            bundles[0].unlink()
+            bundles[0].symlink_to(bundles[1])
+            with self.assertRaises(OSError):
+                exec(compile(body, "performance-pair-protected-inputs", "exec"), {})
+
     def test_keyring_refuses_unprotected_writable_symlinked_and_wrong_bytes(self) -> None:
         keyring = self.root / "keyring"
         payload = b"reviewed fixture bytes"

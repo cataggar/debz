@@ -439,6 +439,15 @@ const full_matrix_input =
 const full_matrix_condition = "github.event_name != 'workflow_dispatch' || inputs.run_full_matrix";
 const aggregate_condition = "${{ always() && (" ++ full_matrix_condition ++ ") }}";
 const full_integration_condition = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_full_matrix)";
+const recovery_cohort_input =
+    \\      run_native_recovery_cohort:
+    \\        description: "Run only the hosted native recovery cohort: six recovery shards and the native workload (amd64 and arm64, Debug and ReleaseSafe)"
+    \\        required: true
+    \\        type: boolean
+    \\        default: false
+;
+const recovery_cohort_condition = full_matrix_condition ++ " || inputs.run_native_recovery_cohort";
+const recovery_cohort_message = "ci.yml: run_native_recovery_cohort must be a required boolean dispatch input defaulting to false that gates only the hosted native workload and recovery shards";
 
 const WorkloadJob = struct {
     name: []const u8,
@@ -560,14 +569,41 @@ test "security: CI dispatch matrix opt-out requires a typed default-true input" 
     }
 }
 
+test "security: CI recovery cohort selector is a typed default-false input gating only the hosted cohort" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    for ([_][]const u8{
+        "",
+        try f.replace(recovery_cohort_input, "required: true", "required: false"),
+        try f.replace(recovery_cohort_input, "type: boolean", "type: string"),
+        try f.replace(recovery_cohort_input, "default: false", "default: true"),
+        try f.replace(recovery_cohort_input, "        default: false", ""),
+        recovery_cohort_input ++ "\n        options: [true]",
+        try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ recovery_cohort_input, recovery_cohort_input }),
+    }) |replacement| {
+        const refused = try f.check("ci-recovery", try f.replace(workflow, recovery_cohort_input, replacement));
+        defer refused.deinit();
+        try refused.failsWith(recovery_cohort_message);
+    }
+    const release = "  build-and-test-workload-release:\n    if: " ++ full_matrix_condition ++ "\n";
+    const widened = try f.check("ci-recovery", try f.replace(workflow, release, "  build-and-test-workload-release:\n    if: " ++ recovery_cohort_condition ++ "\n"));
+    defer widened.deinit();
+    try widened.failsWith(recovery_cohort_message);
+}
+
 test "security: CI dispatch matrix gates preserve non-dispatch coverage on every shard" {
     var f = try Fixture.init();
     defer f.deinit();
     const workflow = try f.source(".github/workflows/ci.yml");
-    const gate = "    if: " ++ full_matrix_condition ++ "\n";
+    const matrix_gate = "    if: " ++ full_matrix_condition ++ "\n";
+    const cohort_gate = "    if: " ++ recovery_cohort_condition ++ "\n";
     const first = std.mem.indexOfScalar(u8, workload_needs, '[') orelse return error.MissingNeeds;
     var names = std.mem.tokenizeAny(u8, workload_needs[first + 1 ..], ", ]");
     while (names.next()) |name| {
+        // The native workload carries the recovery unit filters of the cohort.
+        const cohort = std.mem.eql(u8, name, "build-and-test-workload-native") or std.mem.startsWith(u8, name, "native-recovery-zig-");
+        const gate: []const u8 = if (cohort) cohort_gate else matrix_gate;
         const marker = try std.fmt.allocPrint(f.arena.allocator(), "  {s}:\n", .{name});
         const start = std.mem.indexOf(u8, workflow, marker) orelse return error.MissingJob;
         const end = std.mem.indexOfPos(u8, workflow, start + marker.len, "\n    steps:\n") orelse return error.MissingSteps;
@@ -578,7 +614,9 @@ test "security: CI dispatch matrix gates preserve non-dispatch coverage on every
             "    if: inputs.run_full_matrix\n",
             "    if: github.event_name == 'pull_request' || inputs.run_full_matrix\n",
             "    if: github.event_name != 'workflow_dispatch' || inputs.run_native_real_snapshot\n",
-            gate ++ gate,
+            "    if: github.event_name != 'workflow_dispatch' || inputs.run_native_recovery_cohort\n",
+            if (cohort) matrix_gate else cohort_gate,
+            try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ gate, gate }),
         }) |replacement| {
             const changed = try f.replace(workflow, header, try f.replace(header, gate, replacement));
             const refused = try f.check("ci-recovery", changed);
@@ -1035,7 +1073,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 61), members);
+    try testing.expectEqual(@as(usize, 62), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2814,7 +2852,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     var f = try Fixture.init();
     defer f.deinit();
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
-        "  step native-outcome-build 0 \"\" \"${zenv[@]}\" \"$zig\" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2\n",
+        "  step native-outcome-build 0 \"\" \"${zenv[@]}\" \"$zig\" build build-native-outcome test-native-outcome \\\n    build-native-phase-summary test-native-phase-summary -Doptimize=\"$native_optimize\" -j2\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
         "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
         "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-postinst-protected \\\n",
@@ -3023,6 +3061,51 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     const missing = try nativeCheck(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", null);
     defer missing.deinit();
     try testing.expectEqual(@as(u8, 1), missing.code);
+}
+
+test "security: native database pair CI stays dispatch-only, hosted, matched and bounded" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "      run_native_database_pairs:\n", "      run_native_recovery_cohort:\n", &.{
+        "        type: boolean\n        default: false\n",
+        "        options: [capture, overhead]\n",
+        "          - '[\"1-AB\",\"2-BA\",\"3-AB\"]'\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  native-database-pair:\n", "  protected-reference:\n", &.{
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_native_database_pairs\n",
+        "          fetch-depth: 0\n",
+        "          test \"$RUNNER_ENVIRONMENT\" = github-hosted\n",
+        "            [[ $CONTROL_INPUT =~ ^[0-9a-f]{40}$ && $CONTROL_INPUT != \"$GITHUB_SHA\" ]]\n",
+        "          test ! -e \"$(git rev-parse --git-path shallow)\"\n",
+        "            git --git-dir=\"$tree/bare.git\" fsck --full --no-dangling\n",
+        " -C \"$ORCHESTRATOR/checkout\"",
+        "            \"$GITHUB_SHA\" \"$control\" \"$ORCHESTRATOR/candidate.bundle\" \"$control_bundle\" \\\n",
+        "            if [ -f \"$record\" ] && ! grep -Fxq \"tree=$slot\" \"$record\"; then\n              status=1\n            fi\n",
+        "            \"/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}${sample}1-$ARCHITECTURE\" \\\n",
+        "              rm -rf --one-file-system -- \"$tree\"\n",
+        "          if-no-files-found: error\n",
+    });
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const start = std.mem.indexOf(u8, workflow, "\n  native-database-pair:\n") orelse return error.MissingPairJob;
+    const end = std.mem.indexOfPos(u8, workflow, start + 1, "\n  protected-reference:\n") orelse return error.MissingPairJob;
+    const moved = try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}{s}", .{ workflow[0..start], workflow[end..], workflow[start..end] });
+    const hosted = "    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}\n";
+    const run_pair = "      - name: Run one matched pair on this runner\n";
+    const snapshot_env = "      ARCHITECTURE: ${{ matrix.architecture }}\n      NATIVE_OPTIMIZE: ${{ inputs.native_snapshot_optimize }}\n";
+    const unprotected = "ci.yml: the native database pair job must stay GitHub-hosted without hidden failures, unprotected tools or ownership transfer";
+    const exclusive = "ci.yml: the native database pair driver and inputs must be used only by the matched-pair job";
+    for ([_]struct { text: []const u8, message: []const u8 }{
+        .{ .text = try f.replace(workflow, hosted, "    runs-on: [self-hosted, Linux, X64, ubuntu2604]\n"), .message = unprotected },
+        .{ .text = try f.replace(workflow, run_pair, run_pair ++ "        continue-on-error: true\n"), .message = unprotected },
+        .{ .text = try f.replace(workflow, "          sudo -n env -i -C \"$ORCHESTRATOR/checkout\"", "          sudo env -i -C \"$ORCHESTRATOR/checkout\""), .message = unprotected },
+        .{ .text = try f.replace(workflow, snapshot_env, snapshot_env ++ "      PAIRS: ${{ inputs.native_database_series }}\n"), .message = exclusive },
+        .{ .text = try f.replace(workflow, "      - name: Validate pinned native acceptance inputs\n", "      - run: bash tools/native-database-performance-hosted.sh --validate-values amd64 Debug overhead AB 1\n      - name: Validate pinned native acceptance inputs\n"), .message = exclusive },
+        .{ .text = moved, .message = "ci.yml: the native database pair job must sit between the native snapshot and protected reference jobs" },
+    }) |mutation| {
+        const refused = try nativeCheck(&f, "protected-reference", ".github/workflows/ci.yml", mutation.text);
+        defer refused.deinit();
+        try refused.failsWith(mutation.message);
+    }
 }
 
 test "security: root reference capability proof stays required outside the sudo-free audit" {

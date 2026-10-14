@@ -1,41 +1,50 @@
 const std = @import("std");
-const phase_telemetry = @import("native_phase_telemetry.zig");
+pub const phase_telemetry = @import("native_phase_telemetry.zig");
 
 test "native_recovery.test.phase telemetry preserves canonical progress authority" {
     const allocator = std.testing.allocator;
-    var expected: ?[]u8 = null;
-    defer if (expected) |bytes| allocator.free(bytes);
-    for ([_]bool{ false, true }) |measured| {
-        var fixture = std.testing.tmpDir(.{ .iterate = true });
-        defer fixture.cleanup();
-        const root = root_fs.Root.init(std.testing.io, fixture.dir);
-        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
-            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
-        const intent: Digest = @splat('1');
-        try initializeProgress(allocator, root, intent);
-        var telemetry = phase_telemetry.Context.init(std.testing.io, @splat(2));
-        if (measured) telemetry.attach();
-        defer telemetry.detach();
-        try appendProgress(
-            allocator,
-            root,
-            intent,
-            .{ .kind = .database, .program_step = 0, .substep = 0, .ordinal = 0 },
-            .prepared,
-            .none,
-            null,
-        );
-        const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(progress_path), maximum_progress_bytes);
-        defer allocator.free(bytes);
-        if (expected) |original|
-            try std.testing.expectEqualSlices(u8, original, bytes)
-        else
-            expected = try allocator.dupe(u8, bytes);
-        var parsed = try readProgress(allocator, root);
-        defer parsed.deinit();
-        if (measured) {
-            try std.testing.expectEqual(@as(u64, 1), telemetry.measurement(.progress_serialization).count);
-            try std.testing.expectEqual(@as(u64, 2), telemetry.measurement(.fsync).count);
+    for (1..5) |version| {
+        var expected: ?[]u8 = null;
+        defer if (expected) |bytes| allocator.free(bytes);
+        for ([_]bool{ false, true }) |measured| {
+            var fixture = std.testing.tmpDir(.{ .iterate = true });
+            defer fixture.cleanup();
+            const root = root_fs.Root.init(std.testing.io, fixture.dir);
+            for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+                try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+            const intent: Digest = @splat('1');
+            try initializeProgressVersion(allocator, root, intent, version == 2 or version == 4, version >= 3);
+            var telemetry = phase_telemetry.Context.init(std.testing.io, @splat(2));
+            if (measured) telemetry.attach();
+            defer telemetry.detach();
+            try appendProgress(
+                allocator,
+                root,
+                intent,
+                .{ .kind = .database, .program_step = 0, .substep = 0, .ordinal = 0 },
+                .prepared,
+                .none,
+                null,
+            );
+            const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(progress_path), maximum_progress_bytes);
+            defer allocator.free(bytes);
+            if (expected) |original|
+                try std.testing.expectEqualSlices(u8, original, bytes)
+            else
+                expected = try allocator.dupe(u8, bytes);
+            var parsed = try readProgress(allocator, root);
+            defer parsed.deinit();
+            if (measured) {
+                try std.testing.expectEqual(@as(u64, 1), telemetry.measurement(.progress_serialization).count);
+                try std.testing.expectEqual(@as(u64, 2), telemetry.measurement(.fsync).count);
+                try std.testing.expectEqualDeep(phase_telemetry.ProgressBinding{
+                    .version = parsed.document.version,
+                    .intent_sha256 = parsed.document.intent_sha256,
+                    .sequence = parsed.document.records[0].sequence,
+                    .record_sha256 = parsed.document.records[0].digest_sha256,
+                    .document_sha256 = parsed.document.digest_sha256,
+                }, telemetry.test_progress_binding.?);
+            }
         }
     }
 }
@@ -71,6 +80,7 @@ test "native_recovery.test.phase telemetry cannot announce a failed progress pub
         null,
     ));
     try std.testing.expectEqual(@as(u64, 0), telemetry.sequence);
+    try std.testing.expect(telemetry.test_progress_binding == null);
     try std.testing.expectEqual(@as(u64, 1), telemetry.measurement(.progress_serialization).count);
     try std.testing.expectEqual(@as(u64, 0), telemetry.measurement(.fsync).count);
     const unchanged = try root.readFileAlloc(allocator, try root_fs.Path.init(progress_path), maximum_progress_bytes);
@@ -1191,7 +1201,13 @@ pub fn appendProgress(
         .overwrite = .replace,
         .durable = true,
     });
-    phase_telemetry.progress(@tagName(action.kind), action.program_step, action.substep, action.ordinal, @tagName(stage), @tagName(result));
+    phase_telemetry.progressPublished(@tagName(action.kind), action.program_step, action.substep, action.ordinal, @tagName(stage), @tagName(result), .{
+        .version = document.version,
+        .intent_sha256 = document.intent_sha256,
+        .sequence = record.sequence,
+        .record_sha256 = record.digest_sha256,
+        .document_sha256 = document.digest_sha256,
+    });
 }
 
 pub fn latest(

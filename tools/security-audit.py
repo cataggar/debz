@@ -2111,7 +2111,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_native": ("test-workload-native", (
         "native_dpkg_tests",
-        "run_native_program_corpus_tests", "native_outcome_tests",
+        "run_native_program_corpus_tests", "native_outcome_tests", "run_native_phase_summary_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",
@@ -2521,11 +2521,31 @@ CI_FULL_MATRIX_INPUT = """\
         default: true
 """
 CI_FULL_MATRIX_CONDITION = "github.event_name != 'workflow_dispatch' || inputs.run_full_matrix"
+CI_RECOVERY_COHORT_INPUT = """\
+      run_native_recovery_cohort:
+        description: "Run only the hosted native recovery cohort: six recovery shards and the native workload (amd64 and arm64, Debug and ReleaseSafe)"
+        required: true
+        type: boolean
+        default: false
+"""
+# The native workload carries the recovery unit, telemetry and provenance
+# filters; with the six shards it is the complete hosted test-native-recovery.
+CI_RECOVERY_COHORT_JOBS = ("build-and-test-workload-native", *RECOVERY_ZIG_SHARDS)
+CI_RECOVERY_COHORT_CONDITION = CI_FULL_MATRIX_CONDITION + " || inputs.run_native_recovery_cohort"
 CI_BUILD_AGGREGATE_CONDITION = "${{ always() && (" + CI_FULL_MATRIX_CONDITION + ") }}"
 CI_FULL_INTEGRATION_CONDITION = (
     "github.event_name == 'schedule' || "
     "(github.event_name == 'workflow_dispatch' && inputs.run_full_matrix)"
 )
+
+
+def dispatch_input_exact(block: str, expected: str) -> bool:
+    """Require one exact input definition that no extra property or option extends."""
+    index = block.find(expected)
+    return (
+        index >= 0 and block.count(expected) == 1
+        and re.match(r"(?:      [a-z]|\Z)", block[index + len(expected):]) is not None
+    )
 
 
 def ci_dispatch_matrix_failures(text: str, jobs: dict[str, str]) -> list[str]:
@@ -2539,8 +2559,19 @@ def ci_dispatch_matrix_failures(text: str, jobs: dict[str, str]) -> list[str]:
         != ["      run_full_matrix:"]
     ):
         failures.append("ci.yml: run_full_matrix must be a required boolean dispatch input defaulting to true")
+    if (
+        dispatch is None or not dispatch_input_exact(dispatch.group(1), CI_RECOVERY_COHORT_INPUT)
+        or re.findall(r"(?m)^ *run_native_recovery_cohort:[^\n]*$", text)
+        != ["      run_native_recovery_cohort:"]
+        or text.count("inputs.run_native_recovery_cohort") != len(CI_RECOVERY_COHORT_JOBS)
+    ):
+        failures.append(
+            "ci.yml: run_native_recovery_cohort must be a required boolean dispatch input defaulting to false"
+            " that gates only the hosted native workload and recovery shards"
+        )
     conditions = {
         **{name: CI_FULL_MATRIX_CONDITION for name in (*WORKLOAD_JOBS, *RECOVERY_ZIG_SHARDS)},
+        **{name: CI_RECOVERY_COHORT_CONDITION for name in CI_RECOVERY_COHORT_JOBS},
         "build-and-test": CI_BUILD_AGGREGATE_CONDITION,
         "integration-full": CI_FULL_INTEGRATION_CONDITION,
     }
@@ -2784,6 +2815,8 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference.sh",
     "tools/real_snapshot_reference_paths.py",
     "tools/real-snapshot-native-outcome.zig",
+    "tools/native-phase-summary.zig",
+    "tools/native-database-performance-hosted.sh",
     "tools/real-snapshot-python3-protected-stage.sh",
     "tools/real-snapshot-python3-reference.sh",
     "tools/real-snapshot-signed-proc-bindings.sh",
@@ -2925,6 +2958,299 @@ PROTECTED_REFERENCE_CLEANUP = (
     '            \' protected-cleanup "$PROTECTED_TREE"\n'
 )
 
+NATIVE_DATABASE_PAIR_INPUT_NAMES = (
+    "run_native_database_pairs", "native_database_comparison", "native_database_control_sha",
+    "native_database_architectures", "native_database_modes", "native_database_series",
+)
+
+NATIVE_DATABASE_PAIR_INPUTS = (
+    '      run_native_database_pairs:\n'
+    '        description: "Run matched native database-performance A/B pairs, one pair per disposable hosted runner"\n'
+    '        required: true\n'
+    '        type: boolean\n'
+    '        default: false\n'
+    '      native_database_comparison:\n'
+    '        description: "Matched-pair comparison: capture (published control A, candidate B) or overhead (candidate off/on)"\n'
+    '        required: true\n'
+    '        type: choice\n'
+    '        default: capture\n'
+    '        options: [capture, overhead]\n'
+    '      native_database_control_sha:\n'
+    '        description: "Published measurement-only control commit for capture pairs (empty for overhead)"\n'
+    '        required: false\n'
+    '        type: string\n'
+    '        default: ""\n'
+    '      native_database_architectures:\n'
+    '        description: "Matched-pair architectures (JSON list)"\n'
+    '        required: true\n'
+    '        type: choice\n'
+    '        default: \'["amd64","arm64"]\'\n'
+    '        options:\n'
+    '          - \'["amd64","arm64"]\'\n'
+    '          - \'["amd64"]\'\n'
+    '          - \'["arm64"]\'\n'
+    '      native_database_modes:\n'
+    '        description: "Matched-pair build modes (JSON list)"\n'
+    '        required: true\n'
+    '        type: choice\n'
+    '        default: \'["Debug","ReleaseSafe"]\'\n'
+    '        options:\n'
+    '          - \'["Debug","ReleaseSafe"]\'\n'
+    '          - \'["Debug"]\'\n'
+    '          - \'["ReleaseSafe"]\'\n'
+    '      native_database_series:\n'
+    '        description: "Reviewed interleaved sample-order series (JSON list)"\n'
+    '        required: true\n'
+    '        type: choice\n'
+    '        default: \'["1-AB","2-BA","3-AB"]\'\n'
+    '        options:\n'
+    '          - \'["1-AB","2-BA","3-AB"]\'\n'
+    '          - \'["1-AB"]\'\n'
+    '          - \'["2-BA"]\'\n'
+    '          - \'["3-AB"]\'\n'
+)
+
+NATIVE_DATABASE_PAIR_JOB = (
+    '  native-database-pair:\n'
+    "    if: github.event_name == 'workflow_dispatch' && inputs.run_native_database_pairs\n"
+    '    name: Native database pair (${{ inputs.native_database_comparison }}, ${{ matrix.architecture }}, ${{ matrix.optimize }}, ${{ matrix.pair }})\n'
+    "    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}\n"
+    '    # Prerequisites, bundles and bootstrap 20, both protected slots 300, and\n'
+    '    # evidence copy plus named-tree cleanup 20, leaving 20 for checkout,\n'
+    '    # input validation and upload within the hosted six-hour job limit.\n'
+    '    timeout-minutes: 360\n'
+    '    strategy:\n'
+    '      fail-fast: false\n'
+    '      matrix:\n'
+    '        architecture: ${{ fromJSON(inputs.native_database_architectures) }}\n'
+    '        optimize: ${{ fromJSON(inputs.native_database_modes) }}\n'
+    '        pair: ${{ fromJSON(inputs.native_database_series) }}\n'
+    '    env:\n'
+    '      ARCHITECTURE: ${{ matrix.architecture }}\n'
+    '      OPTIMIZE: ${{ matrix.optimize }}\n'
+    '      PAIR: ${{ matrix.pair }}\n'
+    '      COMPARISON: ${{ inputs.native_database_comparison }}\n'
+    '      CONTROL_INPUT: ${{ inputs.native_database_control_sha }}\n'
+    '      ORCHESTRATOR: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}0-${{ matrix.architecture }}\n'
+    '    steps:\n'
+    '      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n'
+    '        with:\n'
+    '          fetch-depth: 0\n'
+    '          persist-credentials: false\n'
+    '      - name: Validate matched-pair inputs\n'
+    '        env:\n'
+    '          SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}\n'
+    '          SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          test "$RUNNER_ENVIRONMENT" = github-hosted\n'
+    '          case "$ARCHITECTURE/$RUNNER_ARCH" in amd64/X64|arm64/ARM64) ;; *) exit 1 ;; esac\n'
+    '          case "$PAIR" in 1-AB|2-BA|3-AB) ;; *) exit 1 ;; esac\n'
+    '          bash tools/native-database-performance-hosted.sh --validate-values \\\n'
+    '            "$ARCHITECTURE" "$OPTIMIZE" "$COMPARISON" "${PAIR#*-}" "${PAIR%-*}"\n'
+    '          tools/real-snapshot-acceptance.sh --validate-values \\\n'
+    '            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE"\n'
+    '          if [ "$COMPARISON" = capture ]; then\n'
+    '            [[ $CONTROL_INPUT =~ ^[0-9a-f]{40}$ && $CONTROL_INPUT != "$GITHUB_SHA" ]]\n'
+    '          else\n'
+    '            [[ -z $CONTROL_INPUT || $CONTROL_INPUT == "$GITHUB_SHA" ]]\n'
+    '          fi\n'
+    '      - name: Install test runner prerequisites\n'
+    '        timeout-minutes: 10\n'
+    '        run: |\n'
+    '          sudo -n apt-get update\n'
+    '          sudo -n apt-get install --yes --no-install-recommends \\\n'
+    '            dpkg jq liblzma-dev libzstd-dev strace\n'
+    '      - name: Bundle exact candidate and published control histories\n'
+    '        timeout-minutes: 5\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
+    '          test -z "$(git status --porcelain)"\n'
+    '          test ! -e "$(git rev-parse --git-path shallow)"\n'
+    '          git bundle create "$RUNNER_TEMP/native-database-candidate.bundle" HEAD\n'
+    '          if [ "$COMPARISON" = capture ]; then\n'
+    '            control_git="$RUNNER_TEMP/native-database-control.git"\n'
+    '            git init --quiet --bare "$control_git"\n'
+    '            git --git-dir="$control_git" fetch --quiet --no-tags "$PWD" HEAD:refs/heads/candidate\n'
+    '            git --git-dir="$control_git" fetch --quiet --no-tags \\\n'
+    '              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "+$CONTROL_INPUT:refs/heads/control"\n'
+    '            test "$(git --git-dir="$control_git" rev-parse refs/heads/control)" = "$CONTROL_INPUT"\n'
+    '            test ! -e "$control_git/shallow"\n'
+    '            git --git-dir="$control_git" symbolic-ref HEAD refs/heads/control\n'
+    '            git --git-dir="$control_git" bundle create "$RUNNER_TEMP/native-database-control.bundle" HEAD\n'
+    '          fi\n'
+    '      - name: Stage protected orchestration checkout and pair bundles\n'
+    '        timeout-minutes: 5\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          control_bundle=\n'
+    '          if [ "$COMPARISON" = capture ]; then\n'
+    '            control_bundle="$RUNNER_TEMP/native-database-control.bundle"\n'
+    '          fi\n'
+    '          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+    '            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \\\n'
+    "            bash -euo pipefail -c '\n"
+    '            tree=$1 architecture=$2 expected=$3 candidate_bundle=$4 control_bundle=$5\n'
+    '            [[ $tree =~ ^/srv/debz-protected/native-ci-[0-9]+-[0-9]+0-(amd64|arm64)$ ]]\n'
+    '            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]\n'
+    '            umask 022\n'
+    '            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected\n'
+    '            for ancestor in / /srv /srv/debz-protected; do\n'
+    '              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]\n'
+    '              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))\n'
+    '            done\n'
+    '            mkdir -m 0700 -- "$tree"\n'
+    '            install -o root -g root -m 0600 -- "$candidate_bundle" "$tree/candidate.bundle"\n'
+    '            if [[ -n $control_bundle ]]; then\n'
+    '              install -o root -g root -m 0600 -- "$control_bundle" "$tree/control.bundle"\n'
+    '            fi\n'
+    '            git init --quiet --bare "$tree/bare.git"\n'
+    '            git --git-dir="$tree/bare.git" bundle verify "$tree/candidate.bundle"\n'
+    '            git --git-dir="$tree/bare.git" fetch --quiet "$tree/candidate.bundle" HEAD:refs/heads/protected\n'
+    '            test "$(git --git-dir="$tree/bare.git" rev-parse refs/heads/protected)" = "$expected"\n'
+    '            git --git-dir="$tree/bare.git" symbolic-ref HEAD refs/heads/protected\n'
+    '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n'
+    '            git clone --quiet --no-hardlinks "file://$tree/bare.git" "$tree/checkout"\n'
+    '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n'
+    '            \' native-database-pair-bootstrap "$ORCHESTRATOR" "$ARCHITECTURE" "$GITHUB_SHA" \\\n'
+    '            "$RUNNER_TEMP/native-database-candidate.bundle" "$control_bundle"\n'
+    '      - name: Run one matched pair on this runner\n'
+    '        id: pair\n'
+    '        timeout-minutes: 300\n'
+    '        env:\n'
+    '          SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}\n'
+    '          SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          control="$GITHUB_SHA"\n'
+    '          control_bundle="$ORCHESTRATOR/candidate.bundle"\n'
+    '          if [ "$COMPARISON" = capture ]; then\n'
+    '            control="$CONTROL_INPUT"\n'
+    '            control_bundle="$ORCHESTRATOR/control.bundle"\n'
+    '          fi\n'
+    '          sudo -n env -i -C "$ORCHESTRATOR/checkout" PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+    '            GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \\\n'
+    '            GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \\\n'
+    '            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="$GITHUB_JOB" \\\n'
+    '            GITHUB_WORKFLOW="$GITHUB_WORKFLOW" RUNNER_NAME="$RUNNER_NAME" \\\n'
+    '            bash "$ORCHESTRATOR/checkout/tools/native-database-performance-hosted.sh" \\\n'
+    '            "$ORCHESTRATOR" "$ARCHITECTURE" "$OPTIMIZE" "$COMPARISON" "${PAIR#*-}" "${PAIR%-*}" \\\n'
+    '            "$GITHUB_SHA" "$control" "$ORCHESTRATOR/candidate.bundle" "$control_bundle" \\\n'
+    '            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"\n'
+    '      - name: Copy bounded paired evidence\n'
+    '        if: always()\n'
+    '        timeout-minutes: 10\n'
+    '        env:\n'
+    '          PAIR_OUTCOME: ${{ steps.pair.outcome }}\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          case "$PAIR" in 1-AB|2-BA|3-AB) ;; *) exit 1 ;; esac\n'
+    '          sample=${PAIR%-*}\n'
+    '          bash tools/native-database-performance-hosted.sh --validate-values \\\n'
+    '            "$ARCHITECTURE" "$OPTIMIZE" "$COMPARISON" "${PAIR#*-}" "$sample"\n'
+    '          output="$PWD/.native-database-pair/evidence"\n'
+    '          mkdir -p "$output"\n'
+    '          printf \'pair_step_outcome=%s\\n\' "$PAIR_OUTCOME" >"$output/pair-step.txt"\n'
+    '          df -Pk / >"$output/runner-disk.txt"\n'
+    '          status=0\n'
+    '          copy() {\n'
+    '            local source=$1 destination=$2 limit=$3 bytes\n'
+    '            read -r bytes _ < <(sudo -n du -sb "$source") &&\n'
+    '              test "$bytes" -le "$limit" &&\n'
+    '              mkdir -p "$destination" &&\n'
+    '              sudo -n tar -C "$source" -cf - . >"$RUNNER_TEMP/native-database-evidence.tar" &&\n'
+    '              tar --no-same-owner --no-same-permissions -C "$destination" -xf "$RUNNER_TEMP/native-database-evidence.tar"\n'
+    '          }\n'
+    '          pair="$ORCHESTRATOR/pair-$sample-$COMPARISON-$OPTIMIZE"\n'
+    '          if sudo -n test -d "$pair"; then\n'
+    '            copy "$pair" "$output/${pair##*/}" $((256 * 1024 * 1024)) || status=1\n'
+    '          else\n'
+    '            printf \'pair_evidence=unavailable\\nreason=bootstrap-or-pair-validation-failed\\n\' >"$output/pair-collection-failure.txt"\n'
+    '          fi\n'
+    '          for index in 1 2; do\n'
+    '            slot="/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}${sample}${index}-$ARCHITECTURE"\n'
+    '            letter=A\n'
+    '            if [ "$index" = 2 ]; then letter=B; fi\n'
+    '            record="$output/${pair##*/}/slot-$letter.txt"\n'
+    '            if [ -f "$record" ] && ! grep -Fxq "tree=$slot" "$record"; then\n'
+    '              status=1\n'
+    '            fi\n'
+    '            mkdir -p "$output/${slot##*/}"\n'
+    '            if sudo -n test -d "$slot/native-upload"; then\n'
+    '              copy "$slot/native-upload" "$output/${slot##*/}/native-upload" $((512 * 1024 * 1024)) || status=1\n'
+    '            elif sudo -n test -d "$slot"; then\n'
+    '              printf \'native_evidence=unavailable\\nreason=slot-staging-or-export-failed\\n\' >"$output/${slot##*/}/collection-failure.txt"\n'
+    '              if sudo -n test -d "$slot/upload"; then\n'
+    '                copy "$slot/upload" "$output/${slot##*/}/staging" $((512 * 1024 * 1024)) || status=1\n'
+    '              fi\n'
+    '            else\n'
+    '              printf \'native_evidence=unavailable\\nreason=slot-tree-absent\\n\' >"$output/${slot##*/}/collection-failure.txt"\n'
+    '            fi\n'
+    '          done\n'
+    '          if [ -f "$output/${pair##*/}/pair-result.txt" ]; then\n'
+    '            cat "$output/${pair##*/}/pair-result.txt" >>"$GITHUB_STEP_SUMMARY"\n'
+    '          fi\n'
+    '          exit "$status"\n'
+    '      - name: Kill pair descendants and remove only the named trees\n'
+    '        if: always()\n'
+    '        timeout-minutes: 10\n'
+    '        run: |\n'
+    '          set -euo pipefail\n'
+    '          output="$PWD/.native-database-pair/evidence"\n'
+    '          mkdir -p "$output"\n'
+    '          case "$PAIR" in 1-AB|2-BA|3-AB) ;; *) exit 1 ;; esac\n'
+    '          sample=${PAIR%-*}\n'
+    '          status=0\n'
+    '          for tree in "$ORCHESTRATOR" \\\n'
+    '            "/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}${sample}1-$ARCHITECTURE" \\\n'
+    '            "/srv/debz-protected/native-ci-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT}${sample}2-$ARCHITECTURE"; do\n'
+    "            sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -euo pipefail -c '\n"
+    '              tree=$1\n'
+    '              [[ $tree =~ ^/srv/debz-protected/native-ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]\n'
+    '              [[ -e $tree || -L $tree ]] || exit 0\n'
+    '              [[ -d $tree && ! -L $tree && $(stat -c %u:%g "$tree") == 0:0 ]]\n'
+    '              for attempt in 1 2 3 4 5; do\n'
+    '                victims=()\n'
+    '                for process in /proc/[0-9]*; do\n'
+    '                  root=$(readlink "$process/root" 2>/dev/null) || continue\n'
+    '                  cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=\n'
+    '                  case "$root/ $cwd/" in\n'
+    '                    *"$tree/"*) victims+=("${process#/proc/}") ;;\n'
+    '                  esac\n'
+    '                done\n'
+    '                (( ${#victims[@]} )) || break\n'
+    '                echo "killing named native descendants: ${victims[*]}"\n'
+    '                kill -KILL "${victims[@]}" 2>/dev/null || true\n'
+    '                sleep 1\n'
+    '              done\n'
+    '              (( ${#victims[@]} == 0 ))\n'
+    '              if grep -F " $tree" /proc/self/mountinfo; then\n'
+    '                echo "mounts remain beneath $tree" >&2\n'
+    '                exit 1\n'
+    '              fi\n'
+    '              rm -rf --one-file-system -- "$tree"\n'
+    '              test ! -e "$tree"\n'
+    '              \' native-database-pair-cleanup "$tree" >>"$output/cleanup-result.txt" 2>&1 || status=1\n'
+    '          done\n'
+    '          printf \'cleanup_status=%s\\n\' "$status" >>"$output/cleanup-result.txt"\n'
+    '          (\n'
+    '            cd "$output"\n'
+    '            find . -type f ! -name SHA256SUMS -print0 \\\n'
+    '              | sort -z \\\n'
+    '              | xargs -0 -r sha256sum >SHA256SUMS\n'
+    '          )\n'
+    '          exit "$status"\n'
+    '      - name: Upload matched-pair evidence\n'
+    '        if: always()\n'
+    '        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n'
+    '        with:\n'
+    '          name: native-database-pair-${{ inputs.native_database_comparison }}-${{ matrix.architecture }}-${{ matrix.optimize }}-${{ matrix.pair }}\n'
+    '          path: .native-database-pair/evidence/\n'
+    '          if-no-files-found: error\n'
+    '          retention-days: 14\n'
+)
+
 
 PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "set -euo pipefail",
@@ -2934,7 +3260,11 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "  mode=native-staging\n",
     '[[ $mode == proof ]] || prefix=native-ci',
     'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
-    'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome -Doptimize=ReleaseSafe -j2',
+    'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome \\\n'
+    '    build-native-phase-summary test-native-phase-summary -Doptimize="$native_optimize" -j2',
+    'native_optimize=ReleaseSafe\nif [[ $mode == native-staging ]]; then\n'
+    '  native_optimize=${DEBZ_NATIVE_SNAPSHOT_OPTIMIZE:-ReleaseSafe}\n'
+    '  [[ $native_optimize == Debug || $native_optimize == ReleaseSafe ]]',
     '"$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \\\n'
     '    --receipt-from-archive "$tree/reference-dpkg.deb" --prefix "$tree/reference-dpkg"',
     'print(toolchain(Path(sys.argv[2])))',
@@ -3069,6 +3399,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
         "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
         "protected(Path(sys.argv[2]))",
+        "protected(optimize_file)",
+        'export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}',
         '"zig-out/bin/debz-native-outcome",',
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
@@ -3318,6 +3650,43 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'failures.append(f"protected tree must be mode 0700: {describe(current, meta)}")',
     ),
 }
+
+
+def native_database_pair_ci_failures(ci: str) -> list[str]:
+    """Pin the dispatch-only hosted job that runs one matched pair per runner."""
+    failures: list[str] = []
+    dispatch = re.search(r"(?m)^  workflow_dispatch:\n    inputs:\n((?: {6,}[^\n]*\n)*)", ci)
+    if dispatch is None or not dispatch_input_exact(dispatch.group(1), NATIVE_DATABASE_PAIR_INPUTS) or any(
+        re.findall(rf"(?m)^ *{name}:[^\n]*$", ci) != [f"      {name}:"]
+        for name in NATIVE_DATABASE_PAIR_INPUT_NAMES
+    ):
+        failures.append("ci.yml: the native database pair inputs must remain exact dispatch-only selectors")
+    jobs = re.findall(r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci)
+    names = [name for name, _ in jobs]
+    if names.count("native-database-pair") != 1 or names[-3:] != [
+        "ubuntu-real-snapshot", "native-database-pair", "protected-reference",
+    ]:
+        failures.append(
+            "ci.yml: the native database pair job must sit between the native snapshot and protected reference jobs"
+        )
+    job = dict(jobs).get("native-database-pair", "")
+    if "  native-database-pair:\n" + job.rstrip("\n") + "\n" != NATIVE_DATABASE_PAIR_JOB:
+        failures.append("ci.yml: the native database pair job must keep its exact hosted matched-pair wiring")
+    if (
+        "self-hosted" in job or "continue-on-error" in job or "cataggar/ghr" in job
+        or "chown" in job or re.search(r"\bsudo (?!-n )", job)
+        or re.findall(r"(?m)^    runs-on:[^\n]*$", job)
+        != ["    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}"]
+    ):
+        failures.append(
+            "ci.yml: the native database pair job must stay GitHub-hosted without hidden failures,"
+            " unprotected tools or ownership transfer"
+        )
+    if ci.count("native-database-performance-hosted.sh") != job.count("native-database-performance-hosted.sh") or any(
+        ci.count(f"inputs.{name}") != job.count(f"inputs.{name}") for name in NATIVE_DATABASE_PAIR_INPUT_NAMES
+    ):
+        failures.append("ci.yml: the native database pair driver and inputs must be used only by the matched-pair job")
+    return failures
 
 
 def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
@@ -3647,6 +4016,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
     ))
+    failures.extend(native_database_pair_ci_failures(ci))
     native_job = jobs.get("ubuntu-real-snapshot", "")
     for token in (
         "    if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot\n",

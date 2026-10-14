@@ -4,6 +4,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Phase = enum { capture, import, hash, mutation, fsync, progress_serialization };
+pub const schema_id = "https://debz.dev/schema/native-phase-telemetry-v1";
+pub const ProgressBinding = struct {
+    version: u32,
+    intent_sha256: [64]u8,
+    sequence: u64,
+    record_sha256: [64]u8,
+    document_sha256: [64]u8,
+};
 pub const Measurement = struct {
     count: u64 = 0,
     nanoseconds: u64 = 0,
@@ -37,6 +45,7 @@ pub const Context = struct {
     previous: ?*Context = null,
     attached: bool = false,
     enabled: bool = true,
+    test_progress_binding: if (builtin.is_test) ?ProgressBinding else void = if (builtin.is_test) null else {},
 
     /// Opt-in logging preserves quiet/JSON consumer contracts and avoids
     /// measuring every small hash when no profiling was requested.
@@ -79,7 +88,7 @@ pub const Context = struct {
 
     pub fn detach(self: *Context) void {
         if (!self.attached) return;
-        self.emit("attempt_end", 0, 0, 0, "finished", "none");
+        self.emit("attempt_end", 0, 0, 0, "finished", "none", null);
         active = self.previous;
         self.attached = false;
     }
@@ -88,7 +97,7 @@ pub const Context = struct {
         return self.measurements[@intFromEnum(phase)];
     }
 
-    fn emit(self: *Context, kind: []const u8, step: u32, substep: u16, ordinal: u32, stage: []const u8, result: []const u8) void {
+    fn emit(self: *Context, kind: []const u8, step: u32, substep: u16, ordinal: u32, stage: []const u8, result: []const u8, binding: ?ProgressBinding) void {
         const capture = self.measurement(.capture);
         const imported = self.measurement(.import);
         const hash = self.measurement(.hash);
@@ -96,7 +105,7 @@ pub const Context = struct {
         const fsync = self.measurement(.fsync);
         const serialization = self.measurement(.progress_serialization);
         std.log.info(
-            "native_phase attempt={s} process_epoch={s} invocation={d} sequence={d} kind={s} program_step={d} substep={d} ordinal={d} stage={s} result={s} elapsed_ns={d} capture_count={d} capture_ns={d} import_count={d} import_ns={d} hash_count={d} hash_ns={d} mutation_count={d} mutation_ns={d} fsync_count={d} fsync_ns={d} progress_serialization_count={d} progress_serialization_ns={d}",
+            "native_phase attempt={s} process_epoch={s} invocation={d} sequence={d} kind={s} program_step={d} substep={d} ordinal={d} stage={s} result={s} elapsed_ns={d} capture_count={d} capture_ns={d} import_count={d} import_ns={d} hash_count={d} hash_ns={d} mutation_count={d} mutation_ns={d} fsync_count={d} fsync_ns={d} progress_serialization_count={d} progress_serialization_ns={d} schema={s} version=1 clock=awake published={s} progress_version={d} intent_sha256={s} progress_sequence={d} progress_record_sha256={s} progress_document_sha256={s}",
             .{
                 std.fmt.bytesToHex(self.attempt_id, .lower),
                 std.fmt.bytesToHex(self.process_epoch, .lower),
@@ -121,6 +130,13 @@ pub const Context = struct {
                 fsync.nanoseconds,
                 serialization.count,
                 serialization.nanoseconds,
+                schema_id,
+                if (binding != null) "true" else "false",
+                if (binding) |value| value.version else 0,
+                if (binding) |value| &value.intent_sha256 else "-",
+                if (binding) |value| value.sequence else 0,
+                if (binding) |value| &value.record_sha256 else "-",
+                if (binding) |value| &value.document_sha256 else "-",
             },
         );
         self.sequence +|= 1;
@@ -152,9 +168,12 @@ pub fn start(phase: Phase) Span {
     };
 }
 
-/// Emitted only after durable progress publication; not an acknowledgment.
-pub fn progress(kind: []const u8, step: u32, substep: u16, ordinal: u32, stage: []const u8, result: []const u8) void {
-    if (active) |context| context.emit(kind, step, substep, ordinal, stage, result);
+/// The binding names the already-fsynced canonical record, not new authority.
+pub fn progressPublished(kind: []const u8, step: u32, substep: u16, ordinal: u32, stage: []const u8, result: []const u8, binding: ProgressBinding) void {
+    if (active) |context| {
+        if (builtin.is_test) context.test_progress_binding = binding;
+        context.emit(kind, step, substep, ordinal, stage, result, binding);
+    }
 }
 
 test "native_phase_telemetry.test.nested attempts and restarts do not share counters" {
