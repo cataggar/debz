@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const guest = @import("real-snapshot-reference-guest.zig");
 
@@ -637,7 +638,8 @@ const GuestRecorder = struct {
         const data = try self.base.payload(package_name);
         const package = self.base.lockPackage(package_name) orelse return error.MissingRuntimePackage;
         const entry = payloadEntry(data, path) orelse {
-            std.log.err("reference guest member {s}:/{s} is missing", .{ package_name, path });
+            // Hermetic negative tests exercise this refusal; only production logs it.
+            if (!builtin.is_test) std.log.err("reference guest member {s}:/{s} is missing", .{ package_name, path });
             return error.MissingGuestMember;
         };
         if (entry.uid != 0 or entry.gid != 0) return error.UnprotectedGuestMember;
@@ -757,6 +759,21 @@ const GuestRecorder = struct {
             }
         }
     }
+
+    /// /etc/nsswitch.conf may only hold a signed provider copy of the bound lock:
+    /// libc-bin's is always required; systemd's factory copy is bound exactly
+    /// when the lock carries systemd (the protected runtime lock does not). A
+    /// locked provider whose member is missing still refuses.
+    fn nssConfig(self: *GuestRecorder) !void {
+        for ([_]struct { package: []const u8, path: []const u8, required: bool }{
+            .{ .package = "libc-bin", .path = "usr/share/libc-bin/nsswitch.conf", .required = true },
+            .{ .package = "systemd", .path = "usr/share/factory/etc/nsswitch.conf", .required = false },
+        }) |source| {
+            if (!source.required and self.base.lockPackage(source.package) == null) continue;
+            const found = try self.member(source.package, source.path);
+            try self.put("/etc/nsswitch.conf", .nss_config, false, found.identity);
+        }
+    }
 };
 
 /// Derives the guest binding from the original signed lock archives (and the
@@ -814,13 +831,7 @@ fn recordGuest(recorder: *Recorder, dpkg_path: []const u8, lock_sha256: []const 
         try self.chain(&.{"dpkg"}, path, .handler_tool, false);
     }
     // Late NSS: configuration, every libc6 provider, and loader-cache search.
-    for ([_][2][]const u8{
-        .{ "libc-bin", "usr/share/libc-bin/nsswitch.conf" },
-        .{ "systemd", "usr/share/factory/etc/nsswitch.conf" },
-    }) |source| {
-        const found = try self.member(source[0], source[1]);
-        try self.put("/etc/nsswitch.conf", .nss_config, false, found.identity);
-    }
+    try self.nssConfig();
     const library_directory = try std.fmt.allocPrint(allocator, "usr/lib/{s}", .{triplet});
     for ((try recorder.payload("libc6")).data.entries) |entry| {
         const path = std.mem.trimEnd(u8, entry.path, "/");
@@ -1424,6 +1435,159 @@ test "reference runtime closure recursively refuses missing, unbound and archite
     fixtureInteger(u64, &loader, 208, 1);
     fixtureInteger(u64, &loader, 216, 1);
     try std.testing.expectError(error.InvalidRuntimeInterpreter, validateClosure(std.testing.allocator, &objects, "amd64"));
+}
+
+/// Every package of the hosted protected runtime locks of run 38480672695
+/// (staging/runtime.lock.json; amd64 sha256 38189ae3…ecfc, arm64 sha256
+/// 52a74d64…7b1d) in lock order: 61 packages and no systemd. ":all" marks the
+/// architecture-independent packages; the rest carry the target architecture.
+const hosted_protected_runtime_lock = [_][]const u8{
+    "base-files",             "base-passwd",              "bash",               "coreutils:all",
+    "coreutils-from-gnu:all", "dash",                     "debconf:all",        "debianutils",
+    "diffutils",              "dpkg",                     "findutils",          "gawk",
+    "gcc-16-base",            "gnu-coreutils",            "grep",               "gzip",
+    "hostname",               "init-system-helpers:all",  "libacl1",            "libattr1",
+    "libaudit-common:all",    "libaudit1",                "libblkid1",          "libbz2-1.0",
+    "libc-bin",               "libc-gconv-modules-extra", "libc6",              "libcap-ng0",
+    "libcrypt1",              "libdb5.3t64",              "libdebconfclient0",  "libgcc-s1",
+    "libgmp10",               "liblzma5",                 "libmd0",             "libmount1",
+    "libmpfr6",               "libpam-modules",           "libpam-modules-bin", "libpam-runtime:all",
+    "libpam0g",               "libpcre2-8-0",             "libreadline8t64",    "libselinux1",
+    "libsmartcols1",          "libssl3t64",               "libsystemd0",        "libtinfo6",
+    "libudev1",               "libuuid1",                 "libzstd1",           "ncurses-base:all",
+    "ncurses-bin",            "openssl-provider-legacy",  "perl-base",          "readline-common:all",
+    "sed",                    "sysvinit-utils",           "tar",                "util-linux",
+    "zlib1g",
+};
+
+/// The hosted protected lock shape with `added` packages and without `removed`;
+/// each archive identity is a fixture digest that only the lock carries.
+fn fixtureLock(a: std.mem.Allocator, architecture: []const u8, added: []const []const u8, removed: ?[]const u8) !Recorder.debz.exact_lock_v3.Lock {
+    const Package = Recorder.debz.exact_lock_v3.Package;
+    var packages: std.ArrayList(Package) = .empty;
+    for ([_][]const []const u8{ &hosted_protected_runtime_lock, added }) |items| {
+        for (items) |item| {
+            const all = std.mem.endsWith(u8, item, ":all");
+            const name = if (all) item[0 .. item.len - ":all".len] else item;
+            if (removed != null and std.mem.eql(u8, name, removed.?)) continue;
+            var sha512: [64]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(item, &sha512, .{});
+            try packages.append(a, .{
+                .name = name,
+                .version = "fixture",
+                .architecture = if (all) "all" else architecture,
+                .origin = .{ .authenticated_repository = .{ .repository_id = @splat('0'), .repository_snapshot_sha256 = @splat(0) } },
+                .archive_identity = .{ .digests = .{ .sha512 = sha512 }, .primary = .sha512 },
+                .declared_size = 1,
+                .retention = .dependency,
+                .dpkg_selection_hold = false,
+            });
+        }
+    }
+    std.mem.sort(Package, packages.items, {}, struct {
+        fn less(_: void, left: Package, right: Package) bool {
+            return switch (std.mem.order(u8, left.name, right.name)) {
+                .eq => std.mem.order(u8, left.architecture, right.architecture) == .lt,
+                else => |order| order == .lt,
+            };
+        }
+    }.less);
+    return .{
+        .target_architecture = architecture,
+        .request_sha256 = @splat(0),
+        .policy_sha256 = @splat(0),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = packages.items,
+        .digest_sha256 = @splat(0),
+    };
+}
+
+/// A validated payload reduced to one root-owned regular data member.
+fn fixturePayload(a: std.mem.Allocator, path: []const u8, bytes: []const u8) !Recorder.debz.deb_payload.Validation {
+    const entries = try a.alloc(Recorder.debz.deb_payload.Entry, 1);
+    entries[0] = .{
+        .path = try a.dupe(u8, path),
+        .link_target = null,
+        .link_literal = null,
+        .kind = .regular,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .owner_name = "root",
+        .group_name = "root",
+        .mtime = 0,
+        .size = bytes.len,
+        .header_offset = 0,
+        .content_offset = 0,
+    };
+    var validation: Recorder.debz.deb_payload.Validation = undefined;
+    validation.data = undefined;
+    validation.data.entries = entries;
+    validation.data_bytes = try a.dupe(u8, bytes);
+    return validation;
+}
+
+test "reference runtime binds exactly the nsswitch.conf providers of the hosted protected runtime lock" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const providers = [_]struct { package: []const u8, path: []const u8, bytes: []const u8 }{
+        .{ .package = "libc-bin", .path = "usr/share/libc-bin/nsswitch.conf", .bytes = "passwd: files\n" },
+        .{ .package = "systemd", .path = "usr/share/factory/etc/nsswitch.conf", .bytes = "passwd: files systemd\n" },
+    };
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        for ([_]struct { added: []const []const u8, removed: ?[]const u8 = null, systemd_member: bool = true, bound: usize = 0, err: ?anyerror = null }{
+            // The hosted lock: libc-bin's copy alone; systemd is never loaded.
+            .{ .added = &.{}, .bound = 1 },
+            // A lock that carries systemd still binds its factory copy too.
+            .{ .added = &.{"systemd"}, .bound = 2 },
+            // A locked provider without its member refuses; it is never dropped.
+            .{ .added = &.{"systemd"}, .systemd_member = false, .err = error.MissingGuestMember },
+            // libc-bin's copy is always required.
+            .{ .added = &.{}, .removed = "libc-bin", .err = error.MissingRuntimePackage },
+        }) |case| {
+            var recorder: Recorder = .{
+                .allocator = a,
+                .architecture = architecture,
+                .lock = try fixtureLock(a, architecture, case.added, case.removed),
+                .cache = "/nonexistent-reference-runtime-cache",
+                .payloads = .init(a),
+            };
+            for (providers) |provider| {
+                if (recorder.lockPackage(provider.package) == null) continue;
+                const path = if (case.systemd_member or !std.mem.eql(u8, provider.package, "systemd")) provider.path else "usr/lib/systemd/systemd";
+                try recorder.payloads.put(provider.package, try fixturePayload(a, path, provider.bytes));
+            }
+            var self: GuestRecorder = .{
+                .base = &recorder,
+                .triplet = guest.triplet(architecture).?,
+                .interpreter = "",
+                .loader_path = "",
+                .visited = .init(a),
+            };
+            if (case.err) |expected| {
+                try std.testing.expectError(expected, self.nssConfig());
+                continue;
+            }
+            try self.nssConfig();
+            try std.testing.expectEqual(@as(usize, 1), self.entries.items.len);
+            const entry = self.entries.items[0];
+            try std.testing.expectEqualStrings("/etc/nsswitch.conf", entry.path);
+            try std.testing.expectEqual(guest.Role.nss_config, entry.role);
+            try std.testing.expect(!entry.required);
+            try std.testing.expectEqual(case.bound, entry.allowed.len);
+            for (entry.allowed, providers[0..case.bound]) |identity, provider| {
+                const package = recorder.lockPackage(provider.package).?;
+                try std.testing.expectEqualStrings(provider.package, identity.package.?);
+                try std.testing.expectEqualStrings(package.version, identity.version.?);
+                try std.testing.expectEqualStrings(&std.fmt.bytesToHex(package.archive_identity.digests.sha512.?, .lower), identity.archive_sha512.?);
+                try std.testing.expectEqualStrings(provider.path, identity.member.?[1..]);
+                try std.testing.expectEqualStrings(try digest(a, provider.bytes), identity.sha256);
+                try std.testing.expectEqual(@as(u64, provider.bytes.len), identity.size);
+            }
+        }
+    }
 }
 
 test {
