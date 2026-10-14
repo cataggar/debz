@@ -2559,7 +2559,7 @@ jobs:
     defaults:
       run:
         shell: bash /usr/local/bin/as-runner {0}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Bootstrap the hosted-runner-like root container
         shell: bash

@@ -92,11 +92,12 @@ no-build-cache policy.
 
 ## Runner placement and the rootless root container
 
-The sudo-free `build-and-test-workload` core is the only job that runs
-directly on the trusted self-hosted pool
-(`[self-hosted, Linux, X64|ARM64, ubuntu2604]`). Pull requests from forks
-never reach the pool: their rows fall back to the GitHub-hosted `matrix.os`
-runner.
+Jobs that need no `sudo` run directly on the trusted self-hosted pool
+(`[self-hosted, Linux, X64|ARM64, ubuntu2604]`) as its unprivileged runner
+account. These include the action unit checks, the `build-and-test-workload`
+core, the release dry-runs and `fuzz`. Pull requests from forks never reach
+the pool: their rows fall back to a GitHub-hosted runner, and
+`download-action-cache`, which has no hosted form, is skipped.
 
 Thirteen jobs need `sudo` but only root inside a user namespace. They run in a
 privileged rootless root container instead: `install-action-native`, the four
