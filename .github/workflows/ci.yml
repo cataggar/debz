@@ -267,7 +267,13 @@ jobs:
 
   install-action-native:
     name: Install action native transaction (${{ matrix.architecture }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -278,9 +284,50 @@ jobs:
           - runner: ubuntu-24.04-arm
             architecture: arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -910,7 +957,13 @@ jobs:
   build-and-test-workload-production:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload production (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -927,9 +980,50 @@ jobs:
     env:
       OPTIMIZE: ${{ matrix.optimize }}
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -969,7 +1063,13 @@ jobs:
   build-and-test-workload-apt-system:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload apt system (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -986,9 +1086,50 @@ jobs:
     env:
       OPTIMIZE: ${{ matrix.optimize }}
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1053,7 +1194,13 @@ jobs:
   build-and-test-workload-native:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Build and test workload native (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -1070,9 +1217,50 @@ jobs:
     env:
       OPTIMIZE: ${{ matrix.optimize }}
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1117,7 +1305,13 @@ jobs:
   build-and-test-workload-release:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload release (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -1134,9 +1328,50 @@ jobs:
     env:
       OPTIMIZE: ${{ matrix.optimize }}
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1204,7 +1439,13 @@ jobs:
   native-recovery-zig-workflows:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig core (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -1215,9 +1456,50 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1265,7 +1547,13 @@ jobs:
   native-recovery-zig-repository:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig repository (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -1276,9 +1564,50 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1314,7 +1643,13 @@ jobs:
   native-recovery-zig-helper:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig helper, bootstrap, parity and rollback (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -1325,9 +1660,50 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1369,7 +1745,13 @@ jobs:
   native-recovery-zig-family:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig signed FAMILY (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 35
     strategy:
       fail-fast: false
@@ -1380,9 +1762,50 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1418,7 +1841,13 @@ jobs:
   native-recovery-zig-scenarios:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig scenario matrices (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -1429,9 +1858,50 @@ jobs:
           - os: ubuntu-24.04-arm
             name: linux-arm64
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1480,7 +1950,13 @@ jobs:
   native-recovery-zig-diversions:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig diversion shard (${{ matrix.name }} / ${{ matrix.shard }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -1511,9 +1987,50 @@ jobs:
             name: linux-arm64
             shard: 4
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -1809,7 +2326,7 @@ jobs:
             ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
             zig build -Doptimize=Debug -j2 --summary all
       - name: Authenticate the snapshot closure and stage signed bindings
-        timeout-minutes: 12
+        timeout-minutes: 20
         working-directory: ${{ env.PROTECTED }}/checkout
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
@@ -2100,12 +2617,59 @@ jobs:
 
   security-audit:
     name: Security and dependency policy
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604","podman"]') || 'ubuntu-24.04' }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
+    timeout-minutes: 20
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -2176,18 +2740,19 @@ jobs:
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
         run: |
-          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version v0.3.0 --expect "zon=$zon_version")
+          zig build build-release-tool -j2
+          version=$(zig-out/bin/debz-release version v0.3.0 --zon build.zig.zon)
+          zon_version=$version
           zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$version" release-install \
             --prefix "$PWD/.zig-cache/release-install"
-          python3 tools/release.py version v0.3.0 --expect "zon=$zon_version" \
+          zig-out/bin/debz-release version v0.3.0 --expect "zon=$zon_version" \
             --expect "binary=$(.zig-cache/release-install/bin/debz version)"
           epoch=$(git show -s --format=%ct HEAD)
-          python3 tools/release.py binary --tag v0.3.0 --platform "$PLATFORM" \
+          zig-out/bin/debz-release binary --tag v0.3.0 --platform "$PLATFORM" \
             --prefix .zig-cache/release-install --epoch "$epoch" \
             --output release-assets
           for format in tar.gz tar.xz; do
-            python3 tools/release.py audit --tag v0.3.0 \
+            zig-out/bin/debz-release audit --tag v0.3.0 \
               --platform "$PLATFORM" \
               --archive "release-assets/debz-0.3.0-$PLATFORM.$format" --smoke
           done
@@ -2252,9 +2817,21 @@ jobs:
           pattern: release-dry-run-*
           path: release-assets
           merge-multiple: true
-      - name: Verify exact four-archive dry-run
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Verify exact four-archive dry-run with native release core
         run: |
-          python3 tools/release.py verify --tag v0.3.0 \
+          zig build build-release-tool -j2
+          zig-out/bin/debz-release verify --tag v0.3.0 \
             --assets release-assets --smoke
 
   release-policy:
@@ -2265,8 +2842,21 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
       - name: Audit release workflow policy
-        run: tools/release-workflow-policy.py
+        run: |
+          zig build build-release-tool -j2
+          tools/release-workflow-policy.py
 
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)
@@ -2304,7 +2894,13 @@ jobs:
 
   integration-required:
     name: Required disposable root (${{ matrix.suite }}/${{ matrix.architecture }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    container:
+      image: ubuntu:24.04
+      options: --privileged --init
+    defaults:
+      run:
+        shell: bash /usr/local/bin/as-runner {0}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -2323,9 +2919,50 @@ jobs:
             architecture: arm64
             runner: ubuntu-24.04-arm
     steps:
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Hand the checkout to the runner user
+        shell: bash
+        run: chown -R runner:runner "$GITHUB_WORKSPACE"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:

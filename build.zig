@@ -338,6 +338,21 @@ pub fn build(b: *std.Build) void {
     b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals").dependOn(&debian_readiness_tests.step);
     workload_core.dependOn(&debian_readiness_tests.step);
 
+    const release_tool_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency);
+    // Unoptimized level-9 gzip/XZ encoding of a complete release tree takes
+    // minutes, so the installed packager and its encoder are always ReleaseSafe,
+    // including default Debug builds; unit tests still follow -Doptimize.
+    const release_tool = b.addExecutable(.{
+        .name = "debz-release",
+        .root_module = addReleaseToolModule(b, target, .ReleaseSafe, debz, xz_dependency),
+    });
+    const install_release_tool = b.addInstallArtifact(release_tool, .{});
+    b.getInstallStep().dependOn(&install_release_tool.step);
+    b.step("build-release-tool", "Build complete native release packager and validator").dependOn(&install_release_tool.step);
+    const release_tool_tests = b.addRunArtifact(b.addTest(.{ .root_module = release_tool_module }));
+    b.step("test-release-tool", "Test native release tags and complete static ELF mapping refusals").dependOn(&release_tool_tests.step);
+    workload_release.dependOn(&release_tool_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -799,9 +814,11 @@ pub fn build(b: *std.Build) void {
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
     audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));
+    audit_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_tests.step.dependOn(&install_debian_readiness.step);
+    audit_tests.step.dependOn(&install_release_tool.step);
     audit_step.dependOn(&audit_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),
@@ -904,9 +921,29 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const release_test_options = b.addOptions();
+    release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));
+    const release_smoke_debz = b.addExecutable(.{
+        .name = "release-smoke-debz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/release-smoke-debz.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .strip = true,
+        }),
+        .linkage = .static,
+    });
+    release_test_options.addOptionPath("smoke_debz", release_smoke_debz.getEmittedBin());
+    release_policy_tests.root_module.addOptions("release_test_options", release_test_options);
     const run_release_policy_tests = b.addRunArtifact(release_policy_tests);
     run_release_policy_tests.setCwd(b.path("."));
+    run_release_policy_tests.step.dependOn(&install_release_tool.step);
+    release_test_step.dependOn(&release_tool_tests.step);
     release_test_step.dependOn(&run_release_policy_tests.step);
+    const release_consumer_step = b.step("test-release-consumers", "Run native release core and actual packaging consumers without rebuilding GNU install");
+    release_consumer_step.dependOn(&release_tool_tests.step);
+    release_consumer_step.dependOn(&run_release_policy_tests.step);
+    workload_release.dependOn(&run_release_policy_tests.step);
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),
         .target = target,
@@ -921,6 +958,8 @@ pub fn build(b: *std.Build) void {
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
+    install_layout_tests.addArg(b.getInstallPath(.bin, "debz-release"));
+    install_layout_tests.step.dependOn(&install_release_tool.step);
     release_test_step.dependOn(&install_layout_tests.step);
 
     const solver_tests = b.addTest(.{
@@ -2254,7 +2293,7 @@ pub fn build(b: *std.Build) void {
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
     statoverride_recovery.addArtifactArg(native_lifecycle_tests);
-    b.step("test-native-recovery-zig-statoverride", "Run 30 real statoverride crash/recovery cases")
+    b.step("test-native-recovery-zig-statoverride", "Run 39 real statoverride crash/recovery cases")
         .dependOn(&statoverride_recovery.step);
 
     const literal_recovery_module = b.createModule(.{
@@ -2821,6 +2860,27 @@ fn addHelpFlagTests(
         help.expectStdErrEqual("");
         step.dependOn(&help.step);
     }
+}
+
+fn addReleaseToolModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    debz: *std.Build.Module,
+    xz_dependency: *std.Build.Dependency,
+) *std.Build.Module {
+    const release_tool_module = b.createModule(.{
+        .root_source_file = b.path("tools/release.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // The product keeps its decoder-only library; only release tooling encodes XZ.
+    const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
+    release_tool_module.addImport("debz", debz);
+    release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    release_tool_module.addCMacro("LZMA_API_STATIC", "1");
+    release_tool_module.linkLibrary(release_liblzma);
+    return release_tool_module;
 }
 
 fn installReleaseFiles(

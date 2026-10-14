@@ -33,21 +33,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate tag, version, and main ancestry
-        id: release
+      - name: Verify release main ancestry before compiling tooling
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
-          core=${version%%+*}
-          prerelease=false
-          case "$core" in
-            *-*) prerelease=true ;;
-          esac
-          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
-          printf 'version=%s\nzon_version=%s\nprerelease=%s\nepoch=%s\n' \
-            "$version" "$zon_version" "$prerelease" "$epoch" >>"$GITHUB_OUTPUT"
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         env:
@@ -59,6 +48,20 @@ jobs:
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
         run: test "$(zig version)" = 0.16.0
+      - name: Validate tag and version with native release core
+        id: release
+        run: |
+          zig build build-release-tool -j2
+          version=$(zig-out/bin/debz-release version "$GITHUB_REF_NAME" --zon build.zig.zon)
+          zon_version=$version
+          core=${version%%+*}
+          prerelease=false
+          case "$core" in
+            *-*) prerelease=true ;;
+          esac
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          printf 'version=%s\nzon_version=%s\nprerelease=%s\nepoch=%s\n' \
+            "$version" "$zon_version" "$prerelease" "$epoch" >>"$GITHUB_OUTPUT"
       - name: Build complete ReleaseSafe install prefix
         env:
           TARGET: ${{ matrix.target }}
@@ -71,12 +74,12 @@ jobs:
           TAG: ${{ github.ref_name }}
           ZON_VERSION: ${{ steps.release.outputs.zon_version }}
         run: |
-          python3 tools/release.py version "$TAG" --expect "zon=$ZON_VERSION" \
+          zig-out/bin/debz-release version "$TAG" --expect "zon=$ZON_VERSION" \
             --expect "binary=$(release-root/bin/debz version)"
-          python3 tools/release.py binary --tag "$TAG" --platform "$PLATFORM" \
+          zig-out/bin/debz-release binary --tag "$TAG" --platform "$PLATFORM" \
             --prefix release-root --epoch "$EPOCH" --output release-assets
           for format in tar.gz tar.xz; do
-            python3 tools/release.py audit --tag "$TAG" --platform "$PLATFORM" \
+            zig-out/bin/debz-release audit --tag "$TAG" --platform "$PLATFORM" \
               --archive "release-assets/debz-${TAG#v}-$PLATFORM.$format" --smoke
           done
       - name: Upload binary release assets
@@ -103,13 +106,27 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate tag, version, and main ancestry
-        id: release
+      - name: Verify release main ancestry before compiling tooling
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Validate tag and version with native release core
+        id: release
+        run: |
+          zig build build-release-tool -j2
+          version=$(zig-out/bin/debz-release version "$GITHUB_REF_NAME" --zon build.zig.zon)
+          zon_version=$version
           core=${version%%+*}
           prerelease=false
           case "$core" in
@@ -126,7 +143,7 @@ jobs:
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
-          python3 tools/release.py verify --tag "$GITHUB_REF_NAME" \
+          zig-out/bin/debz-release verify --tag "$GITHUB_REF_NAME" \
             --assets release-assets --smoke
       - name: Attest gzip archives
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -183,13 +200,26 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate tag and main ancestry
-        id: release
+      - name: Verify release main ancestry before compiling tooling
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-          zon_version=$(python3 -c 'import pathlib,re; text=pathlib.Path("build.zig.zon").read_text(); match=re.search(r"(?m)^\s*\.version\s*=\s*\"([^\"]+)\"", text); assert match; print(match.group(1))')
-          version=$(python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version")
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Validate tag with native release core
+        id: release
+        run: |
+          zig build build-release-tool -j2
+          version=$(zig-out/bin/debz-release version "$GITHUB_REF_NAME" --zon build.zig.zon)
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
       - name: Install exact release with the first-party setup action
         id: setup
@@ -219,17 +249,6 @@ jobs:
         uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
         with:
           ghr-version: v0.8.1
-      - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
-        env:
-          GH_TOKEN: ${{ github.token }}
-        with:
-          ghr-version: v0.8.1
-          tools: >-
-            cataggar/zig@v0.16.0
-            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
-      - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
       - name: Create signed release download fixture
         id: download-fixture
         env:
@@ -354,7 +373,7 @@ jobs:
           mkdir -p .zig-cache/released
           gh release download "$GITHUB_REF_NAME" --dir .zig-cache/released \
             --pattern "debz-$VERSION-$PLATFORM.tar.gz"
-          python3 tools/release.py audit --tag "$GITHUB_REF_NAME" \
+          zig-out/bin/debz-release audit --tag "$GITHUB_REF_NAME" \
             --platform "$PLATFORM" \
             --archive ".zig-cache/released/debz-$VERSION-$PLATFORM.tar.gz" --smoke
           PATH=/no-host-interpreters "$GHR_PATH" install "cataggar/debz@v$VERSION"

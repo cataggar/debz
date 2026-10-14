@@ -111,6 +111,11 @@ pub fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []cons
     if (!std.mem.eql(u8, observed, marker)) return error.DisposableProjectedRootRequired;
     try mount(&.{ "/usr/bin/mount", "--bind", root, root }, init, allocator);
     try mount(&.{ "/usr/bin/mount", "-t", "proc", "proc", try std.fmt.allocPrint(allocator, "{s}/proc", .{root}) }, init, allocator);
+    // A user namespace cannot mknod, so setup() leaves an empty file that this
+    // private mount namespace binds the host's /dev/null onto. The read-only
+    // projection has no /dev.
+    if (!std.mem.eql(u8, outcome, "readonly"))
+        try mount(&.{ "/usr/bin/mount", "--bind", "/dev/null", try std.fmt.allocPrint(allocator, "{s}/dev/null", .{root}) }, init, allocator);
     const absolute = try allocator.dupeZ(u8, root);
     if (linux.errno(linux.chdir(absolute)) != .SUCCESS or
         linux.errno(linux.chroot(".")) != .SUCCESS or
@@ -299,9 +304,7 @@ fn setup(
     try fixture.write(try support.path(fixture.allocator, relative, ".debz-native-projection"), marker, 0o600);
     for ([_][]const u8{ "proc", "run", "tmp", "dev", "fixture" }) |directory|
         try fixture.directory(try support.path(fixture.allocator, relative, directory));
-    try fixture.run(&.{
-        "/usr/bin/mknod", "-m", "666", try fixture.absolute(try support.path(fixture.allocator, relative, "dev/null")), "c", "1", "3",
-    }, try support.path(fixture.allocator, name, "mknod.log"), 10);
+    try fixture.write(try support.path(fixture.allocator, relative, "dev/null"), "", 0o666);
     const driver_path = if (std.fs.path.isAbsolute(driver)) driver else try std.fs.path.resolve(fixture.allocator, &.{ options.repository, driver });
     try support.copyProgram(fixture, relative, driver_path, "/fixture/native-test");
     const reference_relative = scenario.reference_root[fixture.path.len + 1 ..];

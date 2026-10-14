@@ -189,12 +189,14 @@ current account files. Numeric-only records require no identity blobs.
 Managed observations separately track current override/account state across
 known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
-As in normal execution, successful non-preinst outcomes refresh the override
-database for later phases. Their checkpoints include the database and the
-root-local account inputs used by the refreshed records. Only override records
-created or changed at that boundary add their live targets to managed state;
-unchanged administrator overrides do not add targets. Dpkg's incidental rewrite
-of a numeric identity into an equivalent account name is not a target change.
+As in normal execution, every exited non-preinst outcome, including a nonzero
+exit, refreshes the override database for later phases; replaying a recorded
+exited outcome refreshes the same way. Their checkpoints include the database
+and the root-local account inputs used by the refreshed records. Only override
+records created or changed at that boundary add their live targets to managed
+state; unchanged administrator overrides do not add targets. Dpkg's incidental
+rewrite of a numeric identity into an equivalent account name is not a target
+change.
 The observation binds the actual no-follow kind, bytes and mode/uid/gid after genuine
 `dpkg-statoverride --update`, not an assumed copy of the record's metadata.
 Merged-/usr spellings are observed at their physical alias destination.
@@ -203,6 +205,27 @@ reuses the managed-payload checks, retaining the existing administrator
 conffile exemptions. Dpkg's `statoverride-old` and `diversions-old` remain
 scratch backups, compared byte-for-byte in the genuine-tool oracles rather
 than added to the lock or closure formats.
+
+dpkg reads overrides once per unpack invocation, and native binds each
+invocation's input the same way. The first maximal run of unpack steps replays
+the frozen pre-script resolution and publishes nothing. A later run reads the
+live override database and account files before its first step. It writes the
+result to a managed `native-unpack-statoverride-v1-<program-step>.json`, mode
+`0600`, created exclusively and durably. Preparation observes every planned
+path as absent. The file may become regular only at its own verification
+checkpoint: the invocation's program step, substep `0x4000` and ordinal zero,
+followed by crash point `after_unpack_statoverride_capture`. Nothing may rebind
+it afterwards. The canonical document binds the execution intent, the program
+step and each resolved path's mode, uid and gid, under its own digest. Re-entry
+decodes this input instead of re-reading the database, so overrides the
+invocation's own scripts edit, before or after a crash, never reach its data.
+A tampered, deleted or rebound input refuses with `managed_state_changed`. A
+crash between publication and the checkpoint leaves an unanchored file, which
+recovery refuses rather than adopts. Executions prepared before these inputs
+existed have no planned observation and keep the refreshed resolution; a file
+of that name is refused. Completion validates all inputs before removing any.
+A leftover input without an execution intent is unresolved recovery evidence,
+not a clean root.
 
 Diversion inputs remain genuine database-generation blobs. Managed checkpoints
 also observe the live diversion database, including initial absence, and the
@@ -1054,7 +1077,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs 24
+`zig build test-native-recovery-zig-statoverride` runs 39
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -1062,14 +1085,32 @@ identity, stored-blob and owner drifts. The Zig runner checks exact persisted
 account/group bytes, archive-evicted core recovery, unchanged helper inode and
 bytes, pinned-dpkg filesystem/database/script parity or refusal without
 package mutation, terminal completion, and immutable repeated receipts.
+The six differing-script upgrades are described above.
 The five genuine chrony-shaped additions cover created and changed records at
 `after_script_outcome`, archive-evicted recovery, exact `statoverride` and
 `statoverride-old` bytes, untracked administrator override edits, and mode,
 owner and content drift refusals. Script-created targets are present in both
 the checkpoint and retained settled snapshot; the shared settled verifier
-accepts their captured state and refuses later metadata drift. Fixture scripts
-set deterministic regular-file timestamps before observation rather than
-normalizing differences in captured roots.
+accepts their captured state and refuses later metadata drift. Two more
+chrony cases fail the postinst with exit 23 after it adds every override and
+crash at `after_failure_outcome`; the checkpoint must bind all three targets.
+Without drift, recovery reaches `script_failed` with reference parity, exact
+database bytes and `failed_after_mutation` completion. A log-directory mode
+drift is refused as `managed_state_changed` without mutating the root. Fixture
+scripts set deterministic regular-file timestamps before observation rather
+than normalizing differences in captured roots.
+Six of the seven invocation cases run two pinned-dpkg invocations. In the first, a
+provider postinst adds an override for a file the lifecycle upgrade
+introduces. In the second, the old prerm adds `--update` overrides for `mode`
+and the conffile before the unpack. Native crashes at
+`after_unpack_statoverride_capture`, where the persisted input must hold exactly
+the provider's override. It then recovers with parity, or refuses a tampered,
+deleted or database-drifted input as `managed_state_changed` without mutating
+the root. It also crashes at the provider postinst outcome, before any input
+exists, and at the old prerm outcome with a scriptless provider: the input
+predates the prerm's live database edit. A single-invocation upgrade crashes
+at the old prerm outcome without persisting an input. Recovered roots match
+dpkg's metadata and exact database bytes and retain no input.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
@@ -2306,6 +2347,9 @@ changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
 `postrm-only-{remove,purge}-recovery-*` crash children); `MP` =
 `test/native_recovery_publication.zig::cases/runCase` (14 distinct named
 publication/metadata/release/restore seams and a rollback-release control);
+`SO` = `test/native_recovery_statoverride.zig::InvocationCase/runInvocationCase`
+through `test-native-recovery-zig-statoverride` (the per-invocation
+statoverride input crash children);
 all are
 `test/native_recovery_*.zig` process drivers, not library unit tests. Rows
 with several drivers name a representative real case, not every family of
@@ -2390,6 +2434,7 @@ operations using that selector.
 | `after_unpack_settlement` | O/J/D: settlement durable, later commit owed; R | V #93/#94 |
 | `after_unpack_settlement_commit` | O/J/D: settlement committed, keep original owner; R | V #95 |
 | `after_unpack_settlement_rollback` | O/J/D: rollback settled, retry original failure only; R | V #96/#97 |
+| `after_unpack_statoverride_capture` | O/J: later unpack invocation's statoverride input published and checkpointed before its first script; R from that input, or Q on changed/missing input or database drift | SO `capture_*` |
 
 **Checked bootstrap config-stage result.** `BC` runs the two-archive program
 with distinct `DEBIAN/config` scripts and deliberately fails if either

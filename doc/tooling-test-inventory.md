@@ -7,6 +7,37 @@ share one Zig test with independent mutations.
 
 ## Release (`tools/test_release.py`)
 
+The native `debz-release` owns the complete version/dry-run/binary/audit/verify
+CLI, dependency/license/runtime and installed-policy checks, bounded no-follow
+prefix scanning, safe atomic output and host-only smoke. Actual build, installed
+layout, CI and release workflow consumers bind the emitted native executable.
+Zig-owned tests bind custom install prefixes and launch every native command
+with `PATH=/no-host-interpreters`. Original Python implementations are removed
+rather than kept as fallbacks or mislabeled as historical dpkg references.
+Native tests cover load/dynamic file and virtual mappings, overflow,
+loader/shared-library refusals, long names and signed epochs.
+
+Compression and strict compressed-container decoding now also use the native
+helper: Zig's best-level gzip encoder and a tooling-only encoder build from the
+existing pinned XZ sources. The product retains its decoder-only library.
+Native cases verify deterministic output, both decoded original tar payloads,
+checksum damage, trailing data and forbidden gzip metadata. Portable compressed
+input validation does not equate deflate implementations' compressed bytes.
+
+Tar member reading now uses the same native strict container decoder, with
+GNU long names, signed epochs, checksum/size bounds and original metadata
+refusals. Audit and smoke consume those original member bytes without Python
+archive decoding. `test-release-consumers` runs the native core and all sixteen
+actual consumer tests, without the giant unrelated GNU install rebuild.
+The twelve original cases retain their assertions; two added focused cases
+cover no-follow ancestry, output aliases and bounds, plus exact typed runtime
+and option refusal. A third checks the actual installed native tool can package
+itself without embedding the secret markers it detects. A fourth runs complete
+`verify --smoke` with a static host binary, which must leave only the four assets
+after the pinned directory check, and refuses an unrunnable host binary. The real consumers exercise both compression
+formats, full binary/archive checks and all four assets. Complete byte-level
+crosschecks retain the unchanged original implementation outside the repository.
+
 | Previous case | Zig test (`test/release-tooling.zig`, `release:` prefix) |
 | --- | --- |
 | `test_strict_tags_and_consistency` | strict tags, version consistency, and exact four asset names |

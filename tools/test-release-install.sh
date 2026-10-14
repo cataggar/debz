@@ -3,6 +3,7 @@ set -eu
 
 zig=$1
 version=$2
+release_tool=$3
 root=$PWD/.zig-cache/test-release-install
 gnu_prefix=$root/gnu
 release_prefix=$root/release
@@ -116,20 +117,6 @@ then
   echo "installed documents differ from doc/*.md" >&2
   exit 1
 fi
-python3 - "$release_prefix/share/debz/runtime-dependencies.json" <<'PY'
-import json
-import pathlib
-import sys
-
-runtime = json.loads(pathlib.Path(sys.argv[1]).read_text())
-linux = runtime["linux_release_runtime"]
-assert linux["fully_static"] is True
-assert linux["libc"]["implementation"] == "musl"
-assert linux["libc"]["linkage"] == "static"
-assert {item["name"] for item in linux["included_libraries"]} == {
-    "liblzma",
-    "libsolv",
-    "libzstd",
-    "musl",
-}
-PY
+PATH=/no-host-interpreters "$release_tool" check-runtime \
+  --manifest "$release_prefix/share/debz/runtime-dependencies.json" \
+  --policy security/dependency-policy.json

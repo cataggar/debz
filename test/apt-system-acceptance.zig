@@ -309,11 +309,11 @@ const Runner = struct {
         try self.writeRoot("/etc/group", "root:x:0:\n");
         try self.writeRoot("/etc/os-release", "ID=debian\nNAME=\"debz disposable fixture\"\n");
         try self.writeRoot("/var/lib/dpkg/status", "");
-        for ([_]struct { []const u8, []const u8 }{
-            .{ "null", "3" }, .{ "zero", "5" }, .{ "random", "8" }, .{ "urandom", "9" },
-        }) |device| {
-            const location = try self.path(try std.fmt.allocPrint(self.arena, "/dev/{s}", .{device[0]}));
-            _ = try self.command(&.{ "mknod", "-m", "666", location, "c", "1", device[1] }, 10, null);
+        // A user namespace cannot mknod, so leave empty files that inside()
+        // binds the host's devices onto in its private mount namespace.
+        for (fixture_devices) |device| {
+            const location = try self.path(try std.fmt.allocPrint(self.arena, "/dev/{s}", .{device}));
+            _ = try self.command(&.{ "install", "-m", "666", "/dev/null", location }, 10, null);
         }
         const generator = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_repository, self.arena);
         _ = try self.command(&.{ generator, "--output", try self.path("/repository"), "--suite", "debian-stable", "--architecture", arch }, 120, null);
@@ -495,9 +495,15 @@ pub fn main(init: std.process.Init) !void {
         std.mem.eql(u8, &before, &digest), "host dpkg status changed");
 }
 
+const fixture_devices = [_][]const u8{ "null", "zero", "random", "urandom" };
+
 fn inside(runner: *Runner) !void {
     _ = try runner.command(&.{ "mount", "--bind", runner.root, runner.root }, 10, null);
     _ = try runner.command(&.{ "mount", "-t", "proc", "proc", try runner.path("/proc") }, 10, null);
+    for (fixture_devices) |device| {
+        const source = try std.fmt.allocPrint(runner.arena, "/dev/{s}", .{device});
+        _ = try runner.command(&.{ "mount", "--bind", source, try runner.path(source) }, 10, null);
+    }
     runner.schema_store = try schema_validator.Store.initWithIo(runner.arena, runner.io);
     defer if (runner.schema_store) |*store| store.deinit();
     try insideScenarios(runner);
