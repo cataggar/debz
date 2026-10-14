@@ -143,13 +143,27 @@ group and mode for files and newly created directories. Existing directory
 metadata is retained. Symlinks receive owner/group changes, not mode changes.
 The final archive member of a hard-link group determines shared inode metadata:
 its override wins, or its absence restores the regular source's defaults.
-Conffile policy still preserves existing live metadata where required.
+A conffile's staged copy receives its override like any other member.
+Configure never re-reads overrides. Like dpkg's `file_copy_perms`, it gives a
+replacing conffile or its `.dpkg-dist` copy the installed file's owner and
+mode, while content and mtime come from the archive. A `.dpkg-old` backup
+keeps the installed file's metadata. A new conffile, or one restored because
+it is missing, keeps its staged metadata.
 
-Lifecycle execution freezes this interpretation before its first script,
-including when no overrides exist. Script-written account or override changes
-are observed as current state but do not alter that invocation's resolution;
-the next invocation resolves afresh. Recovery retains the original inputs as
-described in [Native recovery](native-recovery.md).
+dpkg reads the override database once per `--unpack`/`--install`
+invocation, before any archive's maintainer scripts run, and each unpack
+applies the resolution of its invocation. A maximal run of consecutive unpack
+steps is one invocation; it includes their old `prerm`, new `preinst` and old
+`postrm` scripts. The first invocation uses the resolution frozen before the
+first script, including when no overrides exist. A later invocation reads the
+live database and account files immediately before its first step.
+Account or override changes made inside an invocation are observed as current
+state but never reach its own data or staged conffiles. That includes changes
+by the old `prerm upgrade`, the new `prerm failed-upgrade` and the old
+`postrm upgrade`; the next invocation resolves afresh. A configure, trigger or
+remove step between unpacks starts a new invocation, as apt's separate dpkg
+calls do. Recovery retains and replays these inputs as described in
+[Native recovery](native-recovery.md).
 
 Native database plans explicitly preserve the override file without rewriting
 it, including remove and purge. Active `config` scripts and other unsupported

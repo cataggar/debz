@@ -1665,10 +1665,11 @@ fn captureUnpackStatOverrides(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
-    program: *const native_program.Program,
+    steps: []const native_program.Step,
+    native_architecture: []const u8,
     step: native_program.Step,
 ) !void {
-    switch (try unpackStatOverrideCapture(program.steps, step.sequence)) {
+    switch (try unpackStatOverrideCapture(steps, step.sequence)) {
         .none => if (step.phase != .unpack) {
             execution.unpack_stat_overrides = null;
         },
@@ -1677,7 +1678,7 @@ fn captureUnpackStatOverrides(
             execution,
             allocator,
             root,
-            program.target_architecture,
+            native_architecture,
             step.sequence,
         ),
     }
@@ -1692,7 +1693,14 @@ fn beginLifecycleProgramStep(
     step: native_program.Step,
 ) !native_program.Operation {
     const operation = try beginNativeProgramStep(execution, step);
-    captureUnpackStatOverrides(execution, allocator, root, program, step) catch |err| {
+    captureUnpackStatOverrides(
+        execution,
+        allocator,
+        root,
+        program.steps,
+        program.target_architecture,
+        step,
+    ) catch |err| {
         attempt.requireRecovery(allocator, .verification) catch |recovery_err| {
             if (recovery_err != error.MutationEvidenceRequired) return recovery_err;
         };
@@ -36325,6 +36333,59 @@ test "native_unpack.test.unpack statoverride input binds once per unpack invocat
         );
         steps[1].sequence = 7;
         try testing.expectError(error.InvalidLifecycleProgram, unpackStatOverrideCapture(steps[0..case.phases.len], 1));
+    }
+}
+
+test "native_unpack.test.unpack statoverride data input ignores refreshes inside its invocation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init("", &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.ensureDirectory(try root_fs.Path.init("etc"), root_fs.default_directory_permissions);
+    try root.publishFile(try root_fs.Path.init("etc/passwd"), "root:x:0:0::/:/bin/sh\n_fixture:x:42420:42421::/:/bin/sh\n", .{});
+    try root.publishFile(try root_fs.Path.init("etc/group"), "root:x:0:\n_fixture:x:42421:\n", .{});
+    const database = try root_fs.Path.init("var/lib/dpkg/statoverride");
+    try root.publishFile(database, "_fixture _fixture 4750 /usr/share/mode\n", .{});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const frozen_metadata: native_statoverride.Metadata = .{ .mode = 0o600, .uid = 0, .gid = 0 };
+    const live_metadata: native_statoverride.Metadata = .{ .mode = 0o4750, .uid = 42420, .gid = 42421 };
+    var frozen: native_statoverride.Resolved = .{};
+    try frozen.paths.put(arena, "usr/share/mode", frozen_metadata);
+    var refreshed: native_statoverride.Resolved = .{};
+    try refreshed.paths.put(arena, "usr/share/mode", .{ .mode = 0o700, .uid = 1, .gid = 1 });
+    var execution: ExecutionState = .{
+        .stat_overrides = frozen,
+        .frozen_stat_overrides = frozen,
+        .stat_override_allocator = arena,
+    };
+    const verify: native_program.Operation = .{ .verify_final_state = .{
+        .final_state_sha256 = @splat('0'),
+        .installed_count = 0,
+        .config_files_count = 0,
+    } };
+    const phases = [_]native_program.Phase{ .preflight, .unpack, .unpack, .remove, .unpack, .unpack, .configure };
+    const expected = [_]?native_statoverride.Metadata{ null, frozen_metadata, frozen_metadata, null, live_metadata, live_metadata, null };
+    var steps: [phases.len]native_program.Step = undefined;
+    for (phases, 0..) |phase, index| steps[index] = .{
+        .sequence = @intCast(index),
+        .phase = phase,
+        .requires = &.{},
+        .operation = verify,
+    };
+    for (steps, expected) |step, want| {
+        try captureUnpackStatOverrides(&execution, testing.allocator, root, &steps, "amd64", step);
+        if (want) |metadata|
+            try testing.expectEqual(metadata, execution.unpack_stat_overrides.?.get("usr/share/mode").?)
+        else
+            try testing.expect(execution.unpack_stat_overrides == null);
+        // Scripts refresh the tracked resolution and edit the database; an
+        // invocation's bound input sees neither.
+        execution.stat_overrides = refreshed;
+        if (step.sequence == 4)
+            try root.publishFile(database, "root root 0700 /usr/share/mode\n", .{ .overwrite = .replace });
     }
 }
 

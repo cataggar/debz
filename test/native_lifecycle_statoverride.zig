@@ -25,11 +25,39 @@ const hook =
     \\
 ;
 
+/// `/statoverride-edit-at` holds `<script>:<argument> [--update|-] [--update|-]`;
+/// the matching script adds overrides for `mode` and the conffile, each
+/// applied to the installed file only when its flag is `--update`.
+pub const edit_marker = "statoverride-edit-at";
+pub const edit_done = "statoverride-edit-done";
+const edit_hook =
+    \\if [ -f /statoverride-edit-at ]; then
+    \\    IFS=' ' read -r edit_at edit_mode edit_conffile < /statoverride-edit-at
+    \\    if [ "$edit_at" = "$DPKG_MAINTSCRIPT_NAME:$1" ]; then
+    \\        [ "$edit_mode" = --update ] || edit_mode=
+    \\        [ "$edit_conffile" = --update ] || edit_conffile=
+    \\        /usr/bin/dpkg-statoverride $edit_mode --add _debzstat _debzstat 4750 /usr/share/statoverride-lifecycle/mode || exit 41
+    \\        /usr/bin/dpkg-statoverride $edit_conffile --add _debzstat _debzstat 0640 /etc/debz-native.conf || exit 42
+    \\        /stato-mv /statoverride-edit-at /statoverride-edit-done || exit 43
+    \\    fi
+    \\fi
+    \\
+;
+
 pub fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
     return archiveAt(fixture, arch, version, "packages/statoverride");
 }
 
 pub fn archiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
+    return archiveWithHook(fixture, arch, version, workspace, hook);
+}
+
+/// The lifecycle package whose maintainer scripts also honour `edit_marker`.
+pub fn editArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
+    return archiveWithHook(fixture, arch, version, workspace, hook ++ edit_hook);
+}
+
+fn archiveWithHook(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8, scripts_hook: []const u8) ![]u8 {
     const content = try std.fmt.allocPrint(fixture.allocator, "configuration {s}\n", .{version});
     defer fixture.allocator.free(content);
     const extra = try std.fmt.allocPrint(fixture.allocator, "literal version {s}\n", .{version});
@@ -38,7 +66,7 @@ pub fn archiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []cons
         .full_payload = true,
         .conffile_content = content,
         .extra_files = &.{.{ .path = literal, .content = extra }},
-        .scripts = .{ .before_failure = hook },
+        .scripts = .{ .before_failure = scripts_hook },
     });
 }
 
@@ -56,7 +84,7 @@ pub fn seed(case: *support.Scenario, records: []const u8) !void {
     try both(case, "var/lib/dpkg/statoverride", records);
 }
 
-const Expected = struct { mode: u32, uid: u32, gid: u32 };
+pub const Expected = struct { mode: u32, uid: u32, gid: u32 };
 
 fn expectMetadata(case: *support.Scenario, target: []const u8, expected: Expected) !void {
     for ([_][]const u8{ case.reference_root, case.native_root }) |path| {
@@ -418,6 +446,276 @@ fn genuineToolRefresh(fixture: *foundation.Fixture, driver: []const u8, dpkg: []
     try support.assertDatabaseBytes(&case, "statoverride-old");
 }
 
+/// Reports what each root holds before failing, so a hosted oracle run
+/// records the metadata pinned dpkg actually produced.
+pub fn expectObserved(case: *support.Scenario, target: []const u8, expected: Expected) !void {
+    var mismatch = false;
+    for ([_][]const u8{ case.reference_root, case.native_root }, [_][]const u8{ "reference", if (case.fixture.oracle_only) "mirror" else "native" }) |path, side| {
+        var dir = try foundation.guardedRoot(case.fixture.io, path);
+        defer dir.close(case.fixture.io);
+        const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.initPackage(target));
+        if (entry.mode == expected.mode and entry.uid == expected.uid and entry.gid == expected.gid) continue;
+        std.debug.print("{s}: {s} /{s} observed {o} {d}:{d}, expected {o} {d}:{d}\n", .{
+            case.name, side, target, entry.mode, entry.uid, entry.gid, expected.mode, expected.uid, expected.gid,
+        });
+        mismatch = true;
+    }
+    if (mismatch) return error.WrongStatoverrideMetadata;
+}
+
+/// Both roots must have run the edit exactly once, so equal roots cannot
+/// hide a hook that never fired.
+pub fn expectEditApplied(case: *support.Scenario) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const done = try support.readOptionalCaseFile(case, side, edit_done);
+        defer if (done) |bytes| case.fixture.allocator.free(bytes);
+        const pending = try support.readOptionalCaseFile(case, side, edit_marker);
+        defer if (pending) |bytes| case.fixture.allocator.free(bytes);
+        if (done == null or pending != null) return error.StatoverrideEditNotObserved;
+    }
+}
+
+pub const packaged_mode: Expected = .{ .mode = 0o640, .uid = 0, .gid = 0 };
+pub const overridden_mode: Expected = .{ .mode = 0o4750, .uid = 42420, .gid = 42421 };
+pub const packaged_conffile: Expected = .{ .mode = 0o644, .uid = 0, .gid = 0 };
+pub const updated_conffile: Expected = .{ .mode = 0o640, .uid = 42420, .gid = 42421 };
+pub const conffile_path = "etc/debz-native.conf";
+
+/// dpkg reads statoverrides once per invocation, before the old prerm, so
+/// override edits by the upgrade's own scripts never reach its unpacked
+/// data. Configure copies the installed conffile's owner and mode onto the
+/// new one, so only `--update` changes what the conffile ends with.
+fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const first = try editArchive(fixture, arch, "1", "packages/statoverride-edit");
+    defer fixture.allocator.free(first);
+    const second = try editArchive(fixture, arch, "2", "packages/statoverride-edit");
+    defer fixture.allocator.free(second);
+    const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    const old_prerm_failure = name ++ "@1:prerm:upgrade\n";
+    for ([_]struct {
+        label: []const u8,
+        at: []const u8,
+        failure: ?[]const u8 = null,
+        conffile: Expected,
+    }{
+        .{ .label = "old-prerm", .at = "prerm:upgrade", .conffile = packaged_conffile },
+        .{ .label = "old-prerm-update", .at = "prerm:upgrade --update --update", .conffile = updated_conffile },
+        .{ .label = "failed-upgrade", .at = "prerm:failed-upgrade", .failure = old_prerm_failure, .conffile = packaged_conffile },
+        .{ .label = "failed-upgrade-update", .at = "prerm:failed-upgrade --update --update", .failure = old_prerm_failure, .conffile = updated_conffile },
+        .{ .label = "old-postrm", .at = "postrm:upgrade", .conffile = packaged_conffile },
+        .{ .label = "old-postrm-update", .at = "postrm:upgrade - --update", .conffile = updated_conffile },
+    }) |entry| {
+        for ([_]bool{ false, true }) |recovery| {
+            // The durable runtime additionally tracks files that `--update` changed.
+            if (recovery and std.mem.indexOf(u8, entry.at, "--update") == null) continue;
+            const label = try std.fmt.allocPrint(fixture.allocator, "statoverride-invocation-{s}{s}", .{
+                entry.label, if (recovery) "-recovery" else "",
+            });
+            defer fixture.allocator.free(label);
+            var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+            defer case.deinit();
+            try seed(&case, "");
+            try installDpkgStatoverride(&case, dpkg);
+            const marker = try std.fmt.allocPrint(fixture.allocator, "{s}\n", .{entry.at});
+            defer fixture.allocator.free(marker);
+            try replace(&case, edit_marker, marker);
+            if (entry.failure) |failure| try both(&case, support.failure, failure);
+            try case.seed(first);
+            try case.phase(.{ .operation = "upgrade", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
+            try expectEditApplied(&case);
+            try expectObserved(&case, base ++ "/mode", packaged_mode);
+            try expectObserved(&case, conffile_path, entry.conffile);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+            try expectNoUnpackStatOverrideInput(&case);
+            // The next invocation reads the edited database.
+            try case.phase(.{ .operation = "reinstall", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
+            try expectObserved(&case, base ++ "/mode", overridden_mode);
+            try expectObserved(&case, conffile_path, entry.conffile);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+        }
+    }
+}
+
+pub const invocation_provider = "statoverride-invocation-provider";
+pub const invocation_target = base ++ "/introduced";
+
+/// Two dpkg invocations: the second reads the override the first one's
+/// postinst added (only when `provider_edits`), but not those its own old
+/// prerm adds. Archives are provider 1 and 2, then lifecycle 1 and 2.
+pub fn invocationArchives(fixture: *foundation.Fixture, arch: []const u8, workspace: []const u8, provider_edits: bool) ![4][]u8 {
+    const provider_workspace = try support.path(fixture.allocator, workspace, "provider");
+    defer fixture.allocator.free(provider_workspace);
+    const lifecycle_workspace = try support.path(fixture.allocator, workspace, "lifecycle");
+    defer fixture.allocator.free(lifecycle_workspace);
+    var archives: [4][]u8 = undefined;
+    archives[0] = try support.makePackage(fixture, arch, "1", invocation_provider, provider_workspace, if (provider_edits)
+        .{ .scripts = .{ .only_postinst = true } }
+    else
+        .{ .no_scripts = true });
+    errdefer fixture.allocator.free(archives[0]);
+    archives[1] = try support.makePackage(fixture, arch, "2", invocation_provider, provider_workspace, if (provider_edits) .{
+        .scripts = .{ .only_postinst = true },
+        .postinst_append = "if [ \"$1\" = configure ]; then\n" ++
+            "    /usr/bin/dpkg-statoverride --add _debzstat _debzstat 0600 /" ++ invocation_target ++ " || exit 31\n" ++
+            "fi\n",
+    } else .{ .no_scripts = true });
+    errdefer fixture.allocator.free(archives[1]);
+    archives[2] = try editArchive(fixture, arch, "1", lifecycle_workspace);
+    errdefer fixture.allocator.free(archives[2]);
+    archives[3] = try editArchive(fixture, arch, "2", lifecycle_workspace);
+    return archives;
+}
+
+pub fn invocationActions(arch: []const u8) [4]support.Action {
+    return .{
+        .{ .sequence = 0, .kind = "unpack", .package = invocation_provider, .version = "2", .architecture = arch },
+        .{ .sequence = 1, .kind = "configure_pending", .package = name, .version = "2", .architecture = arch },
+        .{ .sequence = 2, .kind = "unpack", .package = name, .version = "2", .architecture = arch },
+        .{ .sequence = 3, .kind = "configure_pending", .package = name, .version = "2", .architecture = arch },
+    };
+}
+
+pub fn expectInvocationMetadata(case: *support.Scenario) !void {
+    try expectEditApplied(case);
+    try expectObserved(case, invocation_target, .{ .mode = 0o600, .uid = 42420, .gid = 42421 });
+    try expectObserved(case, base ++ "/mode", packaged_mode);
+    try expectObserved(case, conffile_path, updated_conffile);
+    try support.assertDatabaseBytes(case, "statoverride");
+    try support.assertDatabaseBytes(case, "statoverride-old");
+}
+
+/// Returns the root-relative path of the one persisted unpack statoverride
+/// input under `root`, if any.
+pub fn unpackStatOverrideInput(fixture: *foundation.Fixture, root: []const u8) !?[]u8 {
+    const directory = try process.rootPath(fixture, root, "var/lib/debz");
+    defer fixture.allocator.free(directory);
+    var dir = fixture.dir.openDir(fixture.io, directory, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close(fixture.io);
+    var iterator = dir.iterate();
+    var found: ?[]u8 = null;
+    errdefer if (found) |path| fixture.allocator.free(path);
+    while (try iterator.next(fixture.io)) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, debz.native_recovery.unpack_statoverride_prefix)) continue;
+        if (found != null or entry.kind != .file) return error.AmbiguousUnpackStatOverrideInput;
+        found = try std.fmt.allocPrint(fixture.allocator, "var/lib/debz/{s}", .{entry.name});
+    }
+    return found;
+}
+
+/// Settled native roots retain no per-invocation statoverride input.
+pub fn expectNoUnpackStatOverrideInput(case: *support.Scenario) !void {
+    if (try unpackStatOverrideInput(case.fixture, case.native_root)) |path| {
+        case.fixture.allocator.free(path);
+        return error.UnpackStatOverrideInputRetained;
+    }
+}
+
+fn genuinePersistedInvocation(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const archives = try invocationArchives(fixture, arch, "packages/statoverride-invocation", true);
+    defer for (archives) |bytes| fixture.allocator.free(bytes);
+    const selected = [_]foundation.PackageIdentity{
+        .{ .name = invocation_provider, .architecture = arch },
+        .{ .name = name, .architecture = arch },
+    };
+    const actions = invocationActions(arch);
+    const groups = [_][]const []const u8{ &.{archives[1]}, &.{archives[3]} };
+    for ([_]bool{ false, true }) |recovery| {
+        var case = try support.Scenario.init(fixture, if (recovery)
+            "statoverride-invocation-persisted-recovery"
+        else
+            "statoverride-invocation-persisted", driver, dpkg, arch, false);
+        defer case.deinit();
+        try seed(&case, "");
+        try installDpkgStatoverride(&case, dpkg);
+        try replace(&case, edit_marker, "prerm:upgrade --update --update\n");
+        try case.seed(archives[0]);
+        try case.seed(archives[2]);
+        try case.phase(.{
+            .operation = "upgrade",
+            .archives = &.{ archives[1], archives[3] },
+            .reference_groups = &groups,
+            .packages = &selected,
+            .ordered_actions = &actions,
+            .recovery = recovery,
+        }, false);
+        try expectInvocationMetadata(&case);
+        try expectNoUnpackStatOverrideInput(&case);
+    }
+}
+
+/// An administrator's owner and mode on an unmodified conffile survive an
+/// upgrade, because dpkg copies them onto the new conffile.
+fn genuineConffileAdministratorMode(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8, second: []const u8) !void {
+    const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    var case = try support.Scenario.init(fixture, "statoverride-conffile-unmodified-admin-mode", driver, dpkg, arch, false);
+    defer case.deinit();
+    try seed(&case, "");
+    try case.seed(first);
+    for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
+        var dir = try foundation.guardedRoot(fixture.io, root_path);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init(conffile_path), .{
+            .mode = 0o600,
+            .uid = 42424,
+            .gid = 42425,
+        });
+    }
+    try case.phase(.{ .operation = "upgrade", .archives = &.{second}, .packages = &chosen }, false);
+    try expectObserved(&case, conffile_path, .{ .mode = 0o600, .uid = 42424, .gid = 42425 });
+}
+
+pub const batch_provider = "statoverride-batch-provider";
+const batch_hook =
+    \\if [ "$DPKG_MAINTSCRIPT_NAME:$1" = prerm:upgrade ]; then
+    \\    /usr/bin/dpkg-statoverride --add _debzstat _debzstat 0600 /usr/share/statoverride-lifecycle/introduced || exit 31
+    \\fi
+    \\
+;
+
+/// One `dpkg --install` of two archives reads statoverrides once, so an
+/// override the first package's old prerm adds reaches the second package's
+/// data only in the next invocation.
+fn genuineBatchInvocation(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8, second: []const u8) !void {
+    const old_provider = try support.makePackage(fixture, arch, "1", batch_provider, "packages/statoverride-batch", .{
+        .scripts = .{ .before_failure = batch_hook },
+    });
+    defer fixture.allocator.free(old_provider);
+    const new_provider = try support.makePackage(fixture, arch, "2", batch_provider, "packages/statoverride-batch", .{
+        .scripts = .{ .before_failure = batch_hook },
+    });
+    defer fixture.allocator.free(new_provider);
+    const selected = [_]foundation.PackageIdentity{
+        .{ .name = batch_provider, .architecture = arch },
+        .{ .name = name, .architecture = arch },
+    };
+    const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    for ([_]bool{ false, true }) |recovery| {
+        var case = try support.Scenario.init(fixture, if (recovery)
+            "statoverride-invocation-batch-recovery"
+        else
+            "statoverride-invocation-batch", driver, dpkg, arch, false);
+        defer case.deinit();
+        try seed(&case, "");
+        try installDpkgStatoverride(&case, dpkg);
+        try case.seed(old_provider);
+        try case.seed(first);
+        try case.phase(.{ .operation = "upgrade", .archives = &.{ new_provider, second }, .packages = &selected, .recovery = recovery }, false);
+        try expectObserved(&case, invocation_target, .{ .mode = 0o644, .uid = 0, .gid = 0 });
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+        try expectNoUnpackStatOverrideInput(&case);
+        try case.phase(.{ .operation = "reinstall", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
+        try expectObserved(&case, invocation_target, .{ .mode = 0o600, .uid = 42420, .gid = 42421 });
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+    }
+}
+
 pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first = try archive(fixture, arch, "1");
     defer fixture.allocator.free(first);
@@ -426,6 +724,10 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
 
     try genuineToolRefresh(fixture, driver, dpkg, arch);
+    try genuineInvocationEdits(fixture, driver, dpkg, arch);
+    try genuinePersistedInvocation(fixture, driver, dpkg, arch);
+    try genuineConffileAdministratorMode(fixture, driver, dpkg, arch, first, second);
+    try genuineBatchInvocation(fixture, driver, dpkg, arch, first, second);
     try genuineChronyLifecycle(fixture, driver, dpkg, arch);
     try genuineChangedChronyLifecycle(fixture, driver, dpkg, arch);
     try genuineFailedChronyLifecycle(fixture, driver, dpkg, arch);

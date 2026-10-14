@@ -170,11 +170,15 @@ state while the operation is still pre-mutation, so a malformed root cannot be
 partially unpacked before this refusal. See the
 [pinned alternatives contract](dpkg-alternatives-reference.md).
 
-Statoverrides use file-backed target-root identities and are resolved before
-scripts. Preinst retains that resolution for its unpack. Every exited
-non-preinst script, including one that exits nonzero, refreshes changed
-override database bytes for later phases and recovery checkpoints, using the
-target root's account files; a later invocation resolves anew. If such a script
+Statoverrides use file-backed target-root identities. As in dpkg, each unpack
+applies the resolution its invocation read before its first step: the first
+invocation's is frozen before any script, and a later one is read live. Scripts
+inside an invocation never change its data or staged conffile metadata, and
+configure copies the installed conffile's owner and mode instead of re-reading
+overrides. Every exited non-preinst script, including one that exits nonzero,
+refreshes the tracked override state for recovery checkpoints, using the target
+root's account files; the next unpack invocation reads the database afresh.
+If such a script
 leaves a malformed or unresolvable database, the result is
 `recovery_required` with `invalid_stat_override_update` instead of
 `script_failed`. Scripts that never start or end without exiting, such as by a
@@ -384,8 +388,20 @@ use `dpkg-statoverride` to change the key mode from 0640 to 0600, with and
 without durable recovery, followed by reinstall/remove/purge. A failed
 chrony-like postinst adds every override before exiting 23 under durable
 recovery; parity, exact database bytes and the retained checkpoint binding of
-all three targets are checked before a `configure` retry, remove and purge. The
-genuine diversion cases also cover postinst and prerm `--rename` moves and 210
+all three targets are checked before a `configure` retry, remove and purge.
+Invocation-bound upgrades have the old `prerm upgrade`, the new
+`prerm failed-upgrade` after an old prerm exit 23, or the old
+`postrm upgrade` add `mode` and conffile overrides, with and without
+`--update`. Expected metadata is fixed independently of native output. The
+upgrade's own data keeps packaged metadata, an `--update`d conffile keeps the
+owner and mode configure copies, and only the following reinstall applies the
+`mode` override. Two-invocation upgrades, with and without durable recovery,
+apply an override that a provider postinst added in the first invocation, but
+not the old prerm's edits in the second, and leave no retained input. A
+single `--install` of two archives keeps the first package's old-prerm
+override out of the second package's data until its reinstall. An
+administrator's owner and mode on an unmodified conffile survive an upgrade.
+The genuine diversion cases also cover postinst and prerm `--rename` moves and 210
 `prerm remove` additions owned by `coreutils-switch`.
 Both suites assert exact database and `-old` bytes. Use
 `-Dnative-reference-dpkg=/absolute/path/to/pinned/dpkg` for artifact-bound
@@ -488,8 +504,10 @@ Advanced fixtures exercise:
 
 - **Statoverrides:** numeric/named identities, new/existing directories,
   conffiles, symlinks, hard links, literal paths and merged-/usr spellings;
-  invocation-frozen account/override changes; fresh resolution on reinstall;
-  administrator conffile metadata under both policies; and pre-script refusals.
+  invocation-frozen account/override changes, including edits by the
+  upgrade's own old prerm, failed-upgrade prerm or old postrm; fresh
+  resolution on reinstall; configure's copy of the installed conffile's owner
+  and mode; administrator conffile metadata under both policies; and pre-script refusals.
 - **Pre-Depends:** a reviewed configure barrier runs the provider's postinst
   before the consumer's preinst; the consumer script independently requires
   that ordering. The reference uses the corresponding separate dpkg command
