@@ -1043,7 +1043,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs 42
+`zig build test-native-recovery-zig-statoverride` runs 43
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -1087,6 +1087,16 @@ database bytes, dpkg's `killed by signal` report and, for the postrm, its
 new-package fallback notice. A copy of the postrm crash rewrites the outcome
 as a resealed, canonical exit 0; recovery must stay blocked without changing
 the root, its database or the pending operation.
+One more case has an upgrade's old postrm apply `--update` overrides to the
+unpacked `mode` file and the conffile, exit 0, and crash at
+`after_upgrade_postrm_outcome`. The reference root must hold the
+script-applied metadata. Archive-evicted recovery must either reach `applied`
+with reference parity, exact database bytes and `succeeded` completion, or
+stay blocked with the pending operation kept, after which a repeated recovery
+may not change the root or its database. Blocking is a known limitation that
+fails closed: the crash interrupts the unpack before it verified, so recovery
+rolls it back in reverse step order, which can revert later steps first, and
+the script-applied `mode` metadata is not a state its journal recorded.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
@@ -2324,8 +2334,9 @@ changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
 `test/native_recovery_publication.zig::cases/runCase` (14 distinct named
 publication/metadata/release/restore seams and a rollback-release control);
 `SO` = `test/native_recovery_statoverride.zig::InvocationCase/runInvocationCase`
-and `SignalCase/runSignalCase` through `test-native-recovery-zig-statoverride`
-(the per-invocation statoverride input and own-signal crash children);
+`SignalCase/runSignalCase` and `runPostrmUpdateCase` through
+`test-native-recovery-zig-statoverride` (the per-invocation statoverride
+input, own-signal and old postrm `--update` crash children);
 all are
 `test/native_recovery_*.zig` process drivers, not library unit tests. Rows
 with several drivers name a representative real case, not every family of
@@ -2377,7 +2388,7 @@ operations using that selector.
 | `after_upgrade_postrm_route_publication` | O/J/D: route contract durable, cache/checkpoint owed; R or Q on drift | V #23/#27 |
 | `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, prior managed route slot still absent; R or Q on changed/missing cache, checkpoint or contract | VR `cache-refresh` |
 | `after_upgrade_postrm_route_checkpoint` | O/J/D: contract/cache/transient managed checkpoint bind unpack and old-postrm script steps; R or Q on changed/missing cache, checkpoint or contract | VR `route-checkpoint` |
-| `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R | V #24/#28/#58, SO `postrm` |
+| `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R, or a blocked root that repeated recovery leaves unchanged after the postrm's `--update` | V #24/#28/#58, SO `postrm`, `postrm-update` |
 | `after_upgrade_unwind_outcome` | O/J/D: unwind outcome durable, no replay; R | V #59/#60 |
 | `after_upgrade_pre_rollback_compensation_outcome` | O/J/D: compensation outcome durable; R | V #61 |
 | `after_upgrade_postrm_marker_cleared` | O/J/D: script marker cleared only after known outcome; R | V #71/#72 |

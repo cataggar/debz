@@ -920,13 +920,28 @@ fn runSignalCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     try support.assertDatabaseBytes(&case, "statoverride");
     try support.assertDatabaseBytes(&case, "statoverride-old");
     try statoverride.expectNoUnpackStatOverrideInput(&case);
-    const proof_path = try process.reportProvenancePath(report.value.provenance_path);
+    try expectSettledReceipt(fixture, driver, arch, &case, report.value, if (install) "failed_after_mutation" else "succeeded");
+    std.debug.print("statoverride signal {s}: recovered as {s}\n", .{ @tagName(kind), report.value.outcome });
+}
+
+/// A settled recovery binds its proof and `completion_outcome` receipt to
+/// one attempt and leaves nothing pending; repeating it changes neither the
+/// root nor the receipt.
+fn expectSettledReceipt(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    arch: []const u8,
+    case: *support.Scenario,
+    report: process.Report,
+    completion_outcome: []const u8,
+) !void {
+    const proof_path = try process.reportProvenancePath(report.provenance_path);
     var proof = try process.rootDocument(fixture, case.native_root, proof_path);
     defer proof.deinit();
-    try process.same(try process.text(proof.value, "attempt_id"), report.value.attempt_id orelse return error.MissingRecoveryProof);
+    try process.same(try process.text(proof.value, "attempt_id"), report.attempt_id orelse return error.MissingRecoveryProof);
     var completion = try process.rootDocument(fixture, case.native_root, completion_path);
     defer completion.deinit();
-    try process.same(try process.text(completion.value, "outcome"), if (install) "failed_after_mutation" else "succeeded");
+    try process.same(try process.text(completion.value, "outcome"), completion_outcome);
     try process.same(try process.text(completion.value, "attempt_id"), try process.text(proof.value, "attempt_id"));
     try process.rootAbsent(fixture, case.native_root, operation_path);
     try process.rootAbsent(fixture, case.native_root, intent_path);
@@ -934,7 +949,7 @@ fn runSignalCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     defer fixture.allocator.free(completion_before);
     const settled = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
     defer fixture.allocator.free(settled);
-    const repeat_log = try support.path(fixture.allocator, name, "recover-again");
+    const repeat_log = try support.path(fixture.allocator, case.name, "recover-again");
     defer fixture.allocator.free(repeat_log);
     var repeated = (try process.invoke(fixture, driver, case.native_root, arch, repeat_log, .{
         .operation = "recover",
@@ -951,7 +966,156 @@ fn runSignalCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     const completion_after = try process.rootBytes(fixture, case.native_root, completion_path);
     defer fixture.allocator.free(completion_after);
     if (!std.mem.eql(u8, completion_before, completion_after)) return error.RepeatedRecoveryReplacedReceipt;
-    std.debug.print("statoverride signal {s}: recovered as {s}\n", .{ @tagName(kind), report.value.outcome });
+}
+
+/// The pinned-dpkg root must hold `expected` at `target`. A mismatch prints
+/// what dpkg left, so hosted oracle output settles the expectation.
+fn expectReferenceMetadata(case: *support.Scenario, target: []const u8, expected: statoverride.Expected) !void {
+    var dir = try foundation.guardedRoot(case.fixture.io, case.reference_root);
+    defer dir.close(case.fixture.io);
+    const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.initPackage(target));
+    if (entry.mode == expected.mode and entry.uid == expected.uid and entry.gid == expected.gid) return;
+    std.debug.print("{s}: reference /{s} observed {o} {d}:{d}, expected {o} {d}:{d}\n", .{
+        case.name, target, entry.mode, entry.uid, entry.gid, expected.mode, expected.uid, expected.gid,
+    });
+    return error.WrongStatoverrideMetadata;
+}
+
+/// Diagnostic only: prints what the native root holds at `target`.
+fn printNativeMetadata(case: *support.Scenario, target: []const u8) !void {
+    var dir = try foundation.guardedRoot(case.fixture.io, case.native_root);
+    defer dir.close(case.fixture.io);
+    const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.initPackage(target));
+    std.debug.print("{s}: native /{s} holds {o} {d}:{d}\n", .{ case.name, target, entry.mode, entry.uid, entry.gid });
+}
+
+/// An upgrade's old postrm applies `--update` overrides to the unpacked
+/// `mode` file and the installed conffile, exits 0, and native crashes at
+/// `after_upgrade_postrm_outcome`. dpkg runs that postrm after extraction and
+/// completes the upgrade with the script-applied metadata
+/// (src/main/unpack.c:1574-1585). Archive-evicted recovery must either end
+/// exactly like dpkg or stay blocked with the pending operation kept, and a
+/// repeated recovery of a blocked root must change nothing. Blocked is the
+/// known limitation: the crash interrupts the unpack before it verified, so
+/// recovery rolls it back and meets `mode` metadata its journal never
+/// recorded.
+fn runPostrmUpdateCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const name = "statoverride-postrm-update-crash";
+    const package_workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(package_workspace);
+    const first = try statoverride.editArchive(fixture, arch, "1", package_workspace);
+    defer fixture.allocator.free(first);
+    const second = try statoverride.editArchive(fixture, arch, "2", package_workspace);
+    defer fixture.allocator.free(second);
+    const archives = [_][]const u8{second};
+    const selected = [_]foundation.PackageIdentity{.{ .name = statoverride.name, .architecture = arch }};
+    const targets = [_][]const u8{ statoverride.base ++ "/mode", statoverride.conffile_path };
+
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seed(&case, "");
+    try installDpkgStatoverride(&case, dpkg);
+    try statoverride.replace(&case, statoverride.edit_marker, "postrm:upgrade --update --update\n");
+    try case.seed(first);
+
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "upgrade",
+        .archives = &archives,
+        .packages = &selected,
+        .triggers = false,
+    }, reference_log) != 0) return error.UnexpectedReferenceOutcome;
+    try expectReferenceMetadata(&case, targets[0], statoverride.overridden_mode);
+    try expectReferenceMetadata(&case, targets[1], statoverride.updated_conffile);
+
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "upgrade",
+        .archives = &archives,
+        .packages = &selected,
+        .crash_at = "after_upgrade_postrm_outcome",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    try statoverride.expectEditApplied(&case);
+    for ([_][]const u8{ first, second }) |path| {
+        try fixture.dir.deleteFile(fixture.io, path[fixture.path.len + 1 ..]);
+        try support.absent(fixture, path[fixture.path.len + 1 ..]);
+    }
+
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+
+    if (std.mem.eql(u8, report.value.outcome, "recovery_required") or std.mem.eql(u8, report.value.outcome, "refused")) {
+        // The first recovery may have reverted later steps before it
+        // blocked; from then on, nothing may change.
+        const blocked = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(blocked);
+        const paths = [_][]const u8{ "var/lib/dpkg/statoverride", "var/lib/dpkg/statoverride-old", "var/lib/dpkg/status" };
+        var contents: [paths.len][]const u8 = undefined;
+        var read: usize = 0;
+        defer for (contents[0..read]) |bytes| fixture.allocator.free(bytes);
+        for (paths) |path| {
+            contents[read] = try process.rootBytes(fixture, case.native_root, path);
+            read += 1;
+        }
+        const pending = try process.rootBytes(fixture, case.native_root, operation_path);
+        fixture.allocator.free(pending);
+        try process.rootAbsent(fixture, case.native_root, completion_path);
+        const repeat_log = try support.path(fixture.allocator, name, "recover-again");
+        defer fixture.allocator.free(repeat_log);
+        var repeated = (try process.invoke(fixture, driver, case.native_root, arch, repeat_log, .{
+            .operation = "recover",
+            .triggers = false,
+            .caller_owned = true,
+            .isolated_helper = true,
+            .core_product = true,
+        })) orelse return error.MissingRecoveryReport;
+        defer repeated.deinit();
+        try expectBlockedUnchanged(fixture, case.native_root, name, repeated.value, blocked, &paths, &contents);
+        std.debug.print("{s}: blocked as {s} ({s}); the first recovery {s} the root\n", .{
+            name,                                                        report.value.outcome, report.value.detail,
+            if (std.mem.eql(u8, before, blocked)) "kept" else "changed",
+        });
+        for (targets) |target| printNativeMetadata(&case, target) catch |err|
+            std.debug.print("{s}: native /{s} unreadable: {s}\n", .{ name, target, @errorName(err) });
+        std.debug.print("statoverride postrm-update after_upgrade_postrm_outcome: blocked\n", .{});
+        return;
+    }
+    if (!std.mem.eql(u8, report.value.outcome, "applied")) {
+        std.debug.print("{s}: unexpected recovery outcome {s}: {s}\n", .{ name, report.value.outcome, report.value.detail });
+        return error.UnexpectedRecoveryOutcome;
+    }
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    defer fixture.allocator.free(comparison);
+    try fixture.directory(comparison);
+    try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+    try statoverride.expectObserved(&case, targets[0], statoverride.overridden_mode);
+    try statoverride.expectObserved(&case, targets[1], statoverride.updated_conffile);
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+    try statoverride.expectNoUnpackStatOverrideInput(&case);
+    try expectSettledReceipt(fixture, driver, arch, &case, report.value, "succeeded");
+    std.debug.print("statoverride postrm-update after_upgrade_postrm_outcome: recovered with parity\n", .{});
 }
 
 fn runChronyCase(
@@ -1331,6 +1495,7 @@ pub fn main(init: std.process.Init) !void {
     }
     for (std.meta.tags(SignalCase)) |kind|
         try runSignalCase(&fixture, driver, reference.executable, reference.architecture, kind);
+    try runPostrmUpdateCase(&fixture, driver, reference.executable, reference.architecture);
     for (cases) |entry| {
         try runCase(&fixture, driver, reference.executable, reference.architecture, entry);
         std.debug.print("statoverride {s}/{s}: recovered or blocked\n", .{ entry.operation, entry.boundary });
