@@ -27,7 +27,7 @@ workload command runs in exactly one job:
 | `build-and-test-workload-production` | `test-workload-production` (package family, production backend, required security and customize tests); pinned `test-native-triggers-zig` and `test-native-diversion-settlement-zig` |
 | `build-and-test-workload-apt-system` | `test-workload-apt-system` (system profile, apt system API/CLI/command/state/orchestrator and required orchestrator security tests); installed-CLI `test-apt-system-acceptance` in both modes; Debug privileged `test-apt-system` |
 | `build-and-test-workload-native` | `test-workload-native` (native alternatives, snapshot, differential, fixture, conffile, dpkg reference/evidence, SHA-512, trigger queue, lifecycle/trigger/settlement unit and recovery unit tests); pinned `test-native-materialization`, `test-native-conffiles`, `test-native-differential` and `test-native-lifecycle-zig`; `test-native-helper-namespace` |
-| `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal and the real-snapshot repin harness); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
+| `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal, real-snapshot repin harness, native release core and actual packaging consumers in both modes); `fuzz`; Debug `test-release` additionally checks installation layout; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
 
 Manual CI dispatches have a boolean `run_full_matrix` input, defaulting to
 `true`. Explicitly setting it to `false` skips all five workload jobs, all six
@@ -93,6 +93,132 @@ minisign key and GitHub attestations, and check `zig version` before use. The
 action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
+
+## Runner placement and the rootless root container
+
+Jobs that need no `sudo` run directly on the trusted self-hosted pool
+(`[self-hosted, Linux, X64|ARM64, ubuntu2604]`) as its unprivileged runner
+account. These include the action unit checks, the `build-and-test-workload`
+core, the release dry-runs and `fuzz`. Pull requests from forks never reach
+the pool: their rows fall back to a GitHub-hosted runner, and
+`download-action-cache`, which has no hosted form, is skipped.
+
+Thirteen jobs need `sudo` but only root inside a user namespace. They run in a
+privileged rootless root container instead: `install-action-native`, the four
+other workload jobs, the six `native-recovery-zig-*` jobs, `security-audit`
+and `integration-required`. Pushes, schedules, dispatches and same-repository
+pull requests schedule them on
+`[self-hosted, Linux, X64|ARM64, ubuntu2604, podman]`. Fork pull requests run
+the identical container on GitHub-hosted Docker. The container is
+`ubuntu:24.04` with `--privileged --init`. Rootless Podman makes its root the
+runner account's user-namespace root, so it can mount, unshare, chroot and
+install packages inside the container. It holds no host capability and cannot
+create device nodes.
+
+A bootstrap step recreates the hosted image's environment:
+
+- It installs the tools the jobs use.
+- It creates the `runner` user (uid 1001) with passwordless sudo.
+- It installs `as-runner` as the job's default `run` shell, so every `run:`
+  step executes as `runner` with `sudo`, as on a GitHub-hosted runner.
+- It removes the minimized image's dpkg path excludes, so the pinned
+  reference dpkg installs man-page alternative links as on a full Ubuntu
+  image.
+
+`uses:` steps such as checkout and the `ghr` Zig installer run as container
+root. A handoff step gives the checkout to `runner` before any later step
+writes to it.
+
+Rootless root differs from hosted real root in three ways:
+
+- **No device nodes.** `mknod` is refused, so fixture roots leave empty files
+  where device nodes would be. Inside their private mount namespaces they bind
+  the host's `/dev/null` over those files. Apt-system acceptance also binds
+  `zero`, `random` and `urandom`.
+- **Overflow owners.** The kernel's root is unmapped, so kernel-owned files
+  such as `/proc/sys/kernel/random/boot_id` and the host's `/dev/null` appear
+  owned by `65534:65534`.
+  - The product's boot-id reader and the reference launcher's accept that
+    owner only as a uid/gid pair. Both now also require the file to be on
+    procfs (`PROC_SUPER_MAGIC`), which tightens the check for every caller,
+    including real root.
+  - The launcher accepts the overflow pair only for its `/dev/null` standard
+    input. Standard output and error must still be root-owned.
+- **No host root.** The signed `/proc` replay needs real host root (`mknod`),
+  so `signed-proc-protected-replay` stays GitHub-hosted.
+
+The opt-in dispatch and schedule jobs also stay GitHub-hosted:
+`arm64-dpkg-oracles`, `integration-full`, `ubuntu-real-snapshot` and
+`protected-reference`. They run rarely and have not been validated rootless.
+
+The security audit pins this placement exactly:
+
+- `ROOTLESS_ROOT_JOBS` lists the thirteen jobs.
+- Each listed job must have the reviewed `runs-on`, container, defaults,
+  bootstrap, checkout and handoff, in that order, and no other step-level
+  `shell:`.
+- No other job may use the `podman` label, `--privileged`, `as-runner` or a
+  sudoers drop-in.
+- Every other check reviews the listed jobs in their GitHub-hosted form. That
+  form is produced by removing exactly this scaffolding, so any difference in
+  the scaffolding leaves those checks failing too.
+- Mutation tests in `test/security-policy.zig` cover each element.
+
+## Focused paid-runner tooling dispatch
+
+`tooling.yml` is a separate **validation-only** workflow, not a required PR,
+release, signed-root or native-cutover acceptance gate. Unlike
+`ci.yml -f run_full_matrix=false`, it does not also schedule privileged
+integration/security jobs or unrelated Actions/release/fuzz cohorts. Existing
+full PR and hosted root/reference gates are unchanged.
+
+The workflow must be registered on the repository's default branch before
+GitHub can dispatch it. Dispatch a branch containing the workflow and the
+actual candidate tooling targets, binding its full commit and tree:
+
+```sh
+candidate=fleet-candidate-branch
+head=$(git rev-parse "$candidate")
+tree=$(git rev-parse "$candidate^{tree}")
+gh workflow run tooling.yml --repo cataggar/debz --ref "$candidate" \
+  -f source_sha="$head" -f source_tree="$tree" \
+  -f selectors="test-integration-repository test-disposable-runtime" \
+  -f architecture=both -f optimize=both
+```
+
+`architecture` accepts `both`, `amd64`, or `arm64`; `optimize` accepts `both`,
+`Debug`, or `ReleaseSafe`. Each selected test has its own native
+architecture/mode row, so the example schedules eight useful paid rows. Runner
+labels are exactly `[self-hosted, Linux, X64, ubuntu2604]` and
+`[self-hosted, Linux, ARM64, ubuntu2604]`. Fork/PR/tag events cannot schedule
+paid rows. A hosted source planner requires the dispatch SHA, checked-out
+commit and supplied tree to agree, validates the actual candidate build-step
+inventory and source guards, then emits the immutable row plan.
+
+The reviewed pure selectors and their producer prerequisites are listed in
+`tools/tooling-fleet.mjs`. Current native fixtures, signing/archive/repository,
+dpkg preparation, Debian readiness, reference runtime, replay comparison and
+oracle-evidence tests are available. Vendor capture/derivation, reference
+order/paths and protected-observation parsing (`*-protected-pure`), release consumers
+and native policies are accepted only when their actual producer and test
+targets exist in the dispatched candidate; an unintegrated port fails planning,
+not a success-shaped fallback. `test`, `test-release`, `security-audit`,
+workload aggregates, root/reference execution and arbitrary build options
+are deliberately not selectors.
+
+Each paid row installs the same signature/attestation-verified, pinned Zig
+0.16.0 toolchain, checks its version before building, refuses root or a foreign
+runner architecture, and creates exclusive run/attempt/source/coordinate-local
+caches without restoring build caches. Only selected tooling producers are
+installed, both normally and at a custom prefix; their actual executable
+inventories, modes and hashes must match, without a guessed helper count.
+The real selected tests receive that custom prefix. Python and privileged
+host commands are poisoned on the test PATH. No host packages or interpreters
+are installed or removed; absolute-command/source policy remains a separate
+mandatory audit, so this lane alone is not complete no-host-Python acceptance.
+Exact bindings, commands, installed inventories and failure logs are retained
+as `tooling-SHA-SELECTOR-ARCH-MODE-ATTEMPT` artifacts. Their
+`acceptance: false` field cannot stand in for any mandatory full/hosted proof.
 
 The dispatch-only native snapshot job instead shares the small protected
 proof's root-owned bootstrap: the same size/SHA-256/minisign-pinned Zig and

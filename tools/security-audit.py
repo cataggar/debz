@@ -1923,13 +1923,8 @@ def audit_dependencies() -> None:
     ):
         fail("build linkage differs from documented runtime dependency model")
     liblzma_build = (ROOT / "build/liblzma.zig").read_text()
-    if (
-        "stream_decoder_mt.c" in liblzma_build
-        or "encoder.c" in liblzma_build
-        or '"HAVE_DECODERS"' not in liblzma_build
-        or '"HAVE_CHECK_SHA256"' not in liblzma_build
-    ):
-        fail("repository-local liblzma build is not the reviewed single-threaded decoder configuration")
+    for failure in liblzma_decoder_configuration_failures(liblzma_build):
+        fail(failure)
 
     notices = (ROOT / "THIRD_PARTY_NOTICES").read_text()
     for required in (
@@ -2128,7 +2123,8 @@ WORKLOAD_PARTITIONS = {
         "run_package_cache_archive_tests",
     )),
     "workload_release": ("test-workload-release", (
-        "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests",
+        "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests", "release_tool_tests",
+        "run_release_policy_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
@@ -2188,8 +2184,9 @@ WORKLOAD_SETUP_LINES = (
     '        run: test "$(zig version)" = 0.16.0',
     "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
 )
-# Only the sudo-free core partition may use the trusted self-hosted pool; every
-# root-requiring workload keeps the disposable GitHub-hosted runner.
+# Only the sudo-free core partition may run directly on the trusted self-hosted
+# pool. Root-requiring workloads reach it only through ROOTLESS_ROOT_JOBS, and
+# are reviewed here in their GitHub-hosted form.
 WORKLOAD_RUNS_ON = "    runs-on: ${{ matrix.os }}"
 WORKLOAD_CORE_RUNS_ON = (
     "    runs-on: ${{ (github.event_name != 'pull_request' || "
@@ -2197,6 +2194,173 @@ WORKLOAD_CORE_RUNS_ON = (
     "fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', "
     "matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}"
 )
+# Jobs whose sudo needs only root inside a user namespace run in a privileged
+# rootless container: on the trusted self-hosted pool for same-repository
+# events, and on GitHub-hosted Docker for forks. The bootstrap recreates the
+# hosted image's passwordless-sudo runner user, and rootless_root_hosted_view
+# removes exactly this scaffolding so every other byte of those jobs is still
+# reviewed in its hosted form. Jobs that need real host root, such as the
+# signed /proc replay, stay GitHub-hosted.
+ROOTLESS_ROOT_JOBS = {
+    "install-action-native": "runner",
+    "build-and-test-workload-production": "os",
+    "build-and-test-workload-apt-system": "os",
+    "build-and-test-workload-native": "os",
+    "build-and-test-workload-release": "os",
+    "native-recovery-zig-workflows": "os",
+    "native-recovery-zig-repository": "os",
+    "native-recovery-zig-helper": "os",
+    "native-recovery-zig-family": "os",
+    "native-recovery-zig-scenarios": "os",
+    "native-recovery-zig-diversions": "os",
+    "security-audit": None,
+    "integration-required": "runner",
+}
+ROOTLESS_ROOT_GATE = (
+    "(github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository)"
+)
+ROOTLESS_ROOT_CONTAINER = (
+    "    container:\n"
+    "      image: ubuntu:24.04\n"
+    "      options: --privileged --init\n"
+    "    defaults:\n"
+    "      run:\n"
+    "        shell: bash /usr/local/bin/as-runner {0}\n"
+)
+ROOTLESS_ROOT_BOOTSTRAP = """\
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \\
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \\
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \\
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
+"""
+# Checkout and the ghr install action run as container root; handing the
+# checkout over before ghr keeps every later step's files owned by runner.
+ROOTLESS_ROOT_CHECKOUT = re.compile(
+    r"      - uses: actions/checkout@[0-9a-f]{40} # v[^\n]+\n"
+    r"        with:\n"
+    r"          persist-credentials: false\n"
+)
+ROOTLESS_ROOT_HANDOFF = (
+    "      - name: Hand the checkout to the runner user\n"
+    "        shell: bash\n"
+    '        run: chown -R runner:runner "$GITHUB_WORKSPACE"\n'
+)
+ROOTLESS_ROOT_FOREIGN_TOKENS = ("podman", "--privileged", "as-runner", "/etc/sudoers.d/")
+CI_JOB_PATTERN = r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)"
+
+
+def rootless_root_runs_on(key: str | None) -> tuple[str, str]:
+    """Return a job's reviewed rootless runs-on line and its hosted equivalent."""
+    labels = '"self-hosted","Linux","{0}","ubuntu2604","podman"'
+    if key is None:
+        return (
+            "    runs-on: ${{ " + ROOTLESS_ROOT_GATE + " && fromJSON('["
+            + labels.format("X64") + "]') || 'ubuntu-24.04' }}",
+            "    runs-on: ubuntu-24.04",
+        )
+    return (
+        "    runs-on: ${{ " + ROOTLESS_ROOT_GATE + " && fromJSON(format('[" + labels + "]', "
+        f"matrix.{key} == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.{key} }}}}",
+        f"    runs-on: ${{{{ matrix.{key} }}}}",
+    )
+
+
+def rootless_root_ci_failures(text: str) -> list[str]:
+    jobs = dict(re.findall(CI_JOB_PATTERN, text))
+    failures: list[str] = []
+    for name, key in ROOTLESS_ROOT_JOBS.items():
+        body = jobs.get(name, "")
+        rootless, _ = rootless_root_runs_on(key)
+        steps = body.partition("    steps:\n")[2]
+        checkout = (
+            ROOTLESS_ROOT_CHECKOUT.match(steps, len(ROOTLESS_ROOT_BOOTSTRAP))
+            if steps.startswith(ROOTLESS_ROOT_BOOTSTRAP) else None
+        )
+        rest = steps[len(ROOTLESS_ROOT_BOOTSTRAP):].replace(ROOTLESS_ROOT_HANDOFF, "", 1)
+        # The next job-level key must follow the container block directly, so
+        # nothing can extend its defaults outside the hosted view.
+        container = re.escape(rootless + "\n" + ROOTLESS_ROOT_CONTAINER) + r"(?=    [a-z])"
+        if (
+            re.findall(r"(?m)^    runs-on:[^\n]*$", body) != [rootless]
+            or len(re.findall(container, body)) != 1
+            or re.findall(r"(?m)^    (?:container|defaults|services):[^\n]*$", body)
+            != ["    container:", "    defaults:"]
+            or body.count("    steps:\n") != 1
+            or checkout is None
+            or not steps.startswith(ROOTLESS_ROOT_HANDOFF, checkout.end())
+            or re.search(r"(?m)^        shell:", rest)
+        ):
+            failures.append(
+                f"ci.yml: {name} must run as the hosted runner user in the reviewed rootless root container"
+            )
+    for name, body in jobs.items():
+        if name not in ROOTLESS_ROOT_JOBS and any(
+            token in body for token in ROOTLESS_ROOT_FOREIGN_TOKENS
+        ):
+            failures.append(f"ci.yml: {name} must not use the rootless root container or its runner label")
+    if any(
+        text.count(scaffold) != len(ROOTLESS_ROOT_JOBS)
+        for scaffold in (ROOTLESS_ROOT_CONTAINER, ROOTLESS_ROOT_BOOTSTRAP, ROOTLESS_ROOT_HANDOFF)
+    ):
+        failures.append("ci.yml: rootless root container scaffolding must appear only in its reviewed jobs")
+    return failures
+
+
+def rootless_root_hosted_view(text: str) -> str:
+    """Return ci.yml with the reviewed rootless scaffolding replaced by the hosted form.
+
+    Unreviewed scaffolding is left in place, so checks of the hosted form fail closed.
+    """
+    if rootless_root_ci_failures(text):
+        return text
+
+    def hosted(match: re.Match[str]) -> str:
+        name, body = match.group(1), match.group(2)
+        if name in ROOTLESS_ROOT_JOBS:
+            rootless, runs_on = rootless_root_runs_on(ROOTLESS_ROOT_JOBS[name])
+            body = body.replace(rootless + "\n" + ROOTLESS_ROOT_CONTAINER, runs_on + "\n", 1)
+            body = body.replace("    steps:\n" + ROOTLESS_ROOT_BOOTSTRAP, "    steps:\n", 1)
+            body = body.replace(ROOTLESS_ROOT_HANDOFF, "", 1)
+        return f"  {name}:\n{body}"
+
+    return re.sub(CI_JOB_PATTERN, hosted, text)
+
+
 WORKLOAD_DEBUG = "${{ matrix.optimize == 'Debug' }}"
 WORKLOAD_RELEASESAFE = "${{ matrix.optimize == 'ReleaseSafe' }}"
 WORKLOAD_PREPARE_DPKG = 'reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"'
@@ -2567,9 +2731,8 @@ def reference_launcher_root_wiring_failures(
 ) -> list[str]:
     """The root capability proof runs in CI, outside the sudo-free security audit."""
     failures: list[str] = []
-    jobs = dict(re.findall(
-        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
-    ))
+    ci = rootless_root_hosted_view(ci)
+    jobs = dict(re.findall(CI_JOB_PATTERN, ci))
     job = jobs.get("security-audit", "")
     step = re.search(
         r"(?ms)^      - name: Prove root reference capability transition\n.*?(?=^      - |^\n|\Z)",
@@ -3938,11 +4101,9 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
 
 
 def native_recovery_ci_failures(text: str) -> list[str]:
-    jobs = dict(re.findall(
-        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
-        text,
-    ))
-    failures = []
+    failures = rootless_root_ci_failures(text)
+    text = rootless_root_hosted_view(text)
+    jobs = dict(re.findall(CI_JOB_PATTERN, text))
     failures.extend(ci_dispatch_matrix_failures(text, jobs))
     failures.extend(workload_ci_failures(jobs, text))
     architectures = (
@@ -4173,7 +4334,7 @@ SIGNED_PROC_CI_STEPS = {
         "            zig build -Doptimize=Debug -j2 --summary all",
     ),
     "Authenticate the snapshot closure and stage signed bindings": (
-        "        timeout-minutes: 12",
+        "        timeout-minutes: 20",
         "        working-directory: ${{ env.PROTECTED }}/checkout",
         '            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \\',
         '            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \\',
@@ -4349,10 +4510,11 @@ def signed_proc_ci_failures(text: str) -> list[str]:
             or (conditions and "        if: ${{ always() }}" not in required)
             or any(not 1 <= int(minutes) <= 25 for minutes in timeout_minutes)
             or (
-                name in (
-                    "Authenticate the snapshot closure and stage signed bindings",
-                    "Generate fresh signed pinned-dpkg prestates",
-                )
+                name == "Authenticate the snapshot closure and stage signed bindings"
+                and timeout_minutes != ["20"]
+            )
+            or (
+                name == "Generate fresh signed pinned-dpkg prestates"
                 and timeout_minutes != ["12"]
             )
         ):
@@ -5331,6 +5493,186 @@ DEBIAN_READINESS_PATHS = (
     "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.py",
 )
 
+def liblzma_decoder_configuration_failures(text: str) -> list[str]:
+    production = text.partition("\npub fn addStaticEncoderLibrary(")[0]
+    if (
+        "stream_decoder_mt.c" in production
+        or "encoder.c" in production
+        or '"HAVE_ENCODERS"' in production
+        or '"HAVE_DECODERS"' not in production
+        or '"HAVE_CHECK_SHA256"' not in production
+    ):
+        return ["repository-local liblzma build is not the reviewed single-threaded decoder configuration"]
+    return []
+
+
+NATIVE_RELEASE_CORE_PATHS = (
+    "build.zig", "build/liblzma.zig", "tools/release.zig", "tools/release.py",
+    "test/release-tooling.zig", "tools/test-release-install.sh",
+)
+
+
+def native_release_core_failures(texts: dict[str, str]) -> list[str]:
+    required = {
+        "build.zig": (
+            'b.path("tools/release.zig")',
+            "b.getInstallStep().dependOn(&install_release_tool.step);",
+            "workload_release.dependOn(&release_tool_tests.step);",
+            'release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));',
+            'release_policy_tests.root_module.addOptions("release_test_options", release_test_options);',
+            "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
+            "const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);",
+            "const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);",
+            "release_tool_module.linkLibrary(release_liblzma);",
+        ),
+        "build/liblzma.zig": (
+            "pub fn addStaticEncoderLibrary(",
+            "const library = addStaticLibrary(b, xz, target, optimize);",
+            '"src/liblzma/rangecoder/price_table.c",',
+            '"HAVE_ENCODER_LZMA1"',
+            '"HAVE_ENCODER_LZMA2"',
+        ),
+        "tools/release.zig": (
+            "pub fn parseTag(",
+            "pub fn validateStaticElf(",
+            "pub fn buildTar(",
+            'try validateStaticElf(allocator, binary, platform);',
+            "try buildTar(allocator, entries, epoch)",
+            "if (machine != platform.machine())",
+            "if (file_mapping.? != virtual_mapping.?)",
+            "if (value.offset - load.file_start != value.address - load.virtual_start)",
+            "if (tag == 1)",
+            "if (!terminated)",
+            "if (terminated and tag != 0)",
+            'tarHeader("././@LongLink", 0, 0, name.len + 1, \'L\', true)',
+            "const padding = (10240 - output.items.len % 10240) % 10240;",
+            "return compressTarLevel(allocator, input, format, 9);",
+            "std.compress.flate.Compress.init(&writer, history, .gzip, if (level == 1) .fastest else .best)",
+            "output[8] = if (level == 1) 4 else 2;",
+            "output[9] = 255;",
+            "c.lzma_easy_encoder(&stream, level, c.LZMA_CHECK_CRC64)",
+            "if (produced > maximum_compressed_bytes - output.items.len)",
+            "if (input[3] != 0)",
+            "if (!std.mem.allEqual(u8, input[4..8], 0))",
+            "debz.metadata_decompression.decompress(allocator, format, input",
+            "const tar = try decompressedTar(allocator, input, args[3]);",
+            "const entries = try readTar(allocator, tar);",
+            "if (checksum != try tarValue(header[148..156]))",
+            "if (signed_size < 0 or signed_size > tar.len - start)",
+            "if ((try seen.getOrPut(name)).found_existing)",
+            "if (mtime != first)",
+        ),
+    }
+    failures = [
+        f"{path}: native release tag, plan, ELF or GNU tar binding is missing"
+        for path, tokens in required.items()
+        if any(token not in texts.get(path, "") for token in tokens)
+    ]
+    if texts.get("tools/release.py", ""):
+        failures.append("tools/release.py: retired Python release implementation was restored")
+    build = texts.get("build.zig", "")
+    release_module = build.partition("\nfn addReleaseToolModule(")[2].partition("\n}\n")[0]
+    if (
+        ".root_module = addReleaseToolModule(b, target, .ReleaseSafe, debz, xz_dependency)," not in build
+        or ".optimize = optimize," not in release_module
+        or "liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);" not in release_module
+    ):
+        failures.append("build.zig: installed release packager and its XZ encoder must always be ReleaseSafe")
+    native = texts.get("tools/release.zig", "")
+    member_body = native.partition("fn readTar(")[2].partition("pub fn validateStaticElf(")[0]
+    if any(token not in member_body for token in (
+        "if (checksum != try tarValue(header[148..156]))",
+        "if (signed_size < 0 or signed_size > tar.len - start)",
+        "if ((try seen.getOrPut(name)).found_existing)",
+        "if (mtime != first)",
+    )):
+        failures.append("tools/release.zig: actual tar member validation body binding is missing")
+    smoke_body = native.partition("fn smoke(")[2].partition("const Options")[0]
+    extraction_body = smoke_body.partition("const root = fs.Root.init(context.io, extraction);")[2].partition("var index = archive.entries.len;")[0]
+    timestamp_body = smoke_body.partition("if (entry.bytes != null) {")[2].partition("} else {")[0]
+    if any(token not in extraction_body for token in (
+        "for (archive.entries) |entry|", "try root.createRegularFile(path",
+        "try file.writeStreamingAll(context.io, bytes);",
+    )) or "try file.setTimestamps(context.io" not in timestamp_body:
+        failures.append("tools/release.zig: actual smoke extraction and file timestamp body binding is missing")
+    for start, end, tokens in (
+        ("fn orchestration(", "fn execute(", (
+            "try scanner.directory(try context.path(prefix)",
+            "try validateBinary(context, scanner.entries.items, root_name, platform, dependencies);",
+            "const tar = try buildTar(allocator, scanner.entries.items, epoch);",
+            "try publish(context, &scanner, paths[number], bytes[number]);",
+            "const archive = try auditArchive(context, archive_path, version, platform, dependencies);",
+            "if (options.smoke and platform == hostPlatform())",
+            'format == .@"tar.gz"',
+        )),
+        ("fn auditArchive(", "fn outputSafe(", (
+            "const tar = try decompressedTar(context.allocator, compressed, name);",
+            "readTar(context.allocator, tar)",
+            "try validatePayload(entry.name, bytes)",
+            "try buildTar(context.allocator, files.items, entries[0].mtime)",
+            "try validateBinary(context, files.items, root, platform, dependencies);",
+        )),
+        ("fn validateBinary(", "const AuditedArchive", (
+            "try validatePolicies(context.allocator, entries, root);",
+            "try validateStaticElf(context.allocator, try findFile(entries, root, \"bin/debz\"), platform);",
+            "try validateRuntime(context.allocator, try findFile(entries, root, \"share/debz/runtime-dependencies.json\"), dependencies);",
+        )),
+        ("const Scanner = struct", "fn validateBinary(", (
+            "self.context.root.pinDirectory(path)",
+            "try file.observeStableAlloc(self.context.allocator, maximum_tar_bytes - self.total)",
+            "if (self.count > maximum_entries)",
+            "if (depth > 128)",
+            "try validatePayload(name, observed.bytes);",
+            "for (self.files.items) |*pin| _ = try pin.metadata();",
+            "for (self.directories.items) |*pin| _ = try pin.metadata();",
+        )),
+        ("fn publish(", "fn hostPlatform(", (
+            "try outputSafe(self.context, self.path);",
+            "try self.scanner.unchanged();",
+            "try self.directory.?.metadata();",
+            "try context.root.stageFile(path",
+            ".durable = true",
+            "try staged.commit();",
+        )),
+        ("fn smoke(", "const Options", (
+            "for (archive.entries) |entry|",
+            "try root.createRegularFile(path",
+            "entry.mtime) * std.time.ns_per_s",
+            "try file.setTimestamps(context.io",
+            'try cleaned.put("PATH", "/no-host-interpreters");',
+            "std.process.run(context.allocator, context.io",
+            ".raw = .fromSeconds(60)",
+            "parent.deleteTree(context.io, directory_name)",
+        )),
+    ):
+        body = native.partition(start)[2].partition(end)[0]
+        if any(token not in body for token in tokens):
+            failures.append(f"tools/release.zig: actual native release consumer body binding is missing: {start}")
+    consumer = texts.get("test/release-tooling.zig", "")
+    for start, end in (("fn release(", "fn releaseFile("), ("fn releaseFile(", "fn packageOk(")):
+        body = consumer.partition(start)[2].partition(end)[0]
+        if any(token not in body for token in (
+            'argv[0] = @import("release_test_options").executable;',
+            'try environment.put("PATH", "/no-host-interpreters");',
+            ".environ_map = &environment,",
+        )):
+            failures.append("test/release-tooling.zig: actual native installed release handoff is missing")
+    if "python3" in consumer or "tools/release.py" in consumer:
+        failures.append("test/release-tooling.zig: retired interpreter release consumer was restored")
+    layout = texts.get("tools/test-release-install.sh", "")
+    if ('PATH=/no-host-interpreters "$release_tool" check-runtime' not in layout or
+            "--manifest \"$release_prefix/share/debz/runtime-dependencies.json\"" not in layout or "python3" in layout):
+        failures.append("tools/test-release-install.sh: actual native runtime check is missing")
+    reader_command = native.partition('if (std.mem.eql(u8, args[1], "read-archive")) {')[2].partition("const compress = ")[0]
+    if any(token not in reader_command for token in (
+        "const tar = try decompressedTar(allocator, input, args[3]);",
+        "const entries = try readTar(allocator, tar);",
+        "std.Io.File.stdout().writeStreamingAll",
+    )):
+        failures.append("tools/release.zig: actual native archive reader command binding is missing")
+    failures.extend(liblzma_decoder_configuration_failures(texts.get("build/liblzma.zig", "")))
+    return failures
+
 
 def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
     required = {
@@ -5476,9 +5818,14 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
         body = match.group(1) if match else ""
         if body.count('"$PWD/zig-out/bin/debz-integration-repository" \\') != expected_count:
             failures.append(f"{job}: every native repository fixture invocation must remain wired")
-    failures.extend(ghr_zig_workflow_failures(texts.get(".github/workflows/release.yml", ""), "release.yml", 2))
-    release = texts.get(".github/workflows/release.yml", "").partition("      - name: Install verified standalone ghr")[2]
-    if not 0 <= release.find("cataggar/zig@v0.16.0") < release.find("zig build build-integration-repository "):
+    failures.extend(ghr_zig_workflow_failures(texts.get(".github/workflows/release.yml", ""), "release.yml", 3))
+    match = re.search(
+        r"(?ms)^  smoke:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        texts.get(".github/workflows/release.yml", ""),
+    )
+    release = match.group(1) if match else ""
+    install = release.find(GHR_ZIG_INSTALL)
+    if not 0 <= install < install + len(GHR_ZIG_INSTALL) <= release.find("zig build build-integration-repository "):
         failures.append("release fixture must install the verified native compiler before building its producer")
     return failures
 
@@ -5846,6 +6193,10 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_release_core_failures({
+        path: (ROOT / path).read_text() for path in NATIVE_RELEASE_CORE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_debian_readiness_failures({
         path: (ROOT / path).read_text() for path in DEBIAN_READINESS_PATHS if (ROOT / path).is_file()
     }):
@@ -5995,7 +6346,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 21, "release.yml": 2}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 23, "release.yml": 3}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -6945,15 +7296,17 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 23)
     elif kind == "ghr-release":
-        failures = ghr_zig_workflow_failures(text, "release.yml", 2)
+        failures = ghr_zig_workflow_failures(text, "release.yml", 3)
     elif kind == "workflow-failure":
         failures = workflow_failure_handling_failures(text, "ci.yml")
     elif kind == "ci-concurrency":
         failures = ci_concurrency_failures(text, "ci.yml")
     elif kind == "ci-recovery":
         failures = native_recovery_ci_failures(text)
+    elif kind == "ci-rootless":
+        failures = rootless_root_ci_failures(text)
     elif kind == "workload-build":
         failures = workload_partition_failures(text)
     elif kind == "ci-signed-proc":
@@ -6962,7 +7315,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
-        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness",
+        "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness", "native-release-core",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6987,6 +7340,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-cli-smoke": CLI_SMOKE_PATHS,
             "native-action-empty-lock": ACTION_EMPTY_LOCK_PATHS,
             "native-debian-readiness": DEBIAN_READINESS_PATHS,
+            "native-release-core": NATIVE_RELEASE_CORE_PATHS,
             "native-integration-archive": INTEGRATION_ARCHIVE_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
@@ -7054,6 +7408,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_action_empty_lock_failures(texts)
         elif kind == "native-debian-readiness":
             failures = native_debian_readiness_failures(texts)
+        elif kind == "native-release-core":
+            failures = native_release_core_failures(texts)
         elif kind == "native-integration-archive":
             failures = native_integration_archive_failures(texts)
         elif kind == "native-baseline-fixture":

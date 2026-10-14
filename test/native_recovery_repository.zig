@@ -474,6 +474,8 @@ fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []const u8
     try mountAt(allocator, init.io, &.{ "/usr/bin/mount", "--bind", root, root });
     const proc = try std.fmt.allocPrint(allocator, "{s}/proc", .{root});
     try mountAt(allocator, init.io, &.{ "/usr/bin/mount", "-t", "proc", "proc", proc });
+    const dev_null = try std.fmt.allocPrint(allocator, "{s}/dev/null", .{root});
+    try mountAt(allocator, init.io, &.{ "/usr/bin/mount", "--bind", "/dev/null", dev_null });
     const zroot = try allocator.dupeZ(u8, root);
     if (linux.errno(linux.chdir(zroot)) != .SUCCESS or
         linux.errno(linux.chroot(".")) != .SUCCESS or
@@ -670,14 +672,12 @@ fn makeRoot(fixture: *foundation.Fixture, name: []const u8, arch: []const u8) ![
         defer fixture.allocator.free(path);
         try fixture.directory(path);
     }
+    // A user namespace cannot mknod, so leave an empty file that inside()
+    // binds the host's /dev/null onto in its private mount namespace.
     if (linux.geteuid() == 0) {
         const null_path = try support.path(fixture.allocator, root_name, "dev/null");
         defer fixture.allocator.free(null_path);
-        const absolute = try fixture.absolute(null_path);
-        defer fixture.allocator.free(absolute);
-        const log = try support.path(fixture.allocator, name, "mknod.log");
-        defer fixture.allocator.free(log);
-        try fixture.run(&.{ "/usr/bin/mknod", "-m", "666", absolute, "c", "1", "3" }, log, 10);
+        try fixture.write(null_path, "", 0o666);
     }
     return root;
 }

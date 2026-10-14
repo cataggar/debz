@@ -141,6 +141,10 @@ pub const diversion_cache_path = "var/lib/debz/native-diversion-cache-v1.json";
 pub const unpack_diversion_prefix = "native-unpack-diversion-v1-";
 pub const unpack_route_settlement_prefix =
     "native-unpack-route-settlement-v1-";
+pub const unpack_statoverride_prefix = "native-unpack-statoverride-v1-";
+/// Substep of the synthetic verification checkpoint that publishes a
+/// persisted unpack statoverride input before the invocation's first step.
+pub const unpack_statoverride_substep: u16 = 0x4000;
 pub const maximum_intent_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_progress_bytes: usize = 64 * 1024 * 1024;
 pub const maximum_records: usize = 200_000;
@@ -199,6 +203,27 @@ pub fn unpackRouteSettlementStep(path: []const u8) !?u32 {
         try unpackRouteSettlementPath(step, &buffer),
     ))
         return error.InvalidUnpackRouteSettlementPath;
+    return step;
+}
+
+pub fn unpackStatOverridePath(program_step: u32, buffer: *[128]u8) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        root_operation.namespace_path ++ "/" ++ unpack_statoverride_prefix ++ "{d}.json",
+        .{program_step},
+    );
+}
+
+pub fn unpackStatOverrideStep(path: []const u8) !?u32 {
+    const prefix = root_operation.namespace_path ++ "/" ++ unpack_statoverride_prefix;
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, ".json") or path.len <= prefix.len + ".json".len)
+        return error.InvalidUnpackStatOverridePath;
+    const step = std.fmt.parseUnsigned(u32, path[prefix.len .. path.len - ".json".len], 10) catch
+        return error.InvalidUnpackStatOverridePath;
+    var buffer: [128]u8 = undefined;
+    if (!std.mem.eql(u8, path, try unpackStatOverridePath(step, &buffer)))
+        return error.InvalidUnpackStatOverridePath;
     return step;
 }
 
@@ -280,6 +305,7 @@ pub const CrashPoint = enum {
     after_unpack_settlement,
     after_unpack_settlement_commit,
     after_unpack_settlement_rollback,
+    after_unpack_statoverride_capture,
 };
 
 pub const CrashController = struct {
@@ -1992,6 +2018,27 @@ pub fn updateManagedState(
                     return error.ManagedStateChanged;
             }
         }
+        if (try unpackStatOverrideStep(path)) |program_step| {
+            // Only the invocation's capture checkpoint may publish the input
+            // anchored absent at preparation, and nothing may rebind it.
+            const capture = !transient and action.kind == .verification and
+                action.program_step == program_step and
+                action.substep == unpack_statoverride_substep and
+                action.ordinal == 0;
+            const previous: ?ManagedEntry = if (base) |snapshot| block: {
+                const previous_index = managedEntryLowerBound(snapshot.entries, path);
+                break :block if (previous_index < snapshot.entries.len and std.mem.eql(u8, snapshot.entries[previous_index].path, path))
+                    snapshot.entries[previous_index]
+                else
+                    null;
+            } else null;
+            if (previous) |entry| {
+                if (!managedEntryEqual(entry, entries[index]) and
+                    (entry.kind != .absent or entries[index].kind != .regular or !capture))
+                    return error.ManagedStateChanged;
+            } else if (entries[index].kind != .absent)
+                return error.ManagedStateChanged;
+        }
     }
     var snapshot: ManagedSnapshot = .{
         .action = action,
@@ -3262,14 +3309,18 @@ fn cleanupDiversionEvidence(
             member.name,
             unpack_route_settlement_prefix,
         );
-        if (!unpack and !route) continue;
+        const statoverride = std.mem.startsWith(u8, member.name, unpack_statoverride_prefix);
+        if (!unpack and !route and !statoverride) continue;
         var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
         _ = if (unpack)
             (try unpackDiversionStep(path)) orelse
                 return error.InvalidManagedState
-        else
+        else if (route)
             (try unpackRouteSettlementStep(path)) orelse
+                return error.InvalidManagedState
+        else
+            (try unpackStatOverrideStep(path)) orelse
                 return error.InvalidManagedState;
         const bytes = (try readManagedFile(
             allocator,
@@ -3298,7 +3349,8 @@ fn cleanupDiversionEvidence(
                 u8,
                 member.name,
                 unpack_route_settlement_prefix,
-            ))
+            ) and
+            !std.mem.startsWith(u8, member.name, unpack_statoverride_prefix))
             continue;
         var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
@@ -3871,6 +3923,57 @@ test "native_recovery.test.unpack inputs cannot be rebound by script or publicat
             else => unreachable,
         }
         for ([_]Action{ script, publication }) |action| {
+            for ([_]bool{ false, true }) |transient|
+                try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, action, &.{}, transient));
+        }
+    }
+}
+
+test "native_recovery.test.unpack statoverride inputs publish only at their capture checkpoint" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    for (0..4) |change| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+        const intent: Digest = @splat('1');
+        const initial: Action = .{ .kind = .verification, .program_step = 0, .substep = 0, .ordinal = 0 };
+        const capture: Action = .{ .kind = .verification, .program_step = 7, .substep = unpack_statoverride_substep, .ordinal = 0 };
+        const script: Action = .{ .kind = .script, .program_step = 8, .substep = 0, .ordinal = 0 };
+        var buffer: [128]u8 = undefined;
+        const path = try root_fs.Path.init(try unpackStatOverridePath(7, &buffer));
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        try root.publishFile(path, "unanchored input", .{});
+        try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, capture, &.{path.text}, false));
+        try root.removeFile(path);
+        _ = try updateManagedState(testing.allocator, root, intent, initial, &.{path.text}, false);
+        try root.publishFile(path, "captured input", .{});
+        for ([_]Action{
+            .{ .kind = .filesystem, .program_step = 7, .substep = unpack_statoverride_substep, .ordinal = 0 },
+            .{ .kind = .script, .program_step = 7, .substep = unpack_statoverride_substep, .ordinal = 0 },
+            .{ .kind = .verification, .program_step = 8, .substep = unpack_statoverride_substep, .ordinal = 0 },
+            .{ .kind = .verification, .program_step = 7, .substep = 0, .ordinal = 0 },
+            .{ .kind = .verification, .program_step = 7, .substep = unpack_statoverride_substep, .ordinal = 1 },
+            script,
+        }) |wrong_anchor| {
+            for ([_]bool{ false, true }) |transient|
+                try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, wrong_anchor, &.{}, transient));
+        }
+        try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, capture, &.{}, true));
+        _ = try updateManagedState(testing.allocator, root, intent, capture, &.{}, false);
+        _ = try updateManagedState(testing.allocator, root, intent, script, &.{}, true);
+        try discardTransientManagedState(testing.allocator, root, intent);
+        switch (change) {
+            0 => try root.publishFile(path, "replacement input", .{ .overwrite = .replace }),
+            1 => try root.applyMetadata(path, .{ .mode = (try root.entry(path)).mode ^ 0o040 }),
+            2 => try root.removeFile(path),
+            3 => try root.publishFile(path, "captured input", .{ .overwrite = .replace }),
+            else => unreachable,
+        }
+        for ([_]Action{ capture, script }) |action| {
             for ([_]bool{ false, true }) |transient|
                 try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, action, &.{}, transient));
         }

@@ -395,16 +395,27 @@ fn metadata(fd: i32) !linux.Statx {
     return value;
 }
 
+fn rootOwned(info: linux.Statx) bool {
+    return info.uid == 0 and info.gid == 0;
+}
+
+// A user namespace that leaves the kernel's root unmapped shows host-owned
+// device nodes and procfs files as the overflow ids, never a mix.
+fn overflowOwned(info: linux.Statx) bool {
+    return info.uid == overflow_id and info.gid == overflow_id;
+}
+
 fn allowedStandardStream(slot: i32, info: linux.Statx, flags: usize) bool {
     const access = flags & 3;
     const path_flag: usize = 1 << @bitOffsetOf(linux.O, "PATH");
-    if (flags & path_flag != 0 or info.uid != 0 or info.gid != 0) return false;
+    if (flags & path_flag != 0) return false;
     if (slot == 0) {
-        return (info.mode & 0o170000) == 0o020000 and
+        return (rootOwned(info) or overflowOwned(info)) and
+            (info.mode & 0o170000) == 0o020000 and
             info.rdev_major == 1 and info.rdev_minor == 3 and access == 0;
     }
     const append_flag: usize = 1 << @bitOffsetOf(linux.O, "APPEND");
-    return (slot == 1 or slot == 2) and
+    return rootOwned(info) and (slot == 1 or slot == 2) and
         (info.mode & 0o170000) == 0o100000 and
         (info.mode & 0o022) == 0 and info.nlink <= 1 and
         access == 1 and flags & append_flag != 0;
@@ -804,6 +815,29 @@ fn emptyDirectory(path: [:0]const u8) !void {
     }
 }
 
+// The 64-bit `struct statfs` shared by x86_64 and the asm-generic aarch64 ABI.
+const Statfs = extern struct {
+    type: i64,
+    bsize: i64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    namelen: i64,
+    frsize: i64,
+    flags: i64,
+    spare: [4]i64,
+};
+const proc_super_magic: i64 = 0x9fa0;
+const overflow_id: u32 = 65534;
+
+fn bootIdFile(filesystem: i64, entry: linux.Statx) bool {
+    return filesystem == proc_super_magic and (rootOwned(entry) or overflowOwned(entry)) and
+        entry.mode == 0o100444 and entry.nlink == 1;
+}
+
 fn readBootId() ![37]u8 {
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true };
     const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve_no_symlinks };
@@ -816,8 +850,9 @@ fn readBootId() ![37]u8 {
     )));
     defer _ = linux.close(fd);
     const entry = try metadata(fd);
-    if (entry.mode != 0o100444 or entry.uid != 0 or entry.gid != 0 or entry.nlink != 1)
-        return error.InvalidBootId;
+    var filesystem: Statfs = undefined;
+    _ = try checked(linux.syscall2(.fstatfs, @as(usize, @intCast(fd)), @intFromPtr(&filesystem)));
+    if (!bootIdFile(filesystem.type, entry)) return error.InvalidBootId;
     var bytes: [38]u8 = undefined;
     const count = try checked(linux.read(fd, &bytes, bytes.len));
     if (count != 37 or bytes[36] != '\n') return error.InvalidBootId;
@@ -2242,6 +2277,14 @@ test "reference standard streams refuse directory-backed stdin and readable host
     input.rdev_minor = 3;
     try std.testing.expect(allowedStandardStream(0, input, 0));
     try std.testing.expect(!allowedStandardStream(0, input, 1));
+    input.uid = overflow_id;
+    input.gid = overflow_id;
+    try std.testing.expect(allowedStandardStream(0, input, 0));
+    input.gid = 0;
+    try std.testing.expect(!allowedStandardStream(0, input, 0));
+    input.uid = 1000;
+    input.gid = 1000;
+    try std.testing.expect(!allowedStandardStream(0, input, 0));
     var output = std.mem.zeroes(linux.Statx);
     output.mode = 0o100600;
     output.nlink = 1;
@@ -2250,8 +2293,33 @@ test "reference standard streams refuse directory-backed stdin and readable host
     try std.testing.expect(allowedStandardStream(2, output, 1 | append));
     try std.testing.expect(!allowedStandardStream(1, output, 2 | append));
     try std.testing.expect(!allowedStandardStream(2, output, 1));
+    output.uid = overflow_id;
+    output.gid = overflow_id;
+    try std.testing.expect(!allowedStandardStream(1, output, 1 | append));
+    try std.testing.expect(!allowedStandardStream(2, output, 1 | append));
+    output.uid = 0;
+    output.gid = 0;
     output.mode = 0o100622;
     try std.testing.expect(!allowedStandardStream(1, output, 1 | append));
+}
+
+test "reference boot id must be procfs' own read-only file" {
+    var entry = std.mem.zeroes(linux.Statx);
+    entry.mode = 0o100444;
+    entry.nlink = 1;
+    try std.testing.expect(bootIdFile(proc_super_magic, entry));
+    try std.testing.expect(!bootIdFile(0x01021994, entry));
+    entry.uid = overflow_id;
+    entry.gid = overflow_id;
+    try std.testing.expect(bootIdFile(proc_super_magic, entry));
+    entry.uid = 0;
+    try std.testing.expect(!bootIdFile(proc_super_magic, entry));
+    entry.gid = 0;
+    entry.mode = 0o100644;
+    try std.testing.expect(!bootIdFile(proc_super_magic, entry));
+    entry.mode = 0o100444;
+    entry.nlink = 2;
+    try std.testing.expect(!bootIdFile(proc_super_magic, entry));
 }
 
 test "reference stdin refuses the read-write /dev/null that subprocess.DEVNULL opens" {

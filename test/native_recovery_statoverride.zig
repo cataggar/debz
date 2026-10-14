@@ -485,6 +485,206 @@ fn runRefreshCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []cons
     try support.assertDatabaseBytes(&case, "statoverride-old");
 }
 
+/// Crash boundaries of the unpack invocation whose old prerm edits the
+/// statoverride database (`statoverride.edit_marker`). `prerm_outcome` uses
+/// a scriptless provider so its first script outcome is that prerm;
+/// `intent_prerm_outcome` is the single invocation the intent froze.
+const InvocationCase = enum {
+    capture_recover,
+    capture_tampered,
+    capture_deleted,
+    capture_database_drift,
+    provider_outcome,
+    prerm_outcome,
+    intent_prerm_outcome,
+};
+
+fn expectUnpackStatOverrideInput(
+    fixture: *foundation.Fixture,
+    root_path: []const u8,
+    expected: []const struct { path: []const u8, mode: i64, uid: i64, gid: i64 },
+) ![]u8 {
+    const path = (try statoverride.unpackStatOverrideInput(fixture, root_path)) orelse
+        return error.MissingUnpackStatOverrideInput;
+    errdefer fixture.allocator.free(path);
+    var document = try process.rootDocument(fixture, root_path, path);
+    defer document.deinit();
+    const step = try process.field(document.value, "program_step");
+    if (step != .integer) return error.WrongUnpackStatOverrideInput;
+    var name_buffer: [128]u8 = undefined;
+    if (!std.mem.eql(u8, path, try debz.native_recovery.unpackStatOverridePath(@intCast(step.integer), &name_buffer)))
+        return error.WrongUnpackStatOverrideInput;
+    const entries = try process.field(document.value, "entries");
+    if (entries != .array or entries.array.items.len != expected.len) return error.WrongUnpackStatOverrideInput;
+    for (entries.array.items, expected) |item, want| {
+        try process.same(try process.text(item, "path"), want.path);
+        for ([_][]const u8{ "mode", "uid", "gid" }, [_]i64{ want.mode, want.uid, want.gid }) |key, value| {
+            const actual = try process.field(item, key);
+            if (actual != .integer or actual.integer != value) return error.WrongUnpackStatOverrideInput;
+        }
+    }
+    var dir = try foundation.guardedRoot(fixture.io, root_path);
+    defer dir.close(fixture.io);
+    const entry = try (root_fs.Root.init(fixture.io, dir)).entry(try root_fs.Path.init(path));
+    if (entry.kind != .file or entry.mode != 0o600 or entry.uid != 0 or entry.gid != 0)
+        return error.WrongUnpackStatOverrideInput;
+    return path;
+}
+
+/// dpkg resolves statoverrides once per invocation, so a crash inside the
+/// second invocation must replay its persisted input instead of re-reading
+/// the database that the old prerm edited before the unpack.
+fn runInvocationCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, kind: InvocationCase) !void {
+    const name = try std.fmt.allocPrint(fixture.allocator, "statoverride-invocation-{s}", .{@tagName(kind)});
+    defer fixture.allocator.free(name);
+    const package_workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(package_workspace);
+    const single = kind == .intent_prerm_outcome;
+    const archives = try statoverride.invocationArchives(fixture, arch, package_workspace, kind != .prerm_outcome);
+    defer for (archives) |bytes| fixture.allocator.free(bytes);
+    const both_selected = [_]foundation.PackageIdentity{
+        .{ .name = statoverride.invocation_provider, .architecture = arch },
+        .{ .name = statoverride.name, .architecture = arch },
+    };
+    const selected: []const foundation.PackageIdentity = if (single) both_selected[1..] else &both_selected;
+    const actions = statoverride.invocationActions(arch);
+    const provider_group = [_][]const u8{archives[1]};
+    const lifecycle_group = [_][]const u8{archives[3]};
+    const both_groups = [_][]const []const u8{ &provider_group, &lifecycle_group };
+    const groups: []const []const []const u8 = if (single) both_groups[1..] else &both_groups;
+    const both_archives = [_][]const u8{ archives[1], archives[3] };
+    const native_archives: []const []const u8 = if (single) &lifecycle_group else &both_archives;
+
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seed(&case, "");
+    try installDpkgStatoverride(&case, dpkg);
+    try statoverride.replace(&case, statoverride.edit_marker, "prerm:upgrade --update --update\n");
+    if (!single) try case.seed(archives[0]);
+    try case.seed(archives[2]);
+
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    for (groups, 0..) |group, index| {
+        const group_log = try std.fmt.allocPrint(fixture.allocator, "{s}/group-{d}", .{ reference_log, index });
+        defer fixture.allocator.free(group_log);
+        try fixture.directory(group_log);
+        if (try support.reference(fixture, dpkg, case.reference_root, .{
+            .operation = "upgrade",
+            .archives = group,
+            .packages = selected,
+            .triggers = false,
+        }, group_log) != 0) return error.UnexpectedReferenceOutcome;
+    }
+
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "upgrade",
+        .archives = native_archives,
+        .packages = selected,
+        .ordered_actions = if (single) null else &actions,
+        .crash_at = switch (kind) {
+            .capture_recover, .capture_tampered, .capture_deleted, .capture_database_drift => "after_unpack_statoverride_capture",
+            .provider_outcome, .prerm_outcome, .intent_prerm_outcome => "after_script_outcome",
+        },
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    for (archives) |path| {
+        try fixture.dir.deleteFile(fixture.io, path[fixture.path.len + 1 ..]);
+        try support.absent(fixture, path[fixture.path.len + 1 ..]);
+    }
+    switch (kind) {
+        .capture_recover, .capture_tampered, .capture_deleted, .capture_database_drift => {
+            const input = try expectUnpackStatOverrideInput(fixture, case.native_root, &.{
+                .{ .path = statoverride.invocation_target, .mode = 0o600, .uid = 42420, .gid = 42421 },
+            });
+            defer fixture.allocator.free(input);
+            const location = try process.rootPath(fixture, case.native_root, input);
+            defer fixture.allocator.free(location);
+            switch (kind) {
+                .capture_tampered => {
+                    const original = try process.rootBytes(fixture, case.native_root, input);
+                    defer fixture.allocator.free(original);
+                    const tampered = try std.mem.replaceOwned(u8, fixture.allocator, original, "\"mode\":384", "\"mode\":420");
+                    defer fixture.allocator.free(tampered);
+                    if (std.mem.eql(u8, original, tampered)) return error.WrongUnpackStatOverrideInput;
+                    try support.fixtureFile(fixture, location, tampered, 0o600);
+                },
+                .capture_deleted => try fixture.dir.deleteFile(fixture.io, location),
+                .capture_database_drift => {
+                    const database = try process.rootPath(fixture, case.native_root, "var/lib/dpkg/statoverride");
+                    defer fixture.allocator.free(database);
+                    try support.fixtureFile(fixture, database, "#42422 #42423 0640 /" ++ statoverride.invocation_target ++ "\n", 0o644);
+                },
+                else => {},
+            }
+        },
+        .prerm_outcome => {
+            // The old prerm already edited the live database; the input predates it.
+            const input = try expectUnpackStatOverrideInput(fixture, case.native_root, &.{});
+            fixture.allocator.free(input);
+            const database = try process.rootBytes(fixture, case.native_root, "var/lib/dpkg/statoverride");
+            defer fixture.allocator.free(database);
+            if (std.mem.indexOf(u8, database, " /" ++ statoverride.base ++ "/mode\n") == null)
+                return error.StatoverrideEditNotObserved;
+        },
+        .provider_outcome, .intent_prerm_outcome => if (try statoverride.unpackStatOverrideInput(fixture, case.native_root)) |path| {
+            fixture.allocator.free(path);
+            return error.PrematureUnpackStatOverrideInput;
+        },
+    }
+
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+    switch (kind) {
+        .capture_tampered, .capture_deleted, .capture_database_drift => {
+            if (!std.mem.eql(u8, report.value.outcome, "recovery_required") or
+                std.mem.indexOf(u8, report.value.detail, "managed_state_changed") == null)
+                return error.UnpackStatOverrideInputDriftAccepted;
+            const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+            defer fixture.allocator.free(after);
+            if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+            return;
+        },
+        else => {},
+    }
+    try process.same(report.value.outcome, "applied");
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    defer fixture.allocator.free(comparison);
+    try fixture.directory(comparison);
+    try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+    try statoverride.expectEditApplied(&case);
+    try statoverride.expectObserved(&case, statoverride.base ++ "/mode", statoverride.packaged_mode);
+    try statoverride.expectObserved(&case, statoverride.conffile_path, statoverride.updated_conffile);
+    switch (kind) {
+        .prerm_outcome => try statoverride.expectObserved(&case, statoverride.invocation_target, .{ .mode = 0o644, .uid = 0, .gid = 0 }),
+        .intent_prerm_outcome => {},
+        else => try statoverride.expectObserved(&case, statoverride.invocation_target, .{ .mode = 0o600, .uid = 42420, .gid = 42421 }),
+    }
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+    try statoverride.expectNoUnpackStatOverrideInput(&case);
+}
+
 fn runChronyCase(
     fixture: *foundation.Fixture,
     driver: []const u8,
@@ -598,6 +798,88 @@ fn runChronyCase(
         ));
     }
     std.debug.print("{s}: checkpoint/settled verification passed\n", .{name});
+}
+
+fn runFailedChronyCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, drift: bool) !void {
+    const name = if (drift) "statoverride-chrony-failed-mode" else "statoverride-chrony-failed-recover";
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seedChrony(&case, dpkg, false);
+    try statoverride.both(&case, support.failure, statoverride.chrony_failure);
+    const workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(workspace);
+    const archive = try statoverride.chronyArchive(fixture, arch, "1", workspace);
+    defer fixture.allocator.free(archive);
+    const selected = [_]foundation.PackageIdentity{.{ .name = statoverride.chrony_name, .architecture = arch }};
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "install",
+        .archives = &.{archive},
+        .packages = &selected,
+    }, reference_log) != 1) return error.UnexpectedReferenceOutcome;
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "install",
+        .archives = &.{archive},
+        .packages = &selected,
+        .crash_at = "after_failure_outcome",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    // The failed postinst added these overrides before exiting nonzero.
+    try expectChronyCheckpoint(fixture, case.native_root);
+    try fixture.dir.deleteFile(fixture.io, archive[fixture.path.len + 1 ..]);
+    for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
+        var dir = try foundation.guardedRoot(fixture.io, root_path);
+        defer dir.close(fixture.io);
+        const root: root_fs.Root = .init(fixture.io, dir);
+        try root.applyMetadata(try root_fs.Path.init(statoverride.admin_target), .{ .mode = 0o600 });
+        if (drift and std.mem.eql(u8, root_path, case.native_root))
+            try root.applyMetadata(try root_fs.Path.init("var/log/chrony"), .{ .mode = 0o700 });
+    }
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+    if (drift) {
+        if (!std.mem.eql(u8, report.value.outcome, "recovery_required") or
+            std.mem.indexOf(u8, report.value.detail, "managed_state_changed") == null)
+            return error.FailedScriptOverrideDriftAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+    } else {
+        try process.same(report.value.outcome, "script_failed");
+        const comparison = try support.path(fixture.allocator, name, "comparison");
+        defer fixture.allocator.free(comparison);
+        try fixture.directory(comparison);
+        try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+        try statoverride.expectChronyMetadata(&case);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+        try statoverride.expectFailedChronyBinding(&case);
+        var completion = try process.rootDocument(fixture, case.native_root, completion_path);
+        defer completion.deinit();
+        try process.same(try process.text(completion.value, "outcome"), "failed_after_mutation");
+    }
+    std.debug.print("{s}: failed-script checkpoint passed\n", .{name});
 }
 
 fn expectChronyCheckpoint(fixture: *foundation.Fixture, root_path: []const u8) !void {
@@ -768,10 +1050,16 @@ pub fn main(init: std.process.Init) !void {
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, .mode);
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, true, .owner);
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, .bytes);
+    try runFailedChronyCase(&fixture, driver, reference.executable, reference.architecture, false);
+    try runFailedChronyCase(&fixture, driver, reference.executable, reference.architecture, true);
     try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, false);
     std.debug.print("statoverride refresh after_script_outcome: recovered\n", .{});
     try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, true);
     std.debug.print("statoverride refresh after_script_outcome: tamper blocked\n", .{});
+    for (std.meta.tags(InvocationCase)) |kind| {
+        try runInvocationCase(&fixture, driver, reference.executable, reference.architecture, kind);
+        std.debug.print("statoverride invocation {s}: recovered or blocked\n", .{@tagName(kind)});
+    }
     for (cases) |entry| {
         try runCase(&fixture, driver, reference.executable, reference.architecture, entry);
         std.debug.print("statoverride {s}/{s}: recovered or blocked\n", .{ entry.operation, entry.boundary });
