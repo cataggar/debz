@@ -262,11 +262,14 @@ successful configuration, preserving the next invocation's last-configured
 argument. Unpacked packages still require matching staged `.dpkg-new` bytes.
 
 Known script failures follow the compiled failure transitions and compensation
-ordering. Restoring managed package files is not permission to roll back
-arbitrary script side effects. Before any script can run, durable evidence must
-identify the invocation as in flight. An outcome that was not durably observed
-blocks further mutation rather than retrying the script, declaring success, or
-falling back to legacy execution.
+ordering. A transaction stops at its first failed package, like
+`dpkg --abort-after=1`: earlier packages keep their settled state, such as
+`unpacked`, and later ones are not touched. dpkg's default of 50 would
+continue with the remaining archives. Restoring managed package files is not
+permission to roll back arbitrary script side effects. Before any script can
+run, durable evidence must identify the invocation as in flight. An outcome
+that was not durably observed blocks further mutation rather than retrying the
+script, declaring success, or falling back to legacy execution.
 
 Already-absent remove/purge is a narrow fixture exception: authorization v1
 cannot represent an absent-package action. Under the same real root lock, this
@@ -407,6 +410,17 @@ not the old prerm's edits in the second, and leave no retained input. A
 single `--install` of two archives keeps the first package's old-prerm
 override out of the second package's data until its reinstall. An
 administrator's owner and mode on an unmodified conffile survive an upgrade.
+Multi-package failure rows compare against `dpkg --abort-after=1`, the policy
+native shares with debz's dpkg executor: in one `--install` of two upgrades,
+the lifecycle package's old prerm `--update`s both overrides and then both its
+prerm calls exit 23. dpkg restores it with `postinst abort-upgrade`, keeping
+the `--update` metadata on the version 1 files, and halts. A provider listed
+first stays unpacked and is configured by a later `configure`; listed second,
+its archive is never read. Both orders run with and without durable recovery,
+and check the reference log and status independently. A dpkg-only row runs
+dpkg's default (`--abort-after=50`): dpkg continues past the failed archive and
+configures the provider. That row records the policy difference and is not a
+parity claim.
 The genuine diversion cases also cover postinst and prerm `--rename` moves and 210
 `prerm remove` additions owned by `coreutils-switch`.
 Both suites assert exact database and `-old` bytes. Use

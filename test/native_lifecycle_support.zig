@@ -373,6 +373,9 @@ pub const Phase = struct {
     fixture_import_drift: ?ImportDrift = null,
     /// Runs both dpkg and the native driver under this caller umask.
     caller_umask: ?u9 = null,
+    /// Passed to the reference dpkg only, as `--abort-after=N`. Native always
+    /// stops at its first failed package, like debz's dpkg executor.
+    abort_after: ?u32 = null,
 };
 
 /// Prefixes `argv` so it starts under `umask`; the shell execs it directly.
@@ -433,6 +436,12 @@ pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []c
     if (!phase.triggers or phase.defer_triggers or phase.reference_trigger_order != null)
         try argv.append(fixture.allocator, "--no-triggers");
     try argv.append(fixture.allocator, if (std.mem.eql(u8, phase.policy, "keep_existing")) "--force-confold" else if (std.mem.eql(u8, phase.policy, "use_package_version")) "--force-confnew" else return error.InvalidConffilePolicy);
+    const abort_after = if (phase.abort_after) |count|
+        try std.fmt.allocPrint(fixture.allocator, "--abort-after={d}", .{count})
+    else
+        null;
+    defer if (abort_after) |flag| fixture.allocator.free(flag);
+    if (abort_after) |flag| try argv.append(fixture.allocator, flag);
     const operation = phase.operation;
     if (std.mem.eql(u8, operation, "install") or std.mem.eql(u8, operation, "upgrade") or
         std.mem.eql(u8, operation, "downgrade") or std.mem.eql(u8, operation, "reinstall") or
@@ -914,6 +923,46 @@ pub fn assertDatabaseBytes(case: *Scenario, basename: []const u8) !void {
     if ((expected == null) != (actual == null)) return error.DatabaseFileChanged;
     if (expected) |left| if (!std.mem.eql(u8, left, actual.?))
         return error.DatabaseFileChanged;
+}
+
+/// The reference dpkg output of the scenario's latest phase, `operation`.
+pub fn lastReferenceLog(case: *Scenario, operation: []const u8) ![]u8 {
+    if (case.index == 0) return error.NoReferencePhase;
+    const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{d}-{s}/reference.log", .{ case.name, case.index - 1, operation });
+    defer case.fixture.allocator.free(relative);
+    return read(case.fixture, relative, 1024 * 1024);
+}
+
+/// Requires the reference dpkg status to record `package` with exactly
+/// `status` and `version`, printing what dpkg recorded otherwise.
+pub fn expectReferencePackage(case: *Scenario, package: []const u8, status: []const u8, version: []const u8) !void {
+    const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/reference/var/lib/dpkg/status", .{case.name});
+    defer case.fixture.allocator.free(relative);
+    const text = try read(case.fixture, relative, 64 * 1024 * 1024);
+    defer case.fixture.allocator.free(text);
+    var observed_status: []const u8 = "";
+    var observed_version: []const u8 = "";
+    var stanzas = std.mem.splitSequence(u8, text, "\n\n");
+    while (stanzas.next()) |stanza| {
+        var name: []const u8 = "";
+        var stanza_status: []const u8 = "";
+        var stanza_version: []const u8 = "";
+        var lines = std.mem.splitScalar(u8, stanza, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "Package: ")) name = line["Package: ".len..];
+            if (std.mem.startsWith(u8, line, "Status: ")) stanza_status = line["Status: ".len..];
+            if (std.mem.startsWith(u8, line, "Version: ")) stanza_version = line["Version: ".len..];
+        }
+        if (!std.mem.eql(u8, name, package)) continue;
+        if (std.mem.eql(u8, stanza_status, status) and std.mem.eql(u8, stanza_version, version)) return;
+        observed_status = stanza_status;
+        observed_version = stanza_version;
+        break;
+    }
+    std.debug.print("{s}: reference {s} observed status '{s}' version '{s}', expected '{s}' '{s}'\n", .{
+        case.name, package, observed_status, observed_version, status, version,
+    });
+    return error.WrongPackageStatus;
 }
 
 pub fn prerequisites(init: std.process.Init, allocator: std.mem.Allocator, pinned: ?[]const u8) !struct { architecture: []u8, executable: []const u8, before: [32]u8 } {

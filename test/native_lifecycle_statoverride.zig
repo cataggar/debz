@@ -723,6 +723,125 @@ fn genuineBatchInvocation(fixture: *foundation.Fixture, driver: []const u8, dpkg
     }
 }
 
+/// dpkg reports every failed archive, and says it halted only once
+/// `--abort-after` errors were counted (src/main/errors.c:57-78, 107-121).
+fn expectBatchReport(case: *support.Scenario, operation: []const u8, halted: bool) !void {
+    const log = try support.lastReferenceLog(case, operation);
+    defer case.fixture.allocator.free(log);
+    const reported = std.mem.indexOf(u8, log, "Errors were encountered while processing:") != null;
+    const stopped = std.mem.indexOf(u8, log, "Processing was halted because there were too many errors.") != null;
+    if (reported and stopped == halted) return;
+    std.debug.print("{s}: reference log reported {} halted {}, expected halted {}\n", .{ case.name, reported, stopped, halted });
+    return error.WrongReferenceErrorReport;
+}
+
+/// Whether the provider's old `prerm upgrade` ran and added its record.
+fn expectIntroducedRecord(case: *support.Scenario, present: bool) !void {
+    const records = try support.readOptionalCaseFile(case, "reference", "var/lib/dpkg/statoverride");
+    defer if (records) |bytes| case.fixture.allocator.free(bytes);
+    const found = if (records) |bytes| std.mem.indexOf(u8, bytes, " /" ++ invocation_target ++ "\n") != null else false;
+    if (found == present) return;
+    std.debug.print("{s}: reference override for /{s} present {}, expected {}\n", .{ case.name, invocation_target, found, present });
+    return error.WrongStatoverrideDatabase;
+}
+
+/// One `dpkg --install` of two upgrades in which the lifecycle package's old
+/// prerm applies `--update` overrides and both of its prerm calls fail.
+/// Native stops at its first failed package, which is
+/// `dpkg --abort-after=1`: the failed archive is unwound by the old
+/// `postinst abort-upgrade` (src/main/cleanup.c:115-125), the loop stops
+/// (archives.c:1588-1592), and the configure queue is skipped
+/// (packages.c:179-180), so an earlier package stays unpacked and a later
+/// archive is never read. With dpkg's default of 50
+/// (src/main/main.c:206), dpkg continues instead; that dpkg-only row
+/// records the policy difference and is not a parity claim.
+fn genuineBatchFailure(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const old_lifecycle = try editArchive(fixture, arch, "1", "packages/statoverride-batch-failure/lifecycle");
+    defer fixture.allocator.free(old_lifecycle);
+    const new_lifecycle = try editArchive(fixture, arch, "2", "packages/statoverride-batch-failure/lifecycle");
+    defer fixture.allocator.free(new_lifecycle);
+    const old_provider = try support.makePackage(fixture, arch, "1", batch_provider, "packages/statoverride-batch-failure/provider", .{
+        .scripts = .{ .before_failure = batch_hook },
+    });
+    defer fixture.allocator.free(old_provider);
+    const new_provider = try support.makePackage(fixture, arch, "2", batch_provider, "packages/statoverride-batch-failure/provider", .{
+        .scripts = .{ .before_failure = batch_hook },
+    });
+    defer fixture.allocator.free(new_provider);
+    const selected = [_]foundation.PackageIdentity{
+        .{ .name = name, .architecture = arch },
+        .{ .name = batch_provider, .architecture = arch },
+    };
+    const provider_only = [_]foundation.PackageIdentity{.{ .name = batch_provider, .architecture = arch }};
+    for ([_]struct {
+        label: []const u8,
+        provider_first: bool,
+        abort_after: ?u32,
+    }{
+        .{ .label = "first", .provider_first = false, .abort_after = 1 },
+        .{ .label = "second", .provider_first = true, .abort_after = 1 },
+        .{ .label = "default-abort-after", .provider_first = false, .abort_after = null },
+    }) |entry| {
+        // Native has no counterpart to dpkg's default policy.
+        if (entry.abort_after == null and !fixture.oracle_only) continue;
+        for ([_]bool{ false, true }) |recovery| {
+            if (recovery and entry.abort_after == null) continue;
+            const label = try std.fmt.allocPrint(fixture.allocator, "statoverride-batch-failure-{s}{s}", .{
+                entry.label, if (recovery) "-recovery" else "",
+            });
+            defer fixture.allocator.free(label);
+            var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+            defer case.deinit();
+            try seed(&case, "");
+            try installDpkgStatoverride(&case, dpkg);
+            try replace(&case, edit_marker, "prerm:upgrade --update --update\n");
+            try both(&case, support.failure, name ++ "@1:prerm:upgrade\n" ++ name ++ "@2:prerm:failed-upgrade\n");
+            try case.seed(old_provider);
+            try case.seed(old_lifecycle);
+            const archives: []const []const u8 = if (entry.provider_first)
+                &.{ new_provider, new_lifecycle }
+            else
+                &.{ new_lifecycle, new_provider };
+            try case.phase(.{
+                .operation = "upgrade",
+                .archives = archives,
+                .packages = &selected,
+                .recovery = recovery,
+                .abort_after = entry.abort_after,
+            }, true);
+            try expectBatchReport(&case, "upgrade", entry.abort_after != null);
+            // The failed old prerm's `--update` stays on the restored version 1 files.
+            try expectEditApplied(&case);
+            try support.expectReferencePackage(&case, name, "install ok installed", "1");
+            try expectObserved(&case, base ++ "/mode", overridden_mode);
+            try expectObserved(&case, conffile_path, updated_conffile);
+            const provider_ran = entry.provider_first or entry.abort_after == null;
+            try expectIntroducedRecord(&case, provider_ran);
+            if (entry.abort_after == null)
+                try support.expectReferencePackage(&case, batch_provider, "install ok installed", "2")
+            else if (entry.provider_first)
+                try support.expectReferencePackage(&case, batch_provider, "install ok unpacked", "2")
+            else
+                try support.expectReferencePackage(&case, batch_provider, "install ok installed", "1");
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+            try expectNoUnpackStatOverrideInput(&case);
+            if (entry.abort_after == null) {
+                std.debug.print("{s}: dpkg default --abort-after continued past the failed archive and configured {s}; native stops at the first failure like --abort-after=1\n", .{
+                    case.name, batch_provider,
+                });
+                continue;
+            }
+            if (!entry.provider_first) continue;
+            // The halted run left the earlier package unpacked; configuring it settles the batch.
+            try case.phase(.{ .operation = "configure", .archives = &.{new_provider}, .packages = &provider_only, .recovery = recovery }, false);
+            try support.expectReferencePackage(&case, batch_provider, "install ok installed", "2");
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+        }
+    }
+}
+
 pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first = try archive(fixture, arch, "1");
     defer fixture.allocator.free(first);
@@ -735,6 +854,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try genuinePersistedInvocation(fixture, driver, dpkg, arch);
     try genuineConffileAdministratorMode(fixture, driver, dpkg, arch, first, second);
     try genuineBatchInvocation(fixture, driver, dpkg, arch, first, second);
+    try genuineBatchFailure(fixture, driver, dpkg, arch);
     try genuineChronyLifecycle(fixture, driver, dpkg, arch);
     try genuineChangedChronyLifecycle(fixture, driver, dpkg, arch);
     try genuineFailedChronyLifecycle(fixture, driver, dpkg, arch);
