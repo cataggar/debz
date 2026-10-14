@@ -51,6 +51,7 @@ const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_unpack_diversion = @import("native_unpack_diversion.zig");
 const native_unpack_route_settlement = @import("native_unpack_route_settlement.zig");
 const native_unpack_settlement = @import("native_unpack_settlement.zig");
+const native_unpack_statoverride = @import("native_unpack_statoverride.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -67,6 +68,10 @@ const version_module = @import("debian_version.zig");
 
 test "native_unpack.test.route settlement contract module" {
     _ = native_unpack_route_settlement;
+}
+
+test "native_unpack.test.unpack statoverride input module" {
+    _ = native_unpack_statoverride;
 }
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -116,6 +121,11 @@ const ExecutionState = struct {
     phase_steps: ?[]const root_mutation.Step = null,
     bounds: ?*RuntimeBounds = null,
     stat_overrides: ?native_statoverride.Resolved = null,
+    /// Resolution the intent froze; the first unpack invocation applies it.
+    frozen_stat_overrides: ?native_statoverride.Resolved = null,
+    /// Resolution the current unpack invocation applies to its own data;
+    /// null keeps the refreshed `stat_overrides`.
+    unpack_stat_overrides: ?native_statoverride.Resolved = null,
     stat_override_allocator: ?std.mem.Allocator = null,
     stat_override_database_bytes: ?[]const u8 = null,
     stat_override_records: []const package_database.StatOverrideRecord = &.{},
@@ -1514,6 +1524,189 @@ fn refreshExecutionStatOverrides(
     execution.stat_override_database_bytes =
         try copyStatOverrideDatabaseBytes(persistent, captured.snapshot.statoverride);
     return true;
+}
+
+/// How an unpack step obtains the statoverride resolution that dpkg reads
+/// once per `--unpack`/`--install` invocation (`archivefiles` calls
+/// `ensure_statoverrides` before any archive runs a maintainer script). A
+/// maximal run of consecutive unpack steps is one invocation.
+const UnpackStatOverrideCapture = enum {
+    /// Not the first step of an unpack invocation.
+    none,
+    /// The first invocation: no script has run since the intent froze the
+    /// resolution, so the frozen resolution is the invocation's input.
+    intent,
+    /// A later invocation: earlier steps may have edited the database or
+    /// account files, so the input is read live and persisted for replay.
+    persisted,
+};
+
+fn unpackStatOverrideCapture(
+    steps: []const native_program.Step,
+    sequence: u32,
+) error{InvalidLifecycleProgram}!UnpackStatOverrideCapture {
+    if (sequence >= steps.len or steps[sequence].sequence != sequence)
+        return error.InvalidLifecycleProgram;
+    if (steps[sequence].phase != .unpack or
+        (sequence != 0 and steps[sequence - 1].phase == .unpack))
+        return .none;
+    for (steps[0..sequence]) |step| switch (step.phase) {
+        .preflight, .bootstrap => {},
+        else => return .persisted,
+    };
+    return .intent;
+}
+
+fn readUnpackStatOverrides(
+    persistent: std.mem.Allocator,
+    temporary: std.mem.Allocator,
+    root: root_fs.Root,
+    native_architecture: []const u8,
+) !native_statoverride.Resolved {
+    var captured = try captureDatabaseSnapshot(temporary, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, native_architecture);
+    var database = switch (try package_database.importSnapshot(temporary, .{
+        .native_architecture = native_architecture,
+        .snapshot = captured.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidStatOverrideUpdate,
+    };
+    defer database.deinit();
+    const records = try cloneStatOverrideRecords(persistent, database.model.stat_overrides);
+    return native_statoverride.read(persistent, root, records) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidStatOverrideUpdate,
+    };
+}
+
+/// Returns the persisted input of the invocation starting at `sequence`,
+/// publishing it from a live read the first time. Null means the intent
+/// predates persisted inputs and keeps the refreshed resolution.
+fn persistedUnpackStatOverrides(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    native_architecture: []const u8,
+    sequence: u32,
+) !?native_statoverride.Resolved {
+    const persistent = execution.stat_override_allocator orelse
+        return error.InvalidLifecycleProgram;
+    const runtime = execution.recovery orelse
+        return try readUnpackStatOverrides(persistent, allocator, root, native_architecture);
+    var path_buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackStatOverridePath(sequence, &path_buffer);
+    const kind = block: {
+        var managed = try native_recovery.readManagedState(allocator, root);
+        defer managed.deinit();
+        if (!std.mem.eql(u8, &managed.document.intent_sha256, &runtime.intent_sha256) or
+            managed.document.transient != null)
+            return error.InvalidManagedState;
+        const snapshot = managed.document.stable orelse break :block null;
+        for (snapshot.entries) |entry|
+            if (std.mem.eql(u8, entry.path, path)) break :block entry.kind;
+        break :block null;
+    };
+    const bytes = if (kind) |value| switch (value) {
+        .regular => (try native_recovery.readManagedFile(
+            allocator,
+            root,
+            runtime.intent_sha256,
+            path,
+            native_unpack_statoverride.maximum_document_bytes,
+        )) orelse return error.InvalidManagedState,
+        .absent => published: {
+            try native_recovery.validateStableManagedState(allocator, root, runtime.intent_sha256);
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const live = try readUnpackStatOverrides(
+                arena.allocator(),
+                allocator,
+                root,
+                native_architecture,
+            );
+            const encoded = try native_unpack_statoverride.encode(
+                allocator,
+                live,
+                runtime.intent_sha256,
+                sequence,
+            );
+            errdefer allocator.free(encoded);
+            try root.publishFile(try root_fs.Path.init(path), encoded, .{
+                .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
+                .overwrite = .fail_if_exists,
+                .durable = true,
+            });
+            _ = try checkpointManagedPaths(
+                allocator,
+                runtime,
+                nativeAction(.verification, sequence, native_recovery.unpack_statoverride_substep, 0),
+                &.{},
+                &.{path},
+                false,
+            );
+            runtime.crash.hit(.after_unpack_statoverride_capture);
+            break :published encoded;
+        },
+        else => return error.InvalidManagedState,
+    } else {
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidManagedState;
+        return null;
+    };
+    defer allocator.free(bytes);
+    return try native_unpack_statoverride.decode(persistent, bytes, runtime.intent_sha256, sequence);
+}
+
+/// Binds the statoverride input of the unpack invocation `step` belongs to;
+/// scripts inside the invocation still refresh the tracked resolution.
+fn captureUnpackStatOverrides(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    steps: []const native_program.Step,
+    native_architecture: []const u8,
+    step: native_program.Step,
+) !void {
+    switch (try unpackStatOverrideCapture(steps, step.sequence)) {
+        .none => if (step.phase != .unpack) {
+            execution.unpack_stat_overrides = null;
+        },
+        .intent => execution.unpack_stat_overrides = execution.frozen_stat_overrides,
+        .persisted => execution.unpack_stat_overrides = try persistedUnpackStatOverrides(
+            execution,
+            allocator,
+            root,
+            native_architecture,
+            step.sequence,
+        ),
+    }
+}
+
+fn beginLifecycleProgramStep(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+    attempt: *root_operation.Attempt,
+    step: native_program.Step,
+) !native_program.Operation {
+    const operation = try beginNativeProgramStep(execution, step);
+    captureUnpackStatOverrides(
+        execution,
+        allocator,
+        root,
+        program.steps,
+        program.target_architecture,
+        step,
+    ) catch |err| {
+        attempt.requireRecovery(allocator, .verification) catch |recovery_err| {
+            if (recovery_err != error.MutationEvidenceRequired) return recovery_err;
+        };
+        return err;
+    };
+    return operation;
 }
 
 const CombinedMutationHooks = struct {
@@ -12687,6 +12880,10 @@ fn boundConffileFile(
     return file;
 }
 
+/// Writes the packaged conffile with the owner and mode of `metadata`. dpkg
+/// configures from `.dpkg-new`, which unpack created with the invocation's
+/// statoverride, after `file_copy_perms` copied the installed file's owner
+/// and mode onto it; configure itself never reads statoverrides.
 fn appendArchiveConffileIntent(
     intents: *std.ArrayList(root_mutation.Intent),
     allocator: std.mem.Allocator,
@@ -12694,8 +12891,7 @@ fn appendArchiveConffileIntent(
     archive: *const BoundArchive,
     file: archive_application.File,
     overwrite: root_mutation.Overwrite,
-    metadata: ?root_fs.Entry,
-    stat_override: ?native_statoverride.Metadata,
+    metadata: root_fs.Entry,
 ) !void {
     var intent = try root_mutation.archiveFileIntent(
         path,
@@ -12704,16 +12900,9 @@ fn appendArchiveConffileIntent(
         archive.binding,
     );
     intent.file.overwrite = overwrite;
-    if (stat_override) |override| {
-        intent.file.mode = override.mode;
-        intent.file.uid = override.uid;
-        intent.file.gid = override.gid;
-    }
-    if (metadata) |entry| {
-        intent.file.mode = entry.mode;
-        intent.file.uid = entry.uid;
-        intent.file.gid = entry.gid;
-    }
+    intent.file.mode = metadata.mode;
+    intent.file.uid = metadata.uid;
+    intent.file.gid = metadata.gid;
     try intents.append(allocator, intent);
 }
 
@@ -13174,8 +13363,7 @@ fn materializeConfigure(
                     archive,
                     file,
                     .require_absent,
-                    null,
-                    stat_overrides.get(conffile.path),
+                    try request.root.entry(try root_fs.Path.initPackage(staged)),
                 ),
                 .replace_unmodified => try appendArchiveConffileIntent(
                     &intents,
@@ -13184,8 +13372,7 @@ fn materializeConfigure(
                     archive,
                     file,
                     .replace,
-                    null,
-                    stat_overrides.get(conffile.path),
+                    try request.root.entry(try root_fs.Path.initPackage(physical)),
                 ),
                 .keep_existing_stage_dist => {
                     const dist = try std.fmt.allocPrint(
@@ -13210,8 +13397,8 @@ fn materializeConfigure(
                         archive,
                         file,
                         .require_absent,
-                        live_metadata,
-                        stat_overrides.get(conffile.path),
+                        live_metadata orelse
+                            try request.root.entry(try root_fs.Path.initPackage(staged)),
                     );
                 },
                 .install_stage_old => {
@@ -13250,7 +13437,6 @@ fn materializeConfigure(
                         file,
                         .replace,
                         current,
-                        stat_overrides.get(conffile.path),
                     );
                 },
                 .identical_no_op,
@@ -17340,6 +17526,7 @@ fn lifecycleDataStep(
         &sequences,
     );
     request.hooks = hooks;
+    if (execution.unpack_stat_overrides) |invocation| request.planning.stat_overrides = invocation;
     request.mutation_database_step = mutation_database_step;
     if (publication_diversions) |cache| request.planning.diversion_records = cache.records;
     request.unpack_diversions = publication_diversions;
@@ -21533,7 +21720,9 @@ const LifecycleScriptOutcome = union(enum) {
 
 /// An exited non-preinst script publishes the override database it leaves,
 /// even after a nonzero exit, to later phases and recovery checkpoints, like
-/// the diversion refresh. Preinst keeps the resolution its unpack used.
+/// the diversion refresh. Unpack data steps never see the refresh: they apply
+/// the input their invocation bound (`captureUnpackStatOverrides`). Preinst
+/// keeps the resolution its unpack used until the next refresh.
 fn scriptRefreshesStatOverrides(
     outcome: LifecycleScriptOutcome,
     kind: maintainer_script.Kind,
@@ -28915,9 +29104,14 @@ fn prepareNativeRecovery(
     for (program.steps) |step| if (step.operation == .unpack_package) {
         unpack_count += 1;
     };
+    var statoverride_capture_count: usize = 0;
+    for (program.steps) |step|
+        if (try unpackStatOverrideCapture(program.steps, step.sequence) == .persisted) {
+            statoverride_capture_count += 1;
+        };
     const observed_paths = try allocator.alloc(
         []const u8,
-        stat_overrides.observed_paths.len + 2 + unpack_count * 2,
+        stat_overrides.observed_paths.len + 2 + unpack_count * 2 + statoverride_capture_count,
     );
     @memcpy(observed_paths[0..stat_overrides.observed_paths.len], stat_overrides.observed_paths);
     observed_paths[stat_overrides.observed_paths.len] = native_diversion.database_path;
@@ -28943,6 +29137,18 @@ fn prepareNativeRecovery(
         );
         observed_index += 1;
     };
+    for (program.steps) |step|
+        if (try unpackStatOverrideCapture(program.steps, step.sequence) == .persisted) {
+            var statoverride_buffer: [128]u8 = undefined;
+            observed_paths[observed_index] = try allocator.dupe(
+                u8,
+                try native_recovery.unpackStatOverridePath(
+                    step.sequence,
+                    &statoverride_buffer,
+                ),
+            );
+            observed_index += 1;
+        };
     _ = try native_recovery.updateManagedState(
         allocator,
         root,
@@ -30373,6 +30579,7 @@ fn orphanNativeEvidenceDetail(
                 name,
                 native_recovery.unpack_route_settlement_prefix,
             ) or
+            std.mem.startsWith(u8, name, native_recovery.unpack_statoverride_prefix) or
             std.mem.eql(u8, name, "native-trigger-events-v1.json") or
             std.mem.startsWith(
                 u8,
@@ -33589,6 +33796,7 @@ fn executeLifecycleProgramWithRequest(
         .bounds = bounds,
         .removal_retry = compiled.removal_retry != null or retry_on_recovery,
         .stat_overrides = stat_overrides,
+        .frozen_stat_overrides = stat_overrides,
         .stat_override_allocator = scratch,
         .stat_override_database_bytes = try copyStatOverrideDatabaseBytes(
             scratch,
@@ -33847,7 +34055,14 @@ fn executeLifecycleProgramWithRequest(
             locked_snapshot.status.bytes,
     );
 
-    for (program.steps) |step| switch (try beginNativeProgramStep(execution, step)) {
+    for (program.steps) |step| switch (try beginLifecycleProgramStep(
+        execution,
+        allocator,
+        root,
+        program,
+        attempt,
+        step,
+    )) {
         .assert_authorization,
         .assert_root_state,
         .assert_database_generation,
@@ -36012,9 +36227,15 @@ test "native_unpack.test.unpack diversion paths have an exact bounded program st
             step,
             (try native_recovery.unpackRouteSettlementStep(route_path)).?,
         );
+        var statoverride_buffer: [128]u8 = undefined;
+        const statoverride_path = try native_recovery.unpackStatOverridePath(step, &statoverride_buffer);
+        try testing.expectEqual(step, (try native_recovery.unpackStatOverrideStep(statoverride_path)).?);
+        try testing.expect(try native_recovery.unpackDiversionStep(statoverride_path) == null);
+        try testing.expect(try native_recovery.unpackStatOverrideStep(path) == null);
     }
     try testing.expect(try native_recovery.unpackDiversionStep(native_recovery.diversion_cache_path) == null);
     try testing.expect(try native_recovery.unpackRouteSettlementStep(native_recovery.diversion_cache_path) == null);
+    try testing.expect(try native_recovery.unpackStatOverrideStep(native_recovery.diversion_cache_path) == null);
     for ([_][]const u8{
         "07.json", "-1.json", "+1.json", "4294967296.json", ".json", "7.json.extra", "7", "7/child.json",
     }) |suffix| {
@@ -36036,6 +36257,135 @@ test "native_unpack.test.unpack diversion paths have an exact bounded program st
             error.InvalidUnpackRouteSettlementPath,
             native_recovery.unpackRouteSettlementStep(route_path),
         );
+        const statoverride_path = try std.fmt.allocPrint(
+            testing.allocator,
+            root_operation.namespace_path ++ "/" ++ native_recovery.unpack_statoverride_prefix ++ "{s}",
+            .{suffix},
+        );
+        defer testing.allocator.free(statoverride_path);
+        try testing.expectError(
+            error.InvalidUnpackStatOverridePath,
+            native_recovery.unpackStatOverrideStep(statoverride_path),
+        );
+    }
+}
+
+test "native_unpack.test.orphan unpack statoverride input remains active" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(try root_fs.Path.init(root_operation.namespace_path), .fromMode(0o755));
+    try testing.expect(!try Runtime.hasActiveEvidence(testing.allocator, root));
+    var buffer: [128]u8 = undefined;
+    try root.publishFile(
+        try root_fs.Path.init(try native_recovery.unpackStatOverridePath(7, &buffer)),
+        "orphan unpack statoverride input",
+        .{},
+    );
+    try testing.expect(try Runtime.hasActiveEvidence(testing.allocator, root));
+}
+
+test "native_unpack.test.unpack statoverride input binds once per unpack invocation" {
+    const verify: native_program.Operation = .{ .verify_final_state = .{
+        .final_state_sha256 = @splat('0'),
+        .installed_count = 0,
+        .config_files_count = 0,
+    } };
+    const Case = struct {
+        phases: []const native_program.Phase,
+        expected: []const UnpackStatOverrideCapture,
+    };
+    for ([_]Case{
+        .{
+            .phases = &.{ .preflight, .unpack, .unpack, .configure, .remove, .unpack, .unpack, .trigger, .unpack, .verify },
+            .expected = &.{ .none, .intent, .none, .none, .none, .persisted, .none, .none, .persisted, .none },
+        },
+        .{
+            .phases = &.{ .preflight, .bootstrap, .bootstrap, .unpack, .unpack, .configure },
+            .expected = &.{ .none, .none, .none, .intent, .none, .none },
+        },
+        .{
+            .phases = &.{ .remove, .unpack, .configure, .unpack },
+            .expected = &.{ .none, .persisted, .none, .persisted },
+        },
+        .{
+            .phases = &.{ .unpack, .unpack },
+            .expected = &.{ .intent, .none },
+        },
+        .{
+            .phases = &.{ .preflight, .remove, .configure, .verify },
+            .expected = &.{ .none, .none, .none, .none },
+        },
+    }) |case| {
+        var steps: [10]native_program.Step = undefined;
+        for (case.phases, 0..) |phase, index| steps[index] = .{
+            .sequence = @intCast(index),
+            .phase = phase,
+            .requires = &.{},
+            .operation = verify,
+        };
+        for (case.expected, 0..) |expected, index|
+            try testing.expectEqual(expected, try unpackStatOverrideCapture(steps[0..case.phases.len], @intCast(index)));
+        try testing.expectError(
+            error.InvalidLifecycleProgram,
+            unpackStatOverrideCapture(steps[0..case.phases.len], @intCast(case.phases.len)),
+        );
+        steps[1].sequence = 7;
+        try testing.expectError(error.InvalidLifecycleProgram, unpackStatOverrideCapture(steps[0..case.phases.len], 1));
+    }
+}
+
+test "native_unpack.test.unpack statoverride data input ignores refreshes inside its invocation" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init("", &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.ensureDirectory(try root_fs.Path.init("etc"), root_fs.default_directory_permissions);
+    try root.publishFile(try root_fs.Path.init("etc/passwd"), "root:x:0:0::/:/bin/sh\n_fixture:x:42420:42421::/:/bin/sh\n", .{});
+    try root.publishFile(try root_fs.Path.init("etc/group"), "root:x:0:\n_fixture:x:42421:\n", .{});
+    const database = try root_fs.Path.init("var/lib/dpkg/statoverride");
+    try root.publishFile(database, "_fixture _fixture 4750 /usr/share/mode\n", .{});
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const frozen_metadata: native_statoverride.Metadata = .{ .mode = 0o600, .uid = 0, .gid = 0 };
+    const live_metadata: native_statoverride.Metadata = .{ .mode = 0o4750, .uid = 42420, .gid = 42421 };
+    var frozen: native_statoverride.Resolved = .{};
+    try frozen.paths.put(arena, "usr/share/mode", frozen_metadata);
+    var refreshed: native_statoverride.Resolved = .{};
+    try refreshed.paths.put(arena, "usr/share/mode", .{ .mode = 0o700, .uid = 1, .gid = 1 });
+    var execution: ExecutionState = .{
+        .stat_overrides = frozen,
+        .frozen_stat_overrides = frozen,
+        .stat_override_allocator = arena,
+    };
+    const verify: native_program.Operation = .{ .verify_final_state = .{
+        .final_state_sha256 = @splat('0'),
+        .installed_count = 0,
+        .config_files_count = 0,
+    } };
+    const phases = [_]native_program.Phase{ .preflight, .unpack, .unpack, .remove, .unpack, .unpack, .configure };
+    const expected = [_]?native_statoverride.Metadata{ null, frozen_metadata, frozen_metadata, null, live_metadata, live_metadata, null };
+    var steps: [phases.len]native_program.Step = undefined;
+    for (phases, 0..) |phase, index| steps[index] = .{
+        .sequence = @intCast(index),
+        .phase = phase,
+        .requires = &.{},
+        .operation = verify,
+    };
+    for (steps, expected) |step, want| {
+        try captureUnpackStatOverrides(&execution, testing.allocator, root, &steps, "amd64", step);
+        if (want) |metadata|
+            try testing.expectEqual(metadata, execution.unpack_stat_overrides.?.get("usr/share/mode").?)
+        else
+            try testing.expect(execution.unpack_stat_overrides == null);
+        // Scripts refresh the tracked resolution and edit the database; an
+        // invocation's bound input sees neither.
+        execution.stat_overrides = refreshed;
+        if (step.sequence == 4)
+            try root.publishFile(database, "root root 0700 /usr/share/mode\n", .{ .overwrite = .replace });
     }
 }
 
@@ -40073,6 +40423,13 @@ test "native_unpack.test.production recovery resumes persisted preparation witho
     try testPreparedMixedLifecycle(true, .production_resume);
 }
 
+test "native_unpack.test.persisted unpack statoverride input replays after a capture crash" {
+    try testPreparedMixedLifecycle(false, .statoverride_capture_crash);
+    try testPreparedMixedLifecycle(true, .statoverride_capture_crash);
+    try testPreparedMixedLifecycle(false, .statoverride_capture_tampered);
+    try testPreparedMixedLifecycle(true, .statoverride_capture_deleted);
+}
+
 test "native_unpack.test.helper preflight refuses planned removal of its target" {
     try testPreparedMixedLifecycle(false, .helper_target_removed);
     try testPreparedMixedLifecycle(true, .helper_target_removed);
@@ -40142,6 +40499,9 @@ const MixedLifecycleCase = enum {
     borrowed,
     production,
     production_resume,
+    statoverride_capture_crash,
+    statoverride_capture_tampered,
+    statoverride_capture_deleted,
     empty_closure,
     helper_target_removed,
     public_missing_helper,
@@ -40664,7 +41024,9 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         } else try caller.abandonIfPreMutation(testing.allocator);
         return;
     }
-    const production = case == .production or case == .production_resume or empty_closure;
+    const capture_drift = case == .statoverride_capture_tampered or case == .statoverride_capture_deleted;
+    const production = case == .production or case == .production_resume or
+        case == .statoverride_capture_crash or capture_drift or empty_closure;
     if (case == .public_missing_helper) {
         try testing.expectError(error.NativeHelperTargetMissing, Runtime.execute(testing.allocator, .{
             .attempt = &caller,
@@ -40734,7 +41096,68 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expectError(error.NativeHelperBindingRequired, Runtime.recover(testing.allocator, &caller));
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
     }
-    const result = if (case == .production_resume)
+    // The removal phase precedes the unpack, so its invocation reads a live
+    // statoverride input that production execution must persist for replay.
+    const capture_step: ?u32 = block: {
+        const steps = compiled.program.program.steps;
+        var found: ?u32 = null;
+        for (steps) |step| switch (try unpackStatOverrideCapture(steps, step.sequence)) {
+            .none => {},
+            .intent => return error.TestUnexpectedResult,
+            .persisted => {
+                try testing.expect(found == null);
+                found = step.sequence;
+            },
+        };
+        break :block found;
+    };
+    try testing.expectEqual(empty_closure, capture_step == null);
+    var capture_buffer: [128]u8 = undefined;
+    const capture_path = try root_fs.Path.init(
+        try native_recovery.unpackStatOverridePath(capture_step orelse 0, &capture_buffer),
+    );
+    if (case == .statoverride_capture_crash or capture_drift) {
+        try expectPreparedNativeProgramCrash(root, &compiled, &.{bytes}, &caller, locks.interface(), .after_unpack_statoverride_capture);
+        var intent = try native_recovery.readIntent(testing.allocator, root);
+        defer intent.deinit();
+        const captured = try root.readFileAlloc(arena.allocator(), capture_path, native_unpack_statoverride.maximum_document_bytes);
+        const resolved = try native_unpack_statoverride.decode(arena.allocator(), captured, intent.intent.digest_sha256, capture_step.?);
+        try testing.expectEqual(@as(usize, 0), resolved.paths.count());
+        try testing.expect(try native_recovery.managedCheckpointMatchesAction(
+            testing.allocator,
+            root,
+            intent.intent.digest_sha256,
+            nativeAction(.verification, capture_step.?, native_recovery.unpack_statoverride_substep, 0),
+        ));
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/old")) == null);
+        try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+        if (case == .statoverride_capture_tampered)
+            try root.publishFile(capture_path, "{}", .{ .overwrite = .replace });
+        if (case == .statoverride_capture_deleted) try root.removeFile(capture_path);
+        caller.release();
+        var previous = (try coordinator.inspect(testing.allocator)).?;
+        defer previous.deinit();
+        const record = previous.record;
+        caller = try coordinator.acquire(testing.allocator, .{
+            .intent = .recovery,
+            .backend = .native,
+            .operation = record.operation,
+            .request_sha256 = record.request_sha256,
+            .policy_sha256 = record.policy_sha256,
+            .target_architecture = record.target_architecture,
+            .foreign_architectures = record.foreign_architectures,
+            .evidence = record.evidence(),
+        });
+        if (capture_drift) {
+            const refused = try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null);
+            try testing.expectEqual(LifecycleOutcome.recovery_required, refused.outcome);
+            try testing.expectEqualStrings("managed_state_changed", refused.detail);
+            try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
+            try testing.expect(try Runtime.hasActiveEvidence(testing.allocator, root));
+            return;
+        }
+    }
+    const result = if (case == .production_resume or case == .statoverride_capture_crash)
         try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null)
     else if (production)
         try executePreparedNativeProgram(
@@ -40778,8 +41201,13 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         return error.TestUnexpectedResult;
     }
     if (case == .borrowed or production) {
+        // A crashed caller is reacquired for recovery and stays recovering.
+        const recovered_caller = case == .statoverride_capture_crash;
         try testing.expect(caller.locked());
-        try testing.expectEqual(root_operation.State.mutating, caller.record().state);
+        try testing.expectEqual(
+            if (recovered_caller) root_operation.State.recovering else root_operation.State.mutating,
+            caller.record().state,
+        );
         try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
         try testing.expect(caller.record().operation.eql(.{ .repository_bootstrap = .add }));
         try testing.expectEqual([_]u8{0x71} ** 32, caller.record().request_sha256);
@@ -40791,6 +41219,11 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         if (production) {
             var intent = try native_recovery.readIntent(testing.allocator, root);
             defer intent.deinit();
+            if (capture_step) |sequence| {
+                const captured = try root.readFileAlloc(arena.allocator(), capture_path, native_unpack_statoverride.maximum_document_bytes);
+                const resolved = try native_unpack_statoverride.decode(arena.allocator(), captured, intent.intent.digest_sha256, sequence);
+                try testing.expectEqual(@as(usize, 0), resolved.paths.count());
+            }
             const blob = intent.intent.blobs[0];
             try testing.expectEqual(native_recovery.BlobKind.request, blob.kind);
             try testing.expectEqualStrings(
@@ -40881,13 +41314,17 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             );
             try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
             try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.workspace_directory)) == null);
+            try testing.expect(try root.entryIfExists(capture_path) == null);
+            try testing.expect(!try Runtime.hasActiveEvidence(testing.allocator, root));
             try native_provenance.verifyEvidence(testing.allocator, root, receipt.document);
             const after_ack = try recoverPreparedNativeProgram(testing.allocator, root, &caller, locks.interface(), null);
             try testing.expectEqual(LifecycleOutcome.applied, after_ack.outcome);
         }
-        try caller.advance(testing.allocator, .{ .state = .mutating, .phase = .mutation });
-        try caller.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
-        try caller.complete(testing.allocator, .succeeded);
+        if (!recovered_caller) {
+            try caller.advance(testing.allocator, .{ .state = .mutating, .phase = .mutation });
+            try caller.advance(testing.allocator, .{ .state = .verifying, .phase = .verification });
+        }
+        try caller.complete(testing.allocator, if (recovered_caller) .recovered else .succeeded);
         try caller.publishProvenance(testing.allocator, @splat(0x74));
         try caller.clear();
     }
