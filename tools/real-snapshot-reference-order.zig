@@ -958,8 +958,9 @@ pub const Context = struct {
         for (try paths.names(self.a, self.io, directory, maximum_packages * 12)) |entry| {
             if (!std.mem.endsWith(u8, entry, ".list")) continue;
             const data = try self.read(self.root, try std.fmt.allocPrint(self.a, "var/lib/dpkg/info/{s}", .{entry}), 8 * 1024 * 1024);
-            var lines = std.mem.splitScalar(u8, data, '\n');
-            while (lines.next()) |line| if (eq(u8, std.mem.trimEnd(u8, line, "\r"), "/dev/null")) return error.ReferencePackageClaimsExcludedDevice;
+            // As the original bytes.splitlines(): \n, \r and \r\n each end a line.
+            var lines = std.mem.splitAny(u8, data, "\r\n");
+            while (lines.next()) |line| if (eq(u8, line, "/dev/null")) return error.ReferencePackageClaimsExcludedDevice;
         }
     }
 };

@@ -949,9 +949,11 @@ test "installed custom-prefix ordering report is actual producer and protected h
         try expectEqualStrings("ii  fixture:amd64 1\n", try paths.readRootFile(a, root, "reference-installed.txt", 4096));
     }
 
-    try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/fixture.list", .data = "/dev/null\n" });
-    const claims = try std.process.run(a, io, .{ .argv = command, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });
-    try expect(claims.term == .exited and claims.term.exited != 0 and std.mem.indexOf(u8, claims.stderr, "ReferencePackageClaimsExcludedDevice") != null);
+    for ([_][]const u8{ "/dev/null\n", "/usr/share/doc/fixture\r/dev/null", "/dev/null\r/usr/share/doc/fixture\n" }) |list| {
+        try work.dir.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/fixture.list", .data = list });
+        const claims = try std.process.run(a, io, .{ .argv = command, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });
+        try expect(claims.term == .exited and claims.term.exited != 0 and std.mem.indexOf(u8, claims.stderr, "ReferencePackageClaimsExcludedDevice") != null);
+    }
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(a, test_options.protected_reference);
     for ([_][]const u8{ "--launcher", "--runtime", "--runtime-tool", "--dpkg", "--root-template", "--workspace", "--archive", "--escape-probe", "--escape-archive", "--profile-scripts" }) |flag|
