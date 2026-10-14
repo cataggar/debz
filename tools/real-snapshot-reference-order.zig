@@ -360,6 +360,26 @@ pub fn conserved(before: []Fields, after: []Fields, selected: []const Package) b
     }
     return true;
 }
+/// The original pending schedule comparison: (status, version) per (package,
+/// architecture), with only `half_configured` moved to half-configured. dpkg
+/// legitimately rewrites other fields (conffile hashes) before the denied postinst.
+pub fn scheduleConserved(candidate: []Fields, pending: []Fields, half_configured: Package) bool {
+    const added: usize = if (findRecord(candidate, half_configured) == null) 1 else 0;
+    if (pending.len != candidate.len + added) return false;
+    for (pending) |record| {
+        const name = field(record, "package");
+        const architecture = field(record, "architecture");
+        var status: []const u8 = "install ok half-configured";
+        var version: []const u8 = half_configured.version;
+        if (!eq(u8, name, half_configured.name) or !eq(u8, architecture, half_configured.architecture)) {
+            const wanted = findRecord(candidate, .{ .name = name, .architecture = architecture, .version = "", .digest = "", .size = 0, .archive = "" }) orelse return false;
+            status = field(wanted, "status");
+            version = field(wanted, "version");
+        }
+        if (!eq(u8, field(record, "status"), status) or !eq(u8, field(record, "version"), version)) return false;
+    }
+    return true;
+}
 
 pub const Member = struct { name: []const u8, bytes: []const u8, kind: u8 };
 pub fn tarMembers(a: A, data: []const u8) ![]Member {
@@ -1989,13 +2009,8 @@ pub fn proveBaseCycle(ctx: Context, setpriv: []const u8) !void {
     try validatePendingResult(observed);
     if (!eq(u8, signed_script, try ctx.read(baseline, relative, maximum_probe_output))) return error.CycleProofCallbackChanged;
     const wanted = try ctx.database(candidate);
-    const expected = try ctx.a.alloc(Fields, wanted.len);
-    for (wanted, expected) |record, *copy| {
-        copy.* = try record.clone(ctx.a);
-        if (eq(u8, field(record, "package"), "libc6") and eq(u8, field(record, "architecture"), "amd64"))
-            try copy.put(ctx.a, "status", .{ .string = "install ok half-configured" });
-    }
-    if (!conserved(expected, after_pending, &.{})) return error.CycleProofScheduleChanged;
+    const libc6: Package = .{ .name = "libc6", .architecture = "amd64", .version = cycle[0].version, .digest = "", .size = 0, .archive = "" };
+    if (!scheduleConserved(wanted, after_pending, libc6)) return error.CycleProofScheduleChanged;
     try ctx.json(proof, "comparison.json", .{
         .schema = "io.github.cataggar.debz.base-cycle-proof.v1",
         .callbacks_executed = @as([]const []const u8, &.{}),

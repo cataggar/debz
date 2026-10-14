@@ -1550,6 +1550,8 @@ const Oracle = struct {
     configured: bool,
     probes: usize = 0,
     overrides: std.ArrayList([3][]const u8) = .empty,
+    hosted: ?Hosted = null,
+    const Hosted = struct { candidate: []order.Fields, pending: []order.Fields };
     fn get(pointer: *anyopaque) *Oracle {
         return @ptrCast(@alignCast(pointer));
     }
@@ -1559,6 +1561,9 @@ const Oracle = struct {
     fn database(pointer: *anyopaque, root: []const u8) ![]order.Fields {
         const self = get(pointer);
         if (eq(u8, root, self.image)) return self.a.alloc(order.Fields, 0);
+        // Retained hosted records replace the synthetic overrides once those would apply.
+        if (self.hosted) |hosted| for (self.overrides.items) |override| if (eq(u8, override[0], std.fs.path.basename(root)))
+            return self.base.clone(if (eq(u8, override[0], "candidate")) hosted.candidate else hosted.pending);
         const result = try self.base.clone(self.base.records);
         for (self.overrides.items) |override| if (eq(u8, override[0], std.fs.path.basename(root))) for (result) |*record| {
             if (eq(u8, order.field(record.*, "package"), override[1])) try record.put(self.a, "status", .{ .string = override[2] });
@@ -1617,6 +1622,9 @@ const Oracle = struct {
     }
 };
 fn pendingOracle(a: A, work: std.testing.TmpDir, stderr: []const u8, returncode: i32, configured: bool) !void {
+    return pendingOracleWith(a, work, stderr, returncode, configured, null);
+}
+fn pendingOracleWith(a: A, work: std.testing.TmpDir, stderr: []const u8, returncode: i32, configured: bool, hosted: ?Oracle.Hosted) !void {
     const root = try rootPath(a, work);
     try work.dir.createDir(io, "image", .default_dir);
     var image_dir = try work.dir.openDir(io, "image", .{});
@@ -1640,7 +1648,7 @@ fn pendingOracle(a: A, work: std.testing.TmpDir, stderr: []const u8, returncode:
         _ = try paths.syscall(linux.fchmod(pin.fd, 0o644));
     }
     const image = try std.fmt.allocPrint(a, "{s}/image", .{root});
-    var oracle: Oracle = .{ .a = a, .base = base, .image = image, .library = library, .stderr = stderr, .returncode = returncode, .configured = configured };
+    var oracle: Oracle = .{ .a = a, .base = base, .image = image, .library = library, .stderr = stderr, .returncode = returncode, .configured = configured, .hosted = hosted };
     var env: std.process.Environ.Map = .init(a);
     try env.put("PATH", "/usr/bin:/bin");
     const ctx: order.Context = .{
@@ -1688,6 +1696,93 @@ test "original pending loader refusal retains evidence but never counts as callb
     const status = (try evidenceJson(a, proof, "pending-status.json")).object;
     try expectEqualStrings(try std.json.Stringify.valueAlloc(a, status.get("before").?, .{}), try std.json.Stringify.valueAlloc(a, status.get("after").?, .{}));
     try expect(!try paths.exists(proof, "comparison.json"));
+}
+
+// Genuine dpkg records retained by hosted run 38480672695 at c70236b (signed-proc Debug and
+// ReleaseSafe artifacts are byte-identical, and canonical-JSON equal to main e749214's green
+// run 38480170667). Each record of base-cycle-proof/base-cycle-after.json "records" (sha256
+// cd0591481a9eb4a1949f2f78cb1e31227023ae789b18168bae286d429cc2b943) and pending-status.json
+// "after" (sha256 6e07b6617288cfb7c738115bc396f8c1eb1f7b3902f6ee3f6178a3ab9b0e0b5b), as
+// json.dumps(record, separators=(",", ":")), plus pending.stderr verbatim. dpkg --configure
+// records the libc6 conffile hash before the postinst is denied, so the schedule is compared
+// by status and version only, as the original did.
+const hosted_candidate =
+    \\[{"package":"gcc-16-base","status":"install ok installed","priority":"optional","section":"libs","installed-size":"105","maintainer":"Ubuntu Core developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"gcc-16","version":"16-20260322-1ubuntu1","breaks":"gnat (<< 7)","description":"GCC, the GNU Compiler Collection (base package)\n This package contains files common to all languages and libraries\n contained in the GNU Compiler Collection (GCC).","homepage":"http://gcc.gnu.org/","original-maintainer":"Debian GCC Maintainers <debian-gcc@lists.debian.org>"}
+    \\,{"package":"libc-gconv-modules-extra","status":"install ok installed","priority":"optional","section":"libs","installed-size":"8079","maintainer":"Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"glibc","version":"2.43-2ubuntu2.4","replaces":"libc6 (<< 2.42-1)","breaks":"libc6 (<< 2.42-1)","description":"GNU C Library: Non-essential gconv modules\n This package provides additional character set conversion modules for the GNU\n C Library's gconv facility, to support encodings other than Latin-1 and UTF\n based.","original-maintainer":"GNU Libc Maintainers <debian-glibc@lists.debian.org>","homepage":"https://www.gnu.org/software/libc/libc.html","original-vcs-browser":"https://salsa.debian.org/glibc-team/glibc","original-vcs-git":"https://salsa.debian.org/glibc-team/glibc.git"}
+    \\,{"package":"libc6","status":"install ok unpacked","priority":"optional","section":"libs","installed-size":"5798","maintainer":"Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"glibc","version":"2.43-2ubuntu2.4","replaces":"libc6-amd64","depends":"libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)","recommends":"libidn2-0 (>= 2.0.5~)","suggests":"glibc-doc, debconf | debconf-2.0, locales, libnss-nis, libnss-nisplus","breaks":"base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)","conffiles":"\n /etc/ld.so.conf.d/x86_64-linux-gnu.conf newconffile","description":"GNU C Library: Shared libraries\n Contains the standard libraries that are used by nearly all programs on\n the system. This package includes shared versions of the standard C library\n and the standard math library, as well as many others.","original-maintainer":"GNU Libc Maintainers <debian-glibc@lists.debian.org>","homepage":"https://www.gnu.org/software/libc/libc.html","original-vcs-browser":"https://salsa.debian.org/glibc-team/glibc","original-vcs-git":"https://salsa.debian.org/glibc-team/glibc.git"}
+    \\,{"package":"libgcc-s1","protected":"yes","status":"install ok installed","priority":"optional","section":"libs","installed-size":"201","maintainer":"Ubuntu Core developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"gcc-16","version":"16-20260322-1ubuntu1","replaces":"libgcc1 (<< 1:10)","provides":"libgcc1 (= 1:16-20260322-1ubuntu1)","depends":"gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)","description":"GCC support library\n Shared version of the support library, a library of internal subroutines\n that GCC uses to overcome shortcomings of particular machines, or\n special needs for some languages.","homepage":"http://gcc.gnu.org/","important":"yes","original-maintainer":"Debian GCC Maintainers <debian-gcc@lists.debian.org>"}]
+;
+const hosted_pending =
+    \\[{"package":"gcc-16-base","status":"install ok installed","priority":"optional","section":"libs","installed-size":"105","maintainer":"Ubuntu Core developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"gcc-16","version":"16-20260322-1ubuntu1","breaks":"gnat (<< 7)","description":"GCC, the GNU Compiler Collection (base package)\n This package contains files common to all languages and libraries\n contained in the GNU Compiler Collection (GCC).","homepage":"http://gcc.gnu.org/","original-maintainer":"Debian GCC Maintainers <debian-gcc@lists.debian.org>"}
+    \\,{"package":"libc-gconv-modules-extra","status":"install ok installed","priority":"optional","section":"libs","installed-size":"8079","maintainer":"Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"glibc","version":"2.43-2ubuntu2.4","replaces":"libc6 (<< 2.42-1)","breaks":"libc6 (<< 2.42-1)","description":"GNU C Library: Non-essential gconv modules\n This package provides additional character set conversion modules for the GNU\n C Library's gconv facility, to support encodings other than Latin-1 and UTF\n based.","original-maintainer":"GNU Libc Maintainers <debian-glibc@lists.debian.org>","homepage":"https://www.gnu.org/software/libc/libc.html","original-vcs-browser":"https://salsa.debian.org/glibc-team/glibc","original-vcs-git":"https://salsa.debian.org/glibc-team/glibc.git"}
+    \\,{"package":"libc6","status":"install ok half-configured","priority":"optional","section":"libs","installed-size":"5798","maintainer":"Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"glibc","version":"2.43-2ubuntu2.4","replaces":"libc6-amd64","depends":"libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)","recommends":"libidn2-0 (>= 2.0.5~)","suggests":"glibc-doc, debconf | debconf-2.0, locales, libnss-nis, libnss-nisplus","breaks":"base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)","conffiles":"\n /etc/ld.so.conf.d/x86_64-linux-gnu.conf cadc57d8e0387642c3de4bb1edff3f02","description":"GNU C Library: Shared libraries\n Contains the standard libraries that are used by nearly all programs on\n the system. This package includes shared versions of the standard C library\n and the standard math library, as well as many others.","original-maintainer":"GNU Libc Maintainers <debian-glibc@lists.debian.org>","homepage":"https://www.gnu.org/software/libc/libc.html","original-vcs-browser":"https://salsa.debian.org/glibc-team/glibc","original-vcs-git":"https://salsa.debian.org/glibc-team/glibc.git"}
+    \\,{"package":"libgcc-s1","protected":"yes","status":"install ok installed","priority":"optional","section":"libs","installed-size":"201","maintainer":"Ubuntu Core developers <ubuntu-devel-discuss@lists.ubuntu.com>","architecture":"amd64","multi-arch":"same","source":"gcc-16","version":"16-20260322-1ubuntu1","replaces":"libgcc1 (<< 1:10)","provides":"libgcc1 (= 1:16-20260322-1ubuntu1)","depends":"gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)","description":"GCC support library\n Shared version of the support library, a library of internal subroutines\n that GCC uses to overcome shortcomings of particular machines, or\n special needs for some languages.","homepage":"http://gcc.gnu.org/","important":"yes","original-maintainer":"Debian GCC Maintainers <debian-gcc@lists.debian.org>"}]
+;
+const hosted_pending_stderr =
+    \\dpkg: warning: 'diff' not found in PATH or not executable
+    \\dpkg: warning: 'ldconfig' not found in PATH or not executable
+    \\dpkg: warning: overriding problem because --force enabled:
+    \\dpkg: warning: 2 expected programs not found in PATH or not executable
+    \\Note: root's PATH should usually contain /usr/local/sbin, /usr/sbin and /sbin
+    \\dpkg: could not open log '/var/log/dpkg.log': No such file or directory
+    \\dpkg (subprocess): unable to execute installed libc6:amd64 package post-installation script (/var/lib/dpkg/info/libc6:amd64.postinst): Permission denied
+    \\dpkg: error processing package libc6:amd64 (--configure):
+    \\ installed libc6:amd64 package post-installation script subprocess returned error exit status 2
+    \\Errors were encountered while processing:
+    \\ libc6:amd64
+    \\
+;
+fn hostedRecords(a: A, json: []const u8) ![]order.Fields {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const records = try a.alloc(order.Fields, value.array.items.len);
+    for (value.array.items, records) |item, *record| record.* = item.object;
+    return records;
+}
+
+test "hosted base cycle pending keeps the original status and version schedule comparison" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const candidate = try hostedRecords(a, hosted_candidate);
+    const pending = try hostedRecords(a, hosted_pending);
+    {
+        var work = std.testing.tmpDir(.{ .iterate = true });
+        defer work.cleanup();
+        try pendingOracleWith(a, work, hosted_pending_stderr, 1, true, .{ .candidate = candidate, .pending = pending });
+        const comparison = (try evidenceJson(a, try rootPath(a, work), "evidence/base-cycle-proof/comparison.json")).object;
+        for ([_][2][]const u8{ .{ "candidate", hosted_candidate }, .{ "pending", hosted_pending } }) |retained| {
+            const genuine = try std.json.parseFromSliceLeaky(std.json.Value, a, retained[1], .{});
+            try expectEqualStrings(try std.json.Stringify.valueAlloc(a, genuine, .{}), try std.json.Stringify.valueAlloc(a, comparison.get(retained[0]).?, .{}));
+        }
+    }
+    const Mutation = union(enum) { set: [3][]const u8, drop: []const u8, extra: []const u8 };
+    for ([_]Mutation{
+        .{ .set = .{ "libc6", "status", "install ok unpacked" } },
+        .{ .set = .{ "libc6", "version", "2.43-2ubuntu2.5" } },
+        .{ .set = .{ "libgcc-s1", "status", "install ok unpacked" } },
+        .{ .set = .{ "gcc-16-base", "version", "16-20260322-1ubuntu2" } },
+        .{ .drop = "libc-gconv-modules-extra" },
+        .{ .extra = "libc-bin" },
+    }) |mutation| {
+        var mutated: std.ArrayList(order.Fields) = .empty;
+        for (pending) |record| {
+            var copy = try record.clone(a);
+            switch (mutation) {
+                .set => |change| if (eq(u8, order.field(copy, "package"), change[0])) try copy.put(a, change[1], .{ .string = change[2] }),
+                .drop => |name| if (eq(u8, order.field(copy, "package"), name)) continue,
+                .extra => {},
+            }
+            try mutated.append(a, copy);
+        }
+        if (mutation == .extra) {
+            var copy = try pending[0].clone(a);
+            try copy.put(a, "package", .{ .string = mutation.extra });
+            try mutated.append(a, copy);
+        }
+        var work = std.testing.tmpDir(.{ .iterate = true });
+        defer work.cleanup();
+        try expectError(error.CycleProofScheduleChanged, pendingOracleWith(a, work, hosted_pending_stderr, 1, true, .{ .candidate = candidate, .pending = mutated.items }));
+    }
 }
 
 test "original pending oversized output is retained bounded and still refuses" {
