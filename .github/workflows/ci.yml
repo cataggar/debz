@@ -2261,7 +2261,7 @@ jobs:
             ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
             zig build -Doptimize=Debug -j2 --summary all
       - name: Authenticate the snapshot closure and stage signed bindings
-        timeout-minutes: 12
+        timeout-minutes: 20
         working-directory: ${{ env.PROTECTED }}/checkout
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \

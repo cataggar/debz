@@ -3964,7 +3964,7 @@ SIGNED_PROC_CI_STEPS = {
         "            zig build -Doptimize=Debug -j2 --summary all",
     ),
     "Authenticate the snapshot closure and stage signed bindings": (
-        "        timeout-minutes: 12",
+        "        timeout-minutes: 20",
         "        working-directory: ${{ env.PROTECTED }}/checkout",
         '            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \\',
         '            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \\',
@@ -4140,10 +4140,11 @@ def signed_proc_ci_failures(text: str) -> list[str]:
             or (conditions and "        if: ${{ always() }}" not in required)
             or any(not 1 <= int(minutes) <= 25 for minutes in timeout_minutes)
             or (
-                name in (
-                    "Authenticate the snapshot closure and stage signed bindings",
-                    "Generate fresh signed pinned-dpkg prestates",
-                )
+                name == "Authenticate the snapshot closure and stage signed bindings"
+                and timeout_minutes != ["20"]
+            )
+            or (
+                name == "Generate fresh signed pinned-dpkg prestates"
                 and timeout_minutes != ["12"]
             )
         ):

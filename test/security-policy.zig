@@ -684,7 +684,7 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
         .{ .before = "          test ! -s .tmp/protected-writable.txt\n", .after = "" },
         .{ .before = "for path in / /srv /srv/debz-protected \"$PROTECTED\"; do", .after = "for path in \"$PROTECTED\"; do" },
         .{ .before = "            tools/real-snapshot-signed-proc-prestates.sh \\", .after = "            true \\" },
-        .{ .before = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 12\n", .after = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 25\n" },
+        .{ .before = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 20\n", .after = "      - name: Authenticate the snapshot closure and stage signed bindings\n        timeout-minutes: 25\n" },
         .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 25\n" },
         .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n        timeout-minutes: 25\n" },
         .{ .before = "      - name: Generate fresh signed pinned-dpkg prestates\n        timeout-minutes: 12\n", .after = "      - name: Generate fresh signed pinned-dpkg prestates\n        if: false\n        timeout-minutes: 12\n" },
