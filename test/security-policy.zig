@@ -828,7 +828,7 @@ test "security: every split build workload job, mode and step fails closed under
     try refused.failsWith("ci.yml: build-and-test-workload-apt-system must execute Normalize apt facade acceptance diagnostics exactly as reviewed");
 }
 
-test "security: only the fork-gated core workload may use self-hosted runners" {
+test "security: only the fork-gated core workload may use self-hosted runners directly" {
     var f = try Fixture.init();
     defer f.deinit();
     const workflow = try f.source(".github/workflows/ci.yml");
@@ -847,14 +847,113 @@ test "security: only the fork-gated core workload may use self-hosted runners" {
         defer rejected.deinit();
         try rejected.failsWith(core_limit);
     }
+    // Root-requiring workloads reach the pool only through the rootless root
+    // container; running one directly there is refused, and the hosted-form
+    // review fails closed rather than ignoring the job.
+    const rootless_runs_on = try rootlessRunsOn(&f, "os");
     for (workload_jobs[1..]) |root_job| {
         const body = try job(workflow, root_job.name, root_job.next);
-        const changed = try f.replace(workflow, body, try f.replace(body, "    runs-on: ${{ matrix.os }}", core_runs_on));
+        const changed = try f.replace(workflow, body, try f.replace(body, rootless_runs_on, core_runs_on));
         const rejected = try f.check("ci-recovery", changed);
         defer rejected.deinit();
+        try rejected.failsWith(try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must run as the hosted runner user in the reviewed rootless root container", .{root_job.name}));
         const limit = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must require both architectures and optimization modes within 45 minutes", .{root_job.name});
         try rejected.failsWith(limit);
     }
+}
+
+const rootless_gate = "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
+
+fn rootlessRunsOn(f: *Fixture, key: ?[]const u8) ![]const u8 {
+    const matrix_key = key orelse return "    runs-on: ${{ " ++ rootless_gate ++ " && fromJSON('[\"self-hosted\",\"Linux\",\"X64\",\"ubuntu2604\",\"podman\"]') || 'ubuntu-24.04' }}";
+    return std.fmt.allocPrint(
+        f.arena.allocator(),
+        "    runs-on: ${{{{ " ++ rootless_gate ++ " && fromJSON(format('[\"self-hosted\",\"Linux\",\"{{0}}\",\"ubuntu2604\",\"podman\"]', matrix.{s} == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.{s} }}}}",
+        .{ matrix_key, matrix_key },
+    );
+}
+
+const RootlessJob = struct { name: []const u8, next: []const u8, key: ?[]const u8 };
+
+const rootless_root_jobs = [_]RootlessJob{
+    .{ .name = "install-action-native", .next = "\n  download-action-cache:\n", .key = "runner" },
+    .{ .name = "build-and-test-workload-production", .next = "\n  build-and-test-workload-apt-system:\n", .key = "os" },
+    .{ .name = "build-and-test-workload-apt-system", .next = "\n  build-and-test-workload-native:\n", .key = "os" },
+    .{ .name = "build-and-test-workload-native", .next = "\n  build-and-test-workload-release:\n", .key = "os" },
+    .{ .name = "build-and-test-workload-release", .next = "\n  native-recovery-zig-workflows:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-workflows", .next = "\n  native-recovery-zig-repository:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-repository", .next = "\n  native-recovery-zig-helper:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-helper", .next = "\n  native-recovery-zig-family:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-family", .next = "\n  native-recovery-zig-scenarios:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-scenarios", .next = "\n  native-recovery-zig-diversions:\n", .key = "os" },
+    .{ .name = "native-recovery-zig-diversions", .next = "\n  arm64-dpkg-oracles:\n", .key = "os" },
+    .{ .name = "security-audit", .next = "\n  release-dry-run:\n", .key = null },
+    .{ .name = "integration-required", .next = "\n  integration-full:\n", .key = "runner" },
+};
+
+test "security: root-requiring jobs use only the reviewed rootless root container" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const valid = try f.check("ci-rootless", workflow);
+    defer valid.deinit();
+    try valid.ok();
+    const shell = "        shell: bash /usr/local/bin/as-runner {0}\n";
+    const options = "      options: --privileged --init\n";
+    const handoff = "      - name: Hand the checkout to the runner user\n        shell: bash\n        run: chown -R runner:runner \"$GITHUB_WORKSPACE\"\n";
+    for (rootless_root_jobs) |rootless_job| {
+        const body = try job(workflow, rootless_job.name, rootless_job.next);
+        const runs_on = try rootlessRunsOn(&f, rootless_job.key);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, runs_on));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, handoff));
+        const bootstrap = try step(body, "Bootstrap the hosted-runner-like root container");
+        const diagnostic = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must run as the hosted runner user in the reviewed rootless root container", .{rootless_job.name});
+        const unhanded = try f.replace(body, handoff, "");
+        for ([_]struct { before: []const u8, after: []const u8 }{
+            .{ .before = rootless_gate ++ " && ", .after = "" },
+            .{ .before = ",\"podman\"]", .after = "]" },
+            .{ .before = runs_on, .after = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ runs_on, runs_on }) },
+            .{ .before = runs_on, .after = "    runs-on: [self-hosted, Linux, X64, ubuntu2604, podman]" },
+            .{ .before = "      image: ubuntu:24.04\n", .after = "      image: ubuntu:latest\n" },
+            .{ .before = options, .after = "      options: --privileged --init --pid=host\n" },
+            .{ .before = options, .after = options ++ "      volumes:\n        - /:/host\n" },
+            .{ .before = "    container:\n", .after = "    services:\n      cache:\n        image: ubuntu:24.04\n    container:\n" },
+            .{ .before = shell, .after = "        shell: bash {0}\n" },
+            .{ .before = shell, .after = shell ++ "        working-directory: /tmp\n" },
+            .{ .before = bootstrap, .after = "" },
+            .{ .before = "exec runuser -u runner -- env PATH=\"$PATH\" bash -e \"$1\"", .after = "exec bash -e \"$1\"" },
+            .{ .before = handoff, .after = "" },
+            .{ .before = handoff, .after = handoff ++ "      - name: Run as container root\n        shell: bash\n        run: id\n" },
+            .{ .before = body, .after = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ unhanded, handoff[0 .. handoff.len - 1] }) },
+        }) |mutation| {
+            const changed = try f.replace(workflow, body, try f.replace(body, mutation.before, mutation.after));
+            const rejected = try f.check("ci-rootless", changed);
+            defer rejected.deinit();
+            if (rejected.code == 0) std.debug.print("rootless mutation missed in {s}: {s}\n", .{ rootless_job.name, mutation.after });
+            try rejected.failsWith(diagnostic);
+            const hosted = try f.check("ci-recovery", changed);
+            defer hosted.deinit();
+            try testing.expect(hosted.code != 0);
+        }
+    }
+    // A job that needs real host root keeps its GitHub-hosted runner, and the
+    // rootless scaffolding cannot be borrowed by any job outside the list.
+    const signed = try job(workflow, "signed-proc-protected-replay", "\n  build-and-test:\n");
+    const container = "    container:\n      image: ubuntu:24.04\n" ++ options ++ "    defaults:\n      run:\n" ++ shell;
+    for ([_][]const u8{
+        try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ try rootlessRunsOn(&f, null), container }),
+        "    runs-on: [self-hosted, Linux, X64, ubuntu2604, podman]\n",
+        "    runs-on: ubuntu-24.04\n    container:\n      image: ubuntu:24.04\n" ++ options,
+    }) |borrowed| {
+        const changed = try f.replace(workflow, signed, try f.replace(signed, "    runs-on: ubuntu-24.04\n", borrowed));
+        const rejected = try f.check("ci-rootless", changed);
+        defer rejected.deinit();
+        try rejected.failsWith("ci.yml: signed-proc-protected-replay must not use the rootless root container or its runner label");
+    }
+    const duplicated = try f.replace(workflow, signed, try f.replace(signed, "    steps:\n", "    steps:\n" ++ handoff));
+    const scaffolded = try f.check("ci-rootless", duplicated);
+    defer scaffolded.deinit();
+    try scaffolded.failsWith("ci.yml: rootless root container scaffolding must appear only in its reviewed jobs");
 }
 
 test "security: every former workload target runs exactly once across the split jobs" {
