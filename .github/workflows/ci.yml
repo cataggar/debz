@@ -102,6 +102,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_signed_proc_replay:
+        description: "Run hosted amd64 signed proc replay in protected roots (Debug and ReleaseSafe)"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -2204,6 +2209,7 @@ jobs:
           retention-days: 14
 
   signed-proc-protected-replay:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay
     name: Signed proc replay in protected amd64 roots (${{ matrix.optimize }})
     runs-on: ubuntu-24.04
     timeout-minutes: 35

@@ -704,8 +704,32 @@ test "security: hosted amd64 signed proc replay refuses skips, weakened staging 
     const valid = try f.check("ci-signed-proc", workflow);
     defer valid.deinit();
     try valid.ok();
+    const signed_proc_input =
+        \\      run_signed_proc_replay:
+        \\        description: "Run hosted amd64 signed proc replay in protected roots (Debug and ReleaseSafe)"
+        \\        required: true
+        \\        type: boolean
+        \\        default: false
+    ;
+    for ([_][]const u8{
+        "",
+        try f.replace(signed_proc_input, "required: true", "required: false"),
+        try f.replace(signed_proc_input, "type: boolean", "type: string"),
+        try f.replace(signed_proc_input, "default: false", "default: true"),
+        try f.replace(signed_proc_input, "        default: false", ""),
+        signed_proc_input ++ "\n        options: [true]",
+        try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ signed_proc_input, signed_proc_input }),
+    }) |replacement| {
+        const rejected = try f.check("ci-signed-proc", try f.replace(workflow, signed_proc_input, replacement));
+        defer rejected.deinit();
+        try rejected.failsWith("ci.yml: signed proc replay");
+    }
     const signed = try job(workflow, "signed-proc-protected-replay", "\n  build-and-test:\n");
     for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n", .after = "" },
+        .{ .before = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n", .after = "    if: false\n" },
+        .{ .before = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n", .after = "    if: github.event_name != 'workflow_dispatch' || inputs.run_signed_proc_replay\n" },
+        .{ .before = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n", .after = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay\n" },
         .{ .before = "    timeout-minutes: 35", .after = "    timeout-minutes: 90" },
         .{ .before = "    runs-on: ubuntu-24.04", .after = "    runs-on: ubuntu-24.04-arm" },
         .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [Debug]" },

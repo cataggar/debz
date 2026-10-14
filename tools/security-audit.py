@@ -4280,7 +4280,16 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     return failures
 
 
+SIGNED_PROC_CI_INPUT = """\
+      run_signed_proc_replay:
+        description: "Run hosted amd64 signed proc replay in protected roots (Debug and ReleaseSafe)"
+        required: true
+        type: boolean
+        default: false
+"""
+SIGNED_PROC_CI_CONDITION = "    if: github.event_name == 'workflow_dispatch' && inputs.run_signed_proc_replay"
 SIGNED_PROC_CI_JOB = (
+    SIGNED_PROC_CI_CONDITION,
     "    name: Signed proc replay in protected amd64 roots (${{ matrix.optimize }})",
     "    runs-on: ubuntu-24.04",
     "    timeout-minutes: 35",
@@ -4468,9 +4477,13 @@ SIGNED_PROC_CI_STEPS = {
 def signed_proc_ci_failures(text: str) -> list[str]:
     """Require the hosted amd64 non-skipped signed proc replay job as reviewed.
 
-    The job is deliberately outside the required aggregate: the pinned
-    snapshot's Valid-Until and the #262 repin change the signed identities.
+    The job is deliberately outside the required aggregate and dispatch-gated:
+    live snapshot.ubuntu.com outages, the pinned snapshot's Valid-Until and the
+    #262 repin affect external availability and signed identities.
     """
+    dispatch = re.search(
+        r"(?m)^  workflow_dispatch:\n    inputs:\n((?: {6,}[^\n]*\n)*)", text,
+    )
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
         text,
@@ -4479,8 +4492,13 @@ def signed_proc_ci_failures(text: str) -> list[str]:
     lines = body.splitlines()
     failures = []
     if (
-        any(line not in lines for line in SIGNED_PROC_CI_JOB)
-        or re.search(r"(?m)^    (if|needs|continue-on-error):", body)
+        dispatch is None or not dispatch_input_exact(dispatch.group(1), SIGNED_PROC_CI_INPUT)
+        or re.findall(r"(?m)^ *run_signed_proc_replay:[^\n]*$", text)
+        != ["      run_signed_proc_replay:"]
+        or text.count("inputs.run_signed_proc_replay") != 1
+        or any(line not in lines for line in SIGNED_PROC_CI_JOB)
+        or re.findall(r"(?m)^    if:[^\n]*$", body) != [SIGNED_PROC_CI_CONDITION]
+        or re.search(r"(?m)^    (needs|continue-on-error):", body)
         or re.search(r"(?m)^        (include|exclude):", body)
         or "continue-on-error" in body
     ):
