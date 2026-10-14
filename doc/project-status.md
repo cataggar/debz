@@ -350,7 +350,9 @@ logical `Signed-By` values remain root-independent while verifier inputs use
 the imported bytes. Strict imports retain the canonical, digest-bound
 [`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) format;
 explicit finite missing-expiry policy uses
-[`apt-config-snapshot-v2`](../schema/apt-config-snapshot-v2.json). See
+[`apt-config-snapshot-v2`](../schema/apt-config-snapshot-v2.json), and a
+reviewed per-repository archive binding uses
+[`apt-config-snapshot-v3`](../schema/apt-config-snapshot-v3.json). See
 [Target-root APT configuration snapshots](target-apt-config.md).
 
 `debz.repository_api` is the separate versioned repository-management
@@ -382,7 +384,9 @@ an attempt-owned healthy exact-closure-lock v5. Versioned
 request/progress/program/authorization/receipt/recovery documents and a
 `system-install-result-v1` record each operation. Healthy private and held
 installed facts carry no archive origin. Native planning admits only signed or
-authenticated-derived SHA-512 archive identities. No build provides the
+authenticated-derived SHA-512 archive identities. The reviewed Microsoft Noble
+profile alone derives its SHA-512 from the signed SHA-256 match and records it
+as `derived_from_signed_sha256`, never as an upstream SHA-512. No build provides the
 execution generation yet: an authorized attempt refuses before mutation and
 retains its lock. See
 [short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1).

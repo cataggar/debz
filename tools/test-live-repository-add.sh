@@ -71,6 +71,14 @@ if result["descriptor"]["sha256"] != sys.argv[3]:
     sys.exit("repo add installed an unreviewed descriptor")
 raw = open(sys.argv[2] + result["paths"]["target_manifest"]).read()
 snapshot = json.loads(raw)
+if snapshot["schema"] != "https://debz.dev/schema/apt-config-snapshot-v3" or snapshot["version"] != 3:
+    sys.exit("the APT configuration snapshot is not version 3")
+# The reviewed per-repository opt-in: SHA-512 derived locally over bytes the
+# signed SHA-256 authenticated, never an upstream SHA-512.
+bindings = [source["archive_binding"] for source in snapshot["sources"]]
+bindings += [policy["archive_binding"] for policy in snapshot["repository_policies"]]
+if len(bindings) < 2 or any(item != "signed_sha256_derived_sha512" for item in bindings):
+    sys.exit(f"unexpected archive bindings: {bindings}")
 freshness = [source["freshness"] for source in snapshot["sources"]]
 freshness += [policy["freshness"] for policy in snapshot["repository_policies"]]
 reviewed = {

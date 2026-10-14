@@ -1900,7 +1900,7 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
 }
 
 fn source(path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(support.io, path, support.allocator, .limited(128 * 1024));
+    return std.Io.Dir.cwd().readFileAlloc(support.io, path, support.allocator, .limited(256 * 1024));
 }
 
 test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bounds, cleanup, and comparison" {

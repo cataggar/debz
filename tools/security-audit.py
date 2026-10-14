@@ -1442,6 +1442,8 @@ def audit_production_sources() -> None:
     }
     allowed_test_canaries = {
         ("src/repository_policy.zig", "/etc/apt/", '&.{"/etc/apt/trusted.gpg"}'),
+        # A test fixture names a logical path inside its temporary target root.
+        ("src/production_backend.zig", "/etc/apt/", '.logical_path = "/etc/apt/sources.list.d/vendor.list",'),
     }
     target_apt_paths = {
         'const sources_list_path = "/etc/apt/sources.list";',
@@ -5390,6 +5392,174 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
     return failures
 
 
+SYSTEM_INSTALL_LIVE_PATHS = (
+    ".github/workflows/ci.yml",
+    "tools/system-install-live-proof.sh",
+    "tools/system-install-live-proof.py",
+)
+SYSTEM_INSTALL_LIVE_INPUT = """\
+      run_system_install_live:
+        description: "Run the live short system-profile install proof on disposable hosted amd64 and arm64 runners"
+        required: true
+        type: boolean
+        default: false
+"""
+SYSTEM_INSTALL_LIVE_JOB = """\
+  system-install-live:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_system_install_live
+    name: Live system install proof (${{ matrix.architecture }})
+    # Disposable GitHub-hosted runners only: the proof rewrites the runner's
+    # APT sources and adds the reviewed Microsoft repository to the real root.
+    runs-on: ${{ matrix.runner }}
+    # Toolchain 5, static ReleaseSafe build 30, the proof 25 and evidence
+    # upload 5.
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+            target: x86_64-linux-musl
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-linux-musl
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Build the static ReleaseSafe CLI
+        timeout-minutes: 30
+        env:
+          TARGET: ${{ matrix.target }}
+        run: zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe --summary all
+      - name: Prove the short system profile against the live Microsoft feed
+        timeout-minutes: 25
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: tools/system-install-live-proof.sh "$ARCHITECTURE"
+      - name: Upload live system install evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: system-install-live-${{ matrix.architecture }}
+          path: .system-install-live/${{ matrix.architecture }}/
+          if-no-files-found: error
+          retention-days: 14
+"""
+SYSTEM_INSTALL_LIVE_SCRIPT_TOKENS = (
+    "set -euo pipefail\n",
+    'if [ "${GITHUB_ACTIONS:-}" != true ]; then die "refusing to run outside GitHub Actions"; fi\n',
+    'if [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then die "refusing to run outside a disposable GitHub-hosted runner"; fi\n',
+    "if ! grep -qx 'ID=ubuntu' /etc/os-release; then die \"refusing to run outside Ubuntu\"; fi\n",
+    "if ! grep -qx 'VERSION_ID=\"24.04\"' /etc/os-release; then die \"refusing to run outside Ubuntu 24.04\"; fi\n",
+    'if [ "$(dpkg --print-architecture)" != "$arch" ]; then die "the runner is not $arch"; fi\n',
+    'as_root() { sudo -n env -i PATH="$path" LC_ALL=C "$@"; }\n',
+    'check() { as_root python3 -I "$checker" "$@"; }\n',
+    "trap finish EXIT\n",
+    'check prestate "$arch" >"$out/prestate-initial.json" ||\n',
+    '  --transaction-backend legacy_dpkg --json\n',
+    "    die \"the Microsoft feed is older than the reviewed 1209600 s (14-day) bound; debz refused it (ReleaseExpired); no proof is possible from this feed state\"\n",
+    'check repo-add "$out" "$descriptor" "$arch" >"$out/apt-config-snapshot.json" ||\n',
+    'check snapshot >"$work/baseline.txt" || die "could not snapshot /var/lib/dpkg"\n',
+    "cat >\"$out/runs/index\" <<'RUNS'\n"
+    "native-symcrypt root json native symcrypt\n"
+    "native-symcrypt-openssl root json native symcrypt-openssl\n"
+    "legacy-symcrypt root json legacy_dpkg symcrypt\n"
+    "legacy-symcrypt-openssl root json legacy_dpkg symcrypt-openssl\n"
+    "native-symcrypt-again root json native symcrypt\n"
+    "native-symcrypt-human root human native symcrypt\n"
+    "default-symcrypt-human root human default symcrypt\n"
+    "unprivileged-native-symcrypt user json native symcrypt\n"
+    "native-absent root json native debz-live-proof-absent\n"
+    "RUNS\n",
+    '  check snapshot >"$work/after.txt" || die "could not snapshot /var/lib/dpkg after $name"\n',
+    '  if ! cmp -s "$work/baseline.txt" "$work/after.txt"; then\n',
+    '    die "$name changed /var/lib/dpkg; see runs/$name.dpkg.diff"\n',
+    'check verify "$out" "$arch" >"$out/verified.json" || die "the install evidence does not meet the pass criteria"\n',
+)
+SYSTEM_INSTALL_LIVE_CHECKER_TOKENS = (
+    "BOUND = 1209600\n",
+    'DERIVED = "signed_sha256_derived_sha512"\n',
+    'SIGNER = "BC528686B50D79E339D3721CEB3E94ADBE1229CF"\n',
+    'ABSENT = "package has no available candidate; nothing was changed"\n',
+    '        require("upstream" not in (stdout + stderr).lower(), f"{name}: output mentions an upstream digest")\n',
+    '                        and derived["provenance"] == "derived_from_signed_sha256"\n',
+    '                found = self.cache.matches(archive["declared_size"], signed)\n',
+    '                require(all(value == derived["value"] for value in found),\n',
+    '                require(archive["archive_authentication"] == "signed_sha256_only" and "derived_sha512" not in archive,\n',
+    '        require(not os.path.exists(host(EVIDENCE + "/active-v1.json")), "an owned attempt was left unsettled")\n',
+    '        require(published == self.locks, "the locks directory holds install locks no planned run reported")\n',
+)
+
+
+def system_install_live_failures(texts: dict[str, str]) -> list[str]:
+    """The live installed-system proof is dispatch-only, hosted-only, unprivileged in tokens and fail-closed."""
+    failures: list[str] = []
+    ci, script, checker = (texts.get(path, "") for path in SYSTEM_INSTALL_LIVE_PATHS)
+    on = ci.partition("\nconcurrency:\n")[0]
+    if (
+        on.count(SYSTEM_INSTALL_LIVE_INPUT) != 1 or ci.count("run_system_install_live") != 2
+        or ci.count("tools/system-install-live-proof.sh") != 1
+    ):
+        failures.append("ci.yml: the live system install proof must stay behind its default-off dispatch input")
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci.partition("\njobs:\n")[2],
+    ))
+    job = jobs.get("system-install-live")
+    if job is None or "  system-install-live:\n" + job.rstrip("\n") + "\n" != SYSTEM_INSTALL_LIVE_JOB:
+        failures.append(
+            "ci.yml: the live system install proof job must keep its exact hosted runners, read-only permissions and steps"
+        )
+    job = job or ""
+    if (
+        re.search(r"self-hosted|continue-on-error|secrets\.|:\s*write\b|pull_request", job)
+        or re.findall(r"(?m)^ +runner: (.*)$", job) != ["ubuntu-24.04", "ubuntu-24.04-arm"]
+    ):
+        failures.append(
+            "ci.yml: the live system install proof must run only on disposable GitHub-hosted runners without secrets or writes"
+        )
+    for token in SYSTEM_INSTALL_LIVE_SCRIPT_TOKENS:
+        if script.count(token) != 1:
+            failures.append(f"tools/system-install-live-proof.sh: live proof lost {token.strip().splitlines()[0]}")
+    code = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith("#"))
+    if (
+        re.search(r"(?m)\|\|\s*true\b|^\s*exit 0\b|\bsudo (?!-n )|--force|--skip|\bcurl\b|\bwget\b", code)
+        or re.search(r"\bapt(?:-get)?\s+(?:install|remove|purge|upgrade|dist-upgrade|full-upgrade|autoremove)\b", code)
+        or re.search(r"\bdpkg\s+(?:-i|--install|-r|--remove|-P|--configure|--unpack|--set-selections)\b", code)
+        or len(re.findall(r"\bdpkg\s+--purge\b", code)) != 1
+        or code.count("sudo -n dpkg --purge packages-microsoft-prod ") != 1
+    ):
+        failures.append("tools/system-install-live-proof.sh: the live proof must not skip, hide failures or mutate packages")
+    for token in SYSTEM_INSTALL_LIVE_CHECKER_TOKENS:
+        if checker.count(token) != 1:
+            failures.append(f"tools/system-install-live-proof.py: live proof checker lost {token.strip()}")
+    if re.search(
+        r"\b(?:subprocess|shutil|tempfile|socket|urllib|pathlib)\b"
+        r"|\bos\.(?:system|popen|remove|unlink|rename|replace|rmdir|mkdir|makedirs|chmod|chown|truncate"
+        r"|symlink|link|kill|exec\w*|spawn\w*)\b"
+        r"|\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b|write_(?:text|bytes)"
+        r"""|["'](?:[wax]|r\+)[bt+]?["']""",
+        checker,
+    ):
+        failures.append("tools/system-install-live-proof.py: the live proof checker must stay read-only")
+    return failures
+
+
 BASELINE_FIXTURE_PATHS = (
     "build.zig", "tools/generate-native-baseline-fixture.zig",
     "tools/generate-native-baseline-fixture.py",
@@ -5678,6 +5848,10 @@ def audit_ci_pins() -> None:
         path: (ROOT / path).read_text() for path in DISPOSABLE_RUNTIME_PATHS if (ROOT / path).is_file()
     }):
         fail(failure)
+    for failure in system_install_live_failures({
+        path: (ROOT / path).read_text() for path in SYSTEM_INSTALL_LIVE_PATHS if (ROOT / path).is_file()
+    }):
+        fail(failure)
     for failure in native_openpgp_fixture_failures({
         path: (ROOT / path).read_text() for path in OPENPGP_FIXTURE_PATHS if (ROOT / path).is_file()
     }):
@@ -5811,7 +5985,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 23, "release.yml": 3}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 24, "release.yml": 3}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -6761,7 +6935,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 23)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 24)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 3)
     elif kind == "workflow-failure":
@@ -6779,6 +6953,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
         "reference-root", "protected-reference", "native-cli-smoke", "native-action-empty-lock", "native-integration-archive", "native-baseline-fixture", "native-disposable-runtime", "native-openpgp-fixtures", "native-integration-signing", "native-debian-readiness", "native-release-core",
+        "native-system-install-live",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -6807,6 +6982,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-integration-archive": INTEGRATION_ARCHIVE_PATHS,
             "native-baseline-fixture": BASELINE_FIXTURE_PATHS,
             "native-disposable-runtime": DISPOSABLE_RUNTIME_PATHS,
+            "native-system-install-live": SYSTEM_INSTALL_LIVE_PATHS,
             "native-openpgp-fixtures": OPENPGP_FIXTURE_PATHS,
             "native-integration-signing": INTEGRATION_SIGNING_PATHS,
             "native-gate": (
@@ -6879,6 +7055,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_baseline_fixture_failures(texts)
         elif kind == "native-disposable-runtime":
             failures = native_disposable_runtime_failures(texts)
+        elif kind == "native-system-install-live":
+            failures = system_install_live_failures(texts)
         elif kind == "native-openpgp-fixtures":
             failures = native_openpgp_fixture_failures(texts)
         elif kind == "native-integration-signing":

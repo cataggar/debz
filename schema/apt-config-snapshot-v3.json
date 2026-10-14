@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/apt-config-snapshot-v3",
+  "title": "debz target APT configuration snapshot v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "native_architecture",
+    "foreign_architectures",
+    "sources",
+    "configuration_id",
+    "repository_ids",
+    "repository_policies",
+    "keyrings",
+    "global_trust_compatibility",
+    "exclusions",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/apt-config-snapshot-v3" },
+    "version": { "const": 3 },
+    "native_architecture": { "$ref": "#/$defs/architecture" },
+    "foreign_architectures": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/architecture" }
+    },
+    "sources": {
+      "type": "array",
+      "description": "v3 exists only to record a reviewed source archive binding, so at least one source carries signed_sha256_derived_sha512.",
+      "contains": {
+        "properties": { "archive_binding": { "const": "signed_sha256_derived_sha512" } }
+      },
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "sha256", "format", "freshness", "archive_binding"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "format": { "enum": ["deb822", "legacy"] },
+          "freshness": { "$ref": "#/$defs/freshness" },
+          "archive_binding": { "$ref": "#/$defs/archive_binding" }
+        }
+      }
+    },
+    "configuration_id": { "$ref": "#/$defs/sha256" },
+    "repository_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sha256" }
+    },
+    "repository_policies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository_id", "freshness", "archive_binding"],
+        "properties": {
+          "repository_id": { "$ref": "#/$defs/sha256" },
+          "freshness": { "$ref": "#/$defs/freshness" },
+          "archive_binding": { "$ref": "#/$defs/archive_binding" }
+        }
+      }
+    },
+    "keyrings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "sha256", "primary_fingerprints", "use"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "primary_fingerprints": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/fingerprint" }
+          },
+          "use": { "enum": ["declared", "global", "declared_and_global"] }
+        }
+      }
+    },
+    "global_trust_compatibility": { "type": "boolean" },
+    "exclusions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_path", "reason"],
+        "properties": {
+          "logical_path": { "$ref": "#/$defs/logical_path" },
+          "reason": { "enum": ["unsupported_name", "directory", "symlink", "special"] }
+        }
+      }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "archive_binding": {
+      "description": "published_digests: archives are bound by the digests the signed index publishes. signed_sha256_derived_sha512: a reviewed, per-repository opt-in for a signed index that publishes SHA-256 but no SHA-512; a native lock records a SHA-512 computed locally over archive bytes that first matched that signed SHA-256 (derived_from_signed_sha256). It is never an upstream SHA-512 record and adds no authority beyond the signed SHA-256.",
+      "enum": ["published_digests", "signed_sha256_derived_sha512"]
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9-]+$"
+    },
+    "logical_path": {
+      "type": "string",
+      "minLength": 2,
+      "allOf": [
+        {
+          "pattern": "^/[^/\\\\\\u0000-\\u001f\\u007f]+(?:/[^/\\\\\\u0000-\\u001f\\u007f]+)*$"
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)\\.\\.?($|/)"
+          }
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "freshness": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "maximum_release_age_seconds"],
+          "properties": {
+            "mode": { "const": "require_valid_until" },
+            "maximum_release_age_seconds": { "type": "null" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "maximum_release_age_seconds"],
+          "properties": {
+            "mode": {
+              "const": "allow_missing_valid_until_with_max_age_seconds"
+            },
+            "maximum_release_age_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2678400
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1078,23 +1078,6 @@ pub const Backend = struct {
             if (err == error.OutOfMemory) return err;
             return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "active-context preflight refused: {s}", .{@errorName(err)}));
         };
-        if (workflowMode(request.operation, workflow) != .plan_only) {
-            if (request.options.lock_input_path) |path| {
-                const bytes = readFile(allocator, self.io, path, exact_lock_v5.maximum_document_bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => null,
-                };
-                if (bytes) |document| {
-                    defer allocator.free(document);
-                    const is_prestate = exact_lock_v5.hasSchema(allocator, document) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => false,
-                    };
-                    if (is_prestate)
-                        return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: v5 healthy planning authority cannot be unwrapped into a historical archive execution");
-                }
-            }
-        }
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
         if (request.options.lock_input_path == null)
@@ -1104,6 +1087,24 @@ pub const Backend = struct {
         if (self.active_context == null and (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
             request.options.keyring_paths.len == 0))
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires authenticated repository configuration");
+        // Usage refusals above never read the lock; a v5 lock is refused before
+        // the root operation is reserved. The guarded path refuses it again.
+        if (workflowMode(request.operation, workflow) != .plan_only) {
+            const path = request.options.lock_input_path.?;
+            const bytes = readFile(allocator, self.io, path, exact_lock_v5.maximum_document_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            if (bytes) |document| {
+                defer allocator.free(document);
+                const is_prestate = exact_lock_v5.hasSchema(allocator, document) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => false,
+                };
+                if (is_prestate)
+                    return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: v5 healthy planning authority cannot be unwrapped into a historical archive execution");
+            }
+        }
         var guard: RootOperationGuard = .{
             .backend = self,
             .allocator = allocator,
@@ -1624,6 +1625,20 @@ pub const Backend = struct {
                     if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
                 }
                 if (generated_lock.?.nativeLock() != null) {
+                    // A derived-bound repository whose signed index already
+                    // publishes SHA-512 contradicts its reviewed binding; refuse
+                    // before any archive is acquired.
+                    {
+                        const deriving = configuredDerivedRepositoryIds(allocator, generated_lock.?.nativeLock().?, configuration.repositories) catch |err| {
+                            if (err == error.OutOfMemory) return error.OutOfMemory;
+                            return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "signed SHA256 pre-acquisition admission refused: {s}", .{@errorName(err)}));
+                        };
+                        defer allocator.free(deriving);
+                        _ = exact_lock_v3.reserveDerivedSha512(generated_lock.?.nativeLock().?.*, deriving) catch |err| {
+                            if (err == error.OutOfMemory) return error.OutOfMemory;
+                            return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "signed SHA256 pre-acquisition admission refused: {s}", .{@errorName(err)}));
+                        };
+                    }
                     self.bindConfiguredArchiveIdentities(
                         allocator,
                         &generated_lock.?,
@@ -9141,6 +9156,15 @@ const installed_only_status =
     "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
 
 fn activateHealthyPlanningFixture(allocator: std.mem.Allocator, fixture: *const ProductionWorkflowFixture) !*system_product_context.Context {
+    return activateHealthyPlanningFixtureWith(allocator, fixture, @embedFile("fixtures/native_baseline/keyring.gpg"), &.{});
+}
+
+fn activateHealthyPlanningFixtureWith(
+    allocator: std.mem.Allocator,
+    fixture: *const ProductionWorkflowFixture,
+    keyring: []const u8,
+    source_policies: []const @import("target_apt_config.zig").SourcePolicy,
+) !*system_product_context.Context {
     const target = @import("target_apt_config.zig");
     const active = @import("active_repository_config.zig");
     var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
@@ -9150,11 +9174,12 @@ fn activateHealthyPlanningFixture(allocator: std.mem.Allocator, fixture: *const 
     const repository = try std.fmt.allocPrint(allocator, "{s}/repo", .{std.fs.path.dirname(fixture.install_root).?});
     const sources = try std.fmt.allocPrint(allocator, "deb [arch=amd64 signed-by=/usr/share/keyrings/vendor.gpg] file://{s} stable main\n", .{repository});
     try root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/vendor.list"), sources, .{});
-    try root.root.publishFile(try root_fs.Path.init("usr/share/keyrings/vendor.gpg"), @embedFile("fixtures/native_baseline/keyring.gpg"), .{});
+    try root.root.publishFile(try root_fs.Path.init("usr/share/keyrings/vendor.gpg"), keyring, .{});
     var files: target.ProductionFileSystem = .{ .io = std.testing.io, .root = root.root.dir, .host_root = false };
     var snapshot = try target.snapshot(allocator, .{
         .root_path = fixture.install_root,
         .architecture_override = "amd64",
+        .source_policies = source_policies,
         .dependencies = .{ .filesystem = files.interface() },
     });
     defer snapshot.deinit();
@@ -9289,6 +9314,20 @@ test "production healthy installed prestate retains private and published packag
         try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
         try std.testing.expect(!refused.changed);
         var generic: Backend = .{ .io = std.testing.io, .transaction_backend = kind };
+        if (kind == .native) {
+            var historical = options;
+            historical.source_paths = &fixture.source_paths;
+            historical.keyring_paths = &fixture.keyring_paths;
+            const unwrapped = try generic.executeWorkflow(allocator, .{
+                .operation = .install,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = historical,
+            });
+            try std.testing.expectEqual(api.ErrorId.lock_verification_failed, unwrapped.diagnostics[0].id);
+            try std.testing.expect(std.mem.indexOf(u8, unwrapped.diagnostics[0].message, "cannot be unwrapped into a historical archive execution") != null);
+            try std.testing.expect(!unwrapped.changed);
+        }
         try std.testing.expectError(error.UnsupportedLockSchema, generic.packageCacheFingerprint(allocator, .{
             .lock_input_path = fixture.lock_path,
             .cache_root = fixture.cache_path,
@@ -9419,6 +9458,182 @@ test "production system install binds healthy private and held installed facts i
         try std.testing.expectEqualStrings(status, installed_after);
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.record_path, .{}));
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ system_install.active_path, .{}));
+    }
+}
+
+test "production system install derives SHA-512 only over archives that match a reviewed signed SHA-256 binding" {
+    const system_install = @import("system_install.zig");
+    const command = @import("system_install_command.zig");
+    const maximum_age: u64 = 1_209_600;
+    var repository_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer repository_arena.deinit();
+    const signed = try SignedSha256Repository.init(repository_arena.allocator());
+    const moving = try SignedSha256Repository.initWith(repository_arena.allocator(), .{ .valid_until = false });
+    const Scenario = enum { native, legacy, at_bound, unbound, tampered, published_sha512, past_bound };
+    for (std.enums.values(Scenario)) |scenario| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        const status = installed_only_status ++
+            "Package: private-tool\nStatus: hold ok installed\nVersion: 2.0-local\nArchitecture: amd64\n\n";
+        const repository = if (scenario == .at_bound or scenario == .past_bound) moving else signed;
+        // The SHA512-publishing fixture contradicts a derived binding.
+        const published = scenario == .published_sha512;
+        const keyring = if (published) @embedFile("fixtures/native_baseline/keyring.gpg") else repository.keyring;
+        var fixture = try ProductionWorkflowFixture.initWithRepository(
+            allocator,
+            &directory,
+            status,
+            if (published) @embedFile("fixtures/native_baseline/InRelease") else repository.in_release,
+            if (published) @embedFile("fixtures/native_baseline/Packages") else repository.packages,
+            keyring,
+        );
+        defer fixture.deinit();
+        if (!published) {
+            const archive = try allocator.dupe(u8, repository.archive);
+            if (scenario == .tampered) archive[archive.len - 1] ^= 1;
+            try directory.dir.createDirPath(std.testing.io, "repo/pool/main/d/demo");
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/" ++ SignedSha256Repository.package_path, .data = archive });
+        }
+        try prepareBaselinePublicationLocks(&directory);
+        const binding: exact_lock_v3.ArchiveBinding = if (scenario == .unbound) .published_digests else .signed_sha256_derived_sha512;
+        const context = try activateHealthyPlanningFixtureWith(allocator, &fixture, keyring, &.{.{
+            .logical_path = "/etc/apt/sources.list.d/vendor.list",
+            .freshness = .{ .allow_missing_valid_until_with_max_age_seconds = maximum_age },
+            .archive_binding = binding,
+        }});
+        defer context.deinit();
+        const configured = context.snapshot().configuration.repositories[0];
+        try std.testing.expectEqual(binding, configured.archive_binding);
+        try std.testing.expectEqual(
+            if (scenario == .unbound) @import("target_apt_config.zig").ArtifactVersion.v2 else .v3,
+            context.snapshot().manifest.artifact_version,
+        );
+
+        const kind: transaction_engine.Kind = if (scenario == .legacy) .legacy_dpkg else .native;
+        const now_unix: i64 = switch (scenario) {
+            .published_sha512 => 1_788_796_860,
+            .at_bound => SignedSha256Repository.date_unix + maximum_age,
+            .past_bound => SignedSha256Repository.date_unix + maximum_age + 1,
+            else => SignedSha256Repository.now_unix,
+        };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = now_unix };
+        var revalidation: command.Revalidation = .{ .context = context };
+        var planner: command.ProductionPlanner = .{ .backend = &backend, .context = context };
+        var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+        const runner: system_install.Engine = .{
+            .io = std.testing.io,
+            .authority = try command.authorityOf(allocator, context, fixture.install_root, &revalidation),
+            .planner = planner.interface(),
+            .locks = locks.interface(),
+        };
+        const package = if (published) "alpha" else "demo";
+        var result = try runner.run(std.testing.allocator, .{ .package = package }, kind);
+        defer result.deinit();
+        const value = &result.value;
+        try std.testing.expect(!value.changed);
+        const installed_after = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+        try std.testing.expectEqualStrings(status, installed_after);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ system_install.active_path, .{}));
+        const json = try result.canonicalJson(allocator);
+        var human: std.Io.Writer.Allocating = .init(allocator);
+        try system_install.render(allocator, value, .human, &human.writer, &human.writer);
+        for ([_][]const u8{ json, human.written() }) |evidence|
+            try std.testing.expect(std.mem.indexOf(u8, evidence, "upstream") == null);
+
+        const Refusal = struct { api.ExitStatus, api.ErrorId, []const u8 };
+        const refusal: ?Refusal = switch (scenario) {
+            .native, .legacy, .at_bound => null,
+            // Without the reviewed binding an archive covered only by a signed
+            // SHA-256 has no SHA-512 identity the native backend can admit.
+            .unbound => .{ .planning, .planning_failed, "native exact lock requires a SHA-512 archive identity" },
+            .tampered => .{ .download, .download_failed, "signed SHA256 archive binding refused: DigestMismatch" },
+            .published_sha512 => .{ .planning, .lock_verification_failed, "signed SHA256 pre-acquisition admission refused: ArchiveBindingMismatch" },
+            .past_bound => .{ .authentication, .repository_authentication_failed, "ReleaseExpired" },
+        };
+        if (refusal) |expected| {
+            try std.testing.expectEqual(expected[0], result.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.rejected, value.outcome);
+            try std.testing.expectEqual(expected[1], value.diagnostics[0].id);
+            if (std.mem.indexOf(u8, value.diagnostics[0].message, expected[2]) == null) {
+                std.debug.print("unexpected diagnostic: {s}\n", .{value.diagnostics[0].message});
+                return error.TestUnexpectedResult;
+            }
+            try std.testing.expect(value.plan == null and value.lock == null);
+            if (scenario == .tampered) {
+                const cache_path = try std.fs.path.join(allocator, &.{ fixture.install_root, "var/cache/debz" });
+                var cache_dir = try openAbsoluteDirectory(std.testing.io, cache_path);
+                defer cache_dir.close(std.testing.io);
+                var cache = try package_acquisition.Cache.initFromDir(std.testing.io, cache_dir, .{ .maximum_object_bytes = 1024 * 1024 });
+                defer cache.deinit();
+                const identity = content_digest.Identity.init(.{ .sha256 = content_digest.Value.of(.sha256, signed.archive).sha256 }, .sha256) catch unreachable;
+                try std.testing.expectError(error.CacheMiss, cache.lookup(allocator, identity, signed.archive.len, .verify_all_supported));
+            }
+            continue;
+        }
+
+        try std.testing.expectEqual(api.ExitStatus.unavailable, result.exitStatus());
+        try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, value.outcome);
+        try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, value.diagnostics[0].id);
+        const shown = value.plan.?;
+        try std.testing.expectEqual(@as(usize, 1), shown.archives.len);
+        const entry = shown.archives[0];
+        try std.testing.expectEqualStrings("demo", entry.package);
+        try std.testing.expectEqual(content_digest.Algorithm.sha256, entry.primary);
+        try std.testing.expectEqual(@as(usize, 1), entry.published_digests.len);
+        try std.testing.expectEqual(content_digest.Algorithm.sha256, entry.published_digests[0].algorithm);
+        var hex: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(content_digest.Value.of(.sha256, repository.archive).hex(&hex), entry.published_digests[0].value);
+        try std.testing.expectEqual(@as(u64, 2), shown.installed.fact_count);
+        try std.testing.expectEqual(@as(usize, 1), shown.installed.held.len);
+        try std.testing.expectEqualStrings("private-tool", shown.installed.held[0].name);
+        try std.testing.expectEqual(@as(usize, 1), shown.repositories.len);
+        const shown_repository = shown.repositories[0];
+        try std.testing.expectEqualSlices(u8, &configured.id.bytes, &shown_repository.id);
+        try std.testing.expectEqual(system_install.FreshnessPolicy.bounded_missing_valid_until, shown_repository.freshness.policy);
+        try std.testing.expectEqual(@as(?u64, maximum_age), shown_repository.freshness.maximum_release_age_seconds);
+        try std.testing.expect(std.mem.indexOf(u8, human.written(), "missing Valid-Until accepted for at most 1209600 s (explicit repository bound)") != null);
+
+        const lock_file = try std.fs.path.join(allocator, &.{ fixture.install_root, value.lock.? });
+        var lock = try readProductLock(allocator, std.testing.io, lock_file, kind);
+        defer lock.deinit();
+        try std.testing.expect(lock == .active_install);
+        const locked = lock.active_install.archive_lock.lock;
+        try std.testing.expect(locked.packages[0].archive_identity.digests.sha512 == null);
+        if (kind == .native) {
+            // The SHA-512 is computed locally over the archive bytes that
+            // matched the signed SHA-256; it is never an upstream record.
+            try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_derived_sha512, entry.archive_authentication);
+            try std.testing.expectEqualStrings(content_digest.Value.of(.sha512, repository.archive).hex(&hex), &entry.derived_sha512.?.value);
+            try std.testing.expectEqualStrings("derived_from_signed_sha256", @tagName(entry.derived_sha512.?.provenance));
+            try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512, shown_repository.archive_binding);
+            try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512, locked.repositories[0].archive_binding);
+            try std.testing.expectEqual(content_digest.Value.of(.sha512, repository.archive).sha512, locked.packages[0].derived_sha512.?);
+            try std.testing.expect(std.mem.indexOf(u8, json, "\"provenance\":\"derived_from_signed_sha256\"") != null);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                human.written(),
+                "install demo 1.0 [amd64] requested: signed SHA-256; SHA-512 derived locally from the signed SHA-256 match " ++
+                    "(derived_from_signed_sha256; not independently signed)\n",
+            ) != null);
+        } else {
+            // A legacy lock never derives: it binds the published digests only.
+            try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_only, entry.archive_authentication);
+            try std.testing.expect(entry.derived_sha512 == null);
+            try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.published_digests, shown_repository.archive_binding);
+            try std.testing.expect(locked.packages[0].derived_sha512 == null);
+            try std.testing.expect(std.mem.indexOf(u8, json, "derived_from_signed_sha256") == null);
+        }
+
+        var again = try runner.run(std.testing.allocator, .{ .package = package }, kind);
+        defer again.deinit();
+        try std.testing.expectEqual(api.ExitStatus.unavailable, again.exitStatus());
+        try std.testing.expect(!again.value.resumed);
+        try std.testing.expect(!std.mem.eql(u8, &value.attempt_id.?, &again.value.attempt_id.?));
+        const installed_again = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+        try std.testing.expectEqualStrings(status, installed_again);
     }
 }
 
@@ -11277,6 +11492,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var dependencies: usize = 0;
     switch (lock) {
         .installed_baseline => return error.UnexpectedInstalledBaseline,
+        .active_install => return error.UnexpectedActiveInstall,
         inline else => |owned| {
             try std.testing.expectEqual(@as(usize, 3), owned.lock.packages.len);
             for (owned.lock.packages) |package| switch (package.retention) {
@@ -11349,8 +11565,20 @@ const SignedSha256Repository = struct {
 
     const package_path = "pool/main/d/demo/demo_1.0_amd64.deb";
     const now_unix: i64 = 1_790_109_000;
+    /// The signed Release `Date`.
+    const date_unix: i64 = 1_790_107_200;
+
+    const Options = struct {
+        /// Without it the Release is a moving feed that only a bounded
+        /// missing-Valid-Until policy admits.
+        valid_until: bool = true,
+    };
 
     fn init(allocator: std.mem.Allocator) !SignedSha256Repository {
+        return initWith(allocator, .{});
+    }
+
+    fn initWith(allocator: std.mem.Allocator, options: Options) !SignedSha256Repository {
         const data = [_]archive_application.test_fixtures.Entry{
             .{ .path = "usr", .kind = '5', .mode = 0o755 },
             .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
@@ -11384,12 +11612,16 @@ const SignedSha256Repository = struct {
                 "Suite: stable\n" ++
                 "Codename: stable\n" ++
                 "Date: Tue, 22 Sep 2026 20:00:00 UTC\n" ++
-                "Valid-Until: Wed, 23 Sep 2026 20:00:00 UTC\n" ++
+                "{s}" ++
                 "Architectures: amd64\n" ++
                 "Components: main\n" ++
                 "Acquire-By-Hash: no\n" ++
                 "SHA256:\n {s} {d} main/binary-amd64/Packages\n",
-            .{ content_digest.Value.of(.sha256, packages).hex(&index_hex), packages.len },
+            .{
+                if (options.valid_until) "Valid-Until: Wed, 23 Sep 2026 20:00:00 UTC\n" else "",
+                content_digest.Value.of(.sha256, packages).hex(&index_hex),
+                packages.len,
+            },
         );
         const signer = try test_openpgp_signer.Signer.init(allocator, .{
             .uid = "debz signed SHA256 fixture <fixture.invalid>",

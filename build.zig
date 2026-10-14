@@ -2922,6 +2922,7 @@ fn installReleaseFiles(
         "active-repository-config-v1.json",
         "apt-config-snapshot-v1.json",
         "apt-config-snapshot-v2.json",
+        "apt-config-snapshot-v3.json",
         "apt-system-cli-diagnostic-v1.json",
         "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",

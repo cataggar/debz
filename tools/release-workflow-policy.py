@@ -65,6 +65,7 @@ CI_GHR_ZIG_JOBS = (
     "fuzz",
     "integration-required",
     "integration-full",
+    "system-install-live",
 )
 RELEASE_GHR_ZIG_JOBS = ("binaries", "release", "smoke")
 
