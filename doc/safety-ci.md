@@ -90,6 +90,76 @@ action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
 
+## Runner placement and the rootless root container
+
+Jobs that need no `sudo` run directly on the trusted self-hosted pool
+(`[self-hosted, Linux, X64|ARM64, ubuntu2604]`) as its unprivileged runner
+account. These include the action unit checks, the `build-and-test-workload`
+core, the release dry-runs and `fuzz`. Pull requests from forks never reach
+the pool: their rows fall back to a GitHub-hosted runner, and
+`download-action-cache`, which has no hosted form, is skipped.
+
+Thirteen jobs need `sudo` but only root inside a user namespace. They run in a
+privileged rootless root container instead: `install-action-native`, the four
+other workload jobs, the six `native-recovery-zig-*` jobs, `security-audit`
+and `integration-required`. Pushes, schedules, dispatches and same-repository
+pull requests schedule them on
+`[self-hosted, Linux, X64|ARM64, ubuntu2604, podman]`. Fork pull requests run
+the identical container on GitHub-hosted Docker. The container is
+`ubuntu:24.04` with `--privileged --init`. Rootless Podman makes its root the
+runner account's user-namespace root, so it can mount, unshare, chroot and
+install packages inside the container. It holds no host capability and cannot
+create device nodes.
+
+A bootstrap step recreates the hosted image's environment:
+
+- It installs the tools the jobs use.
+- It creates the `runner` user (uid 1001) with passwordless sudo.
+- It installs `as-runner` as the job's default `run` shell, so every `run:`
+  step executes as `runner` with `sudo`, as on a GitHub-hosted runner.
+- It removes the minimized image's dpkg path excludes, so the pinned
+  reference dpkg installs man-page alternative links as on a full Ubuntu
+  image.
+
+`uses:` steps such as checkout and the `ghr` Zig installer run as container
+root. A handoff step gives the checkout to `runner` before any later step
+writes to it.
+
+Rootless root differs from hosted real root in three ways:
+
+- **No device nodes.** `mknod` is refused, so fixture roots leave empty files
+  where device nodes would be. Inside their private mount namespaces they bind
+  the host's `/dev/null` over those files. Apt-system acceptance also binds
+  `zero`, `random` and `urandom`.
+- **Overflow owners.** The kernel's root is unmapped, so kernel-owned files
+  such as `/proc/sys/kernel/random/boot_id` and the host's `/dev/null` appear
+  owned by `65534:65534`.
+  - The product's boot-id reader and the reference launcher's accept that
+    owner only as a uid/gid pair. Both now also require the file to be on
+    procfs (`PROC_SUPER_MAGIC`), which tightens the check for every caller,
+    including real root.
+  - The launcher accepts the overflow pair only for its `/dev/null` standard
+    input. Standard output and error must still be root-owned.
+- **No host root.** The signed `/proc` replay needs real host root (`mknod`),
+  so `signed-proc-protected-replay` stays GitHub-hosted.
+
+The opt-in dispatch and schedule jobs also stay GitHub-hosted:
+`arm64-dpkg-oracles`, `integration-full`, `ubuntu-real-snapshot` and
+`protected-reference`. They run rarely and have not been validated rootless.
+
+The security audit pins this placement exactly:
+
+- `ROOTLESS_ROOT_JOBS` lists the thirteen jobs.
+- Each listed job must have the reviewed `runs-on`, container, defaults,
+  bootstrap, checkout and handoff, in that order, and no other step-level
+  `shell:`.
+- No other job may use the `podman` label, `--privileged`, `as-runner` or a
+  sudoers drop-in.
+- Every other check reviews the listed jobs in their GitHub-hosted form. That
+  form is produced by removing exactly this scaffolding, so any difference in
+  the scaffolding leaves those checks failing too.
+- Mutation tests in `test/security-policy.zig` cover each element.
+
 ## Focused paid-runner tooling dispatch
 
 `tooling.yml` is a separate **validation-only** workflow, not a required PR,

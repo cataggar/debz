@@ -664,6 +664,59 @@ pub const SnapshotProcBinding = union(SnapshotProcMode) {
     sudo: *const SnapshotSudoProc,
 };
 
+// The 64-bit `struct statfs` shared by x86_64 and the asm-generic aarch64 ABI.
+const Statfs = extern struct {
+    type: i64,
+    bsize: i64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32,
+    namelen: i64,
+    frsize: i64,
+    flags: i64,
+    spare: [4]i64,
+};
+const proc_super_magic: i64 = 0x9fa0;
+const overflow_id: u32 = 65534;
+
+/// Only procfs' own boot_id is trusted. A user namespace that leaves the
+/// kernel's root unmapped shows its owner as the overflow ids, never a mix.
+fn kernelBootIdFile(filesystem: i64, metadata: linux.Statx) bool {
+    const owner = (metadata.uid == 0 and metadata.gid == 0) or
+        (metadata.uid == overflow_id and metadata.gid == overflow_id);
+    return filesystem == proc_super_magic and owner and
+        metadata.mode == 0o100444 and metadata.nlink == 1;
+}
+
+test "kernel boot id must be procfs' own read-only file" {
+    var metadata = std.mem.zeroes(linux.Statx);
+    metadata.mode = 0o100444;
+    metadata.nlink = 1;
+    try testing.expect(kernelBootIdFile(proc_super_magic, metadata));
+    metadata.uid = overflow_id;
+    metadata.gid = overflow_id;
+    try testing.expect(kernelBootIdFile(proc_super_magic, metadata));
+    try testing.expect(!kernelBootIdFile(0x01021994, metadata));
+    metadata.gid = 0;
+    try testing.expect(!kernelBootIdFile(proc_super_magic, metadata));
+    metadata.uid = 0;
+    metadata.gid = overflow_id;
+    try testing.expect(!kernelBootIdFile(proc_super_magic, metadata));
+    metadata.uid = 1000;
+    metadata.gid = 1000;
+    try testing.expect(!kernelBootIdFile(proc_super_magic, metadata));
+    metadata.uid = 0;
+    metadata.gid = 0;
+    metadata.mode = 0o100644;
+    try testing.expect(!kernelBootIdFile(proc_super_magic, metadata));
+    metadata.mode = 0o100444;
+    metadata.nlink = 2;
+    try testing.expect(!kernelBootIdFile(proc_super_magic, metadata));
+}
+
 fn readKernelBootId() ![37]u8 {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
@@ -685,9 +738,10 @@ fn readKernelBootId() ![37]u8 {
     const fd: i32 = @intCast(opened);
     defer _ = linux.close(fd);
     var metadata: linux.Statx = undefined;
+    var filesystem: Statfs = undefined;
     if (helperStat(fd, &metadata) != .SUCCESS or
-        metadata.uid != 0 or metadata.gid != 0 or
-        metadata.mode != 0o100444 or metadata.nlink != 1)
+        linux.errno(linux.syscall2(.fstatfs, @as(usize, @intCast(fd)), @intFromPtr(&filesystem))) != .SUCCESS or
+        !kernelBootIdFile(filesystem.type, metadata))
         return error.InvalidKernelBootId;
     var bytes: [38]u8 = undefined;
     var offset: usize = 0;

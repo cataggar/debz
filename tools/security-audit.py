@@ -2184,8 +2184,9 @@ WORKLOAD_SETUP_LINES = (
     '        run: test "$(zig version)" = 0.16.0',
     "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
 )
-# Only the sudo-free core partition may use the trusted self-hosted pool; every
-# root-requiring workload keeps the disposable GitHub-hosted runner.
+# Only the sudo-free core partition may run directly on the trusted self-hosted
+# pool. Root-requiring workloads reach it only through ROOTLESS_ROOT_JOBS, and
+# are reviewed here in their GitHub-hosted form.
 WORKLOAD_RUNS_ON = "    runs-on: ${{ matrix.os }}"
 WORKLOAD_CORE_RUNS_ON = (
     "    runs-on: ${{ (github.event_name != 'pull_request' || "
@@ -2193,6 +2194,173 @@ WORKLOAD_CORE_RUNS_ON = (
     "fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', "
     "matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}"
 )
+# Jobs whose sudo needs only root inside a user namespace run in a privileged
+# rootless container: on the trusted self-hosted pool for same-repository
+# events, and on GitHub-hosted Docker for forks. The bootstrap recreates the
+# hosted image's passwordless-sudo runner user, and rootless_root_hosted_view
+# removes exactly this scaffolding so every other byte of those jobs is still
+# reviewed in its hosted form. Jobs that need real host root, such as the
+# signed /proc replay, stay GitHub-hosted.
+ROOTLESS_ROOT_JOBS = {
+    "install-action-native": "runner",
+    "build-and-test-workload-production": "os",
+    "build-and-test-workload-apt-system": "os",
+    "build-and-test-workload-native": "os",
+    "build-and-test-workload-release": "os",
+    "native-recovery-zig-workflows": "os",
+    "native-recovery-zig-repository": "os",
+    "native-recovery-zig-helper": "os",
+    "native-recovery-zig-family": "os",
+    "native-recovery-zig-scenarios": "os",
+    "native-recovery-zig-diversions": "os",
+    "security-audit": None,
+    "integration-required": "runner",
+}
+ROOTLESS_ROOT_GATE = (
+    "(github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository)"
+)
+ROOTLESS_ROOT_CONTAINER = (
+    "    container:\n"
+    "      image: ubuntu:24.04\n"
+    "      options: --privileged --init\n"
+    "    defaults:\n"
+    "      run:\n"
+    "        shell: bash /usr/local/bin/as-runner {0}\n"
+)
+ROOTLESS_ROOT_BOOTSTRAP = """\
+      - name: Bootstrap the hosted-runner-like root container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The minimized image's dpkg config excludes /usr/share/man, so the
+          # reference dpkg would skip man-page alternative links debz installs.
+          rm -f /etc/dpkg/dpkg.cfg.d/excludes
+          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \\
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \\
+            python3-jsonschema sudo unzip xz-utils zstd
+          # Steps run as the hosted image's unprivileged user with passwordless
+          # sudo, because some tools refuse to run as root.
+          useradd --create-home --uid 1001 --shell /bin/bash runner
+          printf 'runner ALL=(ALL:ALL) NOPASSWD: ALL\\n' >/etc/sudoers.d/runner
+          chmod 0440 /etc/sudoers.d/runner
+          cat >/usr/local/bin/as-runner <<'EOF'
+          #!/bin/bash
+          # Run one step script as runner with the hosted default shell. The
+          # runner writes the script and file-command files as container root.
+          set -eu
+          chmod a+r -- "$1"
+          chmod a+x -- "$(dirname -- "$1")"
+          for f in "${GITHUB_ENV-}" "${GITHUB_PATH-}" "${GITHUB_OUTPUT-}" \\
+            "${GITHUB_STEP_SUMMARY-}" "${GITHUB_STATE-}"; do
+            if [ -n "$f" ] && [ -e "$f" ]; then
+              chmod a+rw -- "$f"
+              chmod a+x -- "$(dirname -- "$f")"
+            fi
+          done
+          exec runuser -u runner -- env PATH="$PATH" bash -e "$1"
+          EOF
+          chmod 0755 /usr/local/bin/as-runner
+          id
+          grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status
+          nproc
+          free -g
+"""
+# Checkout and the ghr install action run as container root; handing the
+# checkout over before ghr keeps every later step's files owned by runner.
+ROOTLESS_ROOT_CHECKOUT = re.compile(
+    r"      - uses: actions/checkout@[0-9a-f]{40} # v[^\n]+\n"
+    r"        with:\n"
+    r"          persist-credentials: false\n"
+)
+ROOTLESS_ROOT_HANDOFF = (
+    "      - name: Hand the checkout to the runner user\n"
+    "        shell: bash\n"
+    '        run: chown -R runner:runner "$GITHUB_WORKSPACE"\n'
+)
+ROOTLESS_ROOT_FOREIGN_TOKENS = ("podman", "--privileged", "as-runner", "/etc/sudoers.d/")
+CI_JOB_PATTERN = r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)"
+
+
+def rootless_root_runs_on(key: str | None) -> tuple[str, str]:
+    """Return a job's reviewed rootless runs-on line and its hosted equivalent."""
+    labels = '"self-hosted","Linux","{0}","ubuntu2604","podman"'
+    if key is None:
+        return (
+            "    runs-on: ${{ " + ROOTLESS_ROOT_GATE + " && fromJSON('["
+            + labels.format("X64") + "]') || 'ubuntu-24.04' }}",
+            "    runs-on: ubuntu-24.04",
+        )
+    return (
+        "    runs-on: ${{ " + ROOTLESS_ROOT_GATE + " && fromJSON(format('[" + labels + "]', "
+        f"matrix.{key} == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.{key} }}}}",
+        f"    runs-on: ${{{{ matrix.{key} }}}}",
+    )
+
+
+def rootless_root_ci_failures(text: str) -> list[str]:
+    jobs = dict(re.findall(CI_JOB_PATTERN, text))
+    failures: list[str] = []
+    for name, key in ROOTLESS_ROOT_JOBS.items():
+        body = jobs.get(name, "")
+        rootless, _ = rootless_root_runs_on(key)
+        steps = body.partition("    steps:\n")[2]
+        checkout = (
+            ROOTLESS_ROOT_CHECKOUT.match(steps, len(ROOTLESS_ROOT_BOOTSTRAP))
+            if steps.startswith(ROOTLESS_ROOT_BOOTSTRAP) else None
+        )
+        rest = steps[len(ROOTLESS_ROOT_BOOTSTRAP):].replace(ROOTLESS_ROOT_HANDOFF, "", 1)
+        # The next job-level key must follow the container block directly, so
+        # nothing can extend its defaults outside the hosted view.
+        container = re.escape(rootless + "\n" + ROOTLESS_ROOT_CONTAINER) + r"(?=    [a-z])"
+        if (
+            re.findall(r"(?m)^    runs-on:[^\n]*$", body) != [rootless]
+            or len(re.findall(container, body)) != 1
+            or re.findall(r"(?m)^    (?:container|defaults|services):[^\n]*$", body)
+            != ["    container:", "    defaults:"]
+            or body.count("    steps:\n") != 1
+            or checkout is None
+            or not steps.startswith(ROOTLESS_ROOT_HANDOFF, checkout.end())
+            or re.search(r"(?m)^        shell:", rest)
+        ):
+            failures.append(
+                f"ci.yml: {name} must run as the hosted runner user in the reviewed rootless root container"
+            )
+    for name, body in jobs.items():
+        if name not in ROOTLESS_ROOT_JOBS and any(
+            token in body for token in ROOTLESS_ROOT_FOREIGN_TOKENS
+        ):
+            failures.append(f"ci.yml: {name} must not use the rootless root container or its runner label")
+    if any(
+        text.count(scaffold) != len(ROOTLESS_ROOT_JOBS)
+        for scaffold in (ROOTLESS_ROOT_CONTAINER, ROOTLESS_ROOT_BOOTSTRAP, ROOTLESS_ROOT_HANDOFF)
+    ):
+        failures.append("ci.yml: rootless root container scaffolding must appear only in its reviewed jobs")
+    return failures
+
+
+def rootless_root_hosted_view(text: str) -> str:
+    """Return ci.yml with the reviewed rootless scaffolding replaced by the hosted form.
+
+    Unreviewed scaffolding is left in place, so checks of the hosted form fail closed.
+    """
+    if rootless_root_ci_failures(text):
+        return text
+
+    def hosted(match: re.Match[str]) -> str:
+        name, body = match.group(1), match.group(2)
+        if name in ROOTLESS_ROOT_JOBS:
+            rootless, runs_on = rootless_root_runs_on(ROOTLESS_ROOT_JOBS[name])
+            body = body.replace(rootless + "\n" + ROOTLESS_ROOT_CONTAINER, runs_on + "\n", 1)
+            body = body.replace("    steps:\n" + ROOTLESS_ROOT_BOOTSTRAP, "    steps:\n", 1)
+            body = body.replace(ROOTLESS_ROOT_HANDOFF, "", 1)
+        return f"  {name}:\n{body}"
+
+    return re.sub(CI_JOB_PATTERN, hosted, text)
+
+
 WORKLOAD_DEBUG = "${{ matrix.optimize == 'Debug' }}"
 WORKLOAD_RELEASESAFE = "${{ matrix.optimize == 'ReleaseSafe' }}"
 WORKLOAD_PREPARE_DPKG = 'reference_dpkg="$(zig-out/bin/debz-native-dpkg-reference)"'
@@ -2532,9 +2700,8 @@ def reference_launcher_root_wiring_failures(
 ) -> list[str]:
     """The root capability proof runs in CI, outside the sudo-free security audit."""
     failures: list[str] = []
-    jobs = dict(re.findall(
-        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
-    ))
+    ci = rootless_root_hosted_view(ci)
+    jobs = dict(re.findall(CI_JOB_PATTERN, ci))
     job = jobs.get("security-audit", "")
     step = re.search(
         r"(?ms)^      - name: Prove root reference capability transition\n.*?(?=^      - |^\n|\Z)",
@@ -3564,11 +3731,9 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
 
 
 def native_recovery_ci_failures(text: str) -> list[str]:
-    jobs = dict(re.findall(
-        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
-        text,
-    ))
-    failures = []
+    failures = rootless_root_ci_failures(text)
+    text = rootless_root_hosted_view(text)
+    jobs = dict(re.findall(CI_JOB_PATTERN, text))
     failures.extend(ci_dispatch_matrix_failures(text, jobs))
     failures.extend(workload_ci_failures(jobs, text))
     architectures = (
@@ -6769,6 +6934,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = ci_concurrency_failures(text, "ci.yml")
     elif kind == "ci-recovery":
         failures = native_recovery_ci_failures(text)
+    elif kind == "ci-rootless":
+        failures = rootless_root_ci_failures(text)
     elif kind == "workload-build":
         failures = workload_partition_failures(text)
     elif kind == "ci-signed-proc":
