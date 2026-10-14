@@ -528,8 +528,9 @@ Any other difference, or an unreadable or changed file, fails.
 #### Hosted protected amd64 replay
 
 The CI job **Signed proc replay in protected amd64 roots**
-(`signed-proc-protected-replay`) runs on hosted `ubuntu-24.04` x86_64 for
-every push and pull request. Debug and ReleaseSafe each run on their own
+(`signed-proc-protected-replay`) is gated by the explicit `workflow_dispatch`
+input `run_signed_proc_replay` (`default: false`) and runs on hosted
+`ubuntu-24.04` x86_64. Debug and ReleaseSafe each run on their own
 runner with fresh roots, within 35 minutes. Each run:
 
 1. runs the prestate and binding scripts from the runner-owned checkout
