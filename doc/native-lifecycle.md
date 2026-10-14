@@ -185,7 +185,10 @@ leaves a malformed or unresolvable database, the result is
 signal or timeout, do not refresh.
 Recovery checkpoints live targets only for records created or changed by those
 scripts, leaving unchanged administrator overrides outside this added scope.
-Missing identities refuse before lifecycle mutation. See the
+The old `postrm upgrade` and its new `failed-upgrade` fallback run after the
+data is in place, so their `--update` changes the just-unpacked file. Settled
+verification accepts exactly the owner, group and mode of a matching live
+record. Missing identities refuse before lifecycle mutation. See the
 [metadata contract](native-unpack.md#statoverride-metadata) for directory,
 symlink, hard-link and exact-path behavior.
 
@@ -390,12 +393,15 @@ chrony-like postinst adds every override before exiting 23 under durable
 recovery; parity, exact database bytes and the retained checkpoint binding of
 all three targets are checked before a `configure` retry, remove and purge.
 Invocation-bound upgrades have the old `prerm upgrade`, the new
-`prerm failed-upgrade` after an old prerm exit 23, or the old
-`postrm upgrade` add `mode` and conffile overrides, with and without
-`--update`. Expected metadata is fixed independently of native output. The
-upgrade's own data keeps packaged metadata, an `--update`d conffile keeps the
-owner and mode configure copies, and only the following reinstall applies the
-`mode` override. Two-invocation upgrades, with and without durable recovery,
+`prerm failed-upgrade` after an old prerm exit 23, the old `postrm upgrade`
+(also when it then exits 23), or the new `postrm failed-upgrade` after an old
+postrm exit 23 add `mode` and conffile overrides, with and without
+`--update`. Expected metadata is fixed independently of native output, and a
+mismatch prints what each root observed. Prerm edits leave the upgrade's own
+data with packaged metadata. A postrm `--update` changes the just-unpacked
+`mode` file at once; otherwise only the following reinstall applies the `mode`
+override. An `--update`d conffile keeps the owner and mode configure copies.
+Two-invocation upgrades, with and without durable recovery,
 apply an override that a provider postinst added in the first invocation, but
 not the old prerm's edits in the second, and leave no retained input. A
 single `--install` of two archives keeps the first package's old-prerm

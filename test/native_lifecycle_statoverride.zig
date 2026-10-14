@@ -482,8 +482,10 @@ pub const updated_conffile: Expected = .{ .mode = 0o640, .uid = 42420, .gid = 42
 pub const conffile_path = "etc/debz-native.conf";
 
 /// dpkg reads statoverrides once per invocation, before the old prerm, so
-/// override edits by the upgrade's own scripts never reach its unpacked
-/// data. Configure copies the installed conffile's owner and mode onto the
+/// override edits by the upgrade's own scripts never reach its unpacked data
+/// through extraction. The old postrm and its new `failed-upgrade` fallback
+/// run after extraction, so their `--update` changes the unpacked file
+/// itself. Configure copies the installed conffile's owner and mode onto the
 /// new one, so only `--update` changes what the conffile ends with.
 fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first = try editArchive(fixture, arch, "1", "packages/statoverride-edit");
@@ -492,10 +494,12 @@ fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg
     defer fixture.allocator.free(second);
     const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
     const old_prerm_failure = name ++ "@1:prerm:upgrade\n";
+    const old_postrm_failure = name ++ "@1:postrm:upgrade\n";
     for ([_]struct {
         label: []const u8,
         at: []const u8,
         failure: ?[]const u8 = null,
+        mode: Expected = packaged_mode,
         conffile: Expected,
     }{
         .{ .label = "old-prerm", .at = "prerm:upgrade", .conffile = packaged_conffile },
@@ -503,7 +507,10 @@ fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg
         .{ .label = "failed-upgrade", .at = "prerm:failed-upgrade", .failure = old_prerm_failure, .conffile = packaged_conffile },
         .{ .label = "failed-upgrade-update", .at = "prerm:failed-upgrade --update --update", .failure = old_prerm_failure, .conffile = updated_conffile },
         .{ .label = "old-postrm", .at = "postrm:upgrade", .conffile = packaged_conffile },
-        .{ .label = "old-postrm-update", .at = "postrm:upgrade - --update", .conffile = updated_conffile },
+        .{ .label = "old-postrm-update", .at = "postrm:upgrade --update --update", .mode = overridden_mode, .conffile = updated_conffile },
+        // The old postrm applies, then exits 23; the new postrm `failed-upgrade` succeeds.
+        .{ .label = "old-postrm-update-failed", .at = "postrm:upgrade --update --update", .failure = old_postrm_failure, .mode = overridden_mode, .conffile = updated_conffile },
+        .{ .label = "postrm-failed-upgrade-update", .at = "postrm:failed-upgrade --update --update", .failure = old_postrm_failure, .mode = overridden_mode, .conffile = updated_conffile },
     }) |entry| {
         for ([_]bool{ false, true }) |recovery| {
             // The durable runtime additionally tracks files that `--update` changed.
@@ -523,7 +530,7 @@ fn genuineInvocationEdits(fixture: *foundation.Fixture, driver: []const u8, dpkg
             try case.seed(first);
             try case.phase(.{ .operation = "upgrade", .archives = &.{second}, .packages = &chosen, .recovery = recovery }, false);
             try expectEditApplied(&case);
-            try expectObserved(&case, base ++ "/mode", packaged_mode);
+            try expectObserved(&case, base ++ "/mode", entry.mode);
             try expectObserved(&case, conffile_path, entry.conffile);
             try support.assertDatabaseBytes(&case, "statoverride");
             try support.assertDatabaseBytes(&case, "statoverride-old");

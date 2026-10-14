@@ -10862,11 +10862,113 @@ fn removalCanFollowPayload(
     return true;
 }
 
+/// The override database as the unpack's own old `postrm upgrade`, and its
+/// new `postrm failed-upgrade` fallback, left it. dpkg runs them after
+/// `tar_deferred_extract` put the new payload in place (dpkg 1.22.22
+/// src/main/unpack.c:1574-1585). `dpkg-statoverride --update --add` chowns
+/// and chmods the live path, then writes the database (src/statoverride/
+/// main.c statoverride_add and statdb_node_apply). Nothing later in the
+/// unpack resets that metadata. Read lazily, only for an entry that differs
+/// from the plan.
+const PostrmStatOverrides = struct {
+    arena: std.heap.ArenaAllocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    /// Physical path and resolved metadata per record; null until read.
+    entries: ?[]const Admitted = null,
+
+    const Admitted = struct {
+        path: []const u8,
+        metadata: native_statoverride.Metadata,
+    };
+
+    fn init(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        architecture: []const u8,
+    ) PostrmStatOverrides {
+        return .{ .arena = .init(allocator), .root = root, .architecture = architecture };
+    }
+
+    fn deinit(self: *PostrmStatOverrides) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn records(self: *PostrmStatOverrides, temporary: std.mem.Allocator) ![]const Admitted {
+        if (self.entries) |entries| return entries;
+        self.entries = &.{};
+        const arena = self.arena.allocator();
+        // An unreadable database or root admits nothing, leaving verification exact.
+        const resolved = readUnpackStatOverrides(arena, temporary, self.root, self.architecture) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.entries.?,
+        };
+        const aliases = detectAliases(temporary, self.root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.RootUnreadable => return self.entries.?,
+        };
+        defer deinitAliasEvidence(temporary, aliases);
+        const entries = try arena.alloc(Admitted, resolved.paths.count());
+        var count: usize = 0;
+        var iterator = resolved.paths.iterator();
+        while (iterator.next()) |record| {
+            var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            const physical = canonicalAliasPath(aliases, record.key_ptr.*, &buffer) orelse continue;
+            entries[count] = .{ .path = try arena.dupe(u8, physical), .metadata = record.value_ptr.* };
+            count += 1;
+        }
+        self.entries = entries[0..count];
+        return self.entries.?;
+    }
+
+    /// True when `observed` is the resolved metadata of a record for `path`
+    /// or for a planned hard link sharing its inode. `--update` follows a
+    /// symbolic link, so a record naming one never matches its target.
+    fn admits(
+        self: *PostrmStatOverrides,
+        temporary: std.mem.Allocator,
+        filesystem: []const FilesystemChange,
+        path: []const u8,
+        observed: native_statoverride.Metadata,
+    ) !bool {
+        for (try self.records(temporary)) |record| {
+            if (!std.meta.eql(record.metadata, observed)) continue;
+            if (std.mem.eql(u8, record.path, path)) return true;
+            for (filesystem) |change| switch (change) {
+                .hardlink => |link| if (std.mem.eql(u8, link.source, path) and
+                    std.mem.eql(u8, link.path, record.path)) return true,
+                else => {},
+            };
+        }
+        return false;
+    }
+};
+
+/// Owner, group and mode of a published regular file or FIFO are the plan's,
+/// or, after the in-unpack old postrm ran, those of an override it could
+/// have applied. Directories stay exact: settlement re-applies their
+/// metadata after obsolete removals.
+fn payloadMetadataSettled(
+    temporary: std.mem.Allocator,
+    postrm_overrides: ?*PostrmStatOverrides,
+    filesystem: []const FilesystemChange,
+    path: []const u8,
+    entry: root_fs.Entry,
+    planned: native_statoverride.Metadata,
+) !bool {
+    const observed: native_statoverride.Metadata = .{ .mode = entry.mode, .uid = entry.uid, .gid = entry.gid };
+    if (std.meta.eql(observed, planned)) return true;
+    const overrides = postrm_overrides orelse return false;
+    return overrides.admits(temporary, filesystem, path, observed);
+}
+
 fn verifyMaterializedFilesystem(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
-    plan_value: Plan,
+    filesystem: []const FilesystemChange,
     deferred: []const root_mutation.Intent,
+    postrm_overrides: ?*PostrmStatOverrides,
 ) !void {
     var deferred_paths: std.StringHashMapUnmanaged(void) = .empty;
     defer deferred_paths.deinit(allocator);
@@ -10874,7 +10976,7 @@ fn verifyMaterializedFilesystem(
         .remove, .remove_directory => try deferred_paths.put(allocator, intent.path(), {}),
         else => {},
     };
-    for (plan_value.filesystem) |change| switch (change) {
+    for (filesystem) |change| switch (change) {
         .remove => |removal| if (!deferred_paths.contains(removal.path) and try root.entryIfExists(
             try root_fs.Path.initPackage(removal.path),
         ) != null) return error.MaterializationVerificationFailed,
@@ -10891,9 +10993,13 @@ fn verifyMaterializedFilesystem(
         .file => |file| {
             const path = try root_fs.Path.initPackage(file.path);
             const entry = try root.entry(path);
-            if (!entry.isRegularFile() or entry.mode != file.mode or
-                entry.uid != file.uid or entry.gid != file.gid or
-                entry.modified_nanoseconds != file.modified_nanoseconds)
+            if (!entry.isRegularFile() or
+                entry.modified_nanoseconds != file.modified_nanoseconds or
+                !try payloadMetadataSettled(allocator, postrm_overrides, filesystem, file.path, entry, .{
+                    .mode = file.mode,
+                    .uid = file.uid,
+                    .gid = file.gid,
+                }))
                 return error.MaterializationVerificationFailed;
             const maximum = std.math.cast(usize, entry.size) orelse
                 return error.MaterializationVerificationFailed;
@@ -10928,9 +11034,13 @@ fn verifyMaterializedFilesystem(
         .fifo => |pipe| {
             // Observed by name only; a FIFO is never opened.
             const entry = try root.entry(try root_fs.Path.initPackage(pipe.path));
-            if (entry.kind != .named_pipe or entry.mode != pipe.mode or
-                entry.uid != pipe.uid or entry.gid != pipe.gid or
-                entry.modified_nanoseconds != pipe.modified_nanoseconds)
+            if (entry.kind != .named_pipe or
+                entry.modified_nanoseconds != pipe.modified_nanoseconds or
+                !try payloadMetadataSettled(allocator, postrm_overrides, filesystem, pipe.path, entry, .{
+                    .mode = pipe.mode,
+                    .uid = pipe.uid,
+                    .gid = pipe.gid,
+                }))
                 return error.MaterializationVerificationFailed;
         },
     };
@@ -12141,11 +12251,19 @@ fn materializePlanned(
             try attempt.requireRecovery(allocator, .verification);
             return .{ .outcome = .recovery_required, .detail = "structural_alias_changed" };
         }
+        const postrm_ran = if (request.unpack_hook) |hook| hook.fired else false;
+        var postrm_overrides: ?PostrmStatOverrides = if (postrm_ran) PostrmStatOverrides.init(
+            allocator,
+            request.root,
+            request.planning.program.target_architecture,
+        ) else null;
+        defer if (postrm_overrides) |*value| value.deinit();
         verifyMaterializedFilesystem(
             allocator,
             request.root,
-            planned,
+            planned.filesystem,
             lowered.intents.items[payload_end..],
+            if (postrm_overrides) |*value| value else null,
         ) catch |err| {
             try attempt.requireRecovery(allocator, .verification);
             return .{
@@ -36387,6 +36505,108 @@ test "native_unpack.test.unpack statoverride data input ignores refreshes inside
         if (step.sequence == 4)
             try root.publishFile(database, "root root 0700 /usr/share/mode\n", .{ .overwrite = .replace });
     }
+}
+
+test "native_unpack.test.settled verification admits only database-bound postrm statoverrides" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init("", &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    for ([_][]const u8{ "usr", "usr/bin", "usr/share", "usr/share/dir" }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    try root.createSymbolicLink(try root_fs.Path.init("bin"), "usr/bin");
+    const content = "payload\n";
+    var digest: [32]u8 = undefined;
+    Sha256.hash(content, &digest, .{});
+    const data_path = try root_fs.Path.init("usr/share/data");
+    const tool_path = try root_fs.Path.init("usr/bin/tool");
+    const pipe_path = try root_fs.Path.init("usr/share/pipe");
+    const dir_path = try root_fs.Path.init("usr/share/dir");
+    try root.publishFile(data_path, content, .{});
+    try root.publishFile(tool_path, content, .{});
+    try root.createHardLink(data_path, try root_fs.Path.init("usr/share/link"));
+    try root.createSymbolicLink(try root_fs.Path.init("usr/share/alias"), "data");
+    try root.createNamedPipe(pipe_path);
+    for ([_]root_fs.Path{ data_path, tool_path, pipe_path }) |path|
+        try root.applyMetadata(path, .{ .mode = 0o644 });
+    try root.applyMetadata(dir_path, .{ .mode = 0o755 });
+    const data = try root.entry(data_path);
+    const tool = try root.entry(tool_path);
+    const pipe = try root.entry(pipe_path);
+    const planned = [_]FilesystemChange{
+        .{ .file = .{ .path = "usr/share/data", .artifact = 0, .archive_entry = 0, .sha256 = digest, .mode = 0o644, .uid = data.uid, .gid = data.gid, .modified_nanoseconds = data.modified_nanoseconds } },
+        .{ .hardlink = .{ .path = "usr/share/link", .source = "usr/share/data" } },
+        .{ .file = .{ .path = "usr/bin/tool", .artifact = 0, .archive_entry = 1, .sha256 = digest, .mode = 0o644, .uid = tool.uid, .gid = tool.gid, .modified_nanoseconds = tool.modified_nanoseconds } },
+        .{ .fifo = .{ .path = "usr/share/pipe", .mode = 0o644, .uid = pipe.uid, .gid = pipe.gid, .modified_nanoseconds = pipe.modified_nanoseconds } },
+    };
+    const directory = [_]FilesystemChange{.{ .directory = .{ .path = "usr/share/dir", .mode = 0o755, .uid = data.uid, .gid = data.gid, .modified_nanoseconds = null } }};
+    const Record = struct { uid: ?u32, gid: u32 = 0, mode: []const u8, path: []const u8 };
+    const Check = struct {
+        fn run(target: root_fs.Root, changes: []const FilesystemChange, postrm_ran: bool) !void {
+            var overrides: PostrmStatOverrides = .init(testing.allocator, target, "amd64");
+            defer overrides.deinit();
+            try verifyMaterializedFilesystem(testing.allocator, target, changes, &.{}, if (postrm_ran) &overrides else null);
+        }
+
+        /// A null `uid` names an account the root cannot resolve.
+        fn database(target: root_fs.Root, records: []const Record) !void {
+            var buffer: [512]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buffer);
+            for (records) |record| {
+                if (record.uid) |uid|
+                    try writer.print("#{d} #{d}", .{ uid, record.gid })
+                else
+                    try writer.writeAll("_absent _absent");
+                try writer.print(" {s} /{s}\n", .{ record.mode, record.path });
+            }
+            try target.publishFile(try root_fs.Path.init("var/lib/dpkg/statoverride"), writer.buffered(), .{});
+        }
+    };
+    try Check.run(root, &planned, false);
+    try Check.run(root, &planned, true);
+
+    // The old postrm ran `dpkg-statoverride --update --add` for the hard
+    // link, through the `bin` alias, and for the FIFO.
+    try root.applyMetadata(try root_fs.Path.init("usr/share/link"), .{ .mode = 0o750 });
+    try root.applyMetadata(tool_path, .{ .mode = 0o700 });
+    try root.applyMetadata(pipe_path, .{ .mode = 0o600 });
+    const tool_record: Record = .{ .uid = tool.uid, .gid = tool.gid, .mode = "700", .path = "bin/tool" };
+    const pipe_record: Record = .{ .uid = pipe.uid, .gid = pipe.gid, .mode = "600", .path = "usr/share/pipe" };
+    const applied = [_]Record{ .{ .uid = data.uid, .gid = data.gid, .mode = "750", .path = "usr/share/link" }, tool_record, pipe_record };
+    try Check.database(root, &applied);
+    try testing.expectError(error.MaterializationVerificationFailed, Check.run(root, &planned, false));
+    try Check.run(root, &planned, true);
+
+    // Live metadata no current record resolves to stays a mismatch: no
+    // record, one with another owner, one naming a symbolic link to the
+    // file, and a database whose account cannot be resolved.
+    for ([_][3]Record{
+        .{ .{ .uid = data.uid, .gid = data.gid, .mode = "750", .path = "usr/share/other" }, tool_record, pipe_record },
+        .{ .{ .uid = data.uid ^ 1, .gid = data.gid, .mode = "750", .path = "usr/share/link" }, tool_record, pipe_record },
+        .{ .{ .uid = data.uid, .gid = data.gid, .mode = "750", .path = "usr/share/alias" }, tool_record, pipe_record },
+        .{ .{ .uid = null, .mode = "750", .path = "usr/share/link" }, tool_record, pipe_record },
+    }) |records| {
+        try Check.database(root, &records);
+        try testing.expectError(error.MaterializationVerificationFailed, Check.run(root, &planned, true));
+    }
+    try Check.database(root, &applied);
+    try Check.run(root, &planned, true);
+
+    // `--update` changes neither timestamp nor content.
+    try root.applyMetadata(data_path, .{ .modified_nanoseconds = data.modified_nanoseconds + std.time.ns_per_s });
+    try testing.expectError(error.MaterializationVerificationFailed, Check.run(root, &planned, true));
+    try root.applyMetadata(data_path, .{ .modified_nanoseconds = data.modified_nanoseconds });
+    try Check.run(root, &planned, true);
+    try root.publishFile(tool_path, "changed\n", .{});
+    try root.applyMetadata(tool_path, .{ .mode = 0o700, .modified_nanoseconds = tool.modified_nanoseconds });
+    try testing.expectError(error.MaterializationVerificationFailed, Check.run(root, planned[2..3], true));
+
+    // Settlement re-applies directory metadata, so directories stay exact.
+    try Check.run(root, &directory, true);
+    try root.applyMetadata(dir_path, .{ .mode = 0o700 });
+    try Check.database(root, &.{.{ .uid = data.uid, .gid = data.gid, .mode = "700", .path = "usr/share/dir" }});
+    try testing.expectError(error.MaterializationVerificationFailed, Check.run(root, &directory, true));
 }
 
 test "native_unpack.test.orphan route settlement evidence remains active" {

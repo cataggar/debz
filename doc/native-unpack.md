@@ -165,6 +165,25 @@ remove step between unpacks starts a new invocation, as apt's separate dpkg
 calls do. Recovery retains and replays these inputs as described in
 [Native recovery](native-recovery.md).
 
+The old `postrm upgrade` runs after dpkg has moved the new data into place, as
+does the new `postrm failed-upgrade` that replaces it after a nonzero exit
+(`unpack.c` 1574–1585). A `dpkg-statoverride --update --add` there changes the
+just-unpacked file itself (`statdb_node_apply`: `chown`, then `chmod`), and
+nothing later restores the packaged metadata. Once that script has run, settled
+verification still requires each published file's and FIFO's exact kind and
+mtime, and each file's content digest. A differing owner, group or mode is
+accepted only if it equals a record in the live override database, resolved
+through the root's account files, for that exact path or for a hard link that
+shares its inode. Merged-/usr spellings in records resolve to their physical
+alias destination. Fail-closed cases include:
+
+- an unrecorded `chmod` or `chown`;
+- a record on a symlink, a directory or a non-alias symlinked parent;
+- a record added and then removed;
+- an account changed after the add.
+
+This adds no checkpoint and grants no rename authority.
+
 Native database plans explicitly preserve the override file without rewriting
 it, including remove and purge. Active `config` scripts and other unsupported
 vendor state remain guarded. Alternatives are admitted only through their
@@ -634,7 +653,9 @@ node; FIFO ↔ regular file and FIFO ↔ symbolic link transitions follow the
 [root-mutation rules](root-mutation.md#fifos-288).
 Removal, purge, and obsolete-path removal unlink an installed FIFO by name with
 a recorded `remove_path` step. Post-materialization verification rechecks the
-kind, mode, ownership, and modification time of every published FIFO. Native
+kind, mode, ownership, and modification time of every published FIFO, admitting
+only an old postrm's recorded `--update` as described in
+[Statoverride metadata](#statoverride-metadata). Native
 recovery's managed-state model records a FIFO as its own `fifo` kind so a
 retained FIFO is restored and compared exactly.
 

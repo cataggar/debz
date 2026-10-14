@@ -155,7 +155,12 @@ The observation binds the actual no-follow kind, bytes and mode/uid/gid after ge
 Merged-/usr spellings are observed at their physical alias destination.
 Recovery refuses later target drift before continuing. Settled verification
 reuses the managed-payload checks, retaining the existing administrator
-conffile exemptions. Dpkg's `statoverride-old` and `diversions-old` remain
+conffile exemptions. An old postrm's `--update` of a just-unpacked file passes
+the unpack's post-materialization verification only through a matching live
+record, as the [metadata contract](native-unpack.md#statoverride-metadata)
+describes. The script's existing outcome checkpoint, which observes the
+unpack's planned paths, already binds that live metadata; no checkpoint is
+added. Dpkg's `statoverride-old` and `diversions-old` remain
 scratch backups, compared byte-for-byte in the genuine-tool oracles rather
 than added to the lock or closure formats.
 
