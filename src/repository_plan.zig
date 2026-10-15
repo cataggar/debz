@@ -533,7 +533,9 @@ test "repository_plan.test.canonical executable plan round trips exactly" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Decode.run, .{canonical});
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    try std.testing.checkAllAllocationFailures(debug_allocator.allocator(), Decode.run, .{canonical});
     const noncanonical = try std.fmt.allocPrint(std.testing.allocator, " {s}", .{canonical});
     defer std.testing.allocator.free(noncanonical);
     try std.testing.expectError(error.NonCanonicalDocument, decode(std.testing.allocator, noncanonical));

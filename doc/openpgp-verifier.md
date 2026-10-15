@@ -18,7 +18,7 @@ Adding it would therefore fail debz's deterministic-Zig-build requirement.
 Sequoia was excluded because its production library is LGPL-2.0-or-later.
 
 The selected implementation is a narrow debz-owned parser and verifier using
-only Zig 0.16.0 standard-library SHA, RSA, and Ed25519 primitives. Backend types
+only Zig 0.17.0 standard-library SHA, RSA, and Ed25519 primitives. Backend types
 remain private. This adds no production dependency or license obligation.
 
 ## Supported profile

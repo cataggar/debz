@@ -3104,7 +3104,7 @@ pub const Backend = struct {
             .coordinator = coordinator,
             .token = token,
             .owned = owned,
-            .entered = .initEmpty(),
+            .entered = .empty,
             .highest = .root_operation,
             .adopted = true,
             .bridge = .none,
@@ -4989,7 +4989,7 @@ test "production repository config frozen release freshness is pinned and witnes
         .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = hex, .witness_suites = witnesses },
         .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha256:596EE4CEA058F74D59E2180532C89904E306D90725D42162EDA82C01D4370834", .witness_suites = witnesses },
         .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex[0 .. digest_hex.len - 1], .witness_suites = witnesses },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha256:" ++ "0" ** 64, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha256:" ++ @as([64]u8, @splat('0')), .witness_suites = witnesses },
         .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha512:" ++ hex ++ hex, .witness_suites = witnesses },
         // A frozen pocket has no maximum age of its own.
         .{ .mode = .frozen_release_with_witnesses, .maximum_release_age_seconds = 2678400, .frozen_release_digest = digest_hex, .witness_suites = witnesses },
@@ -5406,8 +5406,7 @@ fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
 test "product API operations exhaustively deny host-root execution" {
     try std.testing.expect(!live_root.host_root_allowed);
     try std.testing.expect(!std.mem.eql(u8, live_root.logical_root_path, "/"));
-    inline for (std.meta.fields(api.Operation)) |field| {
-        const operation: api.Operation = @enumFromInt(field.value);
+    inline for (std.meta.tags(api.Operation)) |operation| {
         var request: api.Request = .{
             .operation = operation,
             .options = .{
@@ -6642,8 +6641,8 @@ fn requireNativeDownloadAdmission(
     const items = try allocator.alloc(api.Item, count);
     defer allocator.free(items);
     comptime var longest_action: []const u8 = "";
-    inline for (std.meta.fields(solver.ActionKind)) |field| {
-        if (field.name.len > longest_action.len) longest_action = field.name;
+    inline for (@typeInfo(solver.ActionKind).@"enum".field_names) |field_name| {
+        if (field_name.len > longest_action.len) longest_action = field_name;
     }
     for (lock.packages, 0..) |package, index| items[index] = .{
         .package = package.name,
@@ -7660,7 +7659,7 @@ test "production workflow native ownership requires an outer identity before roo
                 .acknowledgment_id = @splat(2),
             }),
             2 => request.defer_recovery_clear = true,
-            3 => request.root_attempt_id = [_]u8{2} ** 32,
+            3 => request.root_attempt_id = @splat(2),
             4 => {
                 request.mode = .plan_only;
                 request.orchestration_id = @splat(1);
@@ -8850,7 +8849,7 @@ test "production native family inspection owns all package states without execut
     defer fixture.deinit();
     try directory.dir.deleteDir(std.testing.io, "root/var/lib/debz");
     const request = nativeFamilyInspectionRequest(fixture);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, struct {
         fn exercise(allocator: std.mem.Allocator, input: family.Request) !void {
             const backend: family.NativeBackend = .{ .io = std.testing.io };
             var result = try backend.execute(allocator, input);
@@ -11422,7 +11421,7 @@ test "production workflow native empty removal locks do not grant reconciliation
     request.options.lock_output_path = null;
     request.options.assume_yes = true;
     request.options.conffile = .keep_existing;
-    request.orchestration_id = [_]u8{0x43} ** 32;
+    request.orchestration_id = @splat(0x43);
     request.reconciliation_claim = .{ .post_mutation = .{
         .exact_lock_sha256 = lock.native.lock.digest_sha256,
         .evidence_sha256 = @splat(0x44),
@@ -12404,12 +12403,12 @@ fn runOverlapWatchdog(
     var reaped = false;
     defer if (!reaped) {
         _ = linux.kill(pid, .KILL);
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
     };
     const started = std.Io.Clock.awake.now(std.testing.io);
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(waited)) {
             .SUCCESS => {
@@ -12417,8 +12416,9 @@ fn runOverlapWatchdog(
                     reaped = true;
                     if (expect_timeout)
                         return error.StalledChildExitedBeforeWatchdog;
-                    if (!linux.W.IFEXITED(status) or
-                        linux.W.EXITSTATUS(status) != 0)
+                    const status_bits: u32 = @bitCast(status);
+                    if (!linux.W.IFEXITED(status_bits) or
+                        linux.W.EXITSTATUS(status_bits) != 0)
                         return error.OverlapChildFailed;
                     return;
                 }

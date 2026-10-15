@@ -224,11 +224,11 @@ pub const PayloadReport = struct {
 
     pub fn jsonStringify(self: PayloadReport, writer: anytype) !void {
         try writer.beginObject();
-        inline for (std.meta.fields(PayloadReport)) |field| {
-            const is_fifo = comptime std.mem.eql(u8, field.name, "fifo");
+        inline for (@typeInfo(PayloadReport).@"struct".field_names) |field_name| {
+            const is_fifo = comptime std.mem.eql(u8, field_name, "fifo");
             if (!is_fifo or self.fifo != 0) {
-                try writer.objectField(field.name);
-                try writer.write(@field(self, field.name));
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
             }
         }
         try writer.endObject();
@@ -475,7 +475,7 @@ pub fn inspectArchive(
 
 const GapBuilder = struct {
     arena: std.mem.Allocator,
-    evidence: [std.meta.fields(Category).len]std.ArrayList([]const u8) =
+    evidence: [@typeInfo(Category).@"enum".field_names.len]std.ArrayList([]const u8) =
         @splat(.empty),
 
     fn add(self: *GapBuilder, category: Category, evidence: []const u8) !void {
@@ -775,7 +775,7 @@ pub fn summarize(arena: std.mem.Allocator, packages: []const PackageReport) !Sum
     var triggers: std.StringArrayHashMapUnmanaged(usize) = .empty;
     var members: std.StringArrayHashMapUnmanaged(usize) = .empty;
     var tools: std.StringArrayHashMapUnmanaged(usize) = .empty;
-    var gap_packages: [std.meta.fields(Category).len]std.ArrayList([]const u8) = @splat(.empty);
+    var gap_packages: [@typeInfo(Category).@"enum".field_names.len]std.ArrayList([]const u8) = @splat(.empty);
     var summary: Summary = .{
         .packages = packages.len,
         .admitted = 0,

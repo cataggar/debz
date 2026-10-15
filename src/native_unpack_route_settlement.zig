@@ -3712,5 +3712,5 @@ fn testCodecAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "native_unpack.test.route settlement codec releases partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testCodecAllocations, .{});
+    try testing.checkAllAllocationFailures(.{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } }, testCodecAllocations, .{});
 }

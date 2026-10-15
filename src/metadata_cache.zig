@@ -805,7 +805,7 @@ test "deferred refresh verifies and bounds pending data before any persistent pu
     var observed = try pending.lookup(std.testing.allocator, test_repository, test_snapshot);
     defer observed.deinit();
     try std.testing.expectEqualStrings("data", observed.bytes);
-    const excess = "x" ** 900;
+    const excess = &@as([900]u8, @splat('x'));
     try std.testing.expectError(error.ObjectTooLarge, pending.publish(test_repository, test_snapshot, test_provenance, .{ .digest = Digest.of(excess), .size = excess.len }, excess, .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, namespace, .{}));
     var destination = try testCache(&tmp);

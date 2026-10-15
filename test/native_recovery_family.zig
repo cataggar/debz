@@ -1079,7 +1079,7 @@ fn archiveExecution(
         defer rejected.deinit();
         try expectFamily(rejected.report.value, "update", false);
         try same(try string(rejected.report.value, "exit_status"), "planning");
-        if (std.ascii.indexOfIgnoreCase(try string(try field(rejected.report.value, "diagnostic"), "message"), "semantic request") == null)
+        if (std.ascii.findIgnoreCase(try string(try field(rejected.report.value, "diagnostic"), "message"), "semantic request") == null)
             return error.MissingUpdateSemanticRequestDiagnostic;
         try std.testing.expect(!(try field(rejected.report.value, "changed")).bool);
         try std.testing.expectEqual(.null, try field(rejected.evidence.?.value, "native_install"));
@@ -3086,7 +3086,7 @@ fn ownedComponents(
     defer receipt.deinit();
     try std.testing.expectEqual(check.outcome, receipt.document.outcome);
     const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };
-    var observed_kinds = std.EnumSet(provenance.EvidenceKind).initEmpty();
+    var observed_kinds: std.EnumSet(provenance.EvidenceKind) = .empty;
     var retained_cases: usize = 0;
     for (receipt.document.evidence_files, 0..) |file, index| {
         if (std.mem.indexOfScalar(provenance.EvidenceKind, &retained_kinds, file.kind) == null) continue;
@@ -3510,7 +3510,7 @@ fn missingHelper(fixture: *foundation.Fixture, driver: []const u8, reference: []
     try std.testing.expect(!(try field(refused.report.value, "changed")).bool);
     try std.testing.expectEqual(.null, try field(refused.report.value, "provenance_path"));
     const diagnostic = try string(try field(refused.report.value, "diagnostic"), "message");
-    if (std.ascii.indexOfIgnoreCase(diagnostic, "helper") == null) return error.MissingHelperDiagnostic;
+    if (std.ascii.findIgnoreCase(diagnostic, "helper") == null) return error.MissingHelperDiagnostic;
     try std.testing.expectEqual(.null, try field(refused.evidence.?.value, "native_completion"));
     try support.absent(fixture, helper);
     try support.absent(fixture, try support.path(fixture.allocator, scenario.native_root[fixture.path.len + 1 ..], debz.native_provenance.document_path));

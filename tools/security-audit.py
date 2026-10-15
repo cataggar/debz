@@ -1809,18 +1809,18 @@ def audit_dependencies() -> None:
         "license": musl.get("license"),
         "runtime_linkage": musl.get("runtime_linkage"),
     } != {
-        "source": "https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl",
+        "source": "https://codeberg.org/ziglang/zig/src/tag/0.17.0/lib/libc/musl",
         "upstream_version": "1.2.5",
         "zig_musl_baseline_commit": "0098e650fbceae74c8c468716c0810476f72ec47",
-        "toolchain_version": "0.16.0",
-        "toolchain_commit": "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
-        "toolchain_source_archive": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
-        "toolchain_source_sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
-        "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "toolchain_version": "0.17.0",
+        "toolchain_commit": "7647adab80dd088f4de3610fd245915a912eb6ad",
+        "toolchain_source_archive": "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
+        "toolchain_source_sha256": "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
+        "version": "1.2.5+zig.0.17.0.7647adab80dd",
         "license": "MIT",
         "runtime_linkage": "static_libc_in_debz",
     }:
-        fail("musl provenance differs from the reviewed Zig 0.16.0 toolchain snapshot")
+        fail("musl provenance differs from the reviewed Zig 0.17.0 toolchain snapshot")
     musl_exceptions = {
         item.get("id"): item.get("disposition")
         for item in musl.get("reviewed_exceptions", [])
@@ -1862,10 +1862,10 @@ def audit_dependencies() -> None:
         ),
         "zstd": (
             "https://github.com/cataggar/zstd/archive/"
-            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
-            "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+            "71502da18ccdacac0c2049c033dedbbf25a40b93.tar.gz",
+            "zstd-1.6.0-Nyx42nbYOwBGNLCV3_VPmuHUh7voiJK2Dqm6OBEBfiod",
             "libzstd",
-            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            "71502da18ccdacac0c2049c033dedbbf25a40b93",
         ),
     }
     found = {name: (url, digest) for name, url, digest in dependency_blocks}
@@ -1934,8 +1934,8 @@ def audit_dependencies() -> None:
         "Zstandard libzstd",
         "0BSD",
         "musl libc",
-        "1.2.5+zig.0.16.0.24fdd5b7a4c1",
-        "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+        "1.2.5+zig.0.17.0.7647adab80dd",
+        "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
         "MIT",
     ):
         if required not in notices:
@@ -2179,9 +2179,9 @@ WORKLOAD_SETUP_LINES = (
     "          persist-credentials: false",
     "        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1",
     "          ghr-version: v0.8.1",
-    "            cataggar/zig@v0.16.0",
+    "            cataggar/zig@v0.17.0",
     "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
-    '        run: test "$(zig version)" = 0.16.0',
+    '        run: test "$(zig version)" = 0.17.0',
     "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
 )
 # Only the sudo-free core partition may run directly on the trusted self-hosted
@@ -3275,8 +3275,8 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg",
     "readonly archive_keyring_sha256=80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
     "readonly archive_keyring_size=3607",
-    "    zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00\n    zig_size=55478392\n",
-    "    zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17\n    zig_size=51211944\n",
+    "    zig_sha256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026\n    zig_size=57332648\n",
+    "    zig_sha256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8\n    zig_size=52877280\n",
     '[[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
     '[[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-reference-protected-ci.sh" ]] || {',
     'test "$(git -C "$checkout" rev-parse HEAD)" = "$commit"',
@@ -3707,7 +3707,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         "try testing.expectEqual(old_group.facts.len, new_group.facts.len);",
         "try testing.expect(testClonedEntryFactEqual(left, right));",
         "try testing.expectEqualSlices(u8, old_record, new_record);",
-        "errdefer |err| std.debug.print(",
+        "errdefer std.debug.print(",
         "protected Python alternatives: coordinate={s} phase={s} group={s} error={s}",
     ):
         if token not in python_alternatives:
@@ -4301,7 +4301,7 @@ SIGNED_PROC_CI_JOB = (
 )
 SIGNED_PROC_CI_STEPS = {
     "Install Zig via ghr": (),
-    "Validate Zig version": ('        run: test "$(zig version)" = 0.16.0',),
+    "Validate Zig version": ('        run: test "$(zig version)" = 0.17.0',),
     "Bind the reviewed commit to a hosted amd64 runner": (
         '          test "$RUNNER_ARCH" = X64',
         '          test "$(uname -m)" = x86_64',
@@ -4641,7 +4641,7 @@ def native_recovery_gate_wiring_failures(
         'recovery_family.addArtifactArg(cli);',
         'recovery_bootstrap.addArtifactArg(native_trigger_helper);',
         'repository_recovery.addArtifactArg(cli);',
-        'const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", b.pathFromRoot(".tmp") });',
+        'const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", pathFromRoot(b, ".tmp") });',
         'run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);',
         'repository_recovery.step.dependOn(&repository_fixture_parent.step);',
         'recovery_parity.addArtifactArg(cli);',
@@ -5423,10 +5423,10 @@ GHR_ZIG_INSTALL = """\
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
 """
 
 CI_CONCURRENCY = """\
@@ -5536,7 +5536,7 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/release.zig")',
             "b.getInstallStep().dependOn(&install_release_tool.step);",
             "workload_release.dependOn(&release_tool_tests.step);",
-            'release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));',
+            'release_test_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-release"));',
             'release_policy_tests.root_module.addOptions("release_test_options", release_test_options);',
             "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
             "const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);",
@@ -5698,7 +5698,7 @@ def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/debian-stable-readiness.zig")',
             "b.getInstallStep().dependOn(&install_debian_readiness.step);",
             "workload_core.dependOn(&debian_readiness_tests.step);",
-            'audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));',
+            'audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));',
             "audit_tests.step.dependOn(&install_debian_readiness.step);",
         ),
         "tools/debian-stable-readiness.zig": (
@@ -5863,7 +5863,7 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
         '.argv = &.{ "/usr/bin/gzip", "-n", "-9", "-c", absolute }',
         "std.mem.writeInt(u32, result.stdout[4..8], epoch, .little)",
         "result.stdout[9] = 255;",
-        "std.hash.crc.Crc32.hash(raw)",
+        "std.hash.Crc32.hash(raw)",
         "return error.IntegrationScratchExists;",
         "debz.deb_payload.inspectControlAlloc(allocator, bytes",
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
@@ -5892,10 +5892,10 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
             "dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);",
             "dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);",
             "dpkg_alternatives_reference_tests.step.dependOn(&install_disposable_runtime.step);",
-            'dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));',
+            'dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));',
             "audit_tests.step.dependOn(&install_disposable_runtime.step);",
-            'audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));',
-            'b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}),',
+            'audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));',
+            'b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}),',
             "workload_core.dependOn(&disposable_runtime_tests.step);",
             'disposable_runtime_test_options.addOptionPath("executable", disposable_runtime.getEmittedBin());',
         ),
@@ -5956,7 +5956,7 @@ def native_baseline_fixture_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/generate-native-baseline-fixture.zig")',
             'b.step("generate-native-baseline-fixture",',
             'baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");',
-            'baseline_fixture_test_options.addOptionPath("generated", generated_baseline_fixture);',
+            'baseline_fixture_test_options.addOptionPathDirectory("generated", generated_baseline_fixture);',
             "workload_core.dependOn(&baseline_fixture_tests.step);",
         ),
         BASELINE_FIXTURE_PATHS[1]: (
@@ -5998,7 +5998,7 @@ def native_openpgp_fixture_failures(texts: dict[str, str]) -> list[str]:
         OPENPGP_FIXTURE_PATHS[1]: (
             'const pgp = @import("fixture-openpgp.zig");',
             'const original = @import("debz").test_fixtures.openpgp;',
-            "try std.testing.expectEqualSlices(u8, &@field(original, field.name), @field(actual, field.name));",
+            "try std.testing.expectEqualSlices(u8, &@field(original, field_name), @field(actual, field_name));",
             "try std.testing.expectEqualSlices(u8, expected, generated);",
             "try target.check();",
             "if (point == .before_rename) try self.check();",

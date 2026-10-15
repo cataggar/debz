@@ -413,7 +413,7 @@ pub const PinnedRegularFile = struct {
         var reader = self.file.reader(self.io, &.{});
         const bytes = reader.interface.allocRemaining(
             allocator,
-            .limited(maximum_bytes +| 1),
+            .limited(maximum_bytes),
         ) catch |err| switch (err) {
             error.StreamTooLong => return error.FileTooLarge,
             error.ReadFailed => return reader.err.?,
@@ -968,9 +968,7 @@ pub const Root = struct {
     }
 
     /// Reads the whole file when it is at most `maximum_bytes` long and fails
-    /// with `error.FileTooLarge` otherwise. The saturating probe limit keeps a
-    /// file of exactly `maximum_bytes` readable, because `allocRemaining`
-    /// fails once its own limit is reached.
+    /// with `error.FileTooLarge` otherwise.
     pub fn readFileAlloc(
         self: Root,
         allocator: std.mem.Allocator,
@@ -980,7 +978,7 @@ pub const Root = struct {
         var file = try self.openRegularFile(path);
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes +| 1)) catch |err|
+        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes)) catch |err|
             switch (err) {
                 error.StreamTooLong => error.FileTooLarge,
                 error.ReadFailed => reader.err.?,
@@ -1854,11 +1852,11 @@ test "root_fs.test.path grammar rejects absolute, traversing, and control paths"
     try testing.expectError(error.InvalidPathByte, Path.init("var/delete\x7f"));
     try testing.expectError(error.InvalidPathByte, Path.init("var\\lib"));
 
-    const long_component = "a" ** (maximum_component_bytes + 1);
+    const long_component = &@as([maximum_component_bytes + 1]u8, @splat('a'));
     try testing.expectError(error.PathComponentTooLong, Path.init(long_component));
-    const deep = "a/" ** maximum_path_components ++ "a";
+    const deep = std.mem.asBytes(&@as([maximum_path_components][2]u8, @splat("a/".*))) ++ "a";
     try testing.expectError(error.PathTooDeep, Path.init(deep));
-    const long_path = ("ab/" ** ((maximum_path_bytes / 3) + 1)) ++ "a";
+    const long_path = std.mem.asBytes(&@as([(maximum_path_bytes / 3) + 1][3]u8, @splat("ab/".*))) ++ "a";
     try testing.expectError(error.PathTooLong, Path.init(long_path));
 }
 
@@ -2409,7 +2407,7 @@ test "root_fs.test.pinned directory observation owns allocation failures" {
     try root.createDirectory(path, default_directory_permissions);
     try root.publishFile(try testPath("directory/child"), "x", .{});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         observeDirectoryUnderAllocationFailure,
         .{ root, path },
     );
@@ -2501,7 +2499,7 @@ test "root_fs.test.stable pinned reads own allocation failures" {
     const path = try testPath("file");
     try root.publishFile(path, "content\n", .{});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         stableReadUnderAllocationFailure,
         .{ root, path },
     );
@@ -2587,7 +2585,7 @@ test "root_fs.test.symbolic link publication is bounded and atomic" {
         error.InvalidLinkTargetByte,
         root.createSymbolicLink(try testPath("control"), "usr/\x00bin"),
     );
-    const long_target = "a" ** (maximum_link_target_bytes + 1);
+    const long_target = &@as([maximum_link_target_bytes + 1]u8, @splat('a'));
     try testing.expectError(
         error.LinkTargetTooLong,
         root.createSymbolicLink(try testPath("long"), long_target),

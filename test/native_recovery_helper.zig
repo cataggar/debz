@@ -642,7 +642,7 @@ fn missingPackageOwnedHelper(fixture: *foundation.Fixture, driver: []const u8, a
 fn sealJsonDigest(fixture: *foundation.Fixture, document_value: *std.json.Value, domain: []const u8) !void {
     if (document_value.* != .object) return error.InvalidPersistedRequest;
     const member = document_value.object.getPtr("digest_sha256") orelse return error.MissingPersistedDigest;
-    member.* = .{ .string = "0" ** 64 };
+    member.* = .{ .string = &@as([64]u8, @splat('0')) };
     const canonical = try std.json.Stringify.valueAlloc(fixture.allocator, document_value.*, .{});
     const tagged = try std.mem.concat(fixture.allocator, u8, &.{ domain, canonical });
     const digest = sha256(tagged);
@@ -674,13 +674,13 @@ fn rehashedCallerPolicy(fixture: *foundation.Fixture, driver: []const u8, arch: 
     const caller = persisted.value.object.getPtr("caller") orelse return error.MissingCallerBinding;
     if (caller.* != .object) return error.InvalidPersistedRequest;
     const policy = caller.object.getPtr("policy_sha256") orelse return error.MissingCallerPolicy;
-    policy.* = .{ .string = "f" ** 64 };
+    policy.* = .{ .string = &@as([64]u8, @splat('f')) };
     try sealJsonDigest(fixture, &persisted.value, "debz-native-execution-request-v1\x00");
     const serialized = try std.json.Stringify.valueAlloc(fixture.allocator, persisted.value, .{});
     const altered_request = try std.mem.concat(fixture.allocator, u8, &.{ serialized, "\n" });
     var decoded = try debz.native_execution_request.decodePersisted(fixture.allocator, altered_request);
     defer decoded.deinit();
-    try same(&decoded.execution().caller.policy_sha256, "f" ** 64);
+    try same(&decoded.execution().caller.policy_sha256, &@as([64]u8, @splat('f')));
     const request_file = try relative(fixture, root, request_blob.storage_path);
     try fixture.write(request_file, altered_request, request_blob.mode);
     const blobs = try fixture.allocator.dupe(debz.native_recovery.Blob, intent.intent.blobs);

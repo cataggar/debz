@@ -2884,7 +2884,7 @@ const Validator = struct {
     /// cost is linear in the record's own entries.
     fn validateRecord(self: *Validator, record: PackageRecord) std.mem.Allocator.Error!?Diagnostic {
         const limits = self.options.limits;
-        var metadata_seen = std.EnumSet(RetainedMetadataKind).initEmpty();
+        var metadata_seen: std.EnumSet(RetainedMetadataKind) = .empty;
         for (record.metadata) |entry| {
             if (!safeFileMode(entry.mode))
                 return self.fail(.info_directory, .unsafe_mode, record.name);
@@ -4647,8 +4647,11 @@ fn importUnderAllocationFailure(allocator: std.mem.Allocator, snapshot: Snapshot
 }
 
 test "package_database.test.import stays sound when every allocation can fail" {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    const deterministic_allocator = debug_allocator.allocator();
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         importUnderAllocationFailure,
         .{test_fixtures.snapshot()},
     );
@@ -4656,7 +4659,7 @@ test "package_database.test.import stays sound when every allocation can fail" {
     var repeated = test_fixtures.snapshot();
     repeated.triggers_unincorp = regularFile("/usr/share/toolz toolz toolz:amd64\n");
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         importUnderAllocationFailure,
         .{repeated},
     );

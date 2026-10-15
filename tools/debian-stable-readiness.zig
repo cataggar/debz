@@ -512,10 +512,10 @@ test "official key decoding refuses changed armor, binary identity and primary f
     try std.testing.expectEqualStrings(key, try decodeKey(allocator, armor, pin));
     try std.testing.expectError(error.SignerArmorDigestChanged, decodeKey(allocator, armor ++ "tampered", pin));
     var changed = pin;
-    changed.binary_sha256 = "0" ** 64;
+    changed.binary_sha256 = &@as([64]u8, @splat('0'));
     try std.testing.expectError(error.SignerBinaryDigestChanged, decodeKey(allocator, armor, changed));
     changed = pin;
-    changed.primary_fingerprint = "0" ** 40;
+    changed.primary_fingerprint = &@as([40]u8, @splat('0'));
     try std.testing.expectError(error.SignerFingerprintChanged, decodeKey(allocator, armor, changed));
 }
 
@@ -534,7 +534,7 @@ test "both Release indexes require exact pins and bounded real freshness" {
         try std.testing.expectError(error.ReleaseNotFresh, releaseIndex(allocator, armor, pin, architecture, 1792022400));
         try std.testing.expectError(error.ReleaseDatedInFuture, releaseIndex(allocator, armor, pin, architecture, 0));
         try std.testing.expectError(error.InReleaseDigestChanged, releaseIndex(allocator, try std.mem.concat(allocator, u8, &.{ armor, "changed" }), pin, architecture, now));
-        if (std.mem.eql(u8, architecture, "amd64")) pin.architectures.amd64.index_sha256 = "0" ** 64 else pin.architectures.arm64.index_sha256 = "0" ** 64;
+        if (std.mem.eql(u8, architecture, "amd64")) pin.architectures.amd64.index_sha256 = &@as([64]u8, @splat('0')) else pin.architectures.arm64.index_sha256 = &@as([64]u8, @splat('0'));
         try std.testing.expectError(error.SignedIndexIdentityChanged, releaseIndex(allocator, armor, pin, architecture, now));
     }
 }
@@ -578,7 +578,7 @@ test "index counts bind complete compressed bytes, signed SHA512 and every lower
     const index = try fixtureIndexIdentity(allocator, compressed, 2);
     try std.testing.expectEqual([3]usize{ 2, 2, 0 }, try indexCounts(allocator, compressed, index, null));
     try std.testing.expectEqual([3]usize{ 2, 2, 0 }, try indexCounts(allocator, compressed, index, &hash(std.crypto.hash.sha2.Sha512, compressed)));
-    try std.testing.expectError(error.SignedIndexSha512Changed, indexCounts(allocator, compressed, index, "0" ** 128));
+    try std.testing.expectError(error.SignedIndexSha512Changed, indexCounts(allocator, compressed, index, &@as([128]u8, @splat('0'))));
     try std.testing.expectError(error.SignedIndexIdentityChanged, indexCounts(allocator, try std.mem.concat(allocator, u8, &.{ compressed, "changed" }), index, null));
     var changed = index;
     changed.package_records = 3;

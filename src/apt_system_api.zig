@@ -1308,10 +1308,9 @@ test "apt_system_api.test.success binds profile lock transaction and completion"
 }
 
 test "apt_system_api.test.outcomes have stable exit classifications" {
-    inline for (std.meta.fields(Outcome)) |field| {
-        const outcome: Outcome = @enumFromInt(field.value);
+    inline for (std.meta.tags(Outcome)) |outcome| {
         const status = exitStatus(outcome);
-        try std.testing.expectEqualStrings(field.name, @tagName(status));
+        try std.testing.expectEqualStrings(@tagName(outcome), @tagName(status));
     }
 }
 
@@ -1728,7 +1727,7 @@ test "apt_system_api.test.request v1 and result item package grammars remain dis
             .summary = "installed",
             .items = &.{.{ .package = package }},
         }));
-    const too_long = "a" ** 256;
+    const too_long = &@as([256]u8, @splat('a'));
     try std.testing.expectError(error.InvalidPackage, validateRequest(.{
         .operation = .install,
         .profile_path = "/profile.json",
@@ -1936,13 +1935,12 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
         definitions.get("absolutePath").?.object.get("pattern").?.string,
     );
     const outcomes = definitions.get("outcome").?.object.get("enum").?.array.items;
-    try std.testing.expectEqual(std.meta.fields(Outcome).len, outcomes.len);
+    try std.testing.expectEqual(std.meta.tags(Outcome).len, outcomes.len);
     const diagnostic_ids = definitions.get("diagnosticId").?.object.get("enum").?.array.items;
-    try std.testing.expectEqual(std.meta.fields(DiagnosticId).len, diagnostic_ids.len);
+    try std.testing.expectEqual(std.meta.tags(DiagnosticId).len, diagnostic_ids.len);
 
     const conditions = parsed.value.object.get("allOf").?.array.items;
-    inline for (std.meta.fields(Outcome)) |field| {
-        const outcome: Outcome = @enumFromInt(field.value);
+    inline for (std.meta.tags(Outcome)) |outcome| {
         const expected_status: i64 = @intFromEnum(exitStatus(outcome));
         var found = false;
         for (conditions) |condition| {
@@ -1951,7 +1949,7 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
             const if_properties = if_object.object.get("properties") orelse continue;
             const outcome_property = if_properties.object.get("outcome") orelse continue;
             const outcome_const = outcome_property.object.get("const") orelse continue;
-            if (!std.mem.eql(u8, outcome_const.string, field.name)) continue;
+            if (!std.mem.eql(u8, outcome_const.string, @tagName(outcome))) continue;
             const then_object = condition_object.get("then").?.object;
             const then_properties = then_object.get("properties").?.object;
             const schema_status = then_properties.get("exit_status").?
@@ -1970,13 +1968,13 @@ test "apt_system_api.test.result schema matches enums and absolute paths" {
                     .get("properties").?.object
                     .get("outcome").?.object
                     .get("const").?.string;
-                try std.testing.expectEqualStrings(field.name, diagnostic_outcome);
+                try std.testing.expectEqualStrings(@tagName(outcome), diagnostic_outcome);
                 const wrong_outcome_index =
-                    (@as(usize, @intCast(field.value)) + 1) %
-                    std.meta.fields(Outcome).len;
+                    (@as(usize, @intCast(@intFromEnum(outcome))) + 1) %
+                    std.meta.tags(Outcome).len;
                 try std.testing.expect(!std.mem.eql(
                     u8,
-                    std.meta.fields(Outcome)[wrong_outcome_index].name,
+                    @tagName(std.meta.tags(Outcome)[wrong_outcome_index]),
                     diagnostic_outcome,
                 ));
             }

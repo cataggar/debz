@@ -850,8 +850,8 @@ fn parseType(value: []const u8) ?SourceType {
 }
 
 fn parseArchiveBinding(value: []const u8) ?ArchiveBinding {
-    inline for (std.meta.fields(ArchiveBinding)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (std.meta.tags(ArchiveBinding)) |binding| {
+        if (std.mem.eql(u8, value, @tagName(binding))) return binding;
     }
     return null;
 }
@@ -1086,11 +1086,20 @@ test "source parsing releases repository ownership on allocation failure" {
             try std.testing.expectEqual(@as(usize, 1), sources.repositories.len);
         }
     }.run;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercise, .{
+    const deterministic_allocator: std.mem.Allocator = .{
+        .ptr = std.testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = std.testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.testing.allocator.vtable.free,
+        },
+    };
+    try std.testing.checkAllAllocationFailures(deterministic_allocator, exercise, .{
         "deb [signed-by=/usr/share/keyrings/example.gpg] https://deb.example/debian stable main\n",
         Format.legacy,
     });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercise, .{
+    try std.testing.checkAllAllocationFailures(deterministic_allocator, exercise, .{
         "Types: deb\nURIs: https://deb.example/debian\nSuites: stable\nComponents: main\nSigned-By: /usr/share/keyrings/example.gpg\n",
         Format.deb822,
     });

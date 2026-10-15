@@ -712,7 +712,7 @@ fn runTransactionResult(
     var architecture: ?[]const u8 = null;
     var requested_json = false;
     var for_install = false;
-    var seen: std.EnumSet(TransactionResultSingleOption) = .initEmpty();
+    var seen: std.EnumSet(TransactionResultSingleOption) = .empty;
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--json")) {
             requested_json = true;
@@ -1073,7 +1073,7 @@ fn parsePackageCache(
     var configs: std.ArrayList([]const u8) = .empty;
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
-    var seen: std.EnumSet(PackageCacheSingleOption) = .initEmpty();
+    var seen: std.EnumSet(PackageCacheSingleOption) = .empty;
     var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
     var request: debz.package_cache_workflow.Request = .{
         .lock_input_path = "",
@@ -1627,7 +1627,7 @@ fn parse(
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
-    var seen: std.EnumSet(SingleOption) = .initEmpty();
+    var seen: std.EnumSet(SingleOption) = .empty;
     var selected_backend: ?debz.transaction_engine.Kind = null;
     var native_result = false;
     var options: api.CommonOptions = .{

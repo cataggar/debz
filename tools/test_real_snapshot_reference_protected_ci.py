@@ -38,12 +38,12 @@ HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protect
 from real_snapshot_reference_paths import toolchain, verify_keyring
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
-# The published signature of the pinned x86_64 Zig 0.16.0 archive.
+# The published signature of the pinned x86_64 Zig 0.17.0 archive.
 ZIG_X86_64_MINISIG = (
     "untrusted comment: signature from minisign secret key\n"
-    "RUSGOq2NVecA2YgO2yM1ni51DC/wp3MuUk5nX9mRT+i07G0aLo26+XusTZAn5zOewoAiWLoo/N73C9+jlA3Y9LFDZz7AnxOfFQc=\n"
-    "trusted comment: timestamp:1776173777\tfile:zig-x86_64-linux-0.16.0.tar.xz\thashed\n"
-    "E8nJ7jSGa4zwOaGg1cn+gbKJK73F0aRyCCObkifI1f7ZF61MAVnb8HdsEZsJQTSUbierXPeDdj/q5gYcQbpsCQ==\n"
+    "RUSGOq2NVecA2VBoEOeGzBPCLUN923PdJ8Siq4/5/Yft5EkLCQS/d3Z26i8qvr3E/yADtLLDGeS1g1yq6GHQXNI2oLMXynajRgo=\n"
+    "trusted comment: timestamp:1790965431\tfile:zig-x86_64-linux-0.17.0.tar.xz\thashed\n"
+    "sRbmsqhOqH2oWybcev78e/pu1CRtIZ2Ga/YW2G/WGv79JHI2Sat9FpkGSo2Sik31aJbuPjxGV8tAdBgci59rDQ==\n"
 )
 
 
@@ -86,7 +86,7 @@ class MinisignTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.signer = Signer(self.root)
-        self.name = "zig-test-linux-0.16.0.tar.xz"
+        self.name = "zig-test-linux-0.17.0.tar.xz"
         self.payload = b"pinned toolchain bytes\n" * 64
         self.artifact = self.root / self.name
         self.artifact.write_bytes(self.payload)
@@ -125,7 +125,7 @@ class MinisignTests(unittest.TestCase):
             ({"sha256": hashlib.sha256(self.payload).hexdigest().upper()}, "SHA256"),
             ({"sha256": ""}, "SHA256"),
             ({"size": len(self.payload) - 1}, "size or SHA256"),
-            ({"name": "zig-other-linux-0.16.0.tar.xz"}, "trusted comment"),
+            ({"name": "zig-other-linux-0.17.0.tar.xz"}, "trusted comment"),
             ({"public_key": self.other_key()}, "Ed25519"),
         ):
             with self.subTest(message=message), self.assertRaisesRegex(MINISIGN.VerificationError, message):
@@ -678,7 +678,7 @@ timeout() {
             ("src/native_alternatives.zig",
              '                try testing.expect(testClonedEntryFactEqual(left, right));\n'),
             ("src/native_alternatives.zig",
-             '        errdefer |err| std.debug.print(\n'),
+             '        errdefer std.debug.print(\n'),
             ("src/native_alternatives.zig",
              '        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },\n'),
             ("tools/real-snapshot-less-protected-stage.sh",

@@ -1210,7 +1210,7 @@ pub fn validate(request: Request) ?RejectionReason {
             return .invalid_argument;
     }
 
-    var seen: [std.meta.fields(VariableName).len]bool = @splat(false);
+    var seen: [std.meta.tags(VariableName).len]bool = @splat(false);
     for (request.variables) |variable| {
         if (variable.value.len == 0 or
             variable.value.len > maximum_variable_bytes or
@@ -1771,17 +1771,17 @@ const Strings = struct {
     helper_target: ?[:0]u8,
 
     fn init(allocator: std.mem.Allocator, invocation: Invocation) !Strings {
-        const root = try allocator.dupeZ(u8, invocation.root);
+        const root = try allocator.dupeSentinel(u8, invocation.root, 0);
         errdefer allocator.free(root);
-        const program = try allocator.dupeZ(u8, invocation.program);
+        const program = try allocator.dupeSentinel(u8, invocation.program, 0);
         errdefer allocator.free(program);
         const helper_source = if (invocation.helper_mount) |mount|
-            try allocator.dupeZ(u8, mount.evidence.source_path)
+            try allocator.dupeSentinel(u8, mount.evidence.source_path, 0)
         else
             null;
         errdefer if (helper_source) |path| allocator.free(path);
         const helper_target = if (invocation.helper_mount) |mount|
-            try allocator.dupeZ(u8, mount.evidence.target_path)
+            try allocator.dupeSentinel(u8, mount.evidence.target_path, 0)
         else
             null;
         errdefer if (helper_target) |path| allocator.free(path);
@@ -1791,7 +1791,7 @@ const Strings = struct {
         var filled_argv: usize = 0;
         errdefer for (argv_storage[0..filled_argv]) |item| allocator.free(item);
         for (invocation.argv, argv_storage) |argument, *slot| {
-            slot.* = try allocator.dupeZ(u8, argument);
+            slot.* = try allocator.dupeSentinel(u8, argument, 0);
             filled_argv += 1;
         }
 
@@ -2082,7 +2082,7 @@ fn executeBoundaryProbe(probe: TestBoundaryProbe, environment: [*:null]const ?[*
         );
         linux.exit(125);
     }
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const waited = linux.waitpid(@intCast(forked), &status, 0);
         switch (linux.errno(waited)) {
@@ -2091,7 +2091,8 @@ fn executeBoundaryProbe(probe: TestBoundaryProbe, environment: [*:null]const ?[*
             else => |err| return err,
         }
     }
-    return if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0) .SUCCESS else .IO;
+    const status_bits: u32 = @bitCast(status);
+    return if (linux.W.IFEXITED(status_bits) and linux.W.EXITSTATUS(status_bits) == 0) .SUCCESS else .IO;
 }
 
 fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
@@ -2979,13 +2980,13 @@ fn probeExited(pid: i32) bool {
 }
 
 fn reapChild(pid: i32, nohang: bool) !?u32 {
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const rc = linux.waitpid(pid, &status, if (nohang) linux.W.NOHANG else 0);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return null;
-                return status;
+                return @bitCast(status);
             },
             .INTR => continue,
             .CHILD => return null,
@@ -3625,7 +3626,7 @@ const SockaddrIn = extern struct {
     family: linux.sa_family_t,
     port: u16,
     addr: [4]u8,
-    zero: [8]u8 = .{0} ** 8,
+    zero: [8]u8 = @splat(0),
 };
 
 const SockaddrUn = extern struct {
@@ -3675,7 +3676,7 @@ fn openAbstractUnixListener(name: []const u8) !i32 {
     errdefer _ = linux.close(fd);
     var address: SockaddrUn = .{
         .family = linux.AF.UNIX,
-        .path = .{0} ** 108,
+        .path = @splat(0),
     };
     @memcpy(address.path[1 .. 1 + name.len], name);
     const bound = linux.errno(linux.bind(
@@ -4925,7 +4926,7 @@ test "maintainer_script.test.elevated script child loses host capabilities and k
     try directory.dir.writeFile(testing.io, .{ .sub_path = "file", .data = "protected" });
     const file_path = try absoluteTempPath(testing.allocator, &directory, "file");
     defer testing.allocator.free(file_path);
-    const path = try testing.allocator.dupeZ(u8, file_path);
+    const path = try testing.allocator.dupeSentinel(u8, file_path, 0);
     defer testing.allocator.free(path);
     var status: [2]i32 = undefined;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
@@ -4986,14 +4987,14 @@ test "maintainer_script.test.elevated script child loses host capabilities and k
     var result: [3]u8 = undefined;
     const received = linux.read(status[0], &result, result.len);
     _ = linux.close(status[0]);
-    var waited: u32 = 0;
+    var waited: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
     if (received != result.len or result[0] != 1)
         std.debug.print("script capability probe stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
     try testing.expectEqual(@as(usize, result.len), received);
     try testing.expectEqual(@as(u8, 1), result[0]);
-    try testing.expect(linux.W.IFEXITED(waited));
-    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect(linux.W.IFEXITED(@bitCast(waited)));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(waited)));
     const fd = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(fd));
     defer _ = linux.close(@intCast(fd));
@@ -5039,14 +5040,14 @@ test "maintainer_script.test.partially privileged parent without SETPCAP refuses
     var result: [3]u8 = undefined;
     const received = linux.read(status[0], &result, result.len);
     _ = linux.close(status[0]);
-    var waited: u32 = 0;
+    var waited: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
     if (received != result.len or result[0] != 1)
         std.debug.print("partial privilege probe stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
     try testing.expectEqual(@as(usize, result.len), received);
     try testing.expectEqual(@as(u8, 1), result[0]);
-    try testing.expect(linux.W.IFEXITED(waited));
-    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect(linux.W.IFEXITED(@bitCast(waited)));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(waited)));
 }
 
 test "maintainer_script.test.production script inherits only narrowed capability policy" {
@@ -5295,7 +5296,7 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
     try directory.dir.createDir(testing.io, "proc", .default_dir);
     const path = try absoluteTempPath(testing.allocator, &directory, "");
     defer testing.allocator.free(path);
-    const root_path = try testing.allocator.dupeZ(u8, std.mem.trimEnd(u8, path, "/"));
+    const root_path = try testing.allocator.dupeSentinel(u8, std.mem.trimEnd(u8, path, "/"), 0);
     defer testing.allocator.free(root_path);
     const root = root_fs.Root.init(testing.io, directory.dir);
     var mountpoint = try root.pinDirectory(try root_fs.Path.init("proc"));
@@ -5393,14 +5394,14 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
     var result: [3]u8 = .{ 0, 0, 0 };
     const received = linux.read(status[0], &result, result.len);
     _ = linux.close(status[0]);
-    var waited: u32 = 0;
+    var waited: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
     if (received != result.len or result[0] != 1)
         std.debug.print("snapshot proc PID1 stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
     try testing.expectEqual(@as(usize, result.len), received);
     try testing.expectEqual(@as(u8, 1), result[0]);
-    try testing.expect(linux.W.IFEXITED(waited));
-    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect(linux.W.IFEXITED(@bitCast(waited)));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(waited)));
     try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
 }
 
@@ -5411,7 +5412,7 @@ test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears d
     try directory.dir.createDir(testing.io, "proc", .default_dir);
     const path = try absoluteTempPath(testing.allocator, &directory, "");
     defer testing.allocator.free(path);
-    const root_path = try testing.allocator.dupeZ(u8, std.mem.trimEnd(u8, path, "/"));
+    const root_path = try testing.allocator.dupeSentinel(u8, std.mem.trimEnd(u8, path, "/"), 0);
     defer testing.allocator.free(root_path);
     const root = root_fs.Root.init(testing.io, directory.dir);
     var mountpoint = try root.pinDirectory(try root_fs.Path.init("proc"));
@@ -5506,12 +5507,12 @@ test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears d
     var result: [1]u8 = undefined;
     const received = linux.read(status[0], &result, 1);
     _ = linux.close(status[0]);
-    var waited: u32 = 0;
+    var waited: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
     try testing.expectEqual(@as(usize, 1), received);
     try testing.expectEqual(@as(u8, 0), result[0]);
-    try testing.expect(linux.W.IFEXITED(waited));
-    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect(linux.W.IFEXITED(@bitCast(waited)));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(waited)));
     try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
 }
 
@@ -5542,12 +5543,12 @@ test "maintainer_script.test.exec boundary seals inherited host-root descriptors
     var result: [1]u8 = undefined;
     const received = linux.read(status[0], &result, 1);
     _ = linux.close(status[0]);
-    var waited: u32 = 0;
+    var waited: i32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
     try testing.expectEqual(@as(usize, 1), received);
     try testing.expectEqual(@as(u8, 0), result[0]);
-    try testing.expect(linux.W.IFEXITED(waited));
-    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect(linux.W.IFEXITED(@bitCast(waited)));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(waited)));
 }
 
 fn signedProcFixture(value: ?[*:0]const u8, required: bool) ![]const u8 {
@@ -5955,7 +5956,7 @@ test "maintainer_script.test.signed udev proc rejects altered tools and controls
         "DEBZ_REQUIRE_SIGNED_UDEV_PROC_BAD_TOOL_ROOT",
         "DEBZ_REQUIRE_SIGNED_UDEV_PROC_BAD_CONTROL_ROOT",
     }) |variable| {
-        const name = try testing.allocator.dupeZ(u8, variable);
+        const name = try testing.allocator.dupeSentinel(u8, variable, 0);
         defer testing.allocator.free(name);
         const configured = std.c.getenv(name) orelse continue;
         var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
@@ -6072,7 +6073,7 @@ test "maintainer_script.test.private proc views die on deadline and parent crash
     try directory.dir.createDir(testing.io, "proc", .default_dir);
     const path = try absoluteTempPath(testing.allocator, &directory, "");
     defer testing.allocator.free(path);
-    const root_path = try testing.allocator.dupeZ(u8, std.mem.trimEnd(u8, path, "/"));
+    const root_path = try testing.allocator.dupeSentinel(u8, std.mem.trimEnd(u8, path, "/"), 0);
     defer testing.allocator.free(root_path);
     var mountpoint = try root_fs.Root.init(testing.io, directory.dir).pinDirectory(
         try root_fs.Path.init("proc"),
@@ -6123,7 +6124,7 @@ test "maintainer_script.test.private proc views die on deadline and parent crash
                     testSnapshotProcFailure(status[1], 9, linux.errno(worker));
                 if (worker == 0)
                     testMaskedProcWorker(root_path, descriptor, status[1], false);
-                var child_status: u32 = 0;
+                var child_status: i32 = 0;
                 _ = linux.waitpid(@intCast(worker), &child_status, 0);
                 linux.exit(0);
             }
@@ -6132,16 +6133,16 @@ test "maintainer_script.test.private proc views die on deadline and parent crash
             const received = linux.read(status[0], &ready, ready.len);
             if (received != ready.len or ready[0] != 1) {
                 _ = linux.kill(@intCast(owner), .KILL);
-                var abandoned: u32 = 0;
+                var abandoned: i32 = 0;
                 _ = linux.waitpid(@intCast(owner), &abandoned, 0);
                 _ = linux.close(status[0]);
                 std.debug.print("snapshot proc teardown stage={d} errno={d} bytes={d}\n", .{ ready[1], ready[2], received });
                 return error.NativeHelperNamespaceRequired;
             }
             _ = linux.kill(@intCast(owner), .KILL);
-            var waited: u32 = 0;
+            var waited: i32 = 0;
             try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(owner), &waited, 0)));
-            try testing.expect(linux.W.IFSIGNALED(waited));
+            try testing.expect(linux.W.IFSIGNALED(@bitCast(waited)));
             var pollfd: [1]linux.pollfd = .{.{ .fd = status[0], .events = linux.POLL.IN, .revents = 0 }};
             const drained = linux.poll(&pollfd, pollfd.len, 5_000);
             try testing.expectEqual(linux.E.SUCCESS, linux.errno(drained));

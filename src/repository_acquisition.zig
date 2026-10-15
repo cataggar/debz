@@ -745,7 +745,7 @@ pub const Production = struct {
         const protocol = std.http.Client.Protocol.fromScheme(endpoint.uri.scheme) orelse
             return error.UnsupportedUriScheme;
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const borrowed_host = try endpoint.uri.getHost(&host_buffer);
+        const borrowed_host = try std.Io.net.HostName.fromUri(endpoint.uri, &host_buffer);
         const host_bytes = try allocator.dupe(u8, borrowed_host.bytes);
         return .{
             .protocol = protocol,

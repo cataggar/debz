@@ -72,7 +72,7 @@ amd64 native signed-refresh run.
 
 ## Reproduce the read-only preflight
 
-From a fresh checkout with Zig 0.16.0:
+From a fresh checkout with Zig 0.17.0:
 
 ```sh
 zig build -Doptimize=ReleaseSafe -j2

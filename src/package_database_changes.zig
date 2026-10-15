@@ -692,7 +692,7 @@ const Builder = struct {
         if (entries.len > std.enums.values(database.RetainedMetadataKind).len)
             return self.fail(.info_limit, package);
         const result = try self.arena.alloc(database.RetainedMetadata, entries.len);
-        var seen = std.EnumSet(database.RetainedMetadataKind).initEmpty();
+        var seen: std.EnumSet(database.RetainedMetadataKind) = .empty;
         for (entries, 0..) |entry, index| {
             if (!database.safeFileMode(entry.mode)) return self.fail(.unsafe_mode, package);
             if (entry.kind == .config and
@@ -2442,7 +2442,7 @@ fn checkMetadataAllocations(allocator: std.mem.Allocator, source: database.Datab
 test "package_database_changes.test.inert metadata owns partial allocations" {
     var source = try importFixture();
     defer source.deinit();
-    try testing.checkAllAllocationFailures(testing.allocator, checkMetadataAllocations, .{source});
+    try testing.checkAllAllocationFailures(.{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } }, checkMetadataAllocations, .{source});
 }
 
 fn expectImportRejects(snapshot: database.Snapshot, code: database.Code) !void {
@@ -2545,7 +2545,7 @@ test "package_database_changes.test.produced files must satisfy importer bounds"
     var source = try importFixture();
     defer source.deinit();
 
-    const long_path = "/usr/share/newpkg/" ++ ("a" ** 300);
+    const long_path = "/usr/share/newpkg/" ++ @as([300]u8, @splat('a'));
     var long = newPackage();
     long.paths = &.{ "/.", "/etc", "/etc/newpkg.conf", long_path };
     long.md5sums = null;
@@ -2670,7 +2670,7 @@ test "package_database_changes.test.planning stays sound when every allocation c
     var source = try importFixture();
     defer source.deinit();
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         planUnderAllocationFailure,
         .{source},
     );

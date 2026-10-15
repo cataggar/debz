@@ -7847,12 +7847,13 @@ test "repository backend native caller binds every executable request policy fie
     const request = BindingFixture.request;
     const original = repositoryRequestDigest(request, .native);
     inline for (.{ "cache", "state", "network", "resources" }) |group| {
-        inline for (std.meta.fields(@TypeOf(@field(request, group)))) |field| {
+        const Group = @TypeOf(@field(request, group));
+        inline for (@typeInfo(Group).@"struct".field_names, @typeInfo(Group).@"struct".field_types) |field_name, FieldType| {
             var changed = request;
-            const value = &@field(@field(changed, group), field.name);
-            switch (@typeInfo(field.type)) {
+            const value = &@field(@field(changed, group), field_name);
+            switch (@typeInfo(FieldType)) {
                 .int => value.* += 1,
-                .optional => value.* = if (std.mem.eql(u8, field.name, "proxy_url"))
+                .optional => value.* = if (std.mem.eql(u8, field_name, "proxy_url"))
                     "https://different.example.test"
                 else
                     "/different",
@@ -8261,7 +8262,7 @@ test "repository backend native receipt storage converges at every durable publi
         try std.testing.expectEqual(published.inode, (try root.entry(path)).inode);
         try std.testing.expectEqual(@as(u32, 0o600), (try root.metadata(path)).permissions.toMode() & 0o7777);
         try verifyNativeReceiptBytes(allocator, root, path, bytes, false);
-        try std.testing.checkAllAllocationFailures(allocator, verifyNativeReceiptBytes, .{ root, path, bytes, false });
+        try std.testing.checkAllAllocationFailures(deterministicTestingAllocator(), verifyNativeReceiptBytes, .{ root, path, bytes, false });
         try std.testing.expectError(error.NativeReceiptMismatch, retainNativeReceiptBytes(allocator, root, path, "different receipt", null));
         try verifyNativeReceiptBytes(allocator, root, path, bytes, false);
         try root.removeFile(path);
@@ -8330,7 +8331,7 @@ test "repository backend native package checkpoints preserve installed failure a
         }
     };
     inline for (.{ false, true }) |failed|
-        try std.testing.checkAllAllocationFailures(allocator, Allocation.run, .{ prior, failed, path });
+        try std.testing.checkAllAllocationFailures(deterministicTestingAllocator(), Allocation.run, .{ prior, failed, path });
     for ([_]bool{ false, true }) |installed| {
         var failed = try nativePackageCheckpointState(allocator, prior, true, installed, path);
         defer failed.deinit();
@@ -8632,13 +8633,13 @@ fn testRepositoryNativePackageState(
     }
     if (exercise_refusals) {
         if (!input.attempt.adopted) {
-            var retention_allocations = std.testing.FailingAllocator.init(allocator, .{});
+            var retention_allocations = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
             {
                 var retained = try readRetainedNativeReceipt(retention_allocations.allocator(), input);
                 defer retained.deinit();
             }
             try std.testing.expectEqual(retention_allocations.allocated_bytes, retention_allocations.freed_bytes);
-            var verification_allocations = std.testing.FailingAllocator.init(allocator, .{});
+            var verification_allocations = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
             {
                 var result = try verifyNativePackageState(verification_allocations.allocator(), input);
                 defer result.deinit();
@@ -8648,7 +8649,7 @@ fn testRepositoryNativePackageState(
             // Exercise ownership handoffs without repeatedly hashing the helper
             // for every allocation in the underlying evidence decoders.
             for ([_]usize{ 0, retention_allocations.alloc_index, verification_allocations.alloc_index - 1 }) |fail_index| {
-                var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+                var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = fail_index });
                 if (verifyNativePackageState(failing.allocator(), input)) |value| {
                     var result = value;
                     defer result.deinit();
@@ -9293,14 +9294,14 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         if (failed or request.value.no_refresh) try std.testing.expectEqual(@as(usize, 0), reads);
         if (!failed) try std.testing.expectError(error.RepositoryPackageStageAlreadyAdvanced, persistNativePackageState(allocator, input));
         if (case == .success and pass == 2) {
-            var counting = std.testing.FailingAllocator.init(allocator, .{});
+            var counting = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
             {
                 var counted = try importAndRefreshNative(counting.allocator(), input, dependencies);
                 defer counted.deinit();
             }
             try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
             for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
-                var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+                var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = index });
                 try std.testing.expectError(error.OutOfMemory, importAndRefreshNative(failing.allocator(), input, dependencies));
                 try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
                 try std.testing.expectEqual(inode, (try root.entry(state_path)).inode);
@@ -9559,14 +9560,14 @@ fn testProjectedNativeCompletion(case: RepositoryExecutionCase, projection: *con
         try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
         try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.progress_path)) == null);
         const inode = (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode;
-        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        var counting = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
         var repeated = try completeNative(counting.allocator(), input);
         defer repeated.deinit();
         try std.testing.expectEqual(result.completion.document.digest_sha256, repeated.completion.document.digest_sha256);
         try std.testing.expectEqual(result.checkpoint.state.state.digest_sha256, repeated.checkpoint.state.state.digest_sha256);
         try std.testing.expectEqual(inode, (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode);
         for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
-            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+            var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = index });
             try std.testing.expectError(error.OutOfMemory, completeNative(failing.allocator(), input));
             try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
             try std.testing.expectEqual(inode, (try root.entry(try root_fs.Path.init(root_operation_completion.document_path))).inode);
@@ -9937,7 +9938,7 @@ fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const l
         const current = try attempt.record().canonicalJson(allocator);
         defer allocator.free(current);
         try root.publishFile(try root_fs.Path.init("fixture/repository-history-caller.json"), current, .{ .overwrite = .replace });
-        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        var counting = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
         {
             var repeated = try readNativeRepositoryHistory(counting.allocator(), input);
             defer repeated.deinit();
@@ -9945,7 +9946,7 @@ fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const l
         }
         try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
         for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
-            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+            var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = index });
             try std.testing.expectError(error.OutOfMemory, readNativeRepositoryHistory(failing.allocator(), input));
             try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
         }
@@ -9972,7 +9973,7 @@ fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const l
             if (case == .success) {
                 var fail_index: usize = 0;
                 while (true) : (fail_index += 1) {
-                    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+                    var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = fail_index });
                     if (NativeRepositoryInputs.read(failing.allocator(), input, .package)) |value| {
                         var original = value;
                         original.deinit();
@@ -10054,7 +10055,7 @@ fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const l
                 try std.testing.expectError(error.HistoricalCallerNotClean, readNativeRepositoryHistory(allocator, input));
                 try std.testing.expectEqual(case == .known_failure, result.completed.checkpoint.package_state == .failed);
                 try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
-                var counting = std.testing.FailingAllocator.init(allocator, .{});
+                var counting = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
                 {
                     var repeated = try resumeNativeRepository(counting.allocator(), input, dependencies);
                     defer repeated.deinit();
@@ -10063,7 +10064,7 @@ fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const l
                 }
                 try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
                 for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
-                    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+                    var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = index });
                     try std.testing.expectError(error.OutOfMemory, resumeNativeRepository(failing.allocator(), input, dependencies));
                     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
                 }
@@ -10349,14 +10350,14 @@ fn testProjectedNativeUnchanged(projection: *const live_root.Projection, no_refr
         try std.testing.expect(repeated == .unchanged);
         try std.testing.expectEqual(result.unchanged.state.state.digest_sha256, repeated.unchanged.state.state.digest_sha256);
         try std.testing.expect(result.unchanged.database.eql(repeated.unchanged.database));
-        var counting = std.testing.FailingAllocator.init(allocator, .{});
+        var counting = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{});
         {
             var measured = try completeUnchangedNative(counting.allocator(), input, dependencies);
             defer measured.deinit();
         }
         try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
         for ([_]usize{ 0, counting.alloc_index - 1 }) |index| {
-            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = index });
+            var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = index });
             if (completeUnchangedNative(failing.allocator(), input, dependencies)) |value| {
                 var unexpected = value;
                 unexpected.deinit();
@@ -10602,9 +10603,21 @@ fn testUnchangedDescriptorPlan(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(transaction_executor.planDigest(plan), transaction_executor.planDigest(restored));
 }
 
+fn deterministicTestingAllocator() std.mem.Allocator {
+    return .{
+        .ptr = std.testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = std.testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.testing.allocator.vtable.free,
+        },
+    };
+}
+
 test "repository backend unchanged descriptor planning owns its empty executable inputs" {
     try testUnchangedDescriptorPlan(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnchangedDescriptorPlan, .{});
+    try std.testing.checkAllAllocationFailures(deterministicTestingAllocator(), testUnchangedDescriptorPlan, .{});
 }
 
 const FixturePass = struct {
@@ -11062,7 +11075,7 @@ const NativeCacheClock = struct {
 fn testNativeCacheAllocation(input: NativeCachePreparationRequest) !void {
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = fail_index });
         if (prepareNativeFromCache(failing.allocator(), input)) |value| {
             var result = value;
             defer result.deinit();
@@ -11086,7 +11099,7 @@ fn testNativeCacheAllocation(input: NativeCachePreparationRequest) !void {
 fn testNativeNoExecutionAllocation(input: NativeCachePreparationRequest, diagnostic: bool) !void {
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = fail_index });
         if (executeNativeFromCache(failing.allocator(), input)) |value| {
             var result = value;
             defer result.deinit();
@@ -11430,7 +11443,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
     if (expected_error) |expected| {
         try std.testing.expectError(expected, prepareNativeFromCache(allocator, input));
         if (expected == error.ResourceBudgetExceeded) {
-            var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+            var failing = std.testing.FailingAllocator.init(deterministicTestingAllocator(), .{ .fail_index = 0 });
             try std.testing.expectError(expected, prepareNativeFromCache(failing.allocator(), input));
         }
     } else if (case == .allocation_failures) {

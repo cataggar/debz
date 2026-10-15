@@ -237,7 +237,7 @@ const Fixture = struct {
         const status = try std.fmt.allocPrint(allocator, "Package: dpkg\nStatus: install ok installed\nArchitecture: {s}\nVersion: 1.0\n\n", .{architecture});
         defer allocator.free(status);
         try root.root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
-        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/repository/operations/{s}/apt-config-snapshot-v1.json", .{ state, "1" ** 64 });
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/repository/operations/{s}/apt-config-snapshot-v1.json", .{ state, &@as([64]u8, @splat('1')) });
         errdefer allocator.free(manifest_path);
         return .{ .path = path, .relative_path = relative, .root = root, .state = state, .manifest_path = manifest_path };
     }
@@ -338,11 +338,11 @@ test "system_product_context typed defaults preserve target trust on amd64 and a
 fn requireDeepReadonly(comptime T: type) void {
     switch (@typeInfo(T)) {
         .pointer => |pointer| {
-            if (!pointer.is_const) @compileError("system context exposes mutable owned facts");
+            if (!pointer.attrs.@"const") @compileError("system context exposes mutable owned facts");
             requireDeepReadonly(pointer.child);
         },
-        .@"struct" => |structure| inline for (structure.fields) |field| requireDeepReadonly(field.type),
-        .@"union" => |structure| inline for (structure.fields) |field| requireDeepReadonly(field.type),
+        .@"struct" => |structure| inline for (structure.field_types) |field_type| requireDeepReadonly(field_type),
+        .@"union" => |structure| inline for (structure.field_types) |field_type| requireDeepReadonly(field_type),
         .optional => |optional| requireDeepReadonly(optional.child),
         .array => |array| requireDeepReadonly(array.child),
         else => {},
@@ -372,7 +372,9 @@ test "system_product_context allocation failures retain the published configurat
     var fixture = try Fixture.init("amd64", "/var/lib/debz");
     defer fixture.deinit();
     try fixture.activate();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    try std.testing.checkAllAllocationFailures(debug_allocator.allocator(), struct {
         fn exercise(allocator: std.mem.Allocator, path: []const u8) !void {
             const context = try resolve(allocator, std.testing.io, .{ .root = path });
             defer context.deinit();

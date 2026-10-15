@@ -21,13 +21,13 @@ pub const Record = struct {
     uid: u32,
 
     fn eql(left: Record, right: Record, ignore_digest: bool) bool {
-        inline for (std.meta.fields(Record)) |member| {
-            if (!ignore_digest or !std.mem.eql(u8, member.name, "sha256")) {
-                const a = @field(left, member.name);
-                const b = @field(right, member.name);
-                const equal = if (member.type == []const u8)
+        inline for (@typeInfo(Record).@"struct".field_names, @typeInfo(Record).@"struct".field_types) |member_name, MemberType| {
+            if (!ignore_digest or !std.mem.eql(u8, member_name, "sha256")) {
+                const a = @field(left, member_name);
+                const b = @field(right, member_name);
+                const equal = if (MemberType == []const u8)
                     std.mem.eql(u8, a, b)
-                else if (member.type == ?[]const u8)
+                else if (MemberType == ?[]const u8)
                     optionalTextEql(a, b)
                 else
                     a == b;
@@ -39,15 +39,15 @@ pub const Record = struct {
 
     pub fn jsonStringify(self: Record, stream: *std.json.Stringify) !void {
         try stream.beginObject();
-        inline for (std.meta.fields(Record)) |member| {
-            const value = @field(self, member.name);
-            if (@typeInfo(member.type) == .optional) {
+        inline for (@typeInfo(Record).@"struct".field_names, @typeInfo(Record).@"struct".field_types) |member_name, MemberType| {
+            const value = @field(self, member_name);
+            if (@typeInfo(MemberType) == .optional) {
                 if (value) |present| {
-                    try stream.objectField(member.name);
+                    try stream.objectField(member_name);
                     try stream.write(present);
                 }
             } else {
-                try stream.objectField(member.name);
+                try stream.objectField(member_name);
                 try stream.write(value);
             }
         }
@@ -187,7 +187,7 @@ const Inventory = struct {
         if (@import("builtin").os.tag != .linux) return error.OperationUnsupported;
         var parent = try self.root.openParent(path);
         defer parent.close(self.root.io);
-        const leaf = try self.allocator.dupeZ(u8, parent.leaf);
+        const leaf = try self.allocator.dupeSentinel(u8, parent.leaf, 0);
         const linux = std.os.linux;
         var raw = std.mem.zeroes(linux.Statx);
         switch (linux.errno(linux.statx(parent.dir.handle, leaf, linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT, .{ .TYPE = true, .INO = true }, &raw))) {

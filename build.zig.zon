@@ -2,7 +2,7 @@
     .name = .debz,
     .version = "0.3.0",
     .fingerprint = 0x3c072784b03c6c32,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .libsolv = .{
             .url = "git+https://github.com/cataggar/libsolv.git#e190ef1433e5df60a2238b01438927eb76c285f5",
@@ -13,8 +13,8 @@
             .hash = "N-V-__8AAPy-ZQDvb3F10PKDTFyFXk7kwDjstLisczD0n9Fs",
         },
         .zstd = .{
-            .url = "https://github.com/cataggar/zstd/archive/45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
-            .hash = "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+            .url = "https://github.com/cataggar/zstd/archive/71502da18ccdacac0c2049c033dedbbf25a40b93.tar.gz",
+            .hash = "zstd-1.6.0-Nyx42nbYOwBGNLCV3_VPmuHUh7voiJK2Dqm6OBEBfiod",
         },
     },
     .paths = .{

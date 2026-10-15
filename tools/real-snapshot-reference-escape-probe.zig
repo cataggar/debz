@@ -97,7 +97,7 @@ fn namespaceClone(name: []const u8, flag: u32) void {
     const result = linux.clone2(flag | @intFromEnum(linux.SIG.CHLD), 0);
     if (errno(result) == .SUCCESS and result == 0) linux.exit(0);
     if (errno(result) == .SUCCESS) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         _ = linux.waitpid(@intCast(result), &status, 0);
     }
     report(name, errno(result) == .PERM, "errno={s}", .{@tagName(errno(result))});
@@ -461,9 +461,9 @@ fn checkArchiveUnbound() void {
 /// The kernel starts `/bin/sh SCRIPT configure [VERSION]` for a signed postinst.
 fn scriptProfile(args: []const [*:0]const u8) ?Profile {
     if (args.len < 3 or args.len > 4 or !std.mem.eql(u8, std.mem.span(args[2]), "configure")) return null;
-    inline for (@typeInfo(Profile).@"enum".fields) |field| {
-        if (std.mem.eql(u8, std.mem.span(args[1]), "/var/lib/dpkg/info/" ++ field.name ++ ".postinst"))
-            return @enumFromInt(field.value);
+    inline for (@typeInfo(Profile).@"enum".field_names, @typeInfo(Profile).@"enum".field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, std.mem.span(args[1]), "/var/lib/dpkg/info/" ++ field_name ++ ".postinst"))
+            return @enumFromInt(field_value);
     }
     return null;
 }
@@ -501,7 +501,7 @@ fn startDescendant() void {
         while (true) _ = linux.nanosleep(&delay, null);
     }
     _ = linux.close(ready[1]);
-    var status: u32 = 0;
+    var status: i32 = 0;
     _ = linux.waitpid(@intCast(child), &status, 0);
     var byte: [1]u8 = undefined;
     const got = linux.read(ready[0], &byte, 1);

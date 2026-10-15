@@ -289,7 +289,7 @@ test "request and result package contracts distinguish leading punctuation and r
     defer request.deinit();
     var result = try fixture("tools/fixtures/apt-system-result-v2-origin-main.document.json");
     defer result.deinit();
-    const long = "a" ** 256;
+    const long: [256]u8 = @splat('a');
     for ([_][]const u8{ "+", ".", ":", "=", "a", "Z", "0", "a+", "a-", "a.", "a:", "a=", "-", "é", "\x1f", "a/b", "a_", long[0..] }) |name| {
         field(&request.value, "packages").array.items[0] = .{ .string = name };
         try put(&field(&result.value, "items").array.items[0], "package", .{ .string = name });
@@ -431,7 +431,7 @@ test "maximum item count and text length exceed old megabyte cutoff" {
     for (0..4096) |i| {
         if (i != 0) try document.append(allocator, ',');
         try document.appendSlice(allocator, "{\"package\":\"alpha\",\"version\":\"1\",\"architecture\":\"amd64\",\"detail\":\"");
-        try document.appendSlice(allocator, ("A" ** 4096)[0..]);
+        try document.appendSlice(allocator, &@as([4096]u8, @splat('A')));
         try document.appendSlice(allocator, "\"}");
     }
     try document.appendSlice(allocator, original[end..]);

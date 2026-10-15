@@ -1110,7 +1110,7 @@ fn allocationProfileCase(allocator: std.mem.Allocator, source: []const u8) !void
 
 test "system_profile.test.versioned parsing and trust capture preserve allocation failures" {
     for ([_][]const u8{ valid_profile_json, native_profile_json, legacy_backend_profile_json }) |source|
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationProfileCase, .{source});
+        try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, allocationProfileCase, .{source});
 }
 
 test "system_profile.test.strict profile loads only explicit trusted inputs" {

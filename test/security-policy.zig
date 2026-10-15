@@ -351,7 +351,7 @@ test "security: native-only production candidate refuses shipped routes and exac
     const updated_hash = std.fmt.bytesToHex(digest, .lower);
     const reviewed = try f.replace(
         inventory,
-        "73c3b5707811b3d6d9835c7303c45bb90dd4e0d103521620e4ddfc12963a8ab97790702f886e5489d27c7cee698524d5f38fdc6ebff85b7393290a28cad10c61",
+        "0ad4e9b9ad614d218f7d69516b8e5145afd844f6b4d1c2429eb16d49d90c91c5bac35ae35b88f7a5e7b1b65dbb610560b9e7e5ff15444286bac2f117ba2621f5",
         updated_hash[0..],
     );
     var overrides: std.json.ObjectMap = .empty;
@@ -1613,8 +1613,8 @@ test "security: reviewed musl toolchain, static runtime, and vulnerability dispo
         if (!std.mem.eql(u8, dependency.object.get("name").?.string, "musl")) continue;
         count += 1;
         try testing.expectEqualStrings("1.2.5", dependency.object.get("upstream_version").?.string);
-        try testing.expectEqualStrings("0.16.0", dependency.object.get("toolchain_version").?.string);
-        try testing.expectEqualStrings("24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8", dependency.object.get("toolchain_commit").?.string);
+        try testing.expectEqualStrings("0.17.0", dependency.object.get("toolchain_version").?.string);
+        try testing.expectEqualStrings("7647adab80dd088f4de3610fd245915a912eb6ad", dependency.object.get("toolchain_commit").?.string);
         try testing.expectEqualStrings("MIT", dependency.object.get("license").?.string);
         try testing.expectEqualStrings("static_libc_in_debz", dependency.object.get("runtime_linkage").?.string);
         const exceptions = dependency.object.get("reviewed_exceptions").?.array.items;
@@ -1799,7 +1799,7 @@ test "security: native signed baseline regeneration preserves original bytes and
     defer f.deinit();
     try nativeMutations(&f, "native-baseline-fixture", "build.zig", &.{
         "baseline_fixture_smoke.setEnvironmentVariable(\"PATH\", \"/no-host-interpreters\");",
-        "baseline_fixture_test_options.addOptionPath(\"generated\", generated_baseline_fixture);",
+        "baseline_fixture_test_options.addOptionPathDirectory(\"generated\", generated_baseline_fixture);",
         "workload_core.dependOn(&baseline_fixture_tests.step);",
     });
     try nativeMutations(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.zig", &.{
@@ -1928,7 +1928,7 @@ test "security: native Debian readiness keeps pinned freshness, bounded input an
     try nativeMutations(&f, "native-debian-readiness", "build.zig", &.{
         "workload_core.dependOn(&debian_readiness_tests.step);",
         "audit_tests.step.dependOn(&install_debian_readiness.step);",
-        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", b.getInstallPath(.bin, \"debz-debian-stable-readiness\"));",
+        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", getInstallPath(b, .bin, \"debz-debian-stable-readiness\"));",
     });
     try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-readiness.zig", &.{
         "return error.SignerFingerprintChanged;",
@@ -1963,7 +1963,7 @@ test "security: actual integration archive encoding and every fixture consumer r
     try nativeMutations(&f, "native-integration-archive", "tools/integration-archive.zig", &.{
         ".argv = &.{ \"/usr/bin/gzip\", \"-n\", \"-9\", \"-c\", absolute }",
         "result.stdout[9] = 255;",
-        "std.hash.crc.Crc32.hash(raw)",
+        "std.hash.Crc32.hash(raw)",
         "debz.deb_payload.inspectControlAlloc(allocator, bytes",
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
         "return error.ExtraControlRepositoryFields;",
@@ -2011,7 +2011,7 @@ test "security: native OpenPGP regeneration executes original signing and refuse
         "workload_core.dependOn(&openpgp_fixture_tests.step);",
     });
     try nativeMutations(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.zig", &.{
-        "try std.testing.expectEqualSlices(u8, &@field(original, field.name), @field(actual, field.name));",
+        "try std.testing.expectEqualSlices(u8, &@field(original, field_name), @field(actual, field_name));",
         "if (point == .before_rename) try self.check();",
         "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
     });
@@ -2062,7 +2062,7 @@ test "security: actual integration signing binds every consumer to the native re
         "\"$PWD/zig-out/bin/debz-integration-repository\"",
     });
     try nativeMutations(&f, "native-integration-signing", ".github/workflows/release.yml", &.{
-        "cataggar/zig@v0.16.0",
+        "cataggar/zig@v0.17.0",
         "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
     });
     const restored = try nativeCheck(&f, "native-integration-signing", "tools/requirements-openpgp-fixtures.txt", "cryptography\n");
@@ -2419,7 +2419,7 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
         "recovery_family.addArtifactArg(cli);",
         "recovery_bootstrap.addArtifactArg(native_trigger_helper);",
         "repository_recovery.addArtifactArg(cli);",
-        "const repository_fixture_parent = b.addSystemCommand(&.{ \"mkdir\", \"-p\", b.pathFromRoot(\".tmp\") });",
+        "const repository_fixture_parent = b.addSystemCommand(&.{ \"mkdir\", \"-p\", pathFromRoot(b, \".tmp\") });",
         "run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);",
         "repository_recovery.step.dependOn(&repository_fixture_parent.step);",
         "recovery_parity.addArtifactArg(cli);",

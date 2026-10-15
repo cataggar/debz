@@ -104,7 +104,7 @@ fn gzip(io: std.Io, allocator: std.mem.Allocator, root: fs.Root, workspace: []co
     if (result.stdout.len < 18 or !std.mem.eql(u8, result.stdout[0..10], &.{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 3 }))
         return error.InvalidIntegrationCompression;
     const footer = result.stdout[result.stdout.len - 8 ..];
-    if (std.mem.readInt(u32, footer[0..4], .little) != std.hash.crc.Crc32.hash(raw) or
+    if (std.mem.readInt(u32, footer[0..4], .little) != std.hash.Crc32.hash(raw) or
         std.mem.readInt(u32, footer[4..8], .little) != raw.len)
         return error.InvalidIntegrationCompression;
     std.mem.writeInt(u32, result.stdout[4..8], epoch, .little);

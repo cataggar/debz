@@ -219,7 +219,7 @@ test "repository_command.test.native public admission refuses root aliases befor
 
 test "repository_command.test.canonical transport is owned and allocation safe" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, struct {
         fn exercise(allocator: std.mem.Allocator) !void {
             const fd = try openTransport();
             defer _ = linux.close(fd);

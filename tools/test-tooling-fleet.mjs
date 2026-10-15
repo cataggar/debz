@@ -53,7 +53,7 @@ function fixture() {
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
-if (args[0] === 'version') { console.log(process.env.FAKE_ZIG_VERSION ?? '0.16.0'); }
+if (args[0] === 'version') { console.log(process.env.FAKE_ZIG_VERSION ?? '0.17.0'); }
 else if (args.includes('--help')) {
   console.log(${JSON.stringify([...available].map(name => `  ${name} fixture`).join('\n'))});
 } else {
@@ -115,9 +115,9 @@ test('workflow guards scope actual compiler, consumer, source planner and paid r
     ['          ref: ${{ inputs.source_sha }}', '          ref: main'],
     ['persist-credentials: false', 'persist-credentials: true'],
     ['attestations: read', 'attestations: write'],
-    ['cataggar/zig@v0.16.0', 'cataggar/zig@v0.15.0'],
+    ['cataggar/zig@v0.17.0', 'cataggar/zig@v0.15.0'],
     ['RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U', 'unreviewed-key'],
-    ['run: test "$(zig version)" = 0.16.0', 'run: echo compiler-is-fine'],
+    ['run: test "$(zig version)" = 0.17.0', 'run: echo compiler-is-fine'],
     ['node tools/tooling-fleet.mjs run', 'node tools/tooling-fleet.mjs plan'],
     ['node --test tools/test-tooling-fleet.mjs', 'echo tests-skipped'],
     ['SELECTOR: ${{ matrix.selector }}', 'SELECTOR: install'],

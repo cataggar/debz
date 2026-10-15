@@ -3318,9 +3318,13 @@ pub fn prepare(
     // A simulated crash must leave exactly what a real one would, so the
     // journal is only withdrawn when preparation failed for an ordinary
     // reason and nothing durable can depend on it yet.
-    errdefer |err| if (err != error.SimulatedCrash) store.clear(allocator) catch {};
+    var simulated_crash = false;
+    errdefer if (!simulated_crash) store.clear(allocator) catch {};
     options.hooks.before(.journal_sync, ProgressRecord.no_index) catch |err| switch (err) {
-        error.SimulatedCrash => return error.SimulatedCrash,
+        error.SimulatedCrash => {
+            simulated_crash = true;
+            return error.SimulatedCrash;
+        },
         else => return error.IoFailed,
     };
     try store.createProgress();
@@ -3345,7 +3349,10 @@ pub fn prepare(
     };
     // The prepared boundary is published explicitly rather than assumed from
     // an empty log, so the log always states which journal it belongs to.
-    try engine.publish(.journal, ProgressRecord.no_index, @tagName(Stage.prepared), .unbound);
+    engine.publish(.journal, ProgressRecord.no_index, @tagName(Stage.prepared), .unbound) catch |err| {
+        if (err == error.SimulatedCrash) simulated_crash = true;
+        return err;
+    };
     return engine;
 }
 
@@ -8274,8 +8281,18 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     const root = fixture.root();
     try seedRoot(root);
 
+    const deterministic_allocator: std.mem.Allocator = .{
+        .ptr = testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = testing.allocator.vtable.free,
+        },
+    };
+
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.preflightOnce,
         .{root},
     );
@@ -8294,9 +8311,9 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     );
     defer testing.allocator.free(log);
 
-    try testing.checkAllAllocationFailures(testing.allocator, Case.decodeOnce, .{canonical});
+    try testing.checkAllAllocationFailures(deterministic_allocator, Case.decodeOnce, .{canonical});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.replayOnce,
         .{ engine.journal(), log },
     );
@@ -8304,7 +8321,7 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     // whose precondition an earlier step produces, so it is the path a
     // recovery takes and every allocation on it must fail closed.
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.openOnce,
         .{ root, &fixture.attempt },
     );
@@ -8458,17 +8475,17 @@ test "root_mutation.test.progress records have one fixed canonical shape" {
         .identity.eql(identified.identity));
 
     // Every longest boundary name still fits the fixed field.
-    inline for (@typeInfo(StepState).@"enum".fields) |field| {
+    inline for (@typeInfo(StepState).@"enum".field_names) |field_name| {
         var state_record: ProgressRecord = record;
-        state_record.state = @field(StepState, field.name);
+        state_record.state = @field(StepState, field_name);
         try testing.expectEqual(progress_record_bytes, state_record.encode(&buffer).len);
         _ = try decodeProgressRecord(buffer[0 .. progress_record_bytes - 1]);
     }
-    inline for (@typeInfo(Stage).@"enum".fields) |field| {
+    inline for (@typeInfo(Stage).@"enum".field_names) |field_name| {
         var stage_record: ProgressRecord = record;
         stage_record.scope = .journal;
         stage_record.index = ProgressRecord.no_index;
-        stage_record.stage = @field(Stage, field.name);
+        stage_record.stage = @field(Stage, field_name);
         try testing.expectEqual(progress_record_bytes, stage_record.encode(&buffer).len);
         _ = try decodeProgressRecord(buffer[0 .. progress_record_bytes - 1]);
     }
@@ -11557,7 +11574,7 @@ test "root_mutation.test.crash at every FIFO publication boundary recovers exact
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var uninterrupted: Recorder = .{};
     try recordFifoArrivals(&uninterrupted);
-    var reached: std.EnumSet(Boundary) = .initEmpty();
+    var reached: std.EnumSet(Boundary) = .empty;
     for (uninterrupted.arrivals[0..uninterrupted.len]) |arrival| {
         reached.insert(arrival.boundary);
         for ([_]bool{ false, true }) |resume_forward| {
@@ -11585,7 +11602,7 @@ test "root_mutation.test.crash at every FIFO publication boundary recovers exact
     const failure = [_]Fault{.{ .boundary = .verify, .step = 7, .err = error.RenameFailed }};
     var restoring: Recorder = .{ .faults = &failure, .after_fault = true };
     try recordFifoArrivals(&restoring);
-    var restored: std.EnumSet(Boundary) = .initEmpty();
+    var restored: std.EnumSet(Boundary) = .empty;
     for (restoring.arrivals[0..restoring.len]) |arrival| {
         if (arrival.boundary == .verify and arrival.step == 7 and arrival.occurrence == 1) continue;
         restored.insert(arrival.boundary);

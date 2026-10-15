@@ -43,9 +43,9 @@ pub fn main(init: std.process.Init) !void {
         try std.testing.expect(std.mem.indexOf(u8, line, "hash_count=1 ") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "schema=" ++ telemetry.schema_id ++ " version=1 clock=awake published=true progress_version=4") != null);
         try std.testing.expect(std.mem.indexOf(u8, line, "progress_sequence=9 progress_record_sha256=") != null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "intent_sha256=" ++ ("a" ** 64) ++
-            " progress_sequence=9 progress_record_sha256=" ++ ("b" ** 64) ++
-            " progress_document_sha256=" ++ ("c" ** 64)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "intent_sha256=" ++ @as([64]u8, @splat('a')) ++
+            " progress_sequence=9 progress_record_sha256=" ++ @as([64]u8, @splat('b')) ++
+            " progress_document_sha256=" ++ @as([64]u8, @splat('c'))) != null);
     }
     context.detach();
     try std.testing.expectEqual(@as(usize, if (enabled) 2 else 0), log_count);

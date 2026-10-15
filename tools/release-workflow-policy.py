@@ -24,10 +24,10 @@ GHR_ZIG_INSTALL = """\
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
 """
 GHR_STANDALONE_SETUP = """\
       - name: Install verified standalone ghr

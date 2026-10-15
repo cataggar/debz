@@ -3275,7 +3275,7 @@ test "target_apt_config read-only architecture inspection owns bounded target ev
         .dependencies = .{ .filesystem = production.interface() },
     };
     try testArchitectureInspectionAllocation(std.testing.allocator, request);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testArchitectureInspectionAllocation, .{request});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, testArchitectureInspectionAllocation, .{request});
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "root/var/lib/dpkg/arch",
         .data = "invalid/architecture\n",
