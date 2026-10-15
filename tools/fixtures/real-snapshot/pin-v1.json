@@ -715,6 +715,14 @@
         {
           "form": "fixture",
           "path": "src/fixtures/ubuntu-resolute-procps.postinst"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
         }
       ],
       "digest": "sha256:3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
@@ -732,6 +740,156 @@
       "review": "#330",
       "size": 2757,
       "version_bound": false
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
+        }
+      ],
+      "digest": "sha512:350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f",
+      "id": "archive:libc-bin",
+      "kind": "archive",
+      "mode": null,
+      "package": "libc-bin",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f"
+        },
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#265",
+      "size": 700954,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
+        }
+      ],
+      "digest": "sha256:3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+      "id": "script:libc-bin/postinst",
+      "kind": "script",
+      "mode": "0755",
+      "package": "libc-bin",
+      "path": "postinst",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f"
+        },
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#265",
+      "size": 847,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
+        }
+      ],
+      "digest": "sha256:c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
+      "id": "script:libc-bin/triggers",
+      "kind": "script",
+      "mode": "0644",
+      "package": "libc-bin",
+      "path": "triggers",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f"
+        },
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#265",
+      "size": 440,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
+        }
+      ],
+      "digest": "sha512:09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542",
+      "id": "archive:procps",
+      "kind": "archive",
+      "mode": null,
+      "package": "procps",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542"
+        },
+        "version": "2:4.0.4-9ubuntu1"
+      },
+      "review": "#265",
+      "size": 710224,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
+        }
+      ],
+      "digest": "sha256:f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79",
+      "id": "script:procps/triggers",
+      "kind": "script",
+      "mode": "0644",
+      "package": "procps",
+      "path": "triggers",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542"
+        },
+        "version": "2:4.0.4-9ubuntu1"
+      },
+      "review": "#265",
+      "size": 35,
+      "version_bound": true
     },
     {
       "architectures": [

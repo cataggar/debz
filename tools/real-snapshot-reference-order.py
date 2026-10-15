@@ -75,6 +75,18 @@ KBD_CYCLE = (
 )
 KBD_CYCLE_PROFILE = "kbd_cycle"
 KBD_TRIGGERS = b"# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n"
+TRIGGER_HANDLERS = (
+    ("libc-bin", "2.43-2ubuntu2.4", "amd64", 700954,
+     "350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f",
+     "none", "ldconfig", 847,
+     "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4", 440,
+     "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4"),
+    ("procps", "2:4.0.4-9ubuntu1", "amd64", 710224,
+     "09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542",
+     "none", "/usr/lib/sysctl.d", 2757,
+     "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8", 35,
+     "f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79"),
+)
 SUDO_PRESTATE_COMPANION = ("sudo-rs", "0.2.13-0ubuntu1.2", "amd64")
 MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm", "config")
 LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"
@@ -82,6 +94,10 @@ LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noa
 
 class CycleRefusal(RuntimeError):
     """No authority to break a dependency cycle."""
+
+
+class TriggerRefusal(RuntimeError):
+    """No authority to process an unreviewed trigger closure."""
 
 
 @dataclass(frozen=True)
@@ -197,6 +213,15 @@ def dpkg_command(
                 package.selector, str(launcher.runtime), *(str(p.archive) for p in cycle)]
     if cycle:
         raise CycleRefusal("CycleIdentityChanged: archives on a normal operation")
+    if verb == "triggers_only":
+        if package is not None and architecture == "amd64":
+            for binding in TRIGGER_HANDLERS:
+                if (package.name, package.version, package.architecture, package.size, package.digest) == binding[:5]:
+                    if profile != binding[5]:
+                        raise ValueError(f"unauthorized reference script profile: {profile}")
+                    return [str(launcher.path), str(root), str(dpkg), architecture, profile, verb,
+                            package.selector, str(launcher.runtime), str(package.archive)]
+        raise ValueError(f"reference dpkg operation has no single-script binding: {verb}")
     if verb not in ("probe_unpack", "unpack", "probe_configure", "configure", "continue_prestate"):
         raise ValueError(f"reference dpkg operation has no single-script binding: {verb}")
     if package is None:
@@ -695,6 +720,191 @@ def break_kbd_cycle(
     return cycle[0]
 
 
+def trigger_handler_packages(packages: list[Package], architecture: str) -> tuple[Package, ...]:
+    if architecture != "amd64":
+        raise TriggerRefusal(
+            "reference trigger closure refused: no exact triggered postinst identity/profile "
+            "for this architecture; --pending and multi-package ordering are not authorized"
+        )
+    handlers: list[Package] = []
+    for name, version, arch, size, digest, *_ in TRIGGER_HANDLERS:
+        matches = [p for p in packages if p.name == name]
+        if (len(matches) != 1 or
+            (matches[0].version, matches[0].architecture, matches[0].size, matches[0].digest)
+                != (version, arch, size, digest)):
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name}"
+            )
+        handlers.append(matches[0])
+    return tuple(handlers)
+
+
+def control_members(package: Package) -> dict[str, bytes]:
+    result = subprocess.run(
+        ["dpkg-deb", "--ctrl-tarfile", str(package.archive)],
+        env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+        check=True, timeout=30,
+    )
+    if len(result.stdout) > MAXIMUM_CONTROL_BYTES or result.stderr:
+        raise TriggerRefusal(
+            f"reference trigger closure refused: no exact triggered postinst identity/profile: {package.name} control"
+        )
+    members: dict[str, bytes] = {}
+    with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+        for member in archive.getmembers():
+            if member.isfile():
+                extracted = archive.extractfile(member)
+                if extracted is not None:
+                    members[member.name] = extracted.read(MAXIMUM_CONTROL_BYTES + 1)
+    return members
+
+
+def verify_trigger_handlers(root: Path, handlers: tuple[Package, ...]) -> dict:
+    try:
+        records = database_fields(root)
+        triggers_before = trigger_database(root)
+    except (CycleRefusal, ValueError, OSError) as error:
+        raise TriggerRefusal(
+            f"reference trigger closure refused: no exact triggered postinst identity/profile: {error}"
+        ) from error
+    expected_pending = {(name, arch): (version, pending)
+                        for name, version, arch, _, _, _, pending, *_ in TRIGGER_HANDLERS}
+    for key, installed in records.items():
+        if key in expected_pending:
+            continue
+        if (installed.get("status") != "install ok installed" or
+            any(installed.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version"))):
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {key[0]}"
+            )
+    try:
+        ldconfig_triggers = read_root_file(root, "var/lib/dpkg/triggers/ldconfig", 1024)
+        file_triggers = read_root_file(root, "var/lib/dpkg/triggers/File", MAXIMUM_CONTROL_BYTES)
+    except (ValueError, OSError) as error:
+        raise TriggerRefusal(
+            f"reference trigger closure refused: no exact triggered postinst identity/profile: {error}"
+        ) from error
+    if (ldconfig_triggers != b"libc-bin\n" or
+        b"/usr/lib/sysctl.d procps/noawait" not in file_triggers.splitlines()):
+        raise TriggerRefusal(
+            "reference trigger closure refused: no exact triggered postinst identity/profile: trigger table"
+        )
+    info = root / "var/lib/dpkg/info"
+    handler_meta: list[dict] = []
+    for package, binding in zip(handlers, TRIGGER_HANDLERS):
+        (name, version, arch, _, _, profile, pending_triggers,
+         postinst_size, postinst_sha256, triggers_size, triggers_sha256) = binding
+        try:
+            verify_archive(package)
+        except (ValueError, OSError) as error:
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name}: {error}"
+            ) from error
+        members = control_members(package)
+        if "./control" not in members or "./postinst" not in members or "./triggers" not in members:
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name} control"
+            )
+        fields, = control_fields(members["./control"])
+        postinst_bytes = members["./postinst"]
+        triggers_bytes = members["./triggers"]
+        if (fields.get("package") != name or fields.get("version") != version
+            or fields.get("architecture") != arch
+            or len(postinst_bytes) != postinst_size
+            or hashlib.sha256(postinst_bytes).hexdigest() != postinst_sha256
+            or len(triggers_bytes) != triggers_size
+            or hashlib.sha256(triggers_bytes).hexdigest() != triggers_sha256):
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name} archive"
+            )
+        installed = records.get((name, arch))
+        if (installed is None or installed.get("version") != version
+            or installed.get("status") != "install ok triggers-pending"
+            or installed.get("config-version") != version
+            or installed.get("triggers-awaited") is not None
+            or "\n" in installed.get("triggers-pending", "")
+            or installed.get("triggers-pending", "").split() != [pending_triggers]):
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name} status"
+            )
+        try:
+            postinst_stat = protected(info / f"{name}.postinst")
+            triggers_stat = protected(info / f"{name}.triggers")
+            installed_postinst = read_root_file(root, f"var/lib/dpkg/info/{name}.postinst", MAXIMUM_CONTROL_BYTES)
+            installed_triggers = read_root_file(root, f"var/lib/dpkg/info/{name}.triggers", MAXIMUM_CONTROL_BYTES)
+        except (ValueError, OSError) as error:
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name} info"
+            ) from error
+        if (postinst_stat.st_mode & 0o7777 != 0o755 or triggers_stat.st_mode & 0o7777 != 0o644
+            or installed_postinst != postinst_bytes or installed_triggers != triggers_bytes
+            or (info / f"{name}:{arch}.postinst").exists() or (info / f"{name}:{arch}.postinst").is_symlink()
+            or (info / f"{name}:{arch}.triggers").exists() or (info / f"{name}:{arch}.triggers").is_symlink()):
+            raise TriggerRefusal(
+                f"reference trigger closure refused: no exact triggered postinst identity/profile: {name} installed"
+            )
+        handler_meta.append({
+            "selector": package.selector, "version": version, "profile": profile,
+            "archive_sha512": package.digest, "pending_triggers": [pending_triggers],
+            "postinst_size": postinst_size, "postinst_sha256": postinst_sha256,
+            "triggers_size": triggers_size, "triggers_sha256": triggers_sha256,
+        })
+    return {
+        "handlers": handler_meta, "records": records,
+        "trigger_database": triggers_before,
+        "status_sha512": hashlib.sha512(read_root_file(
+            root, "var/lib/dpkg/status", 4 * 1024 * 1024,
+        )).hexdigest(),
+    }
+
+
+def process_triggers(
+    launcher: Launcher, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+) -> None:
+    handlers = trigger_handler_packages(packages, architecture)
+    before = verify_trigger_handlers(root, handlers)
+    (evidence / "triggers-before.json").write_text(json.dumps(
+        {**before, "records": list(before["records"].values())}, sort_keys=True,
+    ) + "\n")
+    current_records = before["records"]
+    steps: list[dict] = []
+    for package, binding in zip(handlers, TRIGGER_HANDLERS):
+        profile = binding[5]
+        pending_triggers = binding[6]
+        command = dpkg_command(
+            launcher, dpkg, root, architecture, profile, "triggers_only", package,
+        )
+        apply(command, environment, stdout, stderr)
+        after = database_fields(root)
+        triggers_after = trigger_database(root)
+        expected = {key: dict(value) for key, value in current_records.items()}
+        expected[(package.name, "amd64")]["status"] = "install ok installed"
+        expected[(package.name, "amd64")].pop("triggers-pending", None)
+        expected[(package.name, "amd64")].pop("config-version", None)
+        if after != expected or triggers_after != before["trigger_database"]:
+            raise TriggerRefusal(
+                "reference trigger closure refused: database changed beyond the one reviewed "
+                f"trigger transition: {package.selector}"
+            )
+        current_records = after
+        steps.append({
+            "selector": package.selector, "operation": command[3:],
+            "callbacks": [f"{package.name}.postinst triggered {pending_triggers}"],
+            "force": [],
+        })
+    if any(
+        record.get("status") != "install ok installed" or
+        any(record.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version"))
+        for record in current_records.values()
+    ):
+        raise TriggerRefusal("reference trigger closure refused: pending trigger state remained")
+    (evidence / "triggers-after.json").write_text(json.dumps({
+        "steps": steps, "trigger_database": before["trigger_database"],
+        "records": list(current_records.values()),
+    }, sort_keys=True) + "\n")
+
+
 def stage_pending_runtime(baseline: Path, setpriv: Path) -> dict:
     """Stage setpriv's signed library only in the unregistered pending oracle."""
     source = setpriv.with_name("libcap-ng.so.0.0.0")
@@ -1171,10 +1381,9 @@ def install(
         raise RuntimeError("prestate package was never configured")
     if len(configured) != len(packages):
         raise ValueError("reference closure not fully configured")
-    raise RuntimeError(
-        "reference trigger closure refused: the launcher has no exact triggered "
-        "postinst identity/profile or single-package trigger operation; --pending "
-        "and multi-package ordering are not authorized"
+    process_triggers(
+        launcher, dpkg, root, evidence, architecture, packages,
+        environment, stdout, stderr,
     )
 
 
