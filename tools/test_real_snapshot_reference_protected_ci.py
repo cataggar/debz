@@ -678,7 +678,7 @@ timeout() {
             ("src/native_alternatives.zig",
              '                try testing.expect(testClonedEntryFactEqual(left, right));\n'),
             ("src/native_alternatives.zig",
-             '        errdefer |err| std.debug.print(\n'),
+             '        errdefer std.debug.print(\n'),
             ("src/native_alternatives.zig",
              '        .{ "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644", "DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644" },\n'),
             ("tools/real-snapshot-less-protected-stage.sh",
