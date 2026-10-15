@@ -31,8 +31,8 @@ const stages = .{
 };
 
 fn operation(stage: []const u8) ![]const u8 {
-    inline for (std.meta.fields(@TypeOf(stages))) |entry| {
-        if (std.mem.eql(u8, stage, entry.name)) return @field(stages, entry.name);
+    inline for (@typeInfo(@TypeOf(stages)).@"struct".field_names) |entry_name| {
+        if (std.mem.eql(u8, stage, entry_name)) return @field(stages, entry_name);
     }
     return error.InvalidLatestStage;
 }
@@ -353,11 +353,11 @@ test "native outcome refuses duplicate fields hardlinks oversized markers and ex
     const linked = try fixture.run("failure");
     try std.testing.expectEqualStrings("HardLinkedOutcomeEvidence", linked.outcome.diagnostics[0].object.get("message").?.string);
     try root.root.removeFile(try fs.Path.init("alias.json"));
-    try fixture.write("native-stage-v1.json", " " ** 4097);
+    try fixture.write("native-stage-v1.json", &@as([4097]u8, @splat(' ')));
     const oversized = try fixture.run("failure");
     try std.testing.expectEqual(@as(u8, 1), oversized.collector_exit);
     try std.testing.expectEqual(null, oversized.outcome.stage);
-    try fixture.attempt("create", 0, 0, "[" ** 65 ++ "0" ++ "]" ** 65);
+    try fixture.attempt("create", 0, 0, &(@as([65]u8, @splat('[')) ++ "0".* ++ @as([65]u8, @splat(']'))));
     const deep = try fixture.run("failure");
     try std.testing.expectEqualStrings("OutcomeDepthExceeded", deep.outcome.diagnostics[0].object.get("message").?.string);
     try std.testing.expect(!deep.outcome.result_available);

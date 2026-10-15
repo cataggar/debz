@@ -71,7 +71,7 @@ pub fn openProtected(allocator: std.mem.Allocator, path: []const u8, directory: 
     if (!absolutePath(path)) return error.InvalidRuntimePath;
     var parent: usize = 1;
     while (std.mem.indexOfScalarPos(u8, path, parent, '/')) |end| {
-        const prefix = try allocator.dupeZ(u8, path[0..end]);
+        const prefix = try allocator.dupeSentinel(u8, path[0..end], 0);
         defer allocator.free(prefix);
         const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true };
         const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)) };
@@ -86,7 +86,7 @@ pub fn openProtected(allocator: std.mem.Allocator, path: []const u8, directory: 
         if (!protectedMetadata(try stat(fd), true)) return error.UnprotectedRuntimeInput;
         parent = end + 1;
     }
-    const name = try allocator.dupeZ(u8, path);
+    const name = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(name);
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = directory };
     const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)) };
@@ -132,7 +132,7 @@ fn digest(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 
 fn writeNew(allocator: std.mem.Allocator, directory: i32, name: []const u8, bytes: []const u8) !void {
     if (!libraryName(name)) return error.InvalidRuntimePath;
-    const path = try allocator.dupeZ(u8, name);
+    const path = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(path);
     const fd: i32 = @intCast(try syscall(linux.openat(
         directory,
@@ -286,7 +286,7 @@ pub const Bound = struct {
         defer self.allocator.free(parent_path);
         const parent = try openProtected(self.allocator, parent_path, true);
         defer _ = linux.close(parent.fd);
-        const name = try self.allocator.dupeZ(u8, std.fs.path.basename(link.path));
+        const name = try self.allocator.dupeSentinel(u8, std.fs.path.basename(link.path), 0);
         defer self.allocator.free(name);
         const fd: i32 = @intCast(try syscall(linux.openat(
             parent.fd,
@@ -638,7 +638,7 @@ pub fn main(init: std.process.Init) !void {
     defer _ = linux.close(parent.fd);
     const basename = std.fs.path.basename(output);
     if (!libraryName(basename)) return error.InvalidRuntimePath;
-    const output_name = try allocator.dupeZ(u8, basename);
+    const output_name = try allocator.dupeSentinel(u8, basename, 0);
     _ = try syscall(linux.mkdirat(parent.fd, output_name.ptr, 0o700));
     const directory = try openProtected(allocator, output, true);
     defer _ = linux.close(directory.fd);

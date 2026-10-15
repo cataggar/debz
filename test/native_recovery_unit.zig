@@ -255,7 +255,7 @@ test "recovery-unit.retained evidence rejects missing duplicate cross-attempt an
     changed.evidence_files_sha256 = manifestDigest(&files);
     provenance.seal(&changed);
     try std.testing.expectError(error.InvalidEvidence, provenance.validate(changed));
-    files[1].path = "var/lib/debz/native-receipts-v1/" ++ ("b" ** 64) ++ "/foreign.json";
+    files[1].path = "var/lib/debz/native-receipts-v1/" ++ @as([64]u8, @splat('b')) ++ "/foreign.json";
     changed.evidence_files_sha256 = manifestDigest(&files);
     provenance.seal(&changed);
     try std.testing.expectError(error.InvalidEvidence, provenance.validate(changed));
@@ -590,17 +590,17 @@ test "recovery-unit.handler schemas require explicit absent postinst or lowercas
         try std.testing.expectError(error.InvalidHandlerSchema, oracle.validateHandlerSchemaDefinition(allocator, loosened, schema.definition));
         try std.testing.expectError(error.InvalidHandlerSchema, oracle.validateHandlerSchemaDefinition(allocator, "[]", schema.definition));
         for ([_][]const u8{
-            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":null,\"declarations_sha256\":\"" ++ ("b" ** 64) ++ "\"}",
-            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"" ++ ("a" ** 64) ++ "\",\"declarations_sha256\":\"" ++ ("b" ** 64) ++ "\"}",
+            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":null,\"declarations_sha256\":\"" ++ @as([64]u8, @splat('b')) ++ "\"}",
+            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"" ++ @as([64]u8, @splat('a')) ++ "\",\"declarations_sha256\":\"" ++ @as([64]u8, @splat('b')) ++ "\"}",
         }) |valid| {
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, valid, .{});
             defer parsed.deinit();
             try oracle.validateHandler(parsed.value);
         }
         for ([_][]const u8{
-            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"declarations_sha256\":\"" ++ ("b" ** 64) ++ "\"}",
-            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"\",\"declarations_sha256\":\"" ++ ("b" ** 64) ++ "\"}",
-            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"not-a-digest\",\"declarations_sha256\":\"" ++ ("b" ** 64) ++ "\"}",
+            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"declarations_sha256\":\"" ++ @as([64]u8, @splat('b')) ++ "\"}",
+            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"\",\"declarations_sha256\":\"" ++ @as([64]u8, @splat('b')) ++ "\"}",
+            "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":\"not-a-digest\",\"declarations_sha256\":\"" ++ @as([64]u8, @splat('b')) ++ "\"}",
             "{\"package\":{\"name\":\"receiver\",\"version\":\"1\",\"architecture\":\"amd64\"},\"source\":\"installed_package\",\"postinst_sha256\":null,\"declarations_sha256\":null}",
         }) |invalid| {
             var parsed = try std.json.parseFromSlice(std.json.Value, allocator, invalid, .{});
@@ -613,8 +613,8 @@ test "recovery-unit.handler schemas require explicit absent postinst or lowercas
 test "recovery-unit.helper request schemas resolve v1 program policy and reject missing bindings" {
     const request = debz.native_execution_request;
     var program: request.ProgramBinding = undefined;
-    inline for (std.meta.fields(request.ProgramBinding)) |field| {
-        @field(program, field.name) = @splat('a');
+    inline for (@typeInfo(request.ProgramBinding).@"struct".field_names) |field_name| {
+        @field(program, field_name) = @splat('a');
     }
     var document: request.Document = .{
         .install_root = "/fixture",
@@ -643,7 +643,7 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
         u8,
         allocator,
         canonical,
-        ",\"script_policy_sha256\":\"" ++ ("a" ** 64) ++ "\"",
+        ",\"script_policy_sha256\":\"" ++ @as([64]u8, @splat('a')) ++ "\"",
         "",
     );
     defer allocator.free(without_policy);
@@ -661,7 +661,7 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
     defer v1.deinit();
     const program_schema = v1.value.object.get("properties").?.object.get("program").?;
     const required = program_schema.object.get("required").?.array.items;
-    try std.testing.expectEqual(@as(usize, std.meta.fields(request.ProgramBinding).len), required.len);
+    try std.testing.expectEqual(@as(usize, @typeInfo(request.ProgramBinding).@"struct".field_names.len), required.len);
     try std.testing.expect(std.mem.eql(u8, v1.value.object.get("$id").?.string, request.schema_id));
     for ([_]struct { path: []const u8, id: []const u8 }{
         .{ .path = "schema/native-execution-request-v2.json", .id = request.helper_schema_id },
@@ -675,17 +675,17 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
         const execution = parsed.value.object.get("properties").?.object.get("execution").?;
         try std.testing.expectEqualStrings(request.schema_id, execution.object.get("$ref").?.string);
     }
-    inline for (std.meta.fields(request.ProgramBinding)) |field| {
+    inline for (@typeInfo(request.ProgramBinding).@"struct".field_names) |field_name| {
         var found = false;
         for (required) |name| {
-            if (std.mem.eql(u8, name.string, field.name)) found = true;
+            if (std.mem.eql(u8, name.string, field_name)) found = true;
         }
         try std.testing.expect(found);
     }
 
     const helper = debz.native_helper;
     const isolated = try request.withHelper(document, .{
-        .source_path = helper.directory ++ "/" ++ ("e" ** 64) ++ ".bin",
+        .source_path = helper.directory ++ "/" ++ @as([64]u8, @splat('e')) ++ ".bin",
         .target_path = helper.target_path,
         .sha256 = @splat('e'),
         .size = 1,
@@ -705,7 +705,7 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
         .exact_lock_version = helper.legacy_exact_lock_version,
         .exact_lock_sha256 = document.program.exact_lock_sha256,
         .helper = .{
-            .source_path = helper.bootstrap_directory ++ "/helper-" ++ ("b" ** 64) ++ ".bin",
+            .source_path = helper.bootstrap_directory ++ "/helper-" ++ @as([64]u8, @splat('b')) ++ ".bin",
             .target_path = helper.target_path,
             .sha256 = @splat('e'),
             .size = 1,
@@ -739,7 +739,7 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
             u8,
             allocator,
             bytes,
-            ",\"script_policy_sha256\":\"" ++ ("a" ** 64) ++ "\"",
+            ",\"script_policy_sha256\":\"" ++ @as([64]u8, @splat('a')) ++ "\"",
             "",
         );
         defer allocator.free(omitted);
@@ -749,8 +749,8 @@ test "recovery-unit.helper request schemas resolve v1 program policy and reject 
             u8,
             allocator,
             bytes,
-            "\"script_policy_sha256\":\"" ++ ("a" ** 64) ++ "\"",
-            "\"script_policy_sha256\":\"" ++ ("A" ** 64) ++ "\"",
+            "\"script_policy_sha256\":\"" ++ @as([64]u8, @splat('a')) ++ "\"",
+            "\"script_policy_sha256\":\"" ++ @as([64]u8, @splat('A')) ++ "\"",
         );
         defer allocator.free(invalid);
         try std.testing.expectEqual(bytes.len, invalid.len);

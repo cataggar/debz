@@ -138,9 +138,9 @@ export function auditWorkflow(workflow) {
   const compiler = step(paid, 'Install Zig via ghr');
   requireValue(compiler.includes('uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e')
     && compiler.includes('ghr-version: v0.8.1')
-    && compiler.includes('cataggar/zig@v0.16.0\n            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U'),
+    && compiler.includes('cataggar/zig@v0.17.0\n            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U'),
   'tooling compiler signature, action and version must remain pinned');
-  requireValue(step(paid, 'Validate Zig version').trim() === 'run: test "$(zig version)" = 0.16.0',
+  requireValue(step(paid, 'Validate Zig version').trim() === 'run: test "$(zig version)" = 0.17.0',
     'exact compiler version must be checked before building');
   requireValue(step(paid, 'Run bound unprivileged tooling selector').includes(
     'run: node tools/tooling-fleet.mjs run')
@@ -203,7 +203,7 @@ export function runSelector(env, root) {
   requireValue(/^[1-9][0-9]*$/.test(env.GITHUB_RUN_ID ?? '')
     && /^[1-9][0-9]*$/.test(env.GITHUB_RUN_ATTEMPT ?? ''), 'missing exact run identity');
   const zig = findExecutable('zig', env.PATH);
-  requireValue(command(zig, ['version'], { env }).trim() === '0.16.0', 'unverified compiler version');
+  requireValue(command(zig, ['version'], { env }).trim() === '0.17.0', 'unverified compiler version');
   requireValue(!existsSync(join(root, 'zig-out')), 'normal install prefix is not fresh');
   const workspace = join(root, '.cache/tooling-fleet', env.SOURCE_SHA,
     env.GITHUB_RUN_ID, env.GITHUB_RUN_ATTEMPT, env.ARCHITECTURE, env.OPTIMIZE, selected);
@@ -214,7 +214,7 @@ export function runSelector(env, root) {
   const report = {
     source_sha: env.SOURCE_SHA, source_tree: env.SOURCE_TREE, selector: selected,
     architecture, optimize: env.OPTIMIZE, run_id: env.GITHUB_RUN_ID,
-    run_attempt: env.GITHUB_RUN_ATTEMPT, compiler: zig, compiler_version: '0.16.0',
+    run_attempt: env.GITHUB_RUN_ATTEMPT, compiler: zig, compiler_version: '0.17.0',
     build_cache: 'fresh-exclusive-no-restore',
     execution: env.GITHUB_ACTIONS === 'true' ? 'github-actions' : 'local-validation',
     acceptance: false, status: 'running',

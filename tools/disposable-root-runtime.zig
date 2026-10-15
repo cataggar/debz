@@ -32,7 +32,7 @@ fn attributes(allocator: std.mem.Allocator, file: std.Io.File) ![]Attribute {
     while (offset < count) {
         if (result.items.len == 64) return error.FixtureAttributesTooLarge;
         const end = std.mem.indexOfScalarPos(u8, names[0..count], offset, 0) orelse return error.InvalidFixtureAttribute;
-        const name = try allocator.dupeZ(u8, names[offset..end]);
+        const name = try allocator.dupeSentinel(u8, names[offset..end], 0);
         errdefer allocator.free(name);
         const length = linux.fgetxattr(file.handle, name, &value, value.len);
         if (linux.errno(length) != .SUCCESS) return error.FixtureAttributesUnreadable;

@@ -113,14 +113,14 @@ const Driver = struct {
         errdefer driver.deinit();
         const cwd = try std.process.currentPathAlloc(support.io, support.allocator);
         defer support.allocator.free(cwd);
-        const binary = try std.fmt.allocPrint(support.allocator, "{s}/.zig-cache/issue-214-snapshot-fixture-{s}", .{ cwd, if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug" });
+        const binary = try std.fmt.allocPrint(support.allocator, "{s}/.zig-cache/issue-214-snapshot-fixture-{s}", .{ cwd, if (@import("builtin").mode == .safe) "ReleaseSafe" else "Debug" });
         errdefer support.allocator.free(binary);
         if (!fixture_compiled) {
             const binary_arg = try std.fmt.allocPrint(support.allocator, "-femit-bin={s}", .{binary});
             defer support.allocator.free(binary_arg);
             const compiled = try support.runWithTimeout(&.{
-                "zig",                                                                   "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
-                if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug", binary_arg,
+                "zig",                                                              "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
+                if (@import("builtin").mode == .safe) "ReleaseSafe" else "Debug", binary_arg,
             }, .inherit, 120);
             defer compiled.deinit();
             try compiled.ok();

@@ -77,7 +77,7 @@ const Summary = struct {
 
 fn parseFields(line: []const u8) !Fields {
     var result: Fields = undefined;
-    var seen: [std.meta.fields(Fields).len]bool = @splat(false);
+    var seen: [@typeInfo(Fields).@"struct".field_names.len]bool = @splat(false);
     var words = std.mem.tokenizeScalar(u8, line, ' ');
     while (words.next()) |word| {
         const equal = std.mem.indexOfScalar(u8, word, '=') orelse return error.MalformedTelemetry;
@@ -85,18 +85,18 @@ fn parseFields(line: []const u8) !Fields {
         const value = word[equal + 1 ..];
         if (value.len == 0) return error.MalformedTelemetry;
         var recognized = false;
-        inline for (std.meta.fields(Fields), 0..) |field, index| {
-            if (std.mem.eql(u8, name, field.name)) {
+        inline for (@typeInfo(Fields).@"struct".field_names, @typeInfo(Fields).@"struct".field_types, 0..) |field_name, FieldType, index| {
+            if (std.mem.eql(u8, name, field_name)) {
                 if (seen[index]) return error.DuplicateTelemetryField;
                 seen[index] = true;
                 recognized = true;
-                @field(result, field.name) = switch (field.type) {
+                @field(result, field_name) = switch (FieldType) {
                     []const u8 => value,
                     bool => if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.MalformedTelemetry,
                     else => block: {
                         for (value) |byte| if (!std.ascii.isDigit(byte)) return error.MalformedTelemetry;
                         if (value.len > 1 and value[0] == '0') return error.MalformedTelemetry;
-                        break :block std.fmt.parseInt(field.type, value, 10) catch return error.MalformedTelemetry;
+                        break :block std.fmt.parseInt(FieldType, value, 10) catch return error.MalformedTelemetry;
                     },
                 };
             }
@@ -276,12 +276,12 @@ fn exampleLine(allocator: std.mem.Allocator, log: *std.ArrayList(u8), context: *
         .progress_document_sha256 = if (finished) "-" else &progress.digest_sha256,
     };
     try log.appendSlice(allocator, "native_phase");
-    inline for (std.meta.fields(Fields)) |field| {
-        const value = @field(fields, field.name);
-        const rendered = switch (field.type) {
-            []const u8 => try std.fmt.allocPrint(allocator, " {s}={s}", .{ field.name, value }),
-            bool => try std.fmt.allocPrint(allocator, " {s}={s}", .{ field.name, if (value) "true" else "false" }),
-            else => try std.fmt.allocPrint(allocator, " {s}={d}", .{ field.name, value }),
+    inline for (@typeInfo(Fields).@"struct".field_names, @typeInfo(Fields).@"struct".field_types) |field_name, FieldType| {
+        const value = @field(fields, field_name);
+        const rendered = switch (FieldType) {
+            []const u8 => try std.fmt.allocPrint(allocator, " {s}={s}", .{ field_name, value }),
+            bool => try std.fmt.allocPrint(allocator, " {s}={s}", .{ field_name, if (value) "true" else "false" }),
+            else => try std.fmt.allocPrint(allocator, " {s}={d}", .{ field_name, value }),
         };
         defer allocator.free(rendered);
         try log.appendSlice(allocator, rendered);

@@ -476,7 +476,7 @@ fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []const u8
     try mountAt(allocator, init.io, &.{ "/usr/bin/mount", "-t", "proc", "proc", proc });
     const dev_null = try std.fmt.allocPrint(allocator, "{s}/dev/null", .{root});
     try mountAt(allocator, init.io, &.{ "/usr/bin/mount", "--bind", "/dev/null", dev_null });
-    const zroot = try allocator.dupeZ(u8, root);
+    const zroot = try allocator.dupeSentinel(u8, root, 0);
     if (linux.errno(linux.chdir(zroot)) != .SUCCESS or
         linux.errno(linux.chroot(".")) != .SUCCESS or
         linux.errno(linux.chdir("/")) != .SUCCESS) return error.PrivateChrootFailed;
@@ -488,7 +488,7 @@ fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []const u8
     };
     const argv = [_:null]?[*:0]const u8{"/fixture/native-test"};
     var envp = try allocator.allocSentinel(?[*:0]const u8, environment.len, null);
-    for (environment, 0..) |entry, index| envp[index] = (try allocator.dupeZ(u8, entry)).ptr;
+    for (environment, 0..) |entry, index| envp[index] = (try allocator.dupeSentinel(u8, entry, 0)).ptr;
     if (linux.errno(linux.execve("/fixture/native-test", &argv, envp.ptr)) != .SUCCESS)
         return error.PrivateExecFailed;
     unreachable;
@@ -1741,7 +1741,7 @@ fn cliCase(fixture: *foundation.Fixture, self: []const u8, cli: []const u8, arch
     const case_path = try support.path(fixture.allocator, relative, "fixture/cli-case");
     const step_path = try support.path(fixture.allocator, relative, "fixture/cli-step");
     const arguments = [_][]const u8{
-        "repo",   "add",           "--url",          "file:///fixture/absent.deb", "--sha256",              "0" ** 64,
+        "repo",   "add",           "--url",          "file:///fixture/absent.deb", "--sha256",              &@as([64]u8, @splat('0')),
         "--root", "/",             "--architecture", arch,                         "--transaction-backend", "native",
         "--json", "--deadline-ms", "60000",
     };
@@ -1762,7 +1762,7 @@ fn cliCase(fixture: *foundation.Fixture, self: []const u8, cli: []const u8, arch
         .{ .step = "0", .deadline = "115000" },
     }) |invalid| {
         const changed = [_][]const u8{
-            "repo",   "add",           "--url",          "file:///fixture/absent.deb", "--sha256",              "0" ** 64,
+            "repo",   "add",           "--url",          "file:///fixture/absent.deb", "--sha256",              &@as([64]u8, @splat('0')),
             "--root", "/",             "--architecture", arch,                         "--transaction-backend", "native",
             "--json", "--deadline-ms", invalid.deadline,
         };
