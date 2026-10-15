@@ -850,8 +850,8 @@ fn parseType(value: []const u8) ?SourceType {
 }
 
 fn parseArchiveBinding(value: []const u8) ?ArchiveBinding {
-    inline for (std.meta.fields(ArchiveBinding)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (std.meta.tags(ArchiveBinding)) |binding| {
+        if (std.mem.eql(u8, value, @tagName(binding))) return binding;
     }
     return null;
 }

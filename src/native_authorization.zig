@@ -2889,11 +2889,11 @@ test "native_authorization.test.schema and enums stay synchronized with the cont
 }
 
 fn expectEnumMatchesSchema(comptime Enum: type, values: []const std.json.Value) !void {
-    try std.testing.expectEqual(std.meta.fields(Enum).len, values.len);
-    inline for (std.meta.fields(Enum)) |field| {
+    try std.testing.expectEqual(@typeInfo(Enum).@"enum".field_names.len, values.len);
+    inline for (@typeInfo(Enum).@"enum".field_names) |field_name| {
         var matches: usize = 0;
         for (values) |value| {
-            if (value == .string and std.mem.eql(u8, field.name, value.string))
+            if (value == .string and std.mem.eql(u8, field_name, value.string))
                 matches += 1;
         }
         try std.testing.expectEqual(@as(usize, 1), matches);

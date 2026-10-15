@@ -109,7 +109,7 @@ test "native_install_result.test.changed installs bind receipts while unchanged 
         defer parsed.deinit();
         const receipt = parsed.value.object.get("evidence").?.object.get("receipt").?;
         try std.testing.expectEqual(changed, receipt != .null);
-        if (changed) try std.testing.expectEqualStrings("04" ** 32, receipt.object.get("transaction_digest_sha256").?.string);
+        if (changed) try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("04".*))), receipt.object.get("transaction_digest_sha256").?.string);
         var invalid = testResult(changed);
         invalid.changed = !changed;
         try std.testing.expectError(error.InvalidNativeInstallResult, canonicalJson(std.testing.allocator, test_request, invalid));

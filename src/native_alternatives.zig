@@ -3903,9 +3903,9 @@ test "native_alternatives.test.protected signed python3 preinst preserves all re
     }) |coordinate| {
         var phase: []const u8 = "open-roots";
         var group_name: []const u8 = "-";
-        errdefer |err| std.debug.print(
+        errdefer std.debug.print(
             "protected Python alternatives: coordinate={s} phase={s} group={s} error={s}\n",
-            .{ coordinate[0], phase, group_name, @errorName(err) },
+            .{ coordinate[0], phase, group_name, "failed" },
         );
         const before_path = std.c.getenv(coordinate[0]) orelse return error.TestUnexpectedResult;
         const after_path = std.c.getenv(coordinate[1]) orelse return error.TestUnexpectedResult;

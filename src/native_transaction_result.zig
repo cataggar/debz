@@ -1088,7 +1088,7 @@ test "native_transaction_result.test.retained script outcomes bind every exact p
     @memcpy(files[0..6], receipt.evidence_files);
     files[6] = .{
         .kind = .script_outcome,
-        .path = "var/lib/debz/native-receipts-v1/" ++ ("1" ** 64) ++ "/scripts/script-1-0-0.json",
+        .path = "var/lib/debz/native-receipts-v1/" ++ @as([64]u8, @splat('1')) ++ "/scripts/script-1-0-0.json",
         .sha256 = @splat('e'),
         .document_sha256 = @splat('b'),
         .action = .{ .kind = .script, .program_step = 1, .substep = 0, .ordinal = 0 },
@@ -1811,10 +1811,10 @@ fn testSummaries(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings(native_provenance.schema_id, fields.get("transaction_schema").?.string);
     try std.testing.expectEqualStrings("native", fields.get("backend").?.string);
     try std.testing.expectEqualStrings("arm64", fields.get("target_architecture").?.string);
-    try std.testing.expectEqualStrings("01" ** 32, fields.get("request_sha256").?.string);
-    try std.testing.expectEqualStrings("03" ** 32, fields.get("caller_request_sha256").?.string);
-    try std.testing.expectEqualStrings("06" ** 32, fields.get("transaction_digest_sha256").?.string);
-    try std.testing.expectEqualStrings("07" ** 32, fields.get("completion_digest_sha256").?.string);
+    try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("01".*))), fields.get("request_sha256").?.string);
+    try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("03".*))), fields.get("caller_request_sha256").?.string);
+    try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("06".*))), fields.get("transaction_digest_sha256").?.string);
+    try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("07".*))), fields.get("completion_digest_sha256").?.string);
     try std.testing.expectEqual(@as(i64, 0), fields.get("package_count").?.integer);
     try std.testing.expectEqual(@as(?usize, bytes.len - 1), std.mem.indexOfScalar(u8, bytes, '\n'));
     var historical = summary;

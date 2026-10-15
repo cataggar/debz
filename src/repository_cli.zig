@@ -76,7 +76,7 @@ pub fn parseAddForRuntime(
         },
     };
     var selected: ?debz.transaction_engine.Kind = null;
-    var seen: std.EnumSet(Option) = .initEmpty();
+    var seen: std.EnumSet(Option) = .empty;
     var index: usize = 0;
     var options = true;
     while (index < arguments.len) : (index += 1) {

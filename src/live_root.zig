@@ -1247,11 +1247,11 @@ fn probeExited(pid: i32) bool {
 }
 
 fn reapBlocking(pid: i32) Error!u32 {
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const raw = linux.waitpid(pid, &status, 0);
         switch (linux.errno(raw)) {
-            .SUCCESS => return status,
+            .SUCCESS => return @bitCast(status),
             .INTR => continue,
             else => return error.WaitFailed,
         }
@@ -1870,7 +1870,7 @@ test "live_root.test.deadline supervisor kills and reaps its own process group" 
     });
     try std.testing.expect(result.deadline_exceeded and result.interrupt == null);
     try std.testing.expectEqual(@as(u32, @intFromEnum(linux.SIG.KILL)), termination(result.status).signaled);
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, &status, 0)));
 }
 

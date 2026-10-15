@@ -892,19 +892,18 @@ test "repository diagnostic enums serialize and exactly match both schemas" {
                 .get("properties").?.object
                 .get("id").?.object
                 .get("enum").?.array.items;
-        try std.testing.expectEqual(std.meta.fields(DiagnosticId).len, values.len);
-        inline for (std.meta.fields(DiagnosticId)) |field| {
+        try std.testing.expectEqual(@typeInfo(DiagnosticId).@"enum".field_names.len, values.len);
+        inline for (@typeInfo(DiagnosticId).@"enum".field_names) |field_name| {
             var matches: usize = 0;
             for (values) |value| {
-                if (value == .string and std.mem.eql(u8, field.name, value.string))
+                if (value == .string and std.mem.eql(u8, field_name, value.string))
                     matches += 1;
             }
             try std.testing.expectEqual(@as(usize, 1), matches);
         }
     }
 
-    inline for (std.meta.fields(DiagnosticId)) |field| {
-        const id: DiagnosticId = @enumFromInt(field.value);
+    inline for (std.meta.tags(DiagnosticId)) |id| {
         const result = failure(.internal, id, "test", "diagnostic");
         const document = try result.canonicalJson(std.testing.allocator);
         defer std.testing.allocator.free(document);
