@@ -1113,8 +1113,10 @@ The authenticated runtime and individually authorized final triggered-handler
 contracts remain separate follow-ups.
 
 This is **not yet an executable full parity gate**: the closed launcher
-refuses `--configure --pending`, `--triggers-only --pending` and **also**
-single-package trigger actions. A disposable unprivileged dpkg 1.22.22
+refuses `--configure --pending` and `--triggers-only --pending`, and accepts
+`--no-triggers --triggers-only <selector>` only for the two reviewed amd64
+trigger handlers (`libc-bin:amd64` `2.43-2ubuntu2.4` and `procps:amd64`
+`2:4.0.4-9ubuntu1`). A disposable unprivileged dpkg 1.22.22
 two-listener fixture shows `--no-triggers --triggers-only listener-a` runs
 only A and leaves B pending; `--no-triggers --configure seed` runs only
 seed. Without `--no-triggers`, configuring seed also runs an unrelated
@@ -1130,17 +1132,25 @@ authorize arbitrary signed scripts.
 `tools/test_real_snapshot_reference_triggers.py` requires an explicitly
 selected, SHA256-checked pinned dpkg fixture and never runs as root.
 
-A safe later single-listener operation would have to bind the selected
-listener's **triggered** script bytes to the exact authenticated archive,
-verify the pinned installed script, status/trigger queue and version again
-in the launcher before exec, establish that no other script is invoked, and
-compare per-listener ordering and state with pinned dpkg. The current
+For the amd64 reference closure (#265), `tools/real-snapshot-reference-order.py`
+and `tools/real-snapshot-reference-launcher.zig` process pending triggers one
+signed handler at a time (`libc-bin:amd64` for `ldconfig`, then `procps:amd64`
+for `/usr/lib/sysctl.d`). Before and inside the confined chroot, both the
+driver and launcher bind each selected handler's archive size/SHA-512,
+installed `.postinst` (`0755`) and `.triggers` (`0644`) size/SHA-256 (pinned in
+`tools/fixtures/real-snapshot/pin-v1.json`), exact `install ok triggers-pending`
+status, `Config-Version`, single `Triggers-Pending` token, empty
+`Triggers-Awaited`, empty `updates/` and `triggers/Unincorp`, and trigger
+interest table (`triggers/ldconfig` or `triggers/File`) before executing
+`dpkg --no-triggers --triggers-only <selector>` under the `none` profile. After
+each handler step, `process_triggers` verifies state conservation across the
+full dpkg status database and trigger tables (only the selected handler may
+transition from `install ok triggers-pending` to `install ok installed` with
+`Triggers-Pending` and `Config-Version` cleared). The current
 launcher's normal configure path has an exact
 `["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
-profile for any of them. The Python command builder refuses all trigger
-verbs, including attempts to reuse those configure-only profiles. Until
-these distinct identities and closure ordering are proved, finalization
-refuses rather than silently changing `--pending` behavior. Privileged
+profile for any of them. The Python command builder refuses any unreviewed
+`triggers_only` selector or non-`none` profile, and refuses `--triggers-only --pending`. Privileged
 namespace/archive-mount, death/timeout cleanup and
 exact result equivalence still require independently protected small-root
 proof and review before any full-closure comparison. The manual full-reference

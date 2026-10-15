@@ -73,7 +73,7 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
 };
 
 const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle, kbd_cycle };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle, break_kbd_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle, break_kbd_cycle, triggers_only };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -85,6 +85,54 @@ const script_bindings = [_]ScriptBinding{
     .{ .name = "udev", .version = "259.5-0ubuntu3.4", .size = 2578, .digest = "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606" },
     .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .size = 1747, .digest = "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383" },
 };
+const TriggerBinding = struct {
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8 = "amd64",
+    profile: Profile = .none,
+    pending_triggers: []const u8,
+    archive_size: usize,
+    archive_sha512: []const u8,
+    postinst_size: usize,
+    postinst_sha256: []const u8,
+    triggers_size: usize,
+    triggers_sha256: []const u8,
+};
+const trigger_bindings = [_]TriggerBinding{
+    .{
+        .package = "libc-bin",
+        .version = "2.43-2ubuntu2.4",
+        .pending_triggers = "ldconfig",
+        .archive_size = 700954,
+        .archive_sha512 = "350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f",
+        .postinst_size = 847,
+        .postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+        .triggers_size = 440,
+        .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
+    },
+    .{
+        .package = "procps",
+        .version = "2:4.0.4-9ubuntu1",
+        .pending_triggers = "/usr/lib/sysctl.d",
+        .archive_size = 710224,
+        .archive_sha512 = "09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542",
+        .postinst_size = 2757,
+        .postinst_sha256 = "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
+        .triggers_size = 35,
+        .triggers_sha256 = "f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79",
+    },
+};
+fn triggerBindingFor(selector: []const u8) ?TriggerBinding {
+    const colon = std.mem.indexOfScalar(u8, selector, ':') orelse return null;
+    const name = selector[0..colon];
+    const architecture = selector[colon + 1 ..];
+    for (trigger_bindings) |binding| {
+        if (std.mem.eql(u8, binding.package, name) and
+            std.mem.eql(u8, binding.architecture, architecture))
+            return binding;
+    }
+    return null;
+}
 const dpkg_digests = [_][]const u8{
     "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
     "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
@@ -214,6 +262,7 @@ const Options = struct {
     cycle_archives: ?[base_cycle.len][:0]const u8 = null,
     openssl_archives: ?[openssl_cycle.len][:0]const u8 = null,
     kbd_archives: ?[kbd_cycle.len][:0]const u8 = null,
+    trigger_archive: ?[:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -242,6 +291,7 @@ pub fn main(init: std.process.Init) !void {
     var cycle_archives: ?[base_cycle.len][:0]const u8 = null;
     var openssl_archives: ?[openssl_cycle.len][:0]const u8 = null;
     var kbd_archives: ?[kbd_cycle.len][:0]const u8 = null;
+    var trigger_archive: ?[:0]const u8 = null;
     if (verb == .break_base_cycle) {
         var paths: [base_cycle.len][:0]const u8 = undefined;
         for (&paths) |*path| {
@@ -263,7 +313,10 @@ pub fn main(init: std.process.Init) !void {
         }
         kbd_archives = paths;
     }
-    const normal = cycle_archives == null and openssl_archives == null and kbd_archives == null;
+    if (verb == .triggers_only) {
+        trigger_archive = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
+    }
+    const normal = cycle_archives == null and openssl_archives == null and kbd_archives == null and trigger_archive == null;
     const archive = if (normal) args.next() else null;
     const digest = if (normal) args.next() else null;
     const size_text = if (normal) args.next() else null;
@@ -282,6 +335,7 @@ pub fn main(init: std.process.Init) !void {
         .cycle_archives = cycle_archives,
         .openssl_archives = openssl_archives,
         .kbd_archives = kbd_archives,
+        .trigger_archive = trigger_archive,
     };
     try validateOptions(options);
     const status = try run(init.arena.allocator(), options);
@@ -309,7 +363,7 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle or options.verb == .break_kbd_cycle;
+    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle or options.verb == .break_kbd_cycle or options.verb == .triggers_only;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
@@ -321,6 +375,14 @@ fn validateOptions(options: Options) !void {
         return error.InvalidArguments;
     if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))
         return error.InvalidArguments;
+    if ((options.verb == .triggers_only) != (options.trigger_archive != null))
+        return error.InvalidArguments;
+    if (options.trigger_archive) |path| {
+        if (!validAbsolute(path)) return error.InvalidArguments;
+        const binding = triggerBindingFor(options.selector.?) orelse return error.InvalidTriggerHandler;
+        if (options.profile != binding.profile or architecture_index != 0)
+            return error.InvalidTriggerHandler;
+    }
     if (options.kbd_archives) |paths| {
         for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
         if (options.profile != .kbd_cycle or architecture_index != 0 or
@@ -776,6 +838,185 @@ fn verifyCycleAbsent(path: [:0]const u8) !void {
         return error.CycleCallbackChanged;
     }
     if (linux.errno(present) != .NOENT) return error.CycleCallbackChanged;
+}
+
+fn singleTriggerMatches(value: []const u8, expected: []const u8) bool {
+    var tokens = std.mem.tokenizeScalar(u8, value, ' ');
+    const first = tokens.next() orelse return false;
+    if (tokens.next() != null) return false;
+    return std.mem.eql(u8, first, expected);
+}
+
+fn fileContainsLine(bytes: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, expected)) return true;
+    }
+    return false;
+}
+
+fn triggerStatusMatches(status: []const u8, target: TriggerBinding) bool {
+    var matched: [trigger_bindings.len]bool = @splat(false);
+    var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+    while (paragraphs.next()) |paragraph| {
+        if (paragraph.len == 0) continue;
+        var name: ?[]const u8 = null;
+        var architecture: ?[]const u8 = null;
+        var version: ?[]const u8 = null;
+        var state: ?[]const u8 = null;
+        var config_version: ?[]const u8 = null;
+        var triggers_pending: ?[]const u8 = null;
+        var triggers_awaited: ?[]const u8 = null;
+        var identity_field = false;
+        var lines = std.mem.splitScalar(u8, paragraph, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == ' ' or line[0] == '\t') {
+                if (identity_field) return false;
+                continue;
+            }
+            identity_field = false;
+            const separator = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+            const key = line[0..separator];
+            const rest = line[separator + 1 ..];
+            if (rest.len > 0 and rest[0] != ' ') return false;
+            const value = if (rest.len == 0) rest else rest[1..];
+            if (std.ascii.eqlIgnoreCase(key, "Package")) {
+                if (name != null) return false;
+                name = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Architecture")) {
+                if (architecture != null) return false;
+                architecture = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Version")) {
+                if (version != null) return false;
+                version = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Status")) {
+                if (state != null) return false;
+                state = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Config-Version")) {
+                if (config_version != null) return false;
+                config_version = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Triggers-Pending")) {
+                if (triggers_pending != null) return false;
+                triggers_pending = value;
+                identity_field = true;
+            } else if (std.ascii.eqlIgnoreCase(key, "Triggers-Awaited")) {
+                if (triggers_awaited != null) return false;
+                triggers_awaited = value;
+                identity_field = true;
+            }
+        }
+        if (name == null or name.?.len == 0 or
+            architecture == null or architecture.?.len == 0 or
+            version == null or version.?.len == 0 or
+            state == null or triggers_awaited != null)
+            return false;
+        var is_handler = false;
+        for (trigger_bindings, 0..) |binding, index| {
+            if (!std.mem.eql(u8, name.?, binding.package)) continue;
+            if (matched[index]) return false;
+            matched[index] = true;
+            is_handler = true;
+            if (!std.mem.eql(u8, architecture.?, binding.architecture) or
+                !std.mem.eql(u8, version.?, binding.version))
+                return false;
+            const expect_pending = std.mem.eql(u8, binding.package, target.package) or
+                (std.mem.eql(u8, target.package, "libc-bin") and std.mem.eql(u8, binding.package, "procps"));
+            if (expect_pending) {
+                if (!std.mem.eql(u8, state.?, "install ok triggers-pending") or
+                    config_version == null or !std.mem.eql(u8, config_version.?, binding.version) or
+                    triggers_pending == null or !singleTriggerMatches(triggers_pending.?, binding.pending_triggers))
+                    return false;
+            } else {
+                if (!std.mem.eql(u8, state.?, "install ok installed") or
+                    config_version != null or triggers_pending != null)
+                    return false;
+            }
+        }
+        if (!is_handler) {
+            if (!std.mem.eql(u8, state.?, "install ok installed") or
+                config_version != null or triggers_pending != null)
+                return false;
+        }
+    }
+    return std.mem.allEqual(bool, &matched, true);
+}
+
+fn verifyTriggerHandler(selector: []const u8) !void {
+    const binding = triggerBindingFor(selector) orelse return error.InvalidTriggerHandler;
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    if (!triggerStatusMatches(bytes, binding)) return error.TriggerStateChanged;
+    protectedAncestors("/var/lib/dpkg/updates/.trigger-check") catch return error.TriggerStateChanged;
+    emptyDirectory("/var/lib/dpkg/updates") catch return error.TriggerStateChanged;
+    const unincorp_path: [:0]const u8 = "/var/lib/dpkg/triggers/Unincorp";
+    try protectedAncestors(unincorp_path);
+    const unincorp = linux.open(unincorp_path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(unincorp) == .SUCCESS) {
+        _ = linux.close(@intCast(unincorp));
+        const pending = readInstalledFile(unincorp_path, 0) catch return error.TriggerStateChanged;
+        std.heap.page_allocator.free(pending);
+    } else if (linux.errno(unincorp) != .NOENT) return error.TriggerStateChanged;
+    const ldconfig = readInstalledFile("/var/lib/dpkg/triggers/ldconfig", 1024) catch return error.TriggerStateChanged;
+    defer std.heap.page_allocator.free(ldconfig);
+    if (!std.mem.eql(u8, ldconfig, "libc-bin\n")) return error.TriggerStateChanged;
+    const file_triggers = readInstalledFile("/var/lib/dpkg/triggers/File", 64 * 1024) catch return error.TriggerStateChanged;
+    defer std.heap.page_allocator.free(file_triggers);
+    if (!fileContainsLine(file_triggers, "/usr/lib/sysctl.d procps/noawait"))
+        return error.TriggerStateChanged;
+    const postinst_path = try std.fmt.allocPrintSentinel(
+        std.heap.page_allocator,
+        "/var/lib/dpkg/info/{s}.postinst",
+        .{binding.package},
+        0,
+    );
+    defer std.heap.page_allocator.free(postinst_path);
+    const postinst = openVerified(
+        postinst_path,
+        std.crypto.hash.sha2.Sha256,
+        binding.postinst_sha256,
+        binding.postinst_size,
+        binding.postinst_size,
+    ) catch return error.TriggerCallbackChanged;
+    defer _ = linux.close(postinst.fd);
+    if ((postinst.metadata.mode & 0o7777) != 0o755) return error.TriggerCallbackChanged;
+    const triggers_path = try std.fmt.allocPrintSentinel(
+        std.heap.page_allocator,
+        "/var/lib/dpkg/info/{s}.triggers",
+        .{binding.package},
+        0,
+    );
+    defer std.heap.page_allocator.free(triggers_path);
+    const triggers = openVerified(
+        triggers_path,
+        std.crypto.hash.sha2.Sha256,
+        binding.triggers_sha256,
+        binding.triggers_size,
+        binding.triggers_size,
+    ) catch return error.TriggerCallbackChanged;
+    defer _ = linux.close(triggers.fd);
+    if ((triggers.metadata.mode & 0o7777) != 0o644) return error.TriggerCallbackChanged;
+    const qualified_postinst = try std.fmt.allocPrintSentinel(
+        std.heap.page_allocator,
+        "/var/lib/dpkg/info/{s}:amd64.postinst",
+        .{binding.package},
+        0,
+    );
+    defer std.heap.page_allocator.free(qualified_postinst);
+    verifyCycleAbsent(qualified_postinst) catch return error.TriggerCallbackChanged;
+    const qualified_triggers = try std.fmt.allocPrintSentinel(
+        std.heap.page_allocator,
+        "/var/lib/dpkg/info/{s}:amd64.triggers",
+        .{binding.package},
+        0,
+    );
+    defer std.heap.page_allocator.free(qualified_triggers);
+    verifyCycleAbsent(qualified_triggers) catch return error.TriggerCallbackChanged;
 }
 fn protectedRoot(root: [:0]const u8) !Pinned {
     try protectedAncestors(root);
@@ -1449,6 +1690,11 @@ fn childMain(input: Child) noreturn {
             std.log.err("reference kbd cycle operation refused: {s}", .{@errorName(err)});
             fail(status, 11, .STALE);
         };
+    if (child.options.verb == .triggers_only)
+        verifyTriggerHandler(child.options.selector.?) catch |err| {
+            std.log.err("reference trigger operation refused: {s}", .{@errorName(err)});
+            fail(status, 16, .STALE);
+        };
     const archive_setup = mountArchive(child);
     if (archive_setup != .SUCCESS) fail(status, 5, archive_setup);
     const proc_setup = mountProc(child);
@@ -1470,6 +1716,7 @@ fn childMain(input: Child) noreturn {
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
         .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
         .break_kbd_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", "kbd:amd64", null },
+        .triggers_only => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--triggers-only", selector, null },
     };
     const loader_name = std.fmt.allocPrintSentinel(
         allocator,
@@ -1631,6 +1878,47 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
             ) catch return error.CycleIdentityChanged;
             _ = linux.close(source.fd);
         }
+    }
+    if (options.trigger_archive) |path| {
+        const binding = triggerBindingFor(options.selector.?) orelse return error.InvalidTriggerHandler;
+        const source = openVerified(
+            path,
+            std.crypto.hash.sha2.Sha512,
+            binding.archive_sha512,
+            binding.archive_size,
+            binding.archive_size,
+        ) catch return error.TriggerIdentityChanged;
+        _ = linux.close(source.fd);
+        const postinst_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/var/lib/dpkg/info/{s}.postinst",
+            .{ options.root, binding.package },
+            0,
+        );
+        const postinst = try openVerified(
+            postinst_path,
+            std.crypto.hash.sha2.Sha256,
+            binding.postinst_sha256,
+            binding.postinst_size,
+            binding.postinst_size,
+        );
+        defer _ = linux.close(postinst.fd);
+        if ((postinst.metadata.mode & 0o7777) != 0o755) return error.InvalidTriggerHandler;
+        const triggers_path = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/var/lib/dpkg/info/{s}.triggers",
+            .{ options.root, binding.package },
+            0,
+        );
+        const triggers = try openVerified(
+            triggers_path,
+            std.crypto.hash.sha2.Sha256,
+            binding.triggers_sha256,
+            binding.triggers_size,
+            binding.triggers_size,
+        );
+        defer _ = linux.close(triggers.fd);
+        if ((triggers.metadata.mode & 0o7777) != 0o644) return error.InvalidTriggerHandler;
     }
     const root_proc = try std.fmt.allocPrintSentinel(allocator, "{s}/proc", .{options.root}, 0);
     const proc = try openPinned(root_proc, true);
@@ -2412,3 +2700,112 @@ test "reference proc profile is bound to the installed dpkg status version" {
         binding,
     ));
 }
+
+test "reference single-handler trigger bindings validate options and status transitions" {
+    try std.testing.expectEqualStrings("libc-bin", trigger_bindings[0].package);
+    try std.testing.expectEqualStrings("2.43-2ubuntu2.4", trigger_bindings[0].version);
+    try std.testing.expectEqualStrings("ldconfig", trigger_bindings[0].pending_triggers);
+    try std.testing.expectEqual(@as(usize, 700954), trigger_bindings[0].archive_size);
+    try std.testing.expectEqual(@as(usize, 847), trigger_bindings[0].postinst_size);
+    try std.testing.expectEqual(@as(usize, 440), trigger_bindings[0].triggers_size);
+    try std.testing.expectEqualStrings("procps", trigger_bindings[1].package);
+    try std.testing.expectEqualStrings("2:4.0.4-9ubuntu1", trigger_bindings[1].version);
+    try std.testing.expectEqualStrings("/usr/lib/sysctl.d", trigger_bindings[1].pending_triggers);
+    try std.testing.expectEqual(@as(usize, 710224), trigger_bindings[1].archive_size);
+    try std.testing.expectEqual(@as(usize, 2757), trigger_bindings[1].postinst_size);
+    try std.testing.expectEqual(@as(usize, 35), trigger_bindings[1].triggers_size);
+
+    const base_options: Options = .{
+        .root = "/srv/root",
+        .dpkg = "/srv/dpkg",
+        .runtime = "/srv/runtime",
+        .architecture = "amd64",
+        .profile = .none,
+        .verb = .triggers_only,
+        .selector = "libc-bin:amd64",
+        .trigger_archive = "/srv/cache/libc-bin.deb",
+    };
+    try validateOptions(base_options);
+    var procps_options = base_options;
+    procps_options.selector = "procps:amd64";
+    procps_options.trigger_archive = "/srv/cache/procps.deb";
+    try validateOptions(procps_options);
+
+    var missing_archive = base_options;
+    missing_archive.trigger_archive = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(missing_archive));
+
+    var configure_with_trigger_archive = base_options;
+    configure_with_trigger_archive.verb = .configure;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(configure_with_trigger_archive));
+
+    var wrong_arch = base_options;
+    wrong_arch.architecture = "arm64";
+    try std.testing.expectError(error.InvalidTriggerHandler, validateOptions(wrong_arch));
+
+    var wrong_profile = base_options;
+    wrong_profile.profile = .systemd;
+    try std.testing.expectError(error.InvalidTriggerHandler, validateOptions(wrong_profile));
+
+    var unbound_selector = base_options;
+    unbound_selector.selector = "sudo:amd64";
+    try std.testing.expectError(error.InvalidTriggerHandler, validateOptions(unbound_selector));
+
+    var unqualified_selector = base_options;
+    unqualified_selector.selector = "libc-bin";
+    try std.testing.expectError(error.InvalidTriggerHandler, validateOptions(unqualified_selector));
+
+    var pending_flag = base_options;
+    pending_flag.selector = "--pending";
+    try std.testing.expectError(error.InvalidTriggerHandler, validateOptions(pending_flag));
+
+    const step1_status =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2.43-2ubuntu2.4\n" ++
+        "Triggers-Pending:  ldconfig\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2:4.0.4-9ubuntu1\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(triggerStatusMatches(step1_status, trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(step1_status, trigger_bindings[1]));
+
+    const step2_status =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2:4.0.4-9ubuntu1\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(!triggerStatusMatches(step2_status, trigger_bindings[0]));
+    try std.testing.expect(triggerStatusMatches(step2_status, trigger_bindings[1]));
+
+    try std.testing.expect(!triggerStatusMatches(step1_status ++
+        "Package: extra-pending\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 1\n" ++
+        "Triggers-Pending: other\n\n", trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(step1_status ++
+        "Package: unpacked-pkg\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok unpacked\n\n", trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+            "Status: install ok triggers-pending\nConfig-Version: 2.43-2ubuntu2.4\n" ++
+            "Triggers-Pending: ldconfig extra\n\n" ++
+            "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+            "Status: install ok triggers-pending\nConfig-Version: 2:4.0.4-9ubuntu1\n" ++
+            "Triggers-Pending: /usr/lib/sysctl.d\n\n",
+        trigger_bindings[0],
+    ));
+    try std.testing.expect(!triggerStatusMatches(
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+            "Status: install ok triggers-pending\nConfig-Version: 2.43-2ubuntu2.4\n" ++
+            "Triggers-Pending: ldconfig\nTriggers-Awaited: libc6\n\n" ++
+            "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+            "Status: install ok triggers-pending\nConfig-Version: 2:4.0.4-9ubuntu1\n" ++
+            "Triggers-Pending: /usr/lib/sysctl.d\n\n",
+        trigger_bindings[0],
+    ));
+}
+

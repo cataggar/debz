@@ -984,14 +984,173 @@ class ReferenceLauncherTests(unittest.TestCase):
             ("tools/real-snapshot-reference-launcher.zig", 'if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))'),
             ("tools/real-snapshot-reference-launcher.zig", 'for (paths, kbd_cycle) |path, binding| {'),
             ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .break_kbd_cycle)\n        verifyCycle(.kbd)'),
+            ("tools/real-snapshot-reference-launcher.zig", 'if ((options.verb == .triggers_only) != (options.trigger_archive != null))'),
+            ("tools/real-snapshot-reference-launcher.zig", 'if (child.options.verb == .triggers_only)\n        verifyTriggerHandler(child.options.selector.?)'),
             ("tools/real-snapshot-reference-order.py", 'before = verify_kbd_cycle(root, cycle)'),
             ("tools/real-snapshot-reference-order.py", 'expected[("kbd", "amd64")]["status"] = "install ok installed"'),
-            ("tools/real-snapshot-reference-order.py", '"reference trigger closure refused: the launcher has no exact triggered "'),
+            ("tools/real-snapshot-reference-order.py", 'before = verify_trigger_handlers(root, handlers)'),
+            ("tools/real-snapshot-reference-order.py", 'expected[(package.name, "amd64")].pop("triggers-pending", None)'),
+            ("tools/real-snapshot-reference-order.py", '"reference trigger closure refused: no exact triggered postinst identity/profile "'),
         ):
             with self.subTest(path=path, token=token):
                 changed = dict(texts)
                 changed[path] = texts[path].replace(token, "", 1)
                 self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def trigger_handler_fixture(self) -> tuple[tuple[ORDER.Package, ...], dict[tuple[str, str], dict[str, str]], dict[str, dict[str, bytes]]]:
+        packages: list[ORDER.Package] = []
+        records: dict[tuple[str, str], dict[str, str]] = {
+            ("base-files", "amd64"): {
+                "package": "base-files", "version": "14ubuntu1",
+                "architecture": "amd64", "status": "install ok installed",
+            },
+        }
+        controls: dict[str, dict[str, bytes]] = {}
+        (self.root / "var/lib/dpkg/info").mkdir(parents=True, exist_ok=True)
+        (self.root / "var/lib/dpkg/updates").mkdir(parents=True, exist_ok=True)
+        (self.root / "var/lib/dpkg/triggers").mkdir(parents=True, exist_ok=True)
+        (self.root / "var/lib/dpkg/triggers/Unincorp").write_bytes(b"")
+        (self.root / "var/lib/dpkg/triggers/ldconfig").write_bytes(b"libc-bin\n")
+        (self.root / "var/lib/dpkg/triggers/File").write_bytes(b"/usr/lib/sysctl.d procps/noawait\n")
+        for (name, version, arch, size, digest, _, pending,
+             postinst_size, _, triggers_size, _) in ORDER.TRIGGER_HANDLERS:
+            archive = self.root / f"{name}.deb"
+            archive.write_bytes(b"deb")
+            packages.append(ORDER.Package(name, version, arch, digest, size, archive))
+            records[(name, arch)] = {
+                "package": name, "version": version, "architecture": arch,
+                "status": "install ok triggers-pending",
+                "config-version": version, "triggers-pending": pending,
+            }
+            postinst = (f"#!/bin/sh\n# {name}\n".encode() + b"x" * postinst_size)[:postinst_size]
+            triggers = (f"# {name}\n".encode() + b"y" * triggers_size)[:triggers_size]
+            controls[name] = {
+                "./control": (
+                    f"Package: {name}\nVersion: {version}\nArchitecture: {arch}\n"
+                    f"Maintainer: Test <test@example.invalid>\nDescription: {name}\n"
+                ).encode(),
+                "./postinst": postinst,
+                "./triggers": triggers,
+            }
+            postinst_path = self.root / f"var/lib/dpkg/info/{name}.postinst"
+            postinst_path.write_bytes(postinst)
+            postinst_path.chmod(0o755)
+            triggers_path = self.root / f"var/lib/dpkg/info/{name}.triggers"
+            triggers_path.write_bytes(triggers)
+            triggers_path.chmod(0o644)
+        return tuple(packages), records, controls
+
+    def test_trigger_handlers_process_one_signed_handler_at_a_time_and_refuse_drift(self) -> None:
+        handlers, records, controls = self.trigger_handler_fixture()
+        for handler, binding in zip(handlers, ORDER.TRIGGER_HANDLERS):
+            self.assertEqual(
+                ORDER.dpkg_command(
+                    self.launcher, self.root / "dpkg", self.root, "amd64",
+                    "none", "triggers_only", handler,
+                )[3:],
+                ["amd64", "none", "triggers_only", handler.selector,
+                 str(self.launcher.runtime), str(handler.archive)],
+            )
+            with self.assertRaisesRegex(ValueError, "unauthorized reference script profile"):
+                ORDER.dpkg_command(
+                    self.launcher, self.root / "dpkg", self.root, "amd64",
+                    "sudo", "triggers_only", handler,
+                )
+            with self.assertRaisesRegex(ValueError, "single-script binding"):
+                ORDER.dpkg_command(
+                    self.launcher, self.root / "dpkg", self.root, "arm64",
+                    "none", "triggers_only", handler,
+                )
+            with self.assertRaisesRegex(ValueError, "single-script binding"):
+                ORDER.dpkg_command(
+                    self.launcher, self.root / "dpkg", self.root, "amd64",
+                    "none", "triggers_only",
+                    ORDER.Package(handler.name, "0", "amd64", handler.digest, handler.size, handler.archive),
+                )
+        real_sha256 = hashlib.sha256
+        approved_sha256 = {
+            controls["libc-bin"]["./postinst"]: ORDER.TRIGGER_HANDLERS[0][8],
+            controls["libc-bin"]["./triggers"]: ORDER.TRIGGER_HANDLERS[0][10],
+            controls["procps"]["./postinst"]: ORDER.TRIGGER_HANDLERS[1][8],
+            controls["procps"]["./triggers"]: ORDER.TRIGGER_HANDLERS[1][10],
+        }
+
+        def fake_sha256(data: bytes = b""):
+            if data in approved_sha256:
+                return mock.Mock(hexdigest=lambda: approved_sha256[data])
+            return real_sha256(data)
+
+        evidence = self.root / "trigger-evidence"
+        evidence.mkdir()
+        (self.root / "var/lib/dpkg/status").write_bytes(b"status\n")
+        state = {key: dict(value) for key, value in records.items()}
+        commands: list[list[str]] = []
+
+        def apply_trigger(command: list[str], *_args) -> None:
+            commands.append(command)
+            selector = command[6]
+            name, arch = selector.split(":")
+            self.assertEqual(state[(name, arch)]["status"], "install ok triggers-pending")
+            if name == "procps":
+                self.assertEqual(state[("libc-bin", "amd64")]["status"], "install ok installed")
+            state[(name, arch)]["status"] = "install ok installed"
+            state[(name, arch)].pop("triggers-pending", None)
+            state[(name, arch)].pop("config-version", None)
+
+        with (
+            mock.patch.object(ORDER, "protected", side_effect=lambda path, directory=False: path.stat()),
+            mock.patch.object(ORDER, "open_absolute", side_effect=lambda path, directory=False: os.open(path, os.O_RDONLY)),
+            mock.patch.object(ORDER, "read_root_file", side_effect=lambda root, rel, _max: (root / rel).read_bytes()),
+            mock.patch.object(ORDER, "verify_archive"),
+            mock.patch.object(ORDER, "control_members", side_effect=lambda pkg: controls[pkg.name]),
+            mock.patch.object(ORDER, "database_fields", side_effect=lambda _root: {k: dict(v) for k, v in state.items()}),
+            mock.patch.object(ORDER.hashlib, "sha256", side_effect=fake_sha256),
+            mock.patch.object(ORDER, "apply", side_effect=apply_trigger),
+        ):
+            ORDER.process_triggers(
+                self.launcher, self.root / "dpkg", self.root, evidence, "amd64",
+                list(handlers), {}, self.root / "out", self.root / "err",
+            )
+            self.assertEqual(
+                [cmd[5:7] for cmd in commands],
+                [["triggers_only", "libc-bin:amd64"], ["triggers_only", "procps:amd64"]],
+            )
+            after_doc = json.loads((evidence / "triggers-after.json").read_text())
+            self.assertEqual(len(after_doc["steps"]), 2)
+
+            # Negative: wrong architecture
+            with self.assertRaisesRegex(ORDER.TriggerRefusal, "no exact triggered postinst identity"):
+                ORDER.trigger_handler_packages(list(handlers), "arm64")
+
+            # Negative: unexpected third triggers-pending package
+            bad_state = {k: dict(v) for k, v in records.items()}
+            bad_state[("extra", "amd64")] = {
+                "package": "extra", "version": "1", "architecture": "amd64",
+                "status": "install ok triggers-pending", "config-version": "1",
+                "triggers-pending": "other",
+            }
+            with mock.patch.object(ORDER, "database_fields", return_value=bad_state):
+                with self.assertRaisesRegex(ORDER.TriggerRefusal, "extra"):
+                    ORDER.verify_trigger_handlers(self.root, handlers)
+
+            # Negative: modified installed postinst mode
+            state = {k: dict(v) for k, v in records.items()}
+            (self.root / "var/lib/dpkg/info/libc-bin.postinst").chmod(0o644)
+            with self.assertRaisesRegex(ORDER.TriggerRefusal, "libc-bin installed"):
+                ORDER.verify_trigger_handlers(self.root, handlers)
+            (self.root / "var/lib/dpkg/info/libc-bin.postinst").chmod(0o755)
+
+            # Negative: post-step state conservation failure if another package changes
+            def corrupt_apply(command: list[str], *_args) -> None:
+                apply_trigger(command)
+                state[("base-files", "amd64")]["status"] = "install ok unpacked"
+
+            with mock.patch.object(ORDER, "apply", side_effect=corrupt_apply):
+                with self.assertRaisesRegex(ORDER.TriggerRefusal, "database changed beyond the one reviewed"):
+                    ORDER.process_triggers(
+                        self.launcher, self.root / "dpkg", self.root, evidence, "amd64",
+                        list(handlers), {}, self.root / "out", self.root / "err",
+                    )
 
     def pending_oracle_fixture(self, stderr: bytes, *, returncode: int = 1,
                                configured: bool = True) -> Path:
