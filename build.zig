@@ -1474,6 +1474,29 @@ pub fn build(b: *std.Build) void {
     }
     b.step("test-real-snapshot-arm64-bash-postinst-protected", "Require actual native ARM bash configure and independent pinned dpkg agreement")
         .dependOn(&run_arm64_bash_postinst_tests.step);
+    const arm64_util_linux_postinst_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.protected signed arm64 util-linux postinst runs natively and matches pinned dpkg"},
+    });
+    const run_arm64_util_linux_postinst_tests = b.addRunArtifact(arm64_util_linux_postinst_tests);
+    run_arm64_util_linux_postinst_tests.has_side_effects = true;
+    for ([_]struct { option: []const u8, environment: []const u8 }{
+        .{ .option = "root", .environment = "ROOT" },
+        .{ .option = "native-root", .environment = "NATIVE_ROOT" },
+        .{ .option = "dpkg-root", .environment = "DPKG_ROOT" },
+        .{ .option = "bad-script", .environment = "BAD_SCRIPT_ROOT" },
+        .{ .option = "bad-mode", .environment = "BAD_MODE_ROOT" },
+        .{ .option = "bad-tool", .environment = "BAD_TOOL_ROOT" },
+        .{ .option = "bad-alias", .environment = "BAD_ALIAS_ROOT" },
+        .{ .option = "bad-prestate", .environment = "BAD_PRESTATE_ROOT" },
+        .{ .option = "bad-cache", .environment = "BAD_CACHE_ROOT" },
+        .{ .option = "proof", .environment = "PROOF" },
+    }) |coordinate| {
+        const value = b.option([]const u8, b.fmt("arm64-util-linux-postinst-{s}", .{coordinate.option}), "Required protected ARM util-linux configure proof coordinate") orelse "";
+        run_arm64_util_linux_postinst_tests.setEnvironmentVariable(b.fmt("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_{s}", .{coordinate.environment}), value);
+    }
+    b.step("test-real-snapshot-arm64-util-linux-postinst-protected", "Require actual native ARM util-linux configure and independent pinned dpkg agreement")
+        .dependOn(&run_arm64_util_linux_postinst_tests.step);
 
     const native_alternatives_test_module = b.createModule(.{
         .root_source_file = b.path("src/native_alternatives.zig"),

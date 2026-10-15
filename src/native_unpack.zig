@@ -22419,6 +22419,7 @@ fn snapshotLessPreinstIsInert(
 const SnapshotAlternativesArm64Artifact = struct {
     name: []const u8,
     version: []const u8,
+    architecture: []const u8 = "arm64",
     size: u64,
     sha512: []const u8,
 };
@@ -22833,7 +22834,20 @@ fn canonicalCacheName(name: []const u8) bool {
     return true;
 }
 
+const SnapshotArm64CacheProfile = enum {
+    bash,
+    util_linux,
+};
+
 fn verifySnapshotBashArm64Cache(bytes: []const u8) !void {
+    return verifySnapshotArm64LdSoCache(bytes, .bash);
+}
+
+fn verifySnapshotUtilLinuxArm64Cache(bytes: []const u8) !void {
+    return verifySnapshotArm64LdSoCache(bytes, .util_linux);
+}
+
+fn verifySnapshotArm64LdSoCache(bytes: []const u8, comptime profile: SnapshotArm64CacheProfile) !void {
     if (bytes.len < 48 or bytes.len > snapshot_bash_cache_limit or
         !std.mem.eql(u8, bytes[0..20], "glibc-ld.so.cache1.1") or bytes[28] != 2 or
         !std.mem.allEqual(u8, bytes[29..32], 0) or !std.mem.allEqual(u8, bytes[36..48], 0))
@@ -22866,6 +22880,8 @@ fn verifySnapshotBashArm64Cache(bytes: []const u8) !void {
     }
     var libc = false;
     var tinfo = false;
+    var libm = false;
+    var libcrypt = false;
     for (0..count) |index| {
         const entry = 48 + index * 24;
         if (cacheWord(bytes, entry) != 0x0a03 or !std.mem.allEqual(u8, bytes[entry + 12 ..][0..12], 0))
@@ -22879,7 +22895,7 @@ fn verifySnapshotBashArm64Cache(bytes: []const u8) !void {
                 !std.mem.eql(u8, provider, "/usr/lib/aarch64-linux-gnu/libc.so.6"))
                 return error.InvalidAlternativesScriptAuthority;
             libc = true;
-        } else if (std.mem.eql(u8, name, "libtinfo.so.6")) {
+        } else if (profile == .bash and std.mem.eql(u8, name, "libtinfo.so.6")) {
             var approved = false;
             for ([_][]const u8{
                 "/lib/aarch64-linux-gnu/libtinfo.so.6",
@@ -22889,9 +22905,27 @@ fn verifySnapshotBashArm64Cache(bytes: []const u8) !void {
             }) |path| approved = approved or std.mem.eql(u8, provider, path);
             if (!approved) return error.InvalidAlternativesScriptAuthority;
             tinfo = true;
+        } else if (profile == .util_linux and std.mem.eql(u8, name, "libm.so.6")) {
+            if (!std.mem.eql(u8, provider, "/lib/aarch64-linux-gnu/libm.so.6") and
+                !std.mem.eql(u8, provider, "/usr/lib/aarch64-linux-gnu/libm.so.6"))
+                return error.InvalidAlternativesScriptAuthority;
+            libm = true;
+        } else if (profile == .util_linux and std.mem.eql(u8, name, "libcrypt.so.1")) {
+            var approved = false;
+            for ([_][]const u8{
+                "/lib/aarch64-linux-gnu/libcrypt.so.1",
+                "/usr/lib/aarch64-linux-gnu/libcrypt.so.1",
+                "/lib/aarch64-linux-gnu/libcrypt.so.1.1.0",
+                "/usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0",
+            }) |path| approved = approved or std.mem.eql(u8, provider, path);
+            if (!approved) return error.InvalidAlternativesScriptAuthority;
+            libcrypt = true;
         }
     }
-    if (!libc or !tinfo) return error.InvalidAlternativesScriptAuthority;
+    switch (profile) {
+        .bash => if (!libc or !tinfo) return error.InvalidAlternativesScriptAuthority,
+        .util_linux => if (!libc or !libm or !libcrypt) return error.InvalidAlternativesScriptAuthority,
+    }
 }
 
 fn verifySnapshotBashArm64CacheEntry(entry: root_fs.Entry) !void {
@@ -22901,6 +22935,18 @@ fn verifySnapshotBashArm64CacheEntry(entry: root_fs.Entry) !void {
 }
 
 fn verifySnapshotBashArm64CacheInput(allocator: std.mem.Allocator, root: root_fs.Root) !native_alternatives.EntryFact {
+    return verifySnapshotArm64LdSoCacheInput(allocator, root, .bash);
+}
+
+fn verifySnapshotUtilLinuxArm64CacheInput(allocator: std.mem.Allocator, root: root_fs.Root) !native_alternatives.EntryFact {
+    return verifySnapshotArm64LdSoCacheInput(allocator, root, .util_linux);
+}
+
+fn verifySnapshotArm64LdSoCacheInput(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    comptime profile: SnapshotArm64CacheProfile,
+) !native_alternatives.EntryFact {
     const path = try root_fs.Path.init("etc/ld.so.cache");
     const entry = (try root.entryIfExists(path)) orelse return .{ .path = path.text, .kind = .absent };
     try verifySnapshotBashArm64CacheEntry(entry);
@@ -22909,7 +22955,7 @@ fn verifySnapshotBashArm64CacheInput(allocator: std.mem.Allocator, root: root_fs
     const observed = try pinned.observeStableAlloc(allocator, snapshot_bash_cache_limit);
     defer allocator.free(observed.bytes);
     try verifySnapshotBashArm64CacheEntry(observed.entry);
-    try verifySnapshotBashArm64Cache(observed.bytes);
+    try verifySnapshotArm64LdSoCache(observed.bytes, profile);
     var digest: [32]u8 = undefined;
     Sha256.hash(observed.bytes, &digest, .{});
     return .{
@@ -23076,8 +23122,11 @@ fn snapshotUtilLinuxPostinstIsBound(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotUtilLinuxPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    const amd64 = std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64");
+    const arm64 = std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64");
+    if ((!amd64 and !arm64) or
         !std.mem.eql(u8, package.name, "util-linux") or
         !std.mem.eql(u8, package.version, "2.41.3-3ubuntu2.2") or
         kind != .postinst or source != .new_package or
@@ -23086,6 +23135,308 @@ fn snapshotUtilLinuxPostinstIsBound(
         arguments[1].len != 0)
         return error.InvalidAlternativesScriptAuthority;
     return true;
+}
+
+const snapshot_util_linux_arm64_artifacts = [_]SnapshotAlternativesArm64Artifact{
+    .{
+        .name = "util-linux",
+        .version = "2.41.3-3ubuntu2.2",
+        .size = 1055344,
+        .sha512 = "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad",
+    },
+    .{
+        .name = "init-system-helpers",
+        .version = "1.69",
+        .architecture = "all",
+        .size = 39536,
+        .sha512 = "8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5",
+    },
+    .{
+        .name = "perl-base",
+        .version = "5.40.1-7ubuntu0.3",
+        .size = 1787114,
+        .sha512 = "41d0be5882f2c4d996a9e5c75e42d9a852158285da60526a03ff4b073666e039353e9b8c72e25156f38bdc359ff2dfe016a1e105bd8d16b0560aaa13319539a4",
+    },
+    .{
+        .name = "libcrypt1",
+        .version = "1:4.5.1-1",
+        .size = 88276,
+        .sha512 = "d088db1e2abe0d16d3dd0308417db9163eaa1311ab752ec1b2d05df9ba25ca2e20b2dec38ec0daa841f51885bddd59bcc0b48c353ca7ecba23dc5d2df11c0ac3",
+    },
+} ++ snapshot_less_arm64_artifacts;
+
+const snapshot_util_linux_arm64_controls = [_]SignedDebconfControlFile{
+    .{
+        .path = "var/lib/dpkg/info/util-linux.postinst",
+        .size = 2112,
+        .mode = 0o755,
+        .sha256 = "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
+    },
+    .{
+        .path = lifecycle_tmp_ci ++ "/util-linux.postinst",
+        .size = 2112,
+        .mode = 0o755,
+        .sha256 = "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
+    },
+    .{
+        .path = "var/lib/dpkg/info/util-linux.list",
+        .size = 8922,
+        .mode = 0o644,
+        .sha256 = "45503af3321a520be18c144f94e3c8a10eae22e8c5f5eb41532af3777db6a0bf",
+    },
+    .{
+        .path = "var/lib/dpkg/info/less.list",
+        .size = 583,
+        .mode = 0o644,
+        .sha256 = "0206e202ee08fa90d694df6ee0a0f438258ce7f442ff3bc8db4ead65514c62ae",
+    },
+    .{
+        .path = "usr/bin/less",
+        .size = 282008,
+        .mode = 0o755,
+        .sha256 = "dc92b0cc1982509409f1dfbf175e79f6b28940fcc0547ee1db7ab093b7a77738",
+    },
+    .{
+        .path = "usr/share/man/man1/less.1.gz",
+        .size = 28936,
+        .mode = 0o644,
+        .sha256 = "1980f0221b6fedc7144ea0ec931128abea638665b7b7c2ab13387de83c908da3",
+    },
+    .{
+        .path = "usr/bin/more",
+        .size = 68024,
+        .mode = 0o755,
+        .sha256 = "d06d24e93d2fa8d550a2f9977a4aefd34e0ed91fd1f792481d7e475768313501",
+    },
+    .{
+        .path = "usr/share/man/man1/more.1.gz",
+        .size = 2650,
+        .mode = 0o644,
+        .sha256 = "91dc8c4d835aaf3765915af09af73b533ac3a12ac13fe754b3e02c230c1f2d5d",
+    },
+    .{
+        .path = "usr/lib/systemd/system/fstrim.service",
+        .size = 477,
+        .mode = 0o644,
+        .sha256 = "9d5ab55ca0f12257edd33d154e5dc523ddea4d5f2525557cbf96e30b97deab56",
+    },
+    .{
+        .path = "usr/lib/systemd/system/fstrim.timer",
+        .size = 283,
+        .mode = 0o644,
+        .sha256 = "699161252ffaa35a0272aae055e51332df694ff4d28c39f8b666d47ecced3397",
+    },
+    .{
+        .path = "usr/bin/deb-systemd-helper",
+        .size = 24358,
+        .mode = 0o755,
+        .sha256 = "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732",
+    },
+    .{
+        .path = "usr/lib/aarch64-linux-gnu/libm.so.6",
+        .size = 723144,
+        .mode = 0o644,
+        .sha256 = "ffeae799646fae7a8af80402a88f4bc84bfc110af834f5e756aae2fa0a1a9602",
+    },
+    .{
+        .path = "usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0",
+        .size = 264200,
+        .mode = 0o644,
+        .sha256 = "5c5436f75b65261219cbcffe59ed99aed2047d98525526ed62b623884c1135f9",
+    },
+} ++ snapshot_less_arm64_controls[3..].*;
+
+const snapshot_util_linux_arm64_perl: SignedDebconfControlFile = .{
+    .path = "usr/bin/perl",
+    .size = 3942544,
+    .mode = 0o755,
+    .sha256 = "51d562fb5f145f8c12610790b6f67b2868d1aa7c977906b533250f00903681cd",
+};
+
+const snapshot_util_linux_arm64_aliases = snapshot_less_arm64_aliases ++ [_]SnapshotLessArm64Alias{
+    .{ .path = "usr/lib/aarch64-linux-gnu/libcrypt.so.1", .target = "libcrypt.so.1.1.0" },
+};
+
+const snapshot_util_linux_arm64_absent = snapshot_loader_arm64_absent ++ [_][]const u8{
+    "usr/sbin/deb-systemd-helper",
+    "run/systemd/system",
+    "etc/systemd/system/fstrim.timer",
+    "var/lib/systemd/deb-systemd-helper-masked/fstrim.timer",
+};
+
+const snapshot_util_linux_arm64_fstrim_dirs = [_][]const u8{
+    "etc/systemd",
+    "etc/systemd/system",
+    "etc/systemd/system/timers.target.wants",
+    "var/lib/systemd",
+    "var/lib/systemd/deb-systemd-helper-enabled",
+    "var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants",
+};
+
+const snapshot_util_linux_arm64_fstrim_created_paths = [_][]const u8{
+    "etc/systemd/system/timers.target.wants/fstrim.timer",
+    "var/lib/systemd/deb-systemd-helper-enabled/fstrim.timer.dsh-also",
+    "var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/fstrim.timer",
+};
+
+const snapshot_util_linux_arm64_fstrim_link: SnapshotLessArm64Alias = .{
+    .path = "etc/systemd/system/timers.target.wants/fstrim.timer",
+    .target = "/usr/lib/systemd/system/fstrim.timer",
+};
+
+const snapshot_util_linux_arm64_fstrim_also_bytes = "/etc/systemd/system/timers.target.wants/fstrim.timer\n";
+
+fn verifySnapshotUtilLinuxArm64PerlBinding(
+    entry: root_fs.Entry,
+    digest: [32]u8,
+) !void {
+    if (entry.link_count != 1 and entry.link_count != 2)
+        return error.InvalidAlternativesScriptAuthority;
+    var single_link = entry;
+    single_link.link_count = 1;
+    try verifySignedDebconfControlFileBinding(
+        single_link,
+        digest,
+        snapshot_util_linux_arm64_perl,
+        error.InvalidAlternativesScriptAuthority,
+    );
+}
+
+fn verifySnapshotUtilLinuxArm64Perl(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !void {
+    var pinned = try root.pinRegularFile(try root_fs.Path.init(snapshot_util_linux_arm64_perl.path));
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(observed.bytes);
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observed.bytes, &digest, .{});
+    try verifySnapshotUtilLinuxArm64PerlBinding(observed.entry, digest);
+}
+
+fn verifySnapshotUtilLinuxArm64Inputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    artifacts: []const native_program.ProgramArtifact,
+    architecture: []const u8,
+) !native_alternatives.EntryFact {
+    if (!std.mem.eql(u8, architecture, "arm64"))
+        return error.InvalidAlternativesScriptAuthority;
+    for (snapshot_util_linux_arm64_artifacts) |binding|
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            .{ .name = binding.name, .version = binding.version, .architecture = binding.architecture },
+            binding.size,
+            binding.sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+    try verifySnapshotAlternativesArm64Inputs(
+        allocator,
+        root,
+        &snapshot_util_linux_arm64_controls,
+        &snapshot_util_linux_arm64_aliases,
+        &snapshot_util_linux_arm64_absent,
+    );
+    try verifySnapshotUtilLinuxArm64Perl(allocator, root);
+    return try verifySnapshotUtilLinuxArm64CacheInput(allocator, root);
+}
+
+fn verifySnapshotUtilLinuxArm64FstrimAbsent(root: root_fs.Root) !void {
+    for (snapshot_util_linux_arm64_fstrim_created_paths) |path|
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidAlternativesScriptAuthority;
+}
+
+fn verifySnapshotUtilLinuxArm64PagerBefore(before: native_alternatives.Snapshot) !void {
+    const pager = before.group("pager") orelse return error.InvalidAlternativesScriptAuthority;
+    if (pager.record.mode != .auto or
+        !std.mem.eql(u8, pager.record.master_link, "/usr/bin/pager") or
+        !std.mem.eql(u8, pager.selected, "/usr/bin/less") or
+        pager.record.slaves.len != 1 or
+        !std.mem.eql(u8, pager.record.slaves[0].name, "pager.1.gz") or
+        !std.mem.eql(u8, pager.record.slaves[0].link, "/usr/share/man/man1/pager.1.gz") or
+        pager.record.candidate("/bin/more") != null)
+        return error.InvalidAlternativesScriptAuthority;
+    const less = pager.record.candidate("/usr/bin/less") orelse
+        return error.InvalidAlternativesScriptAuthority;
+    if (less.priority != 77 or less.targets.len != 1 or
+        !std.mem.eql(u8, less.targets[0], "/usr/share/man/man1/less.1.gz"))
+        return error.InvalidAlternativesScriptAuthority;
+}
+
+fn verifySnapshotUtilLinuxArm64PostOutput(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    after: native_alternatives.Snapshot,
+) !void {
+    const pager = after.group("pager") orelse return error.InvalidAlternativesScriptAuthority;
+    if (pager.record.mode != .auto or
+        !std.mem.eql(u8, pager.record.master_link, "/usr/bin/pager") or
+        !std.mem.eql(u8, pager.selected, "/usr/bin/less") or
+        pager.record.slaves.len != 1 or
+        !std.mem.eql(u8, pager.record.slaves[0].name, "pager.1.gz") or
+        !std.mem.eql(u8, pager.record.slaves[0].link, "/usr/share/man/man1/pager.1.gz"))
+        return error.InvalidAlternativesScriptAuthority;
+    const less = pager.record.candidate("/usr/bin/less") orelse
+        return error.InvalidAlternativesScriptAuthority;
+    if (less.priority != 77 or less.targets.len != 1 or
+        !std.mem.eql(u8, less.targets[0], "/usr/share/man/man1/less.1.gz"))
+        return error.InvalidAlternativesScriptAuthority;
+    const more = pager.record.candidate("/bin/more") orelse
+        return error.InvalidAlternativesScriptAuthority;
+    if (more.priority != 50 or more.targets.len != 1 or
+        !std.mem.eql(u8, more.targets[0], "/usr/share/man/man1/more.1.gz"))
+        return error.InvalidAlternativesScriptAuthority;
+    for (snapshot_util_linux_arm64_fstrim_dirs) |dir_path| {
+        var dir = try root.pinDirectory(try root_fs.Path.init(dir_path));
+        defer dir.close();
+        const entry = (try dir.metadata()).entry;
+        try verifyModeledEntry(entry, dir_path, .directory, error.InvalidAlternativesScriptAuthority);
+        if (entry.mode != 0o755 or entry.uid != 0 or entry.gid != 0)
+            return error.InvalidAlternativesScriptAuthority;
+    }
+    var link = try root.pinSymbolicLink(try root_fs.Path.init(snapshot_util_linux_arm64_fstrim_link.path));
+    defer link.close();
+    var link_buffer: [128]u8 = undefined;
+    const observed_link = try link.observe(&link_buffer);
+    try verifySnapshotLessArm64AliasBinding(observed_link.entry, observed_link.target, snapshot_util_linux_arm64_fstrim_link);
+    {
+        var also = try root.pinRegularFile(try root_fs.Path.init("var/lib/systemd/deb-systemd-helper-enabled/fstrim.timer.dsh-also"));
+        defer also.close();
+        const observed = try also.observeStableAlloc(allocator, 1024);
+        defer allocator.free(observed.bytes);
+        if (!observed.entry.modeled or observed.entry.kind != .file or
+            observed.entry.mode != 0o644 or observed.entry.uid != 0 or observed.entry.gid != 0 or
+            observed.entry.link_count != 1 or observed.entry.size != snapshot_util_linux_arm64_fstrim_also_bytes.len or
+            !std.mem.eql(u8, observed.bytes, snapshot_util_linux_arm64_fstrim_also_bytes))
+            return error.InvalidAlternativesScriptAuthority;
+    }
+    {
+        var stamp = try root.pinRegularFile(try root_fs.Path.init("var/lib/systemd/deb-systemd-helper-enabled/timers.target.wants/fstrim.timer"));
+        defer stamp.close();
+        const observed = try stamp.observeStableAlloc(allocator, 1024);
+        defer allocator.free(observed.bytes);
+        if (!observed.entry.modeled or observed.entry.kind != .file or
+            observed.entry.mode != 0o644 or observed.entry.uid != 0 or observed.entry.gid != 0 or
+            observed.entry.link_count != 1 or observed.entry.size != 0 or observed.bytes.len != 0)
+            return error.InvalidAlternativesScriptAuthority;
+    }
+}
+
+fn bindSnapshotUtilLinuxArm64ImmutableInputs(script: *native_alternatives.ScriptAuthority) !void {
+    try bindSnapshotAlternativesArm64ImmutableInputs(
+        script,
+        &snapshot_util_linux_arm64_controls,
+        &snapshot_util_linux_arm64_aliases,
+        &snapshot_util_linux_arm64_absent,
+    );
+    const allocator = script.arena.allocator();
+    const targets = try allocator.alloc([]const u8, script.immutable_targets.len + 2);
+    @memcpy(targets[0..script.immutable_targets.len], script.immutable_targets);
+    targets[script.immutable_targets.len] = "/usr/bin/perl";
+    targets[script.immutable_targets.len + 1] = "/etc/ld.so.cache";
+    script.immutable_targets = targets;
 }
 
 fn snapshotUtilLinuxArm64SourcePackage(lock: exact_lock_v3.Lock) !exact_lock_v3.Package {
@@ -25581,7 +25932,7 @@ fn snapshotAlternativesArm64TestArtifacts(
     for (bindings, &artifacts, 0..) |binding, *artifact, index|
         artifact.* = .{
             .index = @intCast(index),
-            .package = .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
+            .package = .{ .name = binding.name, .version = binding.version, .architecture = binding.architecture },
             .archive_identity = content_digest.JsonIdentity.init(try content_digest.Identity.init(
                 .{ .sha512 = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512 },
                 .sha512,
@@ -26091,7 +26442,7 @@ test "native_unpack.test.signed arm64 util-linux source refuses borrowed or unau
     lock.packages = &.{package};
     lock.repositories = &.{};
     try testing.expectError(error.InvalidSnapshotUtilLinuxSource, snapshotUtilLinuxArm64SourcePackage(lock));
-    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+    try testing.expect(try snapshotUtilLinuxPostinstIsBound(
         @embedFile("fixtures/ubuntu-resolute-util-linux.postinst"),
         "arm64",
         .{ .name = "util-linux", .version = "2.41.3-3ubuntu2.2", .architecture = "arm64" },
@@ -26099,6 +26450,226 @@ test "native_unpack.test.signed arm64 util-linux source refuses borrowed or unau
         .new_package,
         &.{ "configure", "" },
     ));
+}
+
+fn snapshotUtilLinuxCacheTestFixture() ![]u8 {
+    const strings =
+        "libcrypt.so.1\x00/usr/lib/aarch64-linux-gnu/libcrypt.so.1\x00" ++
+        "libm.so.6\x00/usr/lib/aarch64-linux-gnu/libm.so.6\x00" ++
+        "libc.so.6\x00/lib/aarch64-linux-gnu/libc.so.6\x00/usr/lib/aarch64-linux-gnu/libc.so.6\x00";
+    const bytes = try testing.allocator.alloc(u8, 48 + 4 * 24 + strings.len);
+    @memset(bytes, 0);
+    @memcpy(bytes[0..20], "glibc-ld.so.cache1.1");
+    std.mem.writeInt(u32, bytes[20..24], 4, .little);
+    std.mem.writeInt(u32, bytes[24..28], strings.len, .little);
+    bytes[28] = 2;
+    const strings_start = 48 + 4 * 24;
+    @memcpy(bytes[strings_start..], strings);
+    for ([_]struct { name: []const u8, provider: []const u8 }{
+        .{ .name = "libcrypt.so.1", .provider = "/usr/lib/aarch64-linux-gnu/libcrypt.so.1" },
+        .{ .name = "libm.so.6", .provider = "/usr/lib/aarch64-linux-gnu/libm.so.6" },
+        .{ .name = "libc.so.6", .provider = "/lib/aarch64-linux-gnu/libc.so.6" },
+        .{ .name = "libc.so.6", .provider = "/usr/lib/aarch64-linux-gnu/libc.so.6" },
+    }, 0..) |binding, index| {
+        const start = 48 + 24 * index;
+        std.mem.writeInt(u32, bytes[start..][0..4], 0x0a03, .little);
+        const name = strings_start + std.mem.indexOf(u8, strings, binding.name).?;
+        const provider = strings_start + std.mem.indexOf(u8, strings, binding.provider).?;
+        std.mem.writeInt(u32, bytes[start + 4 ..][0..4], @intCast(name), .little);
+        std.mem.writeInt(u32, bytes[start + 8 ..][0..4], @intCast(provider), .little);
+    }
+    return bytes;
+}
+
+test "native_unpack.test.signed arm64 util-linux postinst binds only fresh configure and original control metadata" {
+    const script = @embedFile("fixtures/ubuntu-resolute-util-linux.postinst");
+    const util_linux: native_program.PackageIdentity = .{
+        .name = "util-linux",
+        .version = "2.41.3-3ubuntu2.2",
+        .architecture = "arm64",
+    };
+    try testing.expect(try snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        util_linux,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    for ([_][]const []const u8{
+        &.{"configure"},
+        &.{ "configure", "2.41.3-3ubuntu2.1" },
+        &.{"triggered"},
+        &.{ "configure", "", "extra" },
+        &.{ "abort-upgrade", "" },
+    }) |arguments|
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+            script,
+            "arm64",
+            util_linux,
+            .postinst,
+            .new_package,
+            arguments,
+        ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "amd64",
+        util_linux,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        util_linux,
+        .postinst,
+        .installed_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        util_linux,
+        .preinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    var foreign = util_linux;
+    foreign.version = "unreviewed";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        foreign,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    foreign = util_linux;
+    foreign.name = "unreviewed";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        foreign,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    foreign = util_linux;
+    foreign.architecture = "amd64";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, snapshotUtilLinuxPostinstIsBound(
+        script,
+        "arm64",
+        foreign,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    var digest: [32]u8 = undefined;
+    Sha256.hash(script, &digest, .{});
+    const entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = script.len,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySignedDebconfControlFileBinding(
+        entry,
+        digest,
+        snapshot_util_linux_arm64_controls[0],
+        error.InvalidAlternativesScriptAuthority,
+    );
+    for (0..6) |mutation| {
+        var changed = entry;
+        var changed_digest = digest;
+        switch (mutation) {
+            0 => changed.mode = 0o644,
+            1 => changed.uid = 1,
+            2 => changed.link_count = 2,
+            3 => changed.size += 1,
+            4 => changed.kind = .sym_link,
+            5 => changed_digest[0] ^= 1,
+            else => unreachable,
+        }
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySignedDebconfControlFileBinding(
+            changed,
+            changed_digest,
+            snapshot_util_linux_arm64_controls[0],
+            error.InvalidAlternativesScriptAuthority,
+        ));
+    }
+}
+
+test "native_unpack.test.signed arm64 util-linux artifacts cache and perl guards reject tampered inputs" {
+    const originals = try snapshotAlternativesArm64TestArtifacts(&snapshot_util_linux_arm64_artifacts);
+    for (0..originals.len) |index| {
+        for (0..5) |mutation| {
+            var changed = originals;
+            switch (mutation) {
+                0 => changed[index].package.version = "unreviewed",
+                1 => changed[index].package.architecture = if (std.mem.eql(u8, changed[index].package.architecture, "all")) "arm64" else "amd64",
+                2 => changed[index].size += 1,
+                3 => changed[index].archive_identity = originals[(index + 1) % originals.len].archive_identity,
+                4 => changed[index].origin_v2 = null,
+                else => unreachable,
+            }
+            const binding = snapshot_util_linux_arm64_artifacts[index];
+            try testing.expectError(error.InvalidAlternativesScriptAuthority, verifyAuthenticatedSnapshotArtifact(
+                &changed,
+                .{ .name = binding.name, .version = binding.version, .architecture = binding.architecture },
+                binding.size,
+                binding.sha512,
+                error.InvalidAlternativesScriptAuthority,
+            ));
+        }
+    }
+    const perl_digest = (try content_digest.Value.parse(.sha256, snapshot_util_linux_arm64_perl.sha256)).sha256;
+    var perl_entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = snapshot_util_linux_arm64_perl.size,
+        .mode = snapshot_util_linux_arm64_perl.mode,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySnapshotUtilLinuxArm64PerlBinding(perl_entry, perl_digest);
+    perl_entry.link_count = 2;
+    try verifySnapshotUtilLinuxArm64PerlBinding(perl_entry, perl_digest);
+    for ([_]u64{ 0, 3 }) |bad_links| {
+        var changed = perl_entry;
+        changed.link_count = bad_links;
+        try testing.expectError(
+            error.InvalidAlternativesScriptAuthority,
+            verifySnapshotUtilLinuxArm64PerlBinding(changed, perl_digest),
+        );
+    }
+    const cache_bytes = try snapshotUtilLinuxCacheTestFixture();
+    defer testing.allocator.free(cache_bytes);
+    try verifySnapshotUtilLinuxArm64Cache(cache_bytes);
+    for (0..4) |index| {
+        const offset = cacheWord(cache_bytes, 48 + 24 * index + 8);
+        const original = cache_bytes[offset + 1];
+        cache_bytes[offset + 1] = 'X';
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotUtilLinuxArm64Cache(cache_bytes));
+        cache_bytes[offset + 1] = original;
+    }
+    for (0..3) |index| {
+        const offset = cacheWord(cache_bytes, 48 + 24 * index + 4);
+        const original = cache_bytes[offset];
+        cache_bytes[offset] = 'X';
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotUtilLinuxArm64Cache(cache_bytes));
+        cache_bytes[offset] = original;
+    }
 }
 
 test "native_unpack.test.protected signed arm64 util-linux archive source is validated without callback admission" {
@@ -26291,6 +26862,153 @@ test "native_unpack.test.protected signed arm64 bash postinst runs natively and 
     var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
     defer proof.close(testing.io);
     try proof.writeStreamingAll(testing.io, "signed arm64 bash native postinst and independent pinned dpkg agree without skips\n");
+}
+
+test "native_unpack.test.protected signed arm64 util-linux postinst runs natively and matches pinned dpkg" {
+    const source_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_ROOT") orelse return;
+    const native_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_NATIVE_ROOT") orelse return error.TestUnexpectedResult;
+    const reference_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_DPKG_ROOT") orelse return error.TestUnexpectedResult;
+    const artifacts = try snapshotAlternativesArm64TestArtifacts(&snapshot_util_linux_arm64_artifacts);
+    var program = std.mem.zeroes(native_program.Program);
+    program.target_architecture = "arm64";
+    program.artifacts = &artifacts;
+    const script = @embedFile("fixtures/ubuntu-resolute-util-linux.postinst");
+    const util_linux: native_program.PackageIdentity = .{ .name = "util-linux", .version = "2.41.3-3ubuntu2.2", .architecture = "arm64" };
+    var source = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(source_path));
+    defer source.close();
+    _ = try verifySnapshotUtilLinuxArm64Inputs(testing.allocator, source.root, &artifacts, "arm64");
+    try verifySnapshotUtilLinuxArm64FstrimAbsent(source.root);
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+        testing.allocator,
+        source.root,
+        &program,
+        "arm64",
+        script,
+        util_linux,
+        .postinst,
+        .new_package,
+        .trigger,
+        &.{ "configure", "" },
+    ));
+    program.target_architecture = "amd64";
+    try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+        testing.allocator,
+        source.root,
+        &program,
+        "arm64",
+        script,
+        util_linux,
+        .postinst,
+        .new_package,
+        .script,
+        &.{ "configure", "" },
+    ));
+    program.target_architecture = "arm64";
+    for ([_][:0]const u8{
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_SCRIPT_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_MODE_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_TOOL_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_ALIAS_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_PRESTATE_ROOT",
+        "DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_BAD_CACHE_ROOT",
+    }) |name| {
+        const path = std.c.getenv(name) orelse return error.TestUnexpectedResult;
+        var negative = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer negative.close();
+        try testing.expectError(error.InvalidAlternativesScriptAuthority, prepareAlternativesScriptBoundary(
+            testing.allocator,
+            negative.root,
+            &program,
+            "arm64",
+            script,
+            util_linux,
+            .postinst,
+            .new_package,
+            .script,
+            &.{ "configure", "" },
+        ));
+    }
+    var native = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(native_path));
+    defer native.close();
+    var boundary = (try prepareAlternativesScriptBoundary(
+        testing.allocator,
+        native.root,
+        &program,
+        "arm64",
+        script,
+        util_linux,
+        .postinst,
+        .new_package,
+        .script,
+        &.{ "configure", "" },
+    )) orelse return error.TestUnexpectedResult;
+    defer boundary.deinit();
+    var cache_bound = false;
+    for (boundary.immutable_before.facts) |fact|
+        if (std.mem.eql(u8, fact.path, "etc/ld.so.cache")) {
+            try testing.expect(fact.kind == .regular and fact.sha256 != null);
+            cache_bound = true;
+        };
+    try testing.expect(cache_bound);
+    try testing.expectEqual(@as(usize, 1), boundary.script.commands.len);
+    try testing.expectEqualStrings("pager", boundary.script.commands[0].name);
+    var script_digest: [32]u8 = undefined;
+    Sha256.hash(script, &script_digest, .{});
+    var launcher: maintainer_script.SystemLauncher = .{};
+    var report = try maintainer_script.run(testing.allocator, .{
+        .root = std.mem.span(native_path),
+        .identity = .{
+            .package = util_linux.name,
+            .version = util_linux.version,
+            .architecture = util_linux.architecture,
+            .kind = .postinst,
+            .script_path = lifecycle_tmp_ci ++ "/util-linux.postinst",
+            .script_sha256 = script_digest,
+        },
+        .arguments = &.{ "configure", "" },
+        .policy = lifecycleInvocationPolicy(false, false, false),
+    }, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    if (!report.succeeded())
+        std.debug.print("signed arm64 util-linux postinst outcome={any} stderr={s}\n", .{ report.outcome, report.stderr });
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    _ = try verifySnapshotUtilLinuxArm64Inputs(testing.allocator, native.root, &artifacts, "arm64");
+    try native_alternatives.validateScriptInputs(
+        testing.allocator,
+        native.root,
+        boundary.script,
+        boundary.before,
+        boundary.immutable_before,
+        .{},
+    );
+    var after = try native_alternatives.capture(testing.allocator, native.root, boundary.after_authority);
+    defer after.deinit();
+    try native_alternatives.validateScriptTransition(testing.allocator, boundary.before, after, boundary.script, boundary.after_authority);
+    try verifySnapshotUtilLinuxArm64PostOutput(testing.allocator, native.root, after);
+    var reference = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(reference_path));
+    defer reference.close();
+    _ = try verifySnapshotUtilLinuxArm64Inputs(testing.allocator, reference.root, &artifacts, "arm64");
+    var oracle = try native_alternatives.capture(testing.allocator, reference.root, boundary.after_authority);
+    defer oracle.deinit();
+    try verifySnapshotUtilLinuxArm64PostOutput(testing.allocator, reference.root, oracle);
+    try testing.expectEqual(after.groups.len, oracle.groups.len);
+    for (after.groups, oracle.groups) |actual, expected| {
+        try testing.expectEqualDeep(actual.record, expected.record);
+        try testing.expectEqualStrings(actual.selected, expected.selected);
+        try testing.expectEqualDeep(actual.links, expected.links);
+        try testing.expectEqualDeep(actual.missing_master_targets, expected.missing_master_targets);
+        try expectAlternativesReplayFactEqual(actual.record_fact, expected.record_fact);
+        try testing.expectEqual(actual.facts.len, expected.facts.len);
+        for (actual.facts, expected.facts) |left, right|
+            try expectAlternativesReplayFactEqual(left, right);
+        if (std.mem.eql(u8, actual.name, "pager"))
+            try testing.expectEqualStrings("/usr/bin/less", actual.selected);
+    }
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_UTIL_LINUX_POSTINST_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed arm64 util-linux native postinst and independent pinned dpkg agree without skips\n");
 }
 
 test "native_unpack.test.protected signed arm64 less source is validated before fixture mutation" {
@@ -26683,6 +27401,13 @@ fn prepareAlternativesScriptBoundary(
         targets[script.immutable_targets.len] = "/etc/ld.so.cache";
         script.immutable_targets = targets;
     }
+    if (snapshot_util_linux_postinst and std.mem.eql(u8, architecture, "arm64")) {
+        if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
+            return error.InvalidAlternativesScriptAuthority;
+        bash_cache_fact = try verifySnapshotUtilLinuxArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
+        try verifySnapshotUtilLinuxArm64FstrimAbsent(root);
+        try bindSnapshotUtilLinuxArm64ImmutableInputs(&script);
+    }
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
         root,
@@ -26776,6 +27501,8 @@ fn prepareAlternativesScriptBoundary(
         .groups = before_groups[0..before_count],
     });
     errdefer before.deinit();
+    if (snapshot_util_linux_postinst and std.mem.eql(u8, architecture, "arm64"))
+        try verifySnapshotUtilLinuxArm64PagerBefore(before);
     var immutable_before = try native_alternatives.captureScriptInputs(
         allocator,
         root,
@@ -26891,6 +27618,18 @@ fn prepareAlternativesScriptBoundary(
             }
         }
         if (!duplicate) try paths.append(scratch, path);
+    }
+    if (snapshot_util_linux_postinst and std.mem.eql(u8, architecture, "arm64")) {
+        for (snapshot_util_linux_arm64_fstrim_created_paths) |path| {
+            var duplicate = false;
+            for (paths.items) |existing| {
+                if (std.mem.eql(u8, existing, path)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try paths.append(scratch, path);
+        }
     }
     return .{
         .script = script,
@@ -27469,6 +28208,17 @@ fn runLifecycleScript(
                 try attempt.requireRecovery(allocator, .script);
                 return err;
             };
+        if (std.mem.eql(u8, program.target_architecture, "arm64") and
+            native_alternatives.matchesSnapshotUtilLinuxPostinst(script_bytes))
+            _ = verifySnapshotUtilLinuxArm64Inputs(
+                allocator,
+                root,
+                program.artifacts,
+                program.target_architecture,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
         native_alternatives.validateScriptInputs(
             allocator,
             root,
@@ -27498,6 +28248,21 @@ fn runLifecycleScript(
             try attempt.requireRecovery(allocator, .script);
             return err;
         };
+        if (std.mem.eql(u8, program.target_architecture, "arm64") and
+            native_alternatives.matchesSnapshotUtilLinuxPostinst(script_bytes))
+            switch (report.outcome) {
+                .exited => |code| if (code == 0) {
+                    verifySnapshotUtilLinuxArm64PostOutput(
+                        allocator,
+                        root,
+                        alternatives_after.?,
+                    ) catch |err| {
+                        try attempt.requireRecovery(allocator, .script);
+                        return err;
+                    };
+                },
+                else => {},
+            };
         if (native_alternatives.matchesSnapshotConsoleSetupLinuxPostinst(
             script_bytes,
         )) switch (report.outcome) {

@@ -15,7 +15,7 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).parent))
 from real_snapshot_less_fixtures import (
-    copy_exclusive, create_exclusive, parent_descriptor, regular_descriptor,
+    copy_exclusive, create_exclusive, parent_descriptor, read_regular, regular_descriptor,
 )
 from real_snapshot_reference_paths import open_absolute, protected
 
@@ -32,6 +32,12 @@ BASH_ARTIFACTS = {
 }
 UTIL_LINUX_ARTIFACTS = {
     "util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad"),
+    "init-system-helpers": ("1.69", 39536, "8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"),
+    "perl-base": ("5.40.1-7ubuntu0.3", 1787114, "41d0be5882f2c4d996a9e5c75e42d9a852158285da60526a03ff4b073666e039353e9b8c72e25156f38bdc359ff2dfe016a1e105bd8d16b0560aaa13319539a4"),
+    "libcrypt1": ("1:4.5.1-1", 88276, "d088db1e2abe0d16d3dd0308417db9163eaa1311ab752ec1b2d05df9ba25ca2e20b2dec38ec0daa841f51885bddd59bcc0b48c353ca7ecba23dc5d2df11c0ac3"),
+}
+ARCHIVE_ARCHITECTURES = {
+    "init-system-helpers": "all",
 }
 ARCHIVE_ARTIFACTS = {**SOURCE_ARTIFACTS, **BASH_ARTIFACTS, **UTIL_LINUX_ARTIFACTS}
 
@@ -77,8 +83,9 @@ def remove_lib64(root: Path) -> None:
 
 
 def archive(lock: dict, cache: Path, package: str) -> Path:
+    expected_arch = ARCHIVE_ARCHITECTURES.get(package, "arm64")
     entries = [entry for entry in lock["packages"]
-               if entry["name"] == package and entry["architecture"] == "arm64"]
+               if entry["name"] == package and entry["architecture"] == expected_arch]
     if len(entries) != 1:
         raise ValueError(f"ambiguous signed source archive: {package}")
     entry = entries[0]
@@ -115,18 +122,21 @@ def member(archive_path: Path, name: str) -> bytes:
             os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o600, dir_fd=parent,
         )
+        try:
+            with os.fdopen(descriptor, "w+b") as capture:
+                subprocess.run(
+                    ["/usr/bin/dpkg-deb", "--fsys-tarfile", str(archive_path)],
+                    check=True, stdout=capture, timeout=60,
+                    preexec_fn=limit_capture,
+                )
+                if os.fstat(capture.fileno()).st_size > 64 * 1024 * 1024:
+                    raise ValueError("signed source data archive exceeds bound")
+                capture.seek(0)
+                payload = capture.read(64 * 1024 * 1024 + 1)
+        finally:
+            os.unlink(archive_path.name + ".less-source.tar", dir_fd=parent)
     finally:
         os.close(parent)
-    with os.fdopen(descriptor, "w+b") as capture:
-        subprocess.run(
-            ["/usr/bin/dpkg-deb", "--fsys-tarfile", str(archive_path)],
-            check=True, stdout=capture, timeout=60,
-            preexec_fn=limit_capture,
-        )
-        if os.fstat(capture.fileno()).st_size > 64 * 1024 * 1024:
-            raise ValueError("signed source data archive exceeds bound")
-        capture.seek(0)
-        payload = capture.read(64 * 1024 * 1024 + 1)
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as data:
         entries = [entry for entry in data if entry.name.removeprefix("./") == name]
         if (len(entries) != 1 or not entries[0].isfile() or
@@ -144,6 +154,14 @@ def member(archive_path: Path, name: str) -> bytes:
 
 def limit_capture() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
+
+
+def stage_ldconfig_producer(root: Path, locks: dict, cache: Path) -> None:
+    producer = member(archive(locks["libc-bin"], cache, "libc-bin"), "usr/sbin/ldconfig")
+    if (len(producer) != 865848 or hashlib.sha256(producer).hexdigest() !=
+            "b78066d6243748c6565675a63eec5f0d41b6adb3b4635adea6906326db41f9fa"):
+        raise ValueError("signed ldconfig cache producer changed")
+    create_exclusive(root, "var/lib/dpkg/producer-ldconfig", producer, 0o755)
 
 
 def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
@@ -195,11 +213,7 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
         tinfo = archive(locks["bash"], cache, "libtinfo6")
         create_exclusive(root, "var/lib/dpkg/producer-libtinfo6.deb", tinfo.read_bytes(), 0o644)
         if "libc-bin" in locks:
-            producer = member(archive(locks["libc-bin"], cache, "libc-bin"), "usr/sbin/ldconfig")
-            if (len(producer) != 865848 or hashlib.sha256(producer).hexdigest() !=
-                    "b78066d6243748c6565675a63eec5f0d41b6adb3b4635adea6906326db41f9fa"):
-                raise ValueError("signed ldconfig cache producer changed")
-            create_exclusive(root, "var/lib/dpkg/producer-ldconfig", producer, 0o755)
+            stage_ldconfig_producer(root, locks, cache)
     create_exclusive(root, "var/lib/dpkg/producer-dpkg", pinned.read_bytes(), 0o755)
     original = archive(locks[selected_package], cache, selected_package)
     create_exclusive(root, f"var/lib/dpkg/producer-{selected_package}.deb", original.read_bytes(), 0o644)
@@ -238,6 +252,119 @@ def seal_bash(root: Path) -> None:
     create_exclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755)
 
 
+def prepare_util_linux(root: Path, lock_path: Path, cache: Path, pinned: Path,
+                       less_lock_path: Path, dash_lock_path: Path,
+                       util_linux_lock_path: Path, libc_bin_lock_path: Path,
+                       init_helpers_lock_path: Path, perl_base_lock_path: Path) -> None:
+    lock_paths = (
+        lock_path,
+        less_lock_path,
+        dash_lock_path,
+        util_linux_lock_path,
+        libc_bin_lock_path,
+        init_helpers_lock_path,
+        perl_base_lock_path,
+    )
+    for path in (*lock_paths, pinned, Path("/usr/bin/dpkg-deb")):
+        protected(path)
+    protected(root, directory=True)
+    goals = (
+        "dpkg",
+        "less",
+        "dash",
+        "util-linux",
+        "libc-bin",
+        "init-system-helpers",
+        "perl-base",
+    )
+    locks = {}
+    for goal, path in zip(goals, lock_paths):
+        lock = json.loads(path.read_bytes())
+        if lock["target_architecture"] != "arm64":
+            raise ValueError(f"source target must be arm64: {path}")
+        locks[goal] = lock
+    for name, goal in (
+        ("util-linux", "util-linux"),
+        ("init-system-helpers", "init-system-helpers"),
+        ("perl-base", "perl-base"),
+        ("libcrypt1", "perl-base"),
+        ("less", "less"),
+        ("libtinfo6", "less"),
+        ("dash", "dash"),
+        ("dpkg", "dpkg"),
+        ("libc6", "dpkg"),
+        ("libc-bin", "libc-bin"),
+    ):
+        archive(locks[goal], cache, name)
+    remove_lib64(root)
+    for path in ("etc", "etc/alternatives", "var/lib/dpkg/alternatives",
+                 "var/lib/debz-lifecycle-scripts"):
+        directory(root, path)
+    for package, goal, path, mode, expected_size, expected_sha256 in (
+        ("dash", "dash", "usr/bin/dash", 0o755, 133864, "87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9"),
+        ("dpkg", "dpkg", "usr/bin/update-alternatives", 0o755, 68032, "dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807"),
+        ("util-linux", "util-linux", "usr/bin/setpriv", 0o755, 51312, "491ef3bd290472fd6ab94de7706ce54fd13e15b4b1ae8d3a588a55ac310ec57f"),
+        ("libcap-ng0", "util-linux", "usr/lib/aarch64-linux-gnu/libcap-ng.so.0.0.0", 0o644, 67648, "12d4b0f0a4bb8b0a341cdbd51c7388a68eb4cf82cb6f5b4a79da0983b1f1db9e"),
+        ("init-system-helpers", "init-system-helpers", "usr/bin/deb-systemd-helper", 0o755, 24358, "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732"),
+        ("libcrypt1", "perl-base", "usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0", 0o644, 264200, "5c5436f75b65261219cbcffe59ed99aed2047d98525526ed62b623884c1135f9"),
+    ):
+        extracted = member(archive(locks[goal], cache, package), path)
+        if len(extracted) != expected_size or hashlib.sha256(extracted).hexdigest() != expected_sha256:
+            raise ValueError(f"signed {package} runtime member changed: {path}")
+        create_exclusive(root, path, extracted, mode)
+    alias(root, "usr/bin/sh", "dash")
+    alias(root, "usr/lib/aarch64-linux-gnu/libcap-ng.so.0", "libcap-ng.so.0.0.0")
+    alias(root, "usr/lib/aarch64-linux-gnu/libcrypt.so.1", "libcrypt.so.1.1.0")
+    stage_ldconfig_producer(root, locks, cache)
+    create_exclusive(root, "var/lib/dpkg/producer-dpkg", pinned.read_bytes(), 0o755)
+    for name, goal in (
+        ("perl-base", "perl-base"),
+        ("libtinfo6", "less"),
+        ("less", "less"),
+        ("util-linux", "util-linux"),
+    ):
+        deb = archive(locks[goal], cache, name)
+        copy_exclusive(root, f"var/lib/dpkg/producer-{name}.deb", deb, 0o644)
+
+
+def seal_util_linux(root: Path) -> None:
+    with parent_descriptor(root, "usr/bin/perl") as (parent, name):
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=parent,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink not in (1, 2) or
+                    metadata.st_uid != os.geteuid() or metadata.st_gid != os.getegid() or
+                    stat.S_IMODE(metadata.st_mode) != 0o755):
+                raise ValueError("signed perl-base interpreter metadata changed")
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                perl = stream.read(4 * 1024 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+    if (len(perl) != 3942544 or hashlib.sha256(perl).hexdigest() !=
+            "51d562fb5f145f8c12610790b6f67b2868d1aa7c977906b533250f00903681cd"):
+        raise ValueError("signed perl-base interpreter changed")
+    libm = read_regular(root, "usr/lib/aarch64-linux-gnu/libm.so.6", 1024 * 1024)
+    if (len(libm) != 723144 or hashlib.sha256(libm).hexdigest() !=
+            "ffeae799646fae7a8af80402a88f4bc84bfc110af834f5e756aae2fa0a1a9602"):
+        raise ValueError("signed libc6 libm runtime changed")
+    less_list = read_regular(root, "var/lib/dpkg/info/less.list", 2048)
+    if (len(less_list) != 583 or hashlib.sha256(less_list).hexdigest() !=
+            "0206e202ee08fa90d694df6ee0a0f438258ce7f442ff3bc8db4ead65514c62ae"):
+        raise ValueError("signed less prestate ownership path set changed")
+    listing = read_regular(root, "var/lib/dpkg/info/util-linux.list", 16384)
+    if (len(listing) != 8922 or hashlib.sha256(listing).hexdigest() !=
+            "45503af3321a520be18c144f94e3c8a10eae22e8c5f5eb41532af3777db6a0bf"):
+        raise ValueError("signed util-linux ownership path set changed")
+    script = read_regular(root, "var/lib/dpkg/info/util-linux.postinst", 4096)
+    if (len(script) != 2112 or hashlib.sha256(script).hexdigest() !=
+            "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9"):
+        raise ValueError("signed util-linux postinst changed")
+    create_exclusive(root, "var/lib/debz-lifecycle-scripts/util-linux.postinst", script, 0o755)
+
+
 if __name__ == "__main__":
     if os.geteuid() != 0 or os.getegid() != 0:
         raise SystemExit("protected less source setup requires root")
@@ -245,9 +372,13 @@ if __name__ == "__main__":
         prepare(*(Path(argument) for argument in sys.argv[2:]))
     elif sys.argv[1] == "prepare-bash":
         prepare(*(Path(argument) for argument in sys.argv[2:]), package="bash")
+    elif sys.argv[1] == "prepare-util-linux":
+        prepare_util_linux(*(Path(argument) for argument in sys.argv[2:]))
     elif sys.argv[1] == "seal":
         seal(Path(sys.argv[2]))
     elif sys.argv[1] == "seal-bash":
         seal_bash(Path(sys.argv[2]))
+    elif sys.argv[1] == "seal-util-linux":
+        seal_util_linux(Path(sys.argv[2]))
     else:
         raise SystemExit("unknown source setup stage")

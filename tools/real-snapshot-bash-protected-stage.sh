@@ -47,20 +47,24 @@ timeout --signal=TERM --kill-after=5s 120s \
       --force-depends --no-triggers --unpack /var/lib/dpkg/producer-libtinfo6.deb /var/lib/dpkg/producer-bash.deb
   '
 python3 -B -I tools/real_snapshot_less_stage.py seal-bash "$source"
-[[ ! -e "$source/etc/ld.so.cache" && ! -L "$source/etc/ld.so.cache" ]]
-{
+stage_ldconfig_cache() {
+  local root=$1 prefix=$2
+  [[ ! -e "$root/etc/ld.so.cache" && ! -L "$root/etc/ld.so.cache" ]]
+  {
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
       DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
-      chroot "$source" /bin/sh -c '
+      chroot "$root" /bin/sh -c '
     set -eu
     test "$$" -eq 1
     exec setpriv --bounding-set=-sys_admin --no-new-privs \
       /var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu
   '
-} >"$workspace/evidence/bash-cache-producer.stdout" 2>"$workspace/evidence/bash-cache-producer.stderr"
-install -m 0644 "$source/etc/ld.so.cache" "$workspace/evidence/bash-source-ld.so.cache"
+  } >"$workspace/evidence/$prefix-cache-producer.stdout" 2>"$workspace/evidence/$prefix-cache-producer.stderr"
+  install -m 0644 "$root/etc/ld.so.cache" "$workspace/evidence/$prefix-source-ld.so.cache"
+}
+stage_ldconfig_cache "$source" bash
 [[ $(dpkg-query --admindir="$source/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
 read -r bytes _ < <(du -sb "$source")
@@ -124,6 +128,86 @@ timeout --signal=TERM --kill-after=5s 120s \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok installed' ]]
 [[ $(dpkg-query --admindir="$source/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' bash) == '5.3-2ubuntu1 arm64 install ok unpacked' ]]
+util_workspace=$workspace/util-linux
+util_source=$util_workspace/source
+install -d -o root -g root -m 0700 "$util_workspace"
+[[ ! -e "$util_source" && ! -L "$util_source" ]]
+cp -a --reflink=auto --one-file-system -- "$workspace/template" "$util_source"
+python3 -B -I tools/real_snapshot_less_stage.py prepare-util-linux "$util_source" "$lock" "$cache" "$pinned" \
+  "$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json" \
+  "$workspace/evidence/libc-bin.lock.json" "$workspace/evidence/init-system-helpers.lock.json" \
+  "$workspace/evidence/perl-base.lock.json"
+{
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$util_source" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    setpriv --bounding-set=-sys_admin --no-new-privs \
+      /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
+      --force-depends --no-triggers --unpack \
+      /var/lib/dpkg/producer-perl-base.deb \
+      /var/lib/dpkg/producer-libtinfo6.deb \
+      /var/lib/dpkg/producer-less.deb \
+      /var/lib/dpkg/producer-util-linux.deb
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
+      --force-depends --no-triggers --configure less
+  '
+} >"$workspace/evidence/util-linux-source-producer.stdout" 2>"$workspace/evidence/util-linux-source-producer.stderr"
+python3 -B -I tools/real_snapshot_less_stage.py seal-util-linux "$util_source"
+stage_ldconfig_cache "$util_source" util-linux
+[[ $(dpkg-query --admindir="$util_source/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' util-linux) == '2.41.3-3ubuntu2.2 arm64 install ok unpacked' ]]
+[[ $(dpkg-query --admindir="$util_source/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' less) == '668-1build1 arm64 install ok installed' ]]
+for util_name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestate bad-cache; do
+  destination=$util_workspace/$util_name
+  [[ ! -e "$destination" && ! -L "$destination" ]]
+  cp -a --reflink=auto --one-file-system -- "$util_source" "$destination"
+done
+python3 -B -I - "$checkout/tools" "$util_workspace" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_less_fixtures import (
+    chmod_regular, create_exclusive, overwrite_regular, read_regular, replace_symlink,
+)
+
+root = Path(sys.argv[2])
+relative = "var/lib/dpkg/info/util-linux.postinst"
+script = read_regular(root / "bad-script", relative, 4096)
+overwrite_regular(root / "bad-script", relative, script + b"\nunreviewed callback\n")
+chmod_regular(root / "bad-mode", relative, 0o644)
+overwrite_regular(root / "bad-tool", "usr/bin/deb-systemd-helper", b"foreign systemd helper\n")
+replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libcrypt.so.1", "libcrypt.so.1.1.0", "foreign-crypt")
+create_exclusive(root / "bad-prestate", "usr/sbin/deb-systemd-helper", b"#!/bin/sh\nexit 0\n", 0o755)
+cache = read_regular(root / "bad-cache", "etc/ld.so.cache", 1024 * 1024)
+if b"/lib/aarch64-linux-gnu/libm.so.6" not in cache:
+    raise ValueError("original ldconfig cache omitted the libm provider")
+overwrite_regular(root / "bad-cache", "etc/ld.so.cache",
+                  cache.replace(b"/lib/aarch64-linux-gnu/libm.so.6", b"/bad/aarch64-linux-gnu/libm.so.6"))
+PY
+{
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      chroot "$util_workspace/dpkg-after" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
+      --force-depends --no-triggers --configure util-linux
+  '
+} >"$workspace/evidence/util-linux-reference.stdout" 2>"$workspace/evidence/util-linux-reference.stderr"
+[[ $(dpkg-query --admindir="$util_workspace/dpkg-after/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' util-linux) == '2.41.3-3ubuntu2.2 arm64 install ok installed' ]]
+[[ $(dpkg-query --admindir="$util_source/var/lib/dpkg" -W \
+  -f='${Version} ${Architecture} ${Status}' util-linux) == '2.41.3-3ubuntu2.2 arm64 install ok unpacked' ]]
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 8 * 1024 * 1024 * 1024 ))
 echo "signed arm64 bash cached source and nine replay roots staged; required native receipt remains"

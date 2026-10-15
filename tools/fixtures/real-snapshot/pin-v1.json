@@ -942,6 +942,10 @@
         {
           "form": "fixture",
           "path": "src/fixtures/ubuntu-resolute-util-linux.postinst"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
         }
       ],
       "digest": "sha256:31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
@@ -2053,12 +2057,21 @@
     },
     {
       "architectures": [
-        "amd64"
+        "amd64",
+        "arm64"
       ],
       "consumers": [
         {
           "form": "hex",
           "path": "src/maintainer_script.zig"
+        },
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
         }
       ],
       "digest": "sha256:a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732",
@@ -2069,7 +2082,8 @@
       "path": "usr/bin/deb-systemd-helper",
       "provenance": {
         "archives": {
-          "amd64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
+          "amd64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5",
+          "arm64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
         },
         "version": "1.69"
       },
@@ -3866,6 +3880,222 @@
       },
       "review": "#393",
       "size": 339,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "derived_from": [
+        {
+          "package": "util-linux",
+          "version": "2.41.3-3ubuntu2.2"
+        }
+      ],
+      "digest": "sha256:45503af3321a520be18c144f94e3c8a10eae22e8c5f5eb41532af3777db6a0bf",
+      "id": "prestate:util-linux/list",
+      "kind": "prestate",
+      "mode": "0644",
+      "package": "util-linux",
+      "path": "var/lib/dpkg/info/util-linux.list",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad"
+        },
+        "version": "2.41.3-3ubuntu2.2"
+      },
+      "review": "#262",
+      "size": 8922,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5",
+      "id": "archive:init-system-helpers",
+      "kind": "archive",
+      "mode": null,
+      "package": "init-system-helpers",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
+        },
+        "version": "1.69"
+      },
+      "review": "#262",
+      "size": 39536,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha512:41d0be5882f2c4d996a9e5c75e42d9a852158285da60526a03ff4b073666e039353e9b8c72e25156f38bdc359ff2dfe016a1e105bd8d16b0560aaa13319539a4",
+      "id": "archive:perl-base@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "perl-base",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:41d0be5882f2c4d996a9e5c75e42d9a852158285da60526a03ff4b073666e039353e9b8c72e25156f38bdc359ff2dfe016a1e105bd8d16b0560aaa13319539a4"
+        },
+        "version": "5.40.1-7ubuntu0.3"
+      },
+      "review": "#262",
+      "size": 1787114,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha256:51d562fb5f145f8c12610790b6f67b2868d1aa7c977906b533250f00903681cd",
+      "id": "file:perl-base/usr/bin/perl@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "perl-base",
+      "path": "usr/bin/perl",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:41d0be5882f2c4d996a9e5c75e42d9a852158285da60526a03ff4b073666e039353e9b8c72e25156f38bdc359ff2dfe016a1e105bd8d16b0560aaa13319539a4"
+        },
+        "version": "5.40.1-7ubuntu0.3"
+      },
+      "review": "#262",
+      "size": 3942544,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha512:d088db1e2abe0d16d3dd0308417db9163eaa1311ab752ec1b2d05df9ba25ca2e20b2dec38ec0daa841f51885bddd59bcc0b48c353ca7ecba23dc5d2df11c0ac3",
+      "id": "archive:libcrypt1@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "libcrypt1",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:d088db1e2abe0d16d3dd0308417db9163eaa1311ab752ec1b2d05df9ba25ca2e20b2dec38ec0daa841f51885bddd59bcc0b48c353ca7ecba23dc5d2df11c0ac3"
+        },
+        "version": "1:4.5.1-1"
+      },
+      "review": "#262",
+      "size": 88276,
+      "version_bound": true
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha256:5c5436f75b65261219cbcffe59ed99aed2047d98525526ed62b623884c1135f9",
+      "id": "file:libcrypt1/usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0@arm64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "libcrypt1",
+      "path": "usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:d088db1e2abe0d16d3dd0308417db9163eaa1311ab752ec1b2d05df9ba25ca2e20b2dec38ec0daa841f51885bddd59bcc0b48c353ca7ecba23dc5d2df11c0ac3"
+        },
+        "version": "1:4.5.1-1"
+      },
+      "review": "#262",
+      "size": 264200,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_less_stage.py"
+        }
+      ],
+      "digest": "sha256:ffeae799646fae7a8af80402a88f4bc84bfc110af834f5e756aae2fa0a1a9602",
+      "id": "file:libc6/usr/lib/aarch64-linux-gnu/libm.so.6@arm64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "libc6",
+      "path": "usr/lib/aarch64-linux-gnu/libm.so.6",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7"
+        },
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#262",
+      "size": 723144,
       "version_bound": false
     }
   ],

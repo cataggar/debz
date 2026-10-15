@@ -491,7 +491,8 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                 )
                 rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
                 goals = (("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else
-                         ("dpkg", "bash", "dash", "util-linux", "libc-bin") if purpose == "arm64-bash" else ("dpkg",))
+                         ("dpkg", "bash", "dash", "util-linux", "libc-bin",
+                          "init-system-helpers", "perl-base", "less") if purpose == "arm64-bash" else ("dpkg",))
                 self.assertEqual(len(rows), 2 * len(goals))
                 for index, package in enumerate(goals):
                     for offset, command in enumerate(("plan", "download")):
@@ -1360,6 +1361,27 @@ class SignedUtilLinuxSourceTests(unittest.TestCase):
                         stage.archive({"packages": [dict(original, **{field: changed})]},
                                       Path("/unused-cache"), "util-linux")
                     protected.assert_not_called()
+
+    def test_util_linux_runtime_archive_coordinates_bind_arch_all_and_arm64_providers(self) -> None:
+        stage = load("debz_util_linux_runtime_lock_pins", "real_snapshot_less_stage.py")
+        for package, expected_arch in (
+            ("init-system-helpers", "all"),
+            ("perl-base", "arm64"),
+            ("libcrypt1", "arm64"),
+        ):
+            version, size, digest = stage.UTIL_LINUX_ARTIFACTS[package]
+            original = {
+                "name": package, "version": version, "architecture": expected_arch,
+                "declared_size": size, "origin": {"type": "authenticated_repository"},
+                "archive_identity": {"primary": "sha512", "digests": [
+                    {"algorithm": "sha512", "digest": digest}]},
+            }
+            wrong_arch = "arm64" if expected_arch == "all" else "all"
+            with self.subTest(package=package), mock.patch.object(stage, "protected") as protected:
+                with self.assertRaises(ValueError):
+                    stage.archive({"packages": [dict(original, architecture=wrong_arch)]},
+                                  Path("/unused-cache"), package)
+                protected.assert_not_called()
 
 
 if __name__ == "__main__":
