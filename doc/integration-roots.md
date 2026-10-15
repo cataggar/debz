@@ -210,7 +210,7 @@ network-derived input.
 
 ## Local prerequisites
 
-- Zig 0.16.0 and liblzma development files;
+- Zig 0.17.0 and liblzma development files;
 - the native repository fixture driver (built by the integration target);
 - `dpkg` for full/native lanes; native execution also requires Linux private
   mount-namespace privileges (use `DEBZ_INTEGRATION_SUDO=1` when needed).
@@ -820,7 +820,7 @@ checkout is used only to confirm `GITHUB_SHA` and a clean tree and to write a
    into `TREE/checkout`;
 3. `tools/real-snapshot-reference-protected-ci.sh`, run from that checkout.
 
-The script downloads the pinned Zig 0.16.0 tarball and refuses it unless
+The script downloads the pinned Zig 0.17.0 tarball and refuses it unless
 `tools/verify-minisign.py` accepts its pinned name, size, SHA-256 and the
 prehashed minisign signature (file and trusted-comment signatures) under the
 pinned Zig release key. It extracts it with Python's `data` filter. Zig

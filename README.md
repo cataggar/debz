@@ -9,7 +9,7 @@ ghr install cataggar/debz@v0.2.0
 ```
 
 Release binaries are fully static Linux x64 or arm64 executables with Zig
-0.16.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd
+0.17.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd
 included. Gzip and xz binary archives are covered by GitHub provenance
 attestations.
 

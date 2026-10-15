@@ -536,7 +536,7 @@ runner with fresh roots, within 35 minutes. Each run:
 1. runs the prestate and binding scripts from the runner-owned checkout
    and requires both to refuse the writable ancestry. It also requires
    `test-native-signed-proc` to reject missing and relative roots;
-2. stages the reviewed commit (`git archive HEAD`), the verified Zig 0.16.0
+2. stages the reviewed commit (`git archive HEAD`), the verified Zig 0.17.0
    installation, the pinned dpkg prefix and the pinned
    `ubuntu-archive-keyring.gpg` (ubuntu-keyring 2023.11.28.1) beneath
    `/srv/debz-protected/signed-proc`. Every staged entry and every

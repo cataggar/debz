@@ -87,7 +87,7 @@ The published four-job recovery graph uses 14 verified Zig installations;
 this prepared three-job graph requires exactly 13 in both security and
 release workflow policy audits.
 
-Ordinary CI and release builds obtain Zig 0.16.0 from `cataggar/zig` through the
+Ordinary CI and release builds obtain Zig 0.17.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verify the release with its pinned
 minisign key and GitHub attestations, and check `zig version` before use. The
 action cache contains only the exact installed tool and `ghr` transaction state;
@@ -207,7 +207,7 @@ workload aggregates, root/reference execution and arbitrary build options
 are deliberately not selectors.
 
 Each paid row installs the same signature/attestation-verified, pinned Zig
-0.16.0 toolchain, checks its version before building, refuses root or a foreign
+0.17.0 toolchain, checks its version before building, refuses root or a foreign
 runner architecture, and creates exclusive run/attempt/source/coordinate-local
 caches without restoring build caches. Only selected tooling producers are
 installed, both normally and at a custom prefix; their actual executable
@@ -246,7 +246,7 @@ publication or attestation is never cancelled by development CI churn.
 The same tests are native `std.testing.fuzz` targets with seed corpora, so
 coverage-guided runs can use `zig build fuzz --fuzz=<cases>` on Zig toolchains
 where the built-in fuzzer is available. CI uses the deterministic runner
-because Zig 0.16.0's built-in Linux test runner currently fails to compile in
+because Zig 0.17.0's built-in Linux test runner currently fails to compile in
 fuzz instrumentation mode due to its internal stack-trace type mismatch; this
 is an explicit toolchain limitation, not a green substitute sanitizer gate.
 

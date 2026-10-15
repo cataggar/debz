@@ -1613,8 +1613,8 @@ test "security: reviewed musl toolchain, static runtime, and vulnerability dispo
         if (!std.mem.eql(u8, dependency.object.get("name").?.string, "musl")) continue;
         count += 1;
         try testing.expectEqualStrings("1.2.5", dependency.object.get("upstream_version").?.string);
-        try testing.expectEqualStrings("0.16.0", dependency.object.get("toolchain_version").?.string);
-        try testing.expectEqualStrings("24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8", dependency.object.get("toolchain_commit").?.string);
+        try testing.expectEqualStrings("0.17.0", dependency.object.get("toolchain_version").?.string);
+        try testing.expectEqualStrings("7647adab80dd088f4de3610fd245915a912eb6ad", dependency.object.get("toolchain_commit").?.string);
         try testing.expectEqualStrings("MIT", dependency.object.get("license").?.string);
         try testing.expectEqualStrings("static_libc_in_debz", dependency.object.get("runtime_linkage").?.string);
         const exceptions = dependency.object.get("reviewed_exceptions").?.array.items;
@@ -1928,7 +1928,7 @@ test "security: native Debian readiness keeps pinned freshness, bounded input an
     try nativeMutations(&f, "native-debian-readiness", "build.zig", &.{
         "workload_core.dependOn(&debian_readiness_tests.step);",
         "audit_tests.step.dependOn(&install_debian_readiness.step);",
-        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", b.getInstallPath(.bin, \"debz-debian-stable-readiness\"));",
+        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", getInstallPath(b, .bin, \"debz-debian-stable-readiness\"));",
     });
     try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-readiness.zig", &.{
         "return error.SignerFingerprintChanged;",
@@ -2062,7 +2062,7 @@ test "security: actual integration signing binds every consumer to the native re
         "\"$PWD/zig-out/bin/debz-integration-repository\"",
     });
     try nativeMutations(&f, "native-integration-signing", ".github/workflows/release.yml", &.{
-        "cataggar/zig@v0.16.0",
+        "cataggar/zig@v0.17.0",
         "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
     });
     const restored = try nativeCheck(&f, "native-integration-signing", "tools/requirements-openpgp-fixtures.txt", "cryptography\n");
@@ -2419,7 +2419,7 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
         "recovery_family.addArtifactArg(cli);",
         "recovery_bootstrap.addArtifactArg(native_trigger_helper);",
         "repository_recovery.addArtifactArg(cli);",
-        "const repository_fixture_parent = b.addSystemCommand(&.{ \"mkdir\", \"-p\", b.pathFromRoot(\".tmp\") });",
+        "const repository_fixture_parent = b.addSystemCommand(&.{ \"mkdir\", \"-p\", pathFromRoot(b, \".tmp\") });",
         "run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);",
         "repository_recovery.step.dependOn(&repository_fixture_parent.step);",
         "recovery_parity.addArtifactArg(cli);",

@@ -340,10 +340,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install Node 24
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -416,10 +416,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Build unique CLI and exact locks
         id: fixture
         env:
@@ -734,10 +734,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Build static CLI and signed fixture
         run: |
           zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
@@ -880,10 +880,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1036,10 +1036,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1142,10 +1142,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1273,10 +1273,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1384,10 +1384,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1512,10 +1512,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1620,10 +1620,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1716,10 +1716,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1818,10 +1818,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -1914,10 +1914,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -2043,10 +2043,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -2094,10 +2094,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Build and test native oracle evidence tooling
         run: |
           zig build build-dpkg-oracle-evidence test-dpkg-oracle-evidence -Doptimize=ReleaseSafe -j2 --summary all
@@ -2233,10 +2233,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Bind the reviewed commit to a hosted amd64 runner
         run: |
           test "$RUNNER_ARCH" = X64
@@ -2314,7 +2314,7 @@ jobs:
             test $(( 8#$(stat -c '%a' "$path") & 022 )) -eq 0
           done
           sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"
-          test "$(sudo -n env -i "$PROTECTED/zig/zig" version)" = 0.16.0
+          test "$(sudo -n env -i "$PROTECTED/zig/zig" version)" = 0.17.0
           sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
             ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
             zig build --build-file "$PROTECTED/checkout/build.zig" build-native-dpkg-reference \
@@ -2683,10 +2683,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install audited system dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -2737,10 +2737,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Build, package, and audit v0.3.0 binary assets
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -2830,10 +2830,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Verify exact four-archive dry-run with native release core
         run: |
           zig build build-release-tool -j2
@@ -2855,10 +2855,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Audit release workflow policy
         run: |
           zig build build-release-tool -j2
@@ -2879,10 +2879,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
@@ -2976,10 +2976,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install bounded fixture prerequisites
         run: |
           if [ -f /etc/apt/apt-mirrors.txt ]; then
@@ -3034,10 +3034,10 @@ jobs:
         with:
           ghr-version: v0.8.1
           tools: >-
-            cataggar/zig@v0.16.0
+            cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
+        run: test "$(zig version)" = 0.17.0
       - name: Install bounded fixture prerequisites
         run: |
           sudo apt-get update
