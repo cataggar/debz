@@ -10081,7 +10081,7 @@ test "native_unpack.test.live database arch-native admits only the target archit
         .{ .target = "amd64", .bytes = "amd64\r\n", .expect = .mismatch },
         .{ .target = "amd64", .bytes = "AMD64\n", .expect = .mismatch },
         .{ .target = "amd64", .bytes = "amd64x\n", .expect = .mismatch },
-        .{ .target = "amd64", .bytes = "amd64\n" ++ "x" ** 4096, .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\n" ++ @as([4096]u8, @splat('x')), .expect = .mismatch },
         .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o666, .expect = .unsafe },
         .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o620, .expect = .unsafe },
         .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o602, .expect = .unsafe },
@@ -15447,7 +15447,7 @@ fn expectHandoff(result: Result, feature: DeferredFeature) !void {
             var owned = value;
             defer owned.deinit();
             try testing.expect(owned.requires(feature));
-            try testing.expect(!std.mem.eql(u8, &owned.digest, &[_]u8{0} ** 32));
+            try testing.expect(!std.mem.eql(u8, &owned.digest, &@as([32]u8, @splat(0))));
         },
     }
 }
@@ -31293,7 +31293,7 @@ test "native_unpack.test.baseline ownership 100k by 250k scan is indexed and cum
     const missing = fixture.archive("incoming/more", .regular);
     while (index.work < (Limits{}).max_work - 19)
         try index.requireCompatible(&.{missing});
-    const more = [_]archive_application.File{missing} ** 19;
+    const more: [19]archive_application.File = @splat(missing);
     try testing.expectError(error.LimitExceeded, index.requireCompatible(&more));
     const too_many = [_]@import("installed_baseline_component.zig").Component{ fixture.component(payload), fixture.component(payload[0..1]) };
     try testing.expectError(error.InstalledBaselineComponentLimit, BaselineOwnershipIndex.init(allocator, &too_many));
@@ -39978,10 +39978,10 @@ fn expectPreparedNativeProgramCrash(
         ) catch std.process.exit(87);
         std.process.exit(88);
     }
-    var status: u32 = 0;
+    var status: i32 = 0;
     const waited = linux.waitpid(@intCast(child), &status, 0);
     try testing.expectEqual(child, waited);
-    try testing.expectEqual(@as(u32, native_recovery.crash_exit_code), status >> 8);
+    try testing.expectEqual(@as(u32, native_recovery.crash_exit_code), @as(u32, @bitCast(status)) >> 8);
 }
 
 test "native_unpack.test.caller-owned install initializes an absent database" {
@@ -40630,8 +40630,8 @@ fn testPreparedDeadline(
     try testing.expectEqualStrings("deadline_exceeded", report.detail);
     try testing.expect(report.receipt == null);
     try testing.expect(caller.locked());
-    try testing.expectEqual([_]u8{0x71} ** 32, caller.record().request_sha256);
-    try testing.expectEqual([_]u8{0x72} ** 32, caller.record().policy_sha256);
+    try testing.expectEqual(@as([32]u8, @splat(0x71)), caller.record().request_sha256);
+    try testing.expectEqual(@as([32]u8, @splat(0x72)), caller.record().policy_sha256);
     try testing.expectEqual(script_policy, compiled.program.program.script_policy_sha256);
     try testing.expectEqual(program_digest, compiled.program.program.digest_sha256);
     try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation_completion.document_path)) == null);
@@ -41233,8 +41233,8 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         );
         try testing.expectEqual(root_operation.Outcome.pending, caller.record().outcome);
         try testing.expect(caller.record().operation.eql(.{ .repository_bootstrap = .add }));
-        try testing.expectEqual([_]u8{0x71} ** 32, caller.record().request_sha256);
-        try testing.expectEqual([_]u8{0x72} ** 32, caller.record().policy_sha256);
+        try testing.expectEqual(@as([32]u8, @splat(0x71)), caller.record().request_sha256);
+        try testing.expectEqual(@as([32]u8, @splat(0x72)), caller.record().policy_sha256);
         try testing.expectEqual(transaction_executor.planDigest(solver_plan), caller.record().plan_sha256.?);
         try testing.expectEqual(compiled.authorization.authorization.digest_sha256, caller.record().authorization_sha256.?);
         try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null);

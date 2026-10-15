@@ -183,7 +183,7 @@ const ForceSet = std.EnumSet(transaction_executor.ForceRisk);
 /// `{overwrite, depends}`) pass any length or membership comparison, so it is
 /// refused instead of collapsed.
 fn forceSet(force: []const transaction_executor.ForceRisk) ?ForceSet {
-    var set: ForceSet = .initEmpty();
+    var set: ForceSet = .empty;
     for (force) |risk| {
         if (set.contains(risk)) return null;
         set.insert(risk);

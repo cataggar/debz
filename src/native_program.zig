@@ -793,10 +793,10 @@ pub const Program = struct {
 
     pub fn jsonStringify(self: Program, writer: anytype) !void {
         try writer.beginObject();
-        inline for (std.meta.fields(Program)) |field| {
-            if (!std.mem.eql(u8, field.name, "baseline") or self.version == schema_v3_version) {
-                try writer.objectField(field.name);
-                try writer.write(@field(self, field.name));
+        inline for (@typeInfo(Program).@"struct".field_names) |field_name| {
+            if (!std.mem.eql(u8, field_name, "baseline") or self.version == schema_v3_version) {
+                try writer.objectField(field_name);
+                try writer.write(@field(self, field_name));
             }
         }
         try writer.endObject();
@@ -4230,8 +4230,8 @@ fn validateModel(comptime T: type, value: T) bool {
             return validateModel(info.child, inner);
         },
         .@"struct" => |info| {
-            inline for (info.fields) |field| {
-                if (!validateModel(field.type, @field(value, field.name))) return false;
+            inline for (info.field_names, info.field_types) |field_name, FieldType| {
+                if (!validateModel(FieldType, @field(value, field_name))) return false;
             }
             return true;
         },
@@ -8305,11 +8305,11 @@ test "native_program.test.compilation fails closed under allocation failure" {
 }
 
 fn expectEnumMatchesSchema(comptime Enum: type, values: []const std.json.Value) !void {
-    try testing.expectEqual(std.meta.fields(Enum).len, values.len);
-    inline for (std.meta.fields(Enum)) |field| {
+    try testing.expectEqual(@typeInfo(Enum).@"enum".field_names.len, values.len);
+    inline for (@typeInfo(Enum).@"enum".field_names) |field_name| {
         var matches: usize = 0;
         for (values) |value| {
-            if (value == .string and std.mem.eql(u8, field.name, value.string))
+            if (value == .string and std.mem.eql(u8, field_name, value.string))
                 matches += 1;
         }
         try testing.expectEqual(@as(usize, 1), matches);
@@ -8381,7 +8381,7 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
     const required = root.get("required").?.array.items;
     try testing.expectEqual(required.len, properties.count());
     try testing.expectEqual(required.len, serialized.value.object.count());
-    try testing.expectEqual(std.meta.fields(Program).len - 1, required.len);
+    try testing.expectEqual(@typeInfo(Program).@"struct".field_names.len - 1, required.len);
     for (required) |name| {
         try testing.expect(properties.contains(name.string));
         try testing.expect(serialized.value.object.contains(name.string));
@@ -8402,19 +8402,19 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
     defer baseline_schema.deinit();
     const baseline_properties = baseline_schema.value.object.get("properties").?.object;
     const baseline_required = baseline_schema.value.object.get("required").?.array.items;
-    try testing.expectEqual(std.meta.fields(Program).len, baseline_properties.count());
+    try testing.expectEqual(@typeInfo(Program).@"struct".field_names.len, baseline_properties.count());
     try testing.expectEqual(baseline_properties.count(), baseline_required.len);
-    inline for (std.meta.fields(Program)) |field|
-        try testing.expect(baseline_properties.contains(field.name));
+    inline for (@typeInfo(Program).@"struct".field_names) |field_name|
+        try testing.expect(baseline_properties.contains(field_name));
     for (baseline_required) |name| try testing.expect(baseline_properties.contains(name.string));
 
     const operations = definitions.get("operations").?.object;
-    try testing.expectEqual(std.meta.fields(StepKind).len, operations.count());
-    inline for (std.meta.fields(StepKind)) |field| {
-        try testing.expect(operations.contains(field.name));
+    try testing.expectEqual(@typeInfo(StepKind).@"enum".field_names.len, operations.count());
+    inline for (@typeInfo(StepKind).@"enum".field_names) |field_name| {
+        try testing.expect(operations.contains(field_name));
     }
     const variants = definitions.get("operation").?.object.get("oneOf").?.array.items;
-    try testing.expectEqual(std.meta.fields(StepKind).len, variants.len);
+    try testing.expectEqual(@typeInfo(StepKind).@"enum".field_names.len, variants.len);
 
     try expectEnumMatchesSchema(
         Phase,

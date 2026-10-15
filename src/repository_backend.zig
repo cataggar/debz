@@ -7847,12 +7847,13 @@ test "repository backend native caller binds every executable request policy fie
     const request = BindingFixture.request;
     const original = repositoryRequestDigest(request, .native);
     inline for (.{ "cache", "state", "network", "resources" }) |group| {
-        inline for (std.meta.fields(@TypeOf(@field(request, group)))) |field| {
+        const Group = @TypeOf(@field(request, group));
+        inline for (@typeInfo(Group).@"struct".field_names, @typeInfo(Group).@"struct".field_types) |field_name, FieldType| {
             var changed = request;
-            const value = &@field(@field(changed, group), field.name);
-            switch (@typeInfo(field.type)) {
+            const value = &@field(@field(changed, group), field_name);
+            switch (@typeInfo(FieldType)) {
                 .int => value.* += 1,
-                .optional => value.* = if (std.mem.eql(u8, field.name, "proxy_url"))
+                .optional => value.* = if (std.mem.eql(u8, field_name, "proxy_url"))
                     "https://different.example.test"
                 else
                     "/different",

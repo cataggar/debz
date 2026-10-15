@@ -1561,11 +1561,11 @@ test "apt_system_state.test.schema uses the shared evidence contract" {
         properties.get("schema").?.object.get("const").?.string,
     );
     const phases = properties.get("phase").?.object.get("enum").?.array.items;
-    try std.testing.expectEqual(std.meta.fields(Phase).len, phases.len);
-    inline for (std.meta.fields(Phase)) |field| {
+    try std.testing.expectEqual(@typeInfo(Phase).@"enum".field_names.len, phases.len);
+    inline for (@typeInfo(Phase).@"enum".field_names) |field_name| {
         var found = false;
         for (phases) |value| {
-            if (value == .string and std.mem.eql(u8, field.name, value.string)) {
+            if (value == .string and std.mem.eql(u8, field_name, value.string)) {
                 found = true;
             }
         }

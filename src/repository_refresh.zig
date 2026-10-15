@@ -923,7 +923,7 @@ fn validateConfiguration(
         !std.ascii.eqlIgnoreCase(repository.base_uri.scheme, "http") and
         !std.ascii.eqlIgnoreCase(repository.base_uri.scheme, "https"))
         return error.InvalidConfiguration;
-    var seen: std.EnumSet(Compression) = .initEmpty();
+    var seen: std.EnumSet(Compression) = .empty;
     for (refresh_policy.compression_order) |item| {
         if (seen.contains(item)) return error.InvalidConfiguration;
         seen.insert(item);
@@ -2613,11 +2613,11 @@ test "SHA512-only Ubuntu-shaped indexes select and verify for amd64 and arm64" {
     const amd64_packages =
         "Package: microsoft-demo\nVersion: 1.0\nArchitecture: amd64\n" ++
         "Filename: pool/main/m/microsoft-demo_1.0_amd64.deb\nSize: 1\n" ++
-        "SHA512: " ++ ("a" ** 128) ++ "\nDescription: fixture\n\n";
+        "SHA512: " ++ @as([128]u8, @splat('a')) ++ "\nDescription: fixture\n\n";
     const arm64_packages =
         "Package: microsoft-demo\nVersion: 1.0\nArchitecture: arm64\n" ++
         "Filename: pool/main/m/microsoft-demo_1.0_arm64.deb\nSize: 1\n" ++
-        "SHA512: " ++ ("b" ** 128) ++ "\nDescription: fixture\n\n";
+        "SHA512: " ++ @as([128]u8, @splat('b')) ++ "\nDescription: fixture\n\n";
     const amd64_digest = content_digest.Value.of(.sha512, amd64_packages);
     const arm64_digest = content_digest.Value.of(.sha512, arm64_packages);
     var amd64_hex: [128]u8 = undefined;
@@ -3889,7 +3889,7 @@ test "frozen release refusals are typed and publish nothing" {
         );
     }
     try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &.{ witnesses.evidence[0], witnesses.evidence[0] }, &now);
-    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &(.{witnesses.evidence[0]} ** (maximum_freshness_witnesses + 1)), &now);
+    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &@as([maximum_freshness_witnesses + 1]@TypeOf(witnesses.evidence[0]), @splat(witnesses.evidence[0])), &now);
     try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, frozen_test_bounded, &witnesses.evidence, &now);
     try std.testing.expect(!validExpiryPolicy(.{
         .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = @splat(0) } },
@@ -3908,10 +3908,10 @@ test "frozen release refusals are typed and publish nothing" {
     for ([_][]const u8{
         tagged[7..],
         tagged[0 .. tagged.len - 1],
-        "SHA256:" ++ "a" ** 64,
-        "sha256:" ++ "A" ** 64,
-        "sha256:" ++ "0" ** 64,
-        "sha1:" ++ "a" ** 40,
+        "SHA256:" ++ @as([64]u8, @splat('a')),
+        "sha256:" ++ @as([64]u8, @splat('A')),
+        "sha256:" ++ @as([64]u8, @splat('0')),
+        "sha1:" ++ @as([40]u8, @splat('a')),
         taggedDigestText(sha512_pin.frozen_release_with_witnesses.release_digest, &sha512_buffer),
     }) |text| try std.testing.expectError(error.InvalidDigest, parseFrozenReleaseDigest(text));
 

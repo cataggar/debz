@@ -540,16 +540,15 @@ fn validPackages(request: Request) bool {
 }
 
 fn parseOperation(value: []const u8) ?Operation {
-    inline for (std.meta.fields(Operation)) |field| {
-        const operation: Operation = @enumFromInt(field.value);
+    inline for (std.meta.tags(Operation)) |operation| {
         if (std.mem.eql(u8, value, operation.spelling())) return operation;
     }
     return null;
 }
 
 fn parseExitStatus(value: u8) ?ExitStatus {
-    inline for (std.meta.fields(ExitStatus)) |field| {
-        if (field.value == value) return @enumFromInt(value);
+    inline for (std.meta.tags(ExitStatus)) |status| {
+        if (@intFromEnum(status) == value) return status;
     }
     return null;
 }
@@ -764,8 +763,7 @@ test "product_api.test.refresh repository and frozen decisions survive owned tra
 }
 
 test "product_api.test.every non-refresh operation retains its original item JSON" {
-    inline for (std.meta.fields(Operation)) |field| {
-        const operation: Operation = @enumFromInt(field.value);
+    inline for (std.meta.tags(Operation)) |operation| {
         if (operation != .refresh) {
             const result: Result = .{
                 .operation = operation,

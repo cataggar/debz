@@ -551,8 +551,8 @@ test "JSON digest identities reject downgrade order and preserve SHA512-only val
 
     const reversed =
         "{\"primary\":\"sha512\",\"digests\":[" ++
-        "{\"algorithm\":\"sha512\",\"digest\":\"" ++ ("00" ** 64) ++ "\"}," ++
-        "{\"algorithm\":\"sha256\",\"digest\":\"" ++ ("00" ** 32) ++ "\"}]}";
+        "{\"algorithm\":\"sha512\",\"digest\":\"" ++ @as([128]u8, @splat('0')) ++ "\"}," ++
+        "{\"algorithm\":\"sha256\",\"digest\":\"" ++ @as([64]u8, @splat('0')) ++ "\"}]}";
     try testing.expectError(
         error.UnexpectedToken,
         std.json.parseFromSlice(

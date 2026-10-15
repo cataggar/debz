@@ -495,8 +495,8 @@ pub fn validate(document: Document) !void {
         document.architecture.len == 0 or document.architecture.len > 256 or
         (document.defer_triggers and !document.triggers))
         return error.InvalidExecutionRequest;
-    inline for (std.meta.fields(ProgramBinding)) |field|
-        if (!validDigest(@field(document.program, field.name)))
+    inline for (@typeInfo(ProgramBinding).@"struct".field_names) |field_name|
+        if (!validDigest(@field(document.program, field_name)))
             return error.InvalidExecutionRequest;
     inline for (.{
         document.caller.attempt_id,
@@ -642,8 +642,8 @@ pub fn validateIntent(document: Document, intent: native_recovery.Intent) !void 
 
 fn fixtureDocument() Document {
     var program: ProgramBinding = undefined;
-    inline for (std.meta.fields(ProgramBinding)) |field|
-        @field(program, field.name) = @splat('a');
+    inline for (@typeInfo(ProgramBinding).@"struct".field_names) |field_name|
+        @field(program, field_name) = @splat('a');
     var document: Document = .{
         .install_root = "/fixture",
         .root_identity_sha256 = native_recovery.hexDigest(transaction_recovery.rootIdentity("/fixture")),

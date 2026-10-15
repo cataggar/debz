@@ -95,7 +95,7 @@ test "native_provenance.test.retention checks bound bytes before publishing a he
         .expected_sha256 = @splat('0'),
     }};
     try testing.expectError(error.EvidenceChanged, retainEvidence(testing.allocator, root, attempt, &sources));
-    const destination = receipts_directory ++ "/" ++ ("a" ** 64) ++ "/helper.bin";
+    const destination = receipts_directory ++ "/" ++ @as([64]u8, @splat('a')) ++ "/helper.bin";
     try testing.expect(try root.entryIfExists(try root_fs.Path.init(destination)) == null);
 }
 
@@ -491,7 +491,7 @@ pub fn validate(document: Document) !void {
         &document.evidence_files_sha256,
         &evidenceDigest(document.evidence_files),
     )) return error.InvalidDocument;
-    var evidence_kinds = std.EnumSet(EvidenceKind).initEmpty();
+    var evidence_kinds: std.EnumSet(EvidenceKind) = .empty;
     for (document.evidence_files, 0..) |file, index| {
         if (file.path.len <= document.evidence_root.len or
             !std.mem.startsWith(

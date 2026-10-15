@@ -1401,7 +1401,7 @@ test "apt_system_command.test.PTY incomplete line cannot confirm before a proces
     var delay: std.os.linux.timespec = .{ .sec = 0, .nsec = 20_000_000 };
     var remaining: std.os.linux.timespec = undefined;
     _ = std.os.linux.nanosleep(&delay, &remaining);
-    var status: u32 = 0;
+    var status: i32 = 0;
     const early = std.os.linux.waitpid(
         @intCast(fork_result),
         &status,
@@ -1417,10 +1417,11 @@ test "apt_system_command.test.PTY incomplete line cannot confirm before a proces
             else => return error.WaitFailed,
         }
     }
-    try std.testing.expect(std.os.linux.W.IFEXITED(status));
+    const status_bits: u32 = @bitCast(status);
+    try std.testing.expect(std.os.linux.W.IFEXITED(status_bits));
     try std.testing.expectEqual(
         @as(u8, 0),
-        std.os.linux.W.EXITSTATUS(status),
+        std.os.linux.W.EXITSTATUS(status_bits),
     );
 }
 

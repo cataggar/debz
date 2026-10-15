@@ -2550,8 +2550,7 @@ pub const PrivateLiveRootRunner = struct {
             .out_of_memory, .contract_violation => .backend,
             .invariant_violation => .backend,
         };
-        var envelope: [failure_envelope_bytes]u8 =
-            [_]u8{0} ** failure_envelope_bytes;
+        var envelope: [failure_envelope_bytes]u8 = @splat(0);
         @memcpy(
             envelope[0..failure_envelope_magic.len],
             failure_envelope_magic,
@@ -4520,8 +4519,8 @@ fn validateNativeHistoryRequest(
     const receipt = retained.transaction_result orelse return error.InvalidCommittedNativeEvidence;
     var expected_paths = try pathsForBackend(allocator, owned.options.state_path, retained.attempt_id, .native);
     defer expected_paths.deinit(allocator);
-    inline for (std.meta.fields(OperationPaths)) |field|
-        if (!std.mem.eql(u8, @field(paths, field.name), @field(expected_paths, field.name)))
+    inline for (@typeInfo(OperationPaths).@"struct".field_names) |field_name|
+        if (!std.mem.eql(u8, @field(paths, field_name), @field(expected_paths, field_name)))
             return error.InvalidCommittedNativeEvidence;
     if (!documentEqual(lock, owned.exact_lock) or !std.mem.eql(u8, lock.path, paths.exact_lock) or
         !std.mem.eql(u8, receipt.path, paths.transaction_result) or
@@ -14367,9 +14366,9 @@ test "apt_system_orchestrator.test.backend-specific locks preserve shared owners
     inline for (.{ .legacy_dpkg, .native }) |backend| {
         var selected = try pathsForBackend(std.testing.allocator, "/var/lib/debz", @splat(0xab), backend);
         defer selected.deinit(std.testing.allocator);
-        inline for (std.meta.fields(OperationPaths)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "exact_lock"))
-                try std.testing.expectEqualStrings(@field(legacy, field.name), @field(selected, field.name));
+        inline for (@typeInfo(OperationPaths).@"struct".field_names) |field_name| {
+            if (comptime !std.mem.eql(u8, field_name, "exact_lock"))
+                try std.testing.expectEqualStrings(@field(legacy, field_name), @field(selected, field_name));
         }
         try std.testing.expectEqualStrings(
             if (backend == .native) native_exact_lock_name else exact_lock_name,
@@ -17336,10 +17335,10 @@ const TransportFailureBackend = struct {
 
 fn reapSignalTestProcess(pid: i32) !u32 {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const waited = std.os.linux.waitpid(pid, &status, 0);
         switch (std.os.linux.errno(waited)) {
-            .SUCCESS => return status,
+            .SUCCESS => return @bitCast(status),
             .INTR => continue,
             else => return error.WaitFailed,
         }
@@ -17349,14 +17348,14 @@ fn reapSignalTestProcess(pid: i32) !u32 {
 fn reapTestProcessWithDeadline(pid: i32, timeout_ms: u64) !u32 {
     const started = std.Io.Clock.awake.now(std.testing.io);
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const waited = std.os.linux.waitpid(
             pid,
             &status,
             std.os.linux.W.NOHANG,
         );
         switch (std.os.linux.errno(waited)) {
-            .SUCCESS => if (waited != 0) return status,
+            .SUCCESS => if (waited != 0) return @bitCast(status),
             .INTR => continue,
             else => return error.WaitFailed,
         }
@@ -19286,7 +19285,7 @@ const FakeVerifier = struct {
         if (self.lock_failure) |failure| return failure;
         if (!self.lock_valid) return error.OperationalVerificationFailure;
         const digest = if (self.different_lock_check == self.lock_checks)
-            [_]u8{0x77} ** 32
+            @as([32]u8, @splat(0x77))
         else
             self.lock_digest;
         var semantic_request_sha256 = expected_request_sha256;
@@ -19743,18 +19742,19 @@ fn runRetainedCommitOverlapWatchdog(timeout_ms: u64) !void {
     var reaped = false;
     defer if (!reaped) {
         _ = linux.kill(pid, .KILL);
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
     };
     const started = std.Io.Clock.awake.now(std.testing.io);
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(waited)) {
             .SUCCESS => if (waited != 0) {
                 reaped = true;
-                if (!linux.W.IFEXITED(status) or
-                    linux.W.EXITSTATUS(status) != 0)
+                const status_bits: u32 = @bitCast(status);
+                if (!linux.W.IFEXITED(status_bits) or
+                    linux.W.EXITSTATUS(status_bits) != 0)
                     return error.RetainedCommitOverlapFailed;
                 return;
             },
@@ -19928,7 +19928,7 @@ const ProductionRunnerFixture = struct {
             \\Version: 1
             \\
         );
-        const source_z = try allocator.dupeZ(u8, dpkg_path);
+        const source_z = try allocator.dupeSentinel(u8, dpkg_path, 0);
         defer allocator.free(source_z);
         switch (std.os.linux.errno(std.os.linux.mount(
             source_z,
@@ -20830,8 +20830,7 @@ test "apt_system_orchestrator.test.required_privileged.production private child 
 }
 
 test "apt_system_orchestrator.test.private child failure envelope rejects malformed versions and codes" {
-    var envelope: [PrivateLiveRootRunner.failure_envelope_bytes]u8 =
-        [_]u8{0} ** PrivateLiveRootRunner.failure_envelope_bytes;
+    var envelope: [PrivateLiveRootRunner.failure_envelope_bytes]u8 = @splat(0);
     @memcpy(
         envelope[0..PrivateLiveRootRunner.failure_envelope_magic.len],
         PrivateLiveRootRunner.failure_envelope_magic,

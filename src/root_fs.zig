@@ -1854,11 +1854,11 @@ test "root_fs.test.path grammar rejects absolute, traversing, and control paths"
     try testing.expectError(error.InvalidPathByte, Path.init("var/delete\x7f"));
     try testing.expectError(error.InvalidPathByte, Path.init("var\\lib"));
 
-    const long_component = "a" ** (maximum_component_bytes + 1);
+    const long_component = &@as([maximum_component_bytes + 1]u8, @splat('a'));
     try testing.expectError(error.PathComponentTooLong, Path.init(long_component));
-    const deep = "a/" ** maximum_path_components ++ "a";
+    const deep = std.mem.asBytes(&@as([maximum_path_components][2]u8, @splat("a/".*))) ++ "a";
     try testing.expectError(error.PathTooDeep, Path.init(deep));
-    const long_path = ("ab/" ** ((maximum_path_bytes / 3) + 1)) ++ "a";
+    const long_path = std.mem.asBytes(&@as([(maximum_path_bytes / 3) + 1][3]u8, @splat("ab/".*))) ++ "a";
     try testing.expectError(error.PathTooLong, Path.init(long_path));
 }
 
@@ -2587,7 +2587,7 @@ test "root_fs.test.symbolic link publication is bounded and atomic" {
         error.InvalidLinkTargetByte,
         root.createSymbolicLink(try testPath("control"), "usr/\x00bin"),
     );
-    const long_target = "a" ** (maximum_link_target_bytes + 1);
+    const long_target = &@as([maximum_link_target_bytes + 1]u8, @splat('a'));
     try testing.expectError(
         error.LinkTargetTooLong,
         root.createSymbolicLink(try testPath("long"), long_target),

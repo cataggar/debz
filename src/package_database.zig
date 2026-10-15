@@ -2884,7 +2884,7 @@ const Validator = struct {
     /// cost is linear in the record's own entries.
     fn validateRecord(self: *Validator, record: PackageRecord) std.mem.Allocator.Error!?Diagnostic {
         const limits = self.options.limits;
-        var metadata_seen = std.EnumSet(RetainedMetadataKind).initEmpty();
+        var metadata_seen: std.EnumSet(RetainedMetadataKind) = .empty;
         for (record.metadata) |entry| {
             if (!safeFileMode(entry.mode))
                 return self.fail(.info_directory, .unsafe_mode, record.name);
