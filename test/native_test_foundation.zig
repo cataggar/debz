@@ -811,7 +811,7 @@ fn sortedFields(allocator: std.mem.Allocator, fields: *std.StringHashMap([]const
 
 fn captureXattrs(allocator: std.mem.Allocator, absolute: []const u8) ![]const Attribute {
     const linux = std.os.linux;
-    const path = try allocator.dupeZ(u8, absolute);
+    const path = try allocator.dupeSentinel(u8, absolute, 0);
     const probe = linux.llistxattr(path, undefined, 0);
     const size = switch (linux.errno(probe)) {
         .SUCCESS => probe,
@@ -828,7 +828,7 @@ fn captureXattrs(allocator: std.mem.Allocator, absolute: []const u8) ![]const At
     while (start < size) {
         if (attributes.items.len == 64) return error.InvalidFilesystemXattrs;
         const end = std.mem.indexOfScalarPos(u8, names, start, 0) orelse return error.InvalidFilesystemXattrs;
-        const name = try allocator.dupeZ(u8, names[start..end]);
+        const name = try allocator.dupeSentinel(u8, names[start..end], 0);
         const needed = linux.lgetxattr(path, name, undefined, 0);
         if (linux.errno(needed) != .SUCCESS or needed > 1024 * 1024) return error.InvalidFilesystemXattrs;
         total += name.len + needed;
@@ -939,7 +939,7 @@ fn captureFilesystem(
             ));
         } else if (metadata.kind == .character_device or metadata.kind == .block_device) {
             const linux = std.os.linux;
-            const path_z = try allocator.dupeZ(u8, relative);
+            const path_z = try allocator.dupeSentinel(u8, relative, 0);
             var info: linux.Statx = undefined;
             if (linux.errno(linux.statx(root_dir.handle, path_z, linux.AT.SYMLINK_NOFOLLOW, .{
                 .TYPE = true,
@@ -1053,7 +1053,7 @@ fn captureWriteWitnesses(
             ));
         } else if (metadata.kind == .character_device or metadata.kind == .block_device) {
             const linux = std.os.linux;
-            const path_z = try allocator.dupeZ(u8, relative);
+            const path_z = try allocator.dupeSentinel(u8, relative, 0);
             var info: linux.Statx = undefined;
             if (linux.errno(linux.statx(root_dir.handle, path_z, linux.AT.SYMLINK_NOFOLLOW, .{
                 .TYPE = true,

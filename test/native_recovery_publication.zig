@@ -64,7 +64,7 @@ fn retained(fixture: *foundation.Fixture, root: []const u8, original: std.json.V
     var journal = try std.json.parseFromSlice(std.json.Value, fixture.allocator, active, .{});
     defer journal.deinit();
     if (forged) {
-        try process.same(try process.text(journal.value, "attempt_id"), &([_]u8{'f'} ** 64));
+        try process.same(try process.text(journal.value, "attempt_id"), &@as([64]u8, @splat('f')));
     } else {
         try process.same(try process.text(journal.value, "attempt_id"), try process.text(original, "attempt_id"));
     }
@@ -91,7 +91,7 @@ fn forgeJournal(fixture: *foundation.Fixture, root: []const u8) !void {
     @memcpy(bytes[digest_value..][0..64], &sealed);
     var decoded = try debz.root_mutation.decode(fixture.allocator, bytes, debz.root_mutation.maximum_document_bytes);
     defer decoded.deinit();
-    if (!std.mem.eql(u8, &decoded.journal.attempt_id, &([_]u8{0xff} ** 32)))
+    if (!std.mem.eql(u8, &decoded.journal.attempt_id, &@as([32]u8, @splat(0xff))))
         return error.JournalForgeryNotCanonical;
     const destination = try process.rootPath(fixture, root, journal_path);
     defer fixture.allocator.free(destination);

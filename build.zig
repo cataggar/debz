@@ -62,12 +62,57 @@ pub fn build(b: *std.Build) void {
     });
     const libsolv = libsolv_dependency.artifact("solv");
 
+    const c_headers = b.addWriteFiles();
+    const libsolv_c_header = c_headers.add(
+        "libsolv_c.h",
+        \\#define LIBSOLV_INTERNAL 1
+        \\#include "solv/evr.h"
+        \\#include "solv/pool.h"
+        \\#include "solv/poolarch.h"
+        \\#include "solv/problems.h"
+        \\#include "solv/queue.h"
+        \\#include "solv/repo.h"
+        \\#include "solv/rules.h"
+        \\#include "solv/solver.h"
+        \\#include "solv/solvable.h"
+        \\#include "solv/transaction.h"
+        \\
+    );
+    const translate_libsolv = b.addTranslateC(.{
+        .root_source_file = libsolv_c_header,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    translate_libsolv.addIncludePath(libsolv.getEmittedIncludeTree());
+    translate_libsolv.addIncludePath(libsolv_dependency.path("src"));
+    const libsolv_c = translate_libsolv.createModule();
+
+    const compression_c_header = c_headers.add(
+        "compression_c.h",
+        \\#define LZMA_API_STATIC 1
+        \\#include "lzma.h"
+        \\#include "zstd.h"
+        \\
+    );
+    const translate_compression = b.addTranslateC(.{
+        .root_source_file = compression_c_header,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    translate_compression.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    translate_compression.addIncludePath(zstd_dependency.path("lib"));
+    const compression_c = translate_compression.createModule();
+
     const debz = b.addModule("debz", .{
         .root_source_file = b.path("src/debz.zig"),
         .target = target,
         .optimize = optimize,
     });
     debz.addOptions("debz_build_options", build_options);
+    debz.addImport("libsolv_c", libsolv_c);
+    debz.addImport("compression_c", compression_c);
     debz.addIncludePath(libsolv_dependency.path("src"));
     debz.addIncludePath(xz_dependency.path("src/liblzma/api"));
     debz.addIncludePath(zstd_dependency.path("lib"));
@@ -115,7 +160,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cli = b.addRunArtifact(cli);
     run_cli.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cli.addArgs(args);
+    run_cli.addPassthruArgs();
     b.step("run", "Run the debz CLI").dependOn(&run_cli.step);
 
     const tests = b.addTest(.{ .root_module = debz });
@@ -182,7 +227,7 @@ pub fn build(b: *std.Build) void {
     workload_core.dependOn(&native_action_empty_lock_tests.step);
 
     const baseline_fixture_options = b.addOptions();
-    baseline_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    baseline_fixture_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const baseline_fixture_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
         .target = target,
@@ -197,7 +242,7 @@ pub fn build(b: *std.Build) void {
     const install_baseline_fixture = b.addInstallArtifact(baseline_fixture, .{});
     b.step("build-native-baseline-fixture", "Build the native signed baseline fixture generator").dependOn(&install_baseline_fixture.step);
     const regenerate_baseline_fixture = b.addRunArtifact(baseline_fixture);
-    if (b.args) |args| regenerate_baseline_fixture.addArgs(args);
+    regenerate_baseline_fixture.addPassthruArgs();
     b.step("generate-native-baseline-fixture", "Reproduce original signed baseline fixtures without Python").dependOn(&regenerate_baseline_fixture.step);
     const baseline_fixture_smoke = b.addRunArtifact(baseline_fixture);
     baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
@@ -261,7 +306,7 @@ pub fn build(b: *std.Build) void {
     b.step("build-integration-signing", "Build original integration fixture signing").dependOn(&install_integration_signing.step);
     const integration_signing_test_options = b.addOptions();
     integration_signing_test_options.addOptionPath("executable", integration_signing.getEmittedBin());
-    integration_signing_test_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    integration_signing_test_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const integration_signing_test_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-signing.zig"),
         .target = target,
@@ -288,7 +333,7 @@ pub fn build(b: *std.Build) void {
     b.step("build-integration-archive", "Build original integration fixture archive encoding").dependOn(&install_integration_archive.step);
     const integration_archive_test_options = b.addOptions();
     integration_archive_test_options.addOptionPath("executable", integration_archive.getEmittedBin());
-    integration_archive_test_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    integration_archive_test_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const integration_archive_test_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-archive.zig"),
         .target = target,
@@ -301,7 +346,7 @@ pub fn build(b: *std.Build) void {
     workload_core.dependOn(&integration_archive_tests.step);
 
     const native_dpkg_options = b.addOptions();
-    native_dpkg_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_dpkg_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const native_dpkg_module = b.createModule(.{
         .root_source_file = b.path("tools/prepare-native-dpkg.zig"),
         .target = target,
@@ -322,7 +367,7 @@ pub fn build(b: *std.Build) void {
     native_dpkg_test_step.dependOn(&native_dpkg_tests.step);
 
     const debian_readiness_options = b.addOptions();
-    debian_readiness_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    debian_readiness_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const debian_readiness_module = b.createModule(.{
         .root_source_file = b.path("tools/debian-stable-readiness.zig"),
         .target = target,
@@ -382,7 +427,7 @@ pub fn build(b: *std.Build) void {
     workload_core.dependOn(&integration_repository_tests.step);
 
     const openpgp_fixture_options = b.addOptions();
-    openpgp_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    openpgp_fixture_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     const openpgp_fixture_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-openpgp-fixtures.zig"),
         .target = target,
@@ -397,7 +442,7 @@ pub fn build(b: *std.Build) void {
     const install_openpgp_fixture = b.addInstallArtifact(openpgp_fixture, .{});
     b.step("build-openpgp-fixtures", "Build the original RSA and Ed25519 fixture generator").dependOn(&install_openpgp_fixture.step);
     const regenerate_openpgp_fixture = b.addRunArtifact(openpgp_fixture);
-    if (b.args) |args| regenerate_openpgp_fixture.addArgs(args);
+    regenerate_openpgp_fixture.addPassthruArgs();
     b.step("generate-openpgp-fixtures", "Regenerate all original OpenPGP fixtures without Python").dependOn(&regenerate_openpgp_fixture.step);
     const openpgp_fixture_smoke = b.addRunArtifact(openpgp_fixture);
     openpgp_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
@@ -811,10 +856,10 @@ pub fn build(b: *std.Build) void {
             "tools/test_real_snapshot_repin.py",
         },
     );
-    audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
-    audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
-    audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", b.getInstallPath(.bin, "debz-debian-stable-readiness"));
-    audit_tests.setEnvironmentVariable("DEBZ_RELEASE", b.getInstallPath(.bin, "debz-release"));
+    audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
+    audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
+    audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));
+    audit_tests.setEnvironmentVariable("DEBZ_RELEASE", getInstallPath(b, .bin, "debz-release"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_tests.step.dependOn(&install_debian_readiness.step);
@@ -922,7 +967,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const release_test_options = b.addOptions();
-    release_test_options.addOption([]const u8, "executable", b.getInstallPath(.bin, "debz-release"));
+    release_test_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-release"));
     const release_smoke_debz = b.addExecutable(.{
         .name = "release-smoke-debz",
         .root_module = b.createModule(.{
@@ -958,7 +1003,7 @@ pub fn build(b: *std.Build) void {
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
-    install_layout_tests.addArg(b.getInstallPath(.bin, "debz-release"));
+    install_layout_tests.addArg(getInstallPath(b, .bin, "debz-release"));
     install_layout_tests.step.dependOn(&install_release_tool.step);
     release_test_step.dependOn(&install_layout_tests.step);
 
@@ -975,6 +1020,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     production_backend_test_module.addOptions("debz_build_options", build_options);
+    production_backend_test_module.addImport("libsolv_c", libsolv_c);
+    production_backend_test_module.addImport("compression_c", compression_c);
     production_backend_test_module.addIncludePath(libsolv_dependency.path("src"));
     production_backend_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     production_backend_test_module.addIncludePath(zstd_dependency.path("lib"));
@@ -1054,6 +1101,8 @@ pub fn build(b: *std.Build) void {
         "debz_build_options",
         build_options,
     );
+    apt_system_command_test_module.addImport("libsolv_c", libsolv_c);
+    apt_system_command_test_module.addImport("compression_c", compression_c);
     apt_system_command_test_module.addIncludePath(
         libsolv_dependency.path("src"),
     );
@@ -1099,6 +1148,8 @@ pub fn build(b: *std.Build) void {
         "debz_build_options",
         build_options,
     );
+    apt_system_orchestrator_test_module.addImport("libsolv_c", libsolv_c);
+    apt_system_orchestrator_test_module.addImport("compression_c", compression_c);
     apt_system_orchestrator_test_module.addIncludePath(
         libsolv_dependency.path("src"),
     );
@@ -1205,6 +1256,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     product_result_module.addOptions("debz_build_options", build_options);
+    product_result_module.addImport("libsolv_c", libsolv_c);
+    product_result_module.addImport("compression_c", compression_c);
     product_result_module.addIncludePath(libsolv_dependency.path("src"));
     product_result_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     product_result_module.addIncludePath(zstd_dependency.path("lib"));
@@ -1431,6 +1484,8 @@ pub fn build(b: *std.Build) void {
         "debz_build_options",
         build_options,
     );
+    native_alternatives_test_module.addImport("libsolv_c", libsolv_c);
+    native_alternatives_test_module.addImport("compression_c", compression_c);
     native_alternatives_test_module.addIncludePath(
         libsolv_dependency.path("src"),
     );
@@ -1484,14 +1539,16 @@ pub fn build(b: *std.Build) void {
     native_alternatives_oracle_options.addOption(
         []const u8,
         "path",
-        b.pathFromRoot(
+        pathFromRoot(
+            b,
             "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json",
         ),
     );
     native_alternatives_oracle_options.addOption(
         []const u8,
         "vendor_path",
-        b.pathFromRoot(
+        pathFromRoot(
+            b,
             "tools/fixtures/vendor-state/reference-v1.json",
         ),
     );
@@ -1525,11 +1582,11 @@ pub fn build(b: *std.Build) void {
     });
     native_snapshot_module.addImport("debz", debz);
     const native_differential_options = b.addOptions();
-    native_differential_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_differential_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     native_differential_options.addOption(
         []const u8,
         "corpus",
-        b.pathFromRoot("test/native-transaction/corpus-v1.json"),
+        pathFromRoot(b, "test/native-transaction/corpus-v1.json"),
     );
     native_differential_module.addOptions("native_test_options", native_differential_options);
     native_snapshot_module.addOptions("native_test_options", native_differential_options);
@@ -1560,7 +1617,7 @@ pub fn build(b: *std.Build) void {
     });
     native_fixture_module.addImport("debz", debz);
     const native_fixture_options = b.addOptions();
-    native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_fixture_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     native_fixture_options.addOptionPath("native_dpkg_reference", native_dpkg.getEmittedBin());
     native_fixture_options.addOptionPath("integration_repository", integration_repository.getEmittedBin());
     native_fixture_module.addOptions("native_test_options", native_fixture_options);
@@ -1606,7 +1663,7 @@ pub fn build(b: *std.Build) void {
 
     const dpkg_config_reference = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{b.getInstallPath(.bin, "debz-native-dpkg-reference")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
         "python3",                                      "tools/dpkg-config-reference.py",
     });
     dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
@@ -1614,7 +1671,7 @@ pub fn build(b: *std.Build) void {
     const dpkg_config_reference_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
     );
-    dpkg_config_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
+    dpkg_config_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
     dpkg_config_reference_tests.step.dependOn(&install_native_dpkg.step);
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     workload_native.dependOn(&dpkg_config_reference_tests.step);
@@ -1623,7 +1680,7 @@ pub fn build(b: *std.Build) void {
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{b.getInstallPath(.bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{b.getInstallPath(.bin, "debz-native-dpkg-reference")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
         "python3",                                      "tools/dpkg-alternatives-reference.py",
     });
     dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);
@@ -1631,8 +1688,8 @@ pub fn build(b: *std.Build) void {
     const dpkg_alternatives_reference_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_alternatives_reference.py" },
     );
-    dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", b.getInstallPath(.bin, "debz-disposable-runtime"));
-    dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", b.getInstallPath(.bin, "debz-native-dpkg-reference"));
+    dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
+    dpkg_alternatives_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
     dpkg_alternatives_reference_tests.step.dependOn(&install_disposable_runtime.step);
     dpkg_alternatives_reference_tests.step.dependOn(&install_native_dpkg.step);
     dpkg_alternatives_reference.step.dependOn(&dpkg_alternatives_reference_tests.step);
@@ -1729,6 +1786,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     sha512_e2e_module.addOptions("debz_build_options", build_options);
+    sha512_e2e_module.addImport("libsolv_c", libsolv_c);
+    sha512_e2e_module.addImport("compression_c", compression_c);
     sha512_e2e_module.addIncludePath(libsolv_dependency.path("src"));
     sha512_e2e_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     sha512_e2e_module.addIncludePath(zstd_dependency.path("lib"));
@@ -1802,7 +1861,7 @@ pub fn build(b: *std.Build) void {
     });
     const lifecycle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     lifecycle_zig.addArtifactArg(lifecycle_zig_executable);
     lifecycle_zig.addArtifactArg(native_lifecycle_tests);
@@ -1839,7 +1898,7 @@ pub fn build(b: *std.Build) void {
     root_import_unit_step.dependOn(&root_import_executable.step);
     const root_import = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     root_import.addArtifactArg(root_import_executable);
     root_import.addArtifactArg(native_lifecycle_tests);
@@ -1849,7 +1908,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&root_import.step);
     const lifecycle_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     lifecycle_oracle_zig.addArtifactArg(lifecycle_zig_executable);
     lifecycle_oracle_zig.addArg("--oracle-only");
@@ -1875,7 +1934,7 @@ pub fn build(b: *std.Build) void {
     });
     const trigger_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     trigger_zig.addArtifactArg(trigger_zig_executable);
     trigger_zig.addArtifactArg(native_lifecycle_tests);
@@ -1887,7 +1946,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&trigger_zig.step);
     const trigger_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     trigger_oracle_zig.addArtifactArg(trigger_zig_executable);
     trigger_oracle_zig.addArg("--oracle-only");
@@ -1904,7 +1963,7 @@ pub fn build(b: *std.Build) void {
     }
     const settlement_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     settlement_oracle_zig.addArtifactArg(trigger_zig_executable);
     settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });
@@ -1940,7 +1999,7 @@ pub fn build(b: *std.Build) void {
     });
     const settlement = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     settlement.addArtifactArg(settlement_executable);
     settlement.addArtifactArg(native_lifecycle_tests);
@@ -2046,7 +2105,7 @@ pub fn build(b: *std.Build) void {
     });
     const recovery_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_zig.addArtifactArg(recovery_zig_executable);
     recovery_zig.addArtifactArg(native_lifecycle_tests);
@@ -2074,7 +2133,7 @@ pub fn build(b: *std.Build) void {
     });
     const recovery_family = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_family.addArtifactArg(recovery_family_executable);
     recovery_family.addArtifactArg(native_lifecycle_tests);
@@ -2104,7 +2163,7 @@ pub fn build(b: *std.Build) void {
     });
     const recovery_parity = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_parity.addArtifactArg(recovery_parity_executable);
     recovery_parity.addArtifactArg(native_lifecycle_tests);
@@ -2134,7 +2193,7 @@ pub fn build(b: *std.Build) void {
     order_fixture_build.dependOn(&recovery_helper_executable.step);
     const recovery_helper = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_helper.addArtifactArg(recovery_helper_executable);
     recovery_helper.addArtifactArg(native_lifecycle_tests);
@@ -2157,7 +2216,7 @@ pub fn build(b: *std.Build) void {
     });
     const final_gaps = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     final_gaps.addArtifactArg(final_gaps_executable);
     final_gaps.addArtifactArg(native_lifecycle_tests);
@@ -2177,7 +2236,7 @@ pub fn build(b: *std.Build) void {
     });
     const recovery_bootstrap = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_bootstrap.addArtifactArg(recovery_bootstrap_executable);
     recovery_bootstrap.addArtifactArg(native_lifecycle_tests);
@@ -2197,7 +2256,7 @@ pub fn build(b: *std.Build) void {
     repository_recovery_module.addOptions("native_test_options", native_fixture_options);
     const repository_recovery_unit = b.addTest(.{ .root_module = repository_recovery_module });
     const run_repository_recovery_unit = b.addRunArtifact(repository_recovery_unit);
-    const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", b.pathFromRoot(".tmp") });
+    const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", pathFromRoot(b, ".tmp") });
     run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);
     const repository_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-repository",
@@ -2210,7 +2269,7 @@ pub fn build(b: *std.Build) void {
     http_fixture_step.dependOn(&repository_recovery_executable.step);
     const repository_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     repository_recovery.addArtifactArg(repository_recovery_executable);
     repository_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2249,7 +2308,7 @@ pub fn build(b: *std.Build) void {
     });
     const rollback_clock = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     rollback_clock.addArtifactArg(rollback_clock_executable);
     rollback_clock.addArtifactArg(native_lifecycle_tests);
@@ -2269,7 +2328,7 @@ pub fn build(b: *std.Build) void {
     });
     const scriptless_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     scriptless_recovery.addArtifactArg(scriptless_recovery_executable);
     scriptless_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2289,7 +2348,7 @@ pub fn build(b: *std.Build) void {
     });
     const statoverride_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
     statoverride_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2309,7 +2368,7 @@ pub fn build(b: *std.Build) void {
     });
     const literal_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     literal_recovery.addArtifactArg(literal_recovery_executable);
     literal_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2329,7 +2388,7 @@ pub fn build(b: *std.Build) void {
     });
     const metadata_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     metadata_recovery.addArtifactArg(metadata_recovery_executable);
     metadata_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2349,7 +2408,7 @@ pub fn build(b: *std.Build) void {
     });
     const mutation_boundaries = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     mutation_boundaries.addArtifactArg(mutation_boundaries_executable);
     mutation_boundaries.addArtifactArg(native_lifecycle_tests);
@@ -2372,7 +2431,7 @@ pub fn build(b: *std.Build) void {
     });
     const publication_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     publication_recovery.addArtifactArg(publication_recovery_executable);
     publication_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2392,7 +2451,7 @@ pub fn build(b: *std.Build) void {
     });
     const conffile_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     conffile_recovery.addArtifactArg(conffile_recovery_executable);
     conffile_recovery.addArtifactArg(native_lifecycle_tests);
@@ -2412,7 +2471,7 @@ pub fn build(b: *std.Build) void {
     });
     const recovery_diversions = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_diversions.addArtifactArg(recovery_diversions_executable);
     recovery_diversions.addArtifactArg(native_lifecycle_tests);
@@ -2566,6 +2625,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_cache_test_module.addImport("libsolv_c", libsolv_c);
+    package_cache_test_module.addImport("compression_c", compression_c);
     package_cache_test_module.addIncludePath(libsolv_dependency.path("src"));
     package_cache_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     package_cache_test_module.addIncludePath(zstd_dependency.path("lib"));
@@ -2584,6 +2645,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    package_cache_archive_test_module.addImport("libsolv_c", libsolv_c);
+    package_cache_archive_test_module.addImport("compression_c", compression_c);
     package_cache_archive_test_module.addIncludePath(libsolv_dependency.path("src"));
     package_cache_archive_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     package_cache_archive_test_module.addIncludePath(zstd_dependency.path("lib"));
@@ -2658,7 +2721,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_maintainer_script_tests.step);
     const native_helper_namespace_tests = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env", "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     native_helper_namespace_tests.addPrefixedFileArg(
         "DEBZ_SCRIPT_NETWORK_PROBE=",
@@ -2706,12 +2769,12 @@ pub fn build(b: *std.Build) void {
                 "env",
                 "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
                 "DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1",
-                b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}),
-                b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+                b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}),
+                b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
                 b.fmt("DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT={s}", .{roots[0]}),
                 b.fmt("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT={s}", .{roots[1]}),
                 b.fmt("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT={s}", .{roots[2]}),
-                b.fmt("DEBZ_SIGNED_NETWORK_PROOF_DIR={s}", .{b.pathFromRoot(".tmp")}),
+                b.fmt("DEBZ_SIGNED_NETWORK_PROOF_DIR={s}", .{pathFromRoot(b, ".tmp")}),
             });
             signed_proc_run.addPrefixedFileArg(
                 "DEBZ_SCRIPT_NETWORK_PROBE=",
@@ -2865,7 +2928,7 @@ fn addHelpFlagTests(
 fn addReleaseToolModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     debz: *std.Build.Module,
     xz_dependency: *std.Build.Dependency,
 ) *std.Build.Module {
@@ -2876,7 +2939,16 @@ fn addReleaseToolModule(
     });
     // The product keeps its decoder-only library; only release tooling encodes XZ.
     const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
+    const translate_lzma = b.addTranslateC(.{
+        .root_source_file = xz_dependency.path("src/liblzma/api/lzma.h"),
+        .target = target,
+        .optimize = release_tool_module.optimize orelse .Debug,
+        .link_libc = true,
+    });
+    translate_lzma.defineCMacro("LZMA_API_STATIC", "1");
+    translate_lzma.addIncludePath(xz_dependency.path("src/liblzma/api"));
     release_tool_module.addImport("debz", debz);
+    release_tool_module.addImport("lzma_c", translate_lzma.createModule());
     release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     release_tool_module.addCMacro("LZMA_API_STATIC", "1");
     release_tool_module.linkLibrary(release_liblzma);
@@ -3039,14 +3111,14 @@ fn installReleaseFiles(
         const install = b.addInstallFile(b.path(file.source), file.destination);
         b.getInstallStep().dependOn(&install.step);
         regular_modes.step.dependOn(&install.step);
-        regular_modes.addArg(b.getInstallPath(.prefix, file.destination));
+        regular_modes.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = file.destination } });
     }
     for (docs) |name| {
         const destination = b.fmt("share/doc/debz/doc/{s}", .{name});
         const install = b.addInstallFile(b.path(b.fmt("doc/{s}", .{name})), destination);
         b.getInstallStep().dependOn(&install.step);
         regular_modes.step.dependOn(&install.step);
-        regular_modes.addArg(b.getInstallPath(.prefix, destination));
+        regular_modes.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = destination } });
     }
     for (schemas) |name| {
         const source = b.path(b.fmt("schema/{s}", .{name}));
@@ -3055,14 +3127,14 @@ fn installReleaseFiles(
             const install = b.addInstallFile(source, destination);
             b.getInstallStep().dependOn(&install.step);
             regular_modes.step.dependOn(&install.step);
-            regular_modes.addArg(b.getInstallPath(.prefix, destination));
+            regular_modes.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = destination } });
         }
     }
     b.getInstallStep().dependOn(&regular_modes.step);
 
     const executable_mode = b.addSystemCommand(&.{ "chmod", "0755" });
     executable_mode.step.dependOn(&install_cli.step);
-    executable_mode.addArg(b.getInstallPath(.bin, "debz"));
+    executable_mode.addDirectoryArg(.{ .relative = .{ .base = .install_bin, .sub_path = "debz" } });
     b.getInstallStep().dependOn(&executable_mode.step);
 
     const runtime_metadata = b.addInstallFile(
@@ -3077,6 +3149,19 @@ fn installReleaseFiles(
     }
     const runtime_metadata_mode = b.addSystemCommand(&.{ "chmod", "0644" });
     runtime_metadata_mode.step.dependOn(&runtime_metadata.step);
-    runtime_metadata_mode.addArg(b.getInstallPath(.prefix, "share/debz/runtime-dependencies.json"));
+    runtime_metadata_mode.addDirectoryArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "share/debz/runtime-dependencies.json" } });
     release_install.dependOn(&runtime_metadata_mode.step);
+}
+
+fn pathFromRoot(b: *std.Build, sub_path: []const u8) []const u8 {
+    const root_abs = b.root.root_dir.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch @panic("failed to resolve build root");
+    return b.pathResolve(&.{ root_abs, sub_path });
+}
+
+fn getInstallPath(b: *std.Build, dir: std.Build.InstallDir, sub_path: []const u8) []const u8 {
+    return switch (dir) {
+        .bin => pathFromRoot(b, b.pathJoin(&.{ "zig-out", "bin", sub_path })),
+        .prefix => pathFromRoot(b, b.pathJoin(&.{ "zig-out", sub_path })),
+        else => unreachable,
+    };
 }

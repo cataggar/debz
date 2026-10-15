@@ -99,8 +99,8 @@ fn sourceFixture(architecture: []const u8) ![]u8 {
     };
     var original = try locks.create(std.testing.allocator, .{
         .target_architecture = architecture,
-        .request_sha256 = [_]u8{1} ** 32,
-        .policy_sha256 = [_]u8{2} ** 32,
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
         .repositories = &.{repository},
         .local_artifacts = &.{artifact},
         .packages = &packages,
@@ -119,7 +119,7 @@ test "native action empty lock preserves policy and architecture with determinis
         var decoded = try locks.decode(std.testing.allocator, bytes, locks.maximum_document_bytes);
         defer decoded.deinit();
         try std.testing.expectEqualStrings(architecture, decoded.lock.target_architecture);
-        try std.testing.expectEqual([_]u8{2} ** 32, decoded.lock.policy_sha256);
+        try std.testing.expectEqual(@as([32]u8, @splat(2)), decoded.lock.policy_sha256);
         var request: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash("native-action-empty-cache", &request, .{});
         try std.testing.expectEqual(request, decoded.lock.request_sha256);

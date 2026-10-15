@@ -732,7 +732,7 @@ fn forgeConfigJournal(fixture: *foundation.Fixture, root: []const u8) !void {
     @memcpy(bytes[digest_value..][0..64], &sealed);
     var forged = try debz.root_mutation.decode(fixture.allocator, bytes, debz.root_mutation.maximum_document_bytes);
     defer forged.deinit();
-    if (!std.mem.eql(u8, &forged.journal.attempt_id, &([_]u8{0xff} ** 32)))
+    if (!std.mem.eql(u8, &forged.journal.attempt_id, &@as([32]u8, @splat(0xff))))
         return error.ConfigJournalForgeryNotCanonical;
     try fixture.write(try path(fixture, root, debz.root_mutation.journal_path), bytes, 0o600);
 }

@@ -116,7 +116,7 @@ pub fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []cons
     // projection has no /dev.
     if (!std.mem.eql(u8, outcome, "readonly"))
         try mount(&.{ "/usr/bin/mount", "--bind", "/dev/null", try std.fmt.allocPrint(allocator, "{s}/dev/null", .{root}) }, init, allocator);
-    const absolute = try allocator.dupeZ(u8, root);
+    const absolute = try allocator.dupeSentinel(u8, root, 0);
     if (linux.errno(linux.chdir(absolute)) != .SUCCESS or
         linux.errno(linux.chroot(".")) != .SUCCESS or
         linux.errno(linux.chdir("/")) != .SUCCESS) return error.PrivateProjectedChrootFailed;
@@ -126,7 +126,7 @@ pub fn inside(init: std.process.Init, allocator: std.mem.Allocator, root: []cons
         &.{ "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C", "TMPDIR=/tmp", "XDG_CACHE_HOME=/tmp/.cache", "DEBZ_NATIVE_WORKFLOW_REQUEST=/fixture/request.json" };
     const argv = [_:null]?[*:0]const u8{"/fixture/native-test"};
     var envp = try allocator.allocSentinel(?[*:0]const u8, environment.len, null);
-    for (environment, 0..) |entry, index| envp[index] = (try allocator.dupeZ(u8, entry)).ptr;
+    for (environment, 0..) |entry, index| envp[index] = (try allocator.dupeSentinel(u8, entry, 0)).ptr;
     if (linux.errno(linux.execve("/fixture/native-test", &argv, envp.ptr)) != .SUCCESS)
         return error.PrivateProjectedExecFailed;
     unreachable;

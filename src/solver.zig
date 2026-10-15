@@ -11,19 +11,7 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const package_origin = @import("package_origin.zig");
 
-const libsolv = @cImport({
-    @cDefine("LIBSOLV_INTERNAL", "1");
-    @cInclude("solv/evr.h");
-    @cInclude("solv/pool.h");
-    @cInclude("solv/poolarch.h");
-    @cInclude("solv/problems.h");
-    @cInclude("solv/queue.h");
-    @cInclude("solv/repo.h");
-    @cInclude("solv/rules.h");
-    @cInclude("solv/solver.h");
-    @cInclude("solv/solvable.h");
-    @cInclude("solv/transaction.h");
-});
+const libsolv = @import("libsolv_c");
 
 pub const InstallReason = enum {
     manual,
@@ -358,7 +346,7 @@ pub const Context = opaque {
     ) std.mem.Allocator.Error!*Context {
         const context = try createWithAllocator(allocator);
         errdefer context.destroy();
-        const architecture_z = try allocator.dupeZ(u8, architecture);
+        const architecture_z = try allocator.dupeSentinel(u8, architecture, 0);
         defer allocator.free(architecture_z);
         libsolv.pool_setarch(internal(context).pool, architecture_z);
         internal(context).target_architecture = try allocator.dupe(u8, architecture);
@@ -589,7 +577,7 @@ pub const Context = opaque {
         }
         try validateAvailableRecords(input.packages.records, limits);
 
-        const repository_name = try state.allocator.dupeZ(u8, input.repository_id.slice());
+        const repository_name = try state.allocator.dupeSentinel(u8, input.repository_id.slice(), 0);
         defer state.allocator.free(repository_name);
         const repo = libsolv.repo_create(state.pool, repository_name) orelse
             return error.PoolAllocationFailed;

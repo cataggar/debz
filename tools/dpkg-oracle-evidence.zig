@@ -593,21 +593,21 @@ pub fn main(init: std.process.Init) !void {
     var args: Arguments = .{};
     while (iterator.next()) |flag| {
         var matched = false;
-        inline for (std.meta.fields(Arguments)) |field| {
-            const spelling = "--" ++ field.name;
+        inline for (@typeInfo(Arguments).@"struct".field_names) |field_name| {
+            const spelling = "--" ++ field_name;
             var name: [spelling.len]u8 = spelling.*;
             std.mem.replaceScalar(u8, &name, '_', '-');
             if (std.mem.eql(u8, flag, &name)) {
-                if (@field(args, field.name) != null) return error.DuplicateArgument;
-                @field(args, field.name) = iterator.next() orelse return error.MissingArgument;
+                if (@field(args, field_name) != null) return error.DuplicateArgument;
+                @field(args, field_name) = iterator.next() orelse return error.MissingArgument;
                 matched = true;
             }
         }
         if (!matched) return error.InvalidArgument;
     }
-    inline for (std.meta.fields(Arguments)) |field| {
-        const verify_argument = comptime std.mem.eql(u8, field.name, "evidence") or std.mem.eql(u8, field.name, "artifact_root");
-        if ((@field(args, field.name) != null) != (creating != verify_argument)) return error.MissingOrUnexpectedArgument;
+    inline for (@typeInfo(Arguments).@"struct".field_names) |field_name| {
+        const verify_argument = comptime std.mem.eql(u8, field_name, "evidence") or std.mem.eql(u8, field_name, "artifact_root");
+        if ((@field(args, field_name) != null) != (creating != verify_argument)) return error.MissingOrUnexpectedArgument;
     }
     const ctx: Context = .{
         .io = init.io,
@@ -715,7 +715,7 @@ test "native oracle verifier binds both raw observations and refuses changed typ
         .runner = .{ .label = "ubuntu-24.04-arm", .machine = "aarch64", .runner_arch = "ARM64" },
         .schema = schema_id,
         .source = .{
-            .commit = "a" ** 40,
+            .commit = &@as([40]u8, @splat('a')),
             .job = "arm64-dpkg-oracles",
             .repository = "cataggar/debz",
             .run_attempt = .{ .integer = 1 },
@@ -734,7 +734,7 @@ test "native oracle verifier binds both raw observations and refuses changed typ
     const encoded = try canonicalBytes(allocator, document);
     try temporary.dir.writeFile(io, .{ .sub_path = "evidence.json", .data = encoded });
     try verify(ctx, "evidence.json", path);
-    document.oracles.dpkg_update_alternatives.observation.sha256 = "0" ** 64;
+    document.oracles.dpkg_update_alternatives.observation.sha256 = &@as([64]u8, @splat('0'));
     try temporary.dir.writeFile(io, .{ .sub_path = "evidence.json", .data = try canonicalBytes(allocator, document) });
     try std.testing.expectError(error.EvidenceIdentityMismatch, verify(ctx, "evidence.json", path));
     document.oracles.dpkg_update_alternatives.observation.sha256 = record.observation.sha256;

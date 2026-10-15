@@ -2,9 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debz = @import("debz");
 const fs = debz.root_fs;
-const c = @cImport({
-    @cInclude("lzma.h");
-});
+const c = @import("lzma_c");
 
 const Platform = enum {
     @"linux-x64",
@@ -1185,8 +1183,8 @@ fn execute(init: std.process.Init) !void {
                     .root = system.root,
                     .cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
                 };
-                const source = try allocator.dupeZ(u8, try context.read(args[index + 1], 1024 * 1024));
-                const metadata = std.zon.parse.fromSliceAlloc(struct { version: []const u8 }, allocator, source, null, .{
+                const source = try allocator.dupeSentinel(u8, try context.read(args[index + 1], 1024 * 1024), 0);
+                const metadata = std.zon.parse.fromSlice(struct { version: []const u8 }, allocator, source, null, .{
                     .ignore_unknown_fields = true,
                 }) catch return refuse("invalid release ZON metadata", .{});
                 if (!std.mem.eql(u8, metadata.version, version))
@@ -1296,7 +1294,7 @@ test "release ELF bounds reject truncated tables and overflowing mappings withou
 
 test "release GNU tar preserves long names, signed epochs and canonical record padding" {
     const allocator = std.testing.allocator;
-    const name = "root/" ++ "a" ** 101;
+    const name = "root/" ++ @as([101]u8, @splat('a'));
     const tar = try buildTar(allocator, &.{
         .{ .name = name, .bytes = "independent", .mode = 0o644 },
         .{ .name = "root/bin/debz", .bytes = "abc", .mode = 0o755 },
@@ -1305,7 +1303,7 @@ test "release GNU tar preserves long names, signed epochs and canonical record p
     try std.testing.expectEqual(@as(usize, 10240), tar.len);
     try std.testing.expectEqualStrings("././@LongLink", std.mem.sliceTo(tar[512..612], 0));
     try std.testing.expectEqualStrings(name, std.mem.sliceTo(tar[1024..1536], 0));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xff} ** 12), tar[136..148]);
+    try std.testing.expectEqualSlices(u8, &@as([12]u8, @splat(0xff)), tar[136..148]);
     try std.testing.expectError(error.InvalidReleaseInput, buildTar(allocator, &.{.{ .name = "../escape", .bytes = "x", .mode = 0o644 }}, 123));
 }
 
@@ -1354,7 +1352,7 @@ test "release member reader preserves original GNU long names signed epochs and 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const name = "root/" ++ "a" ** 101;
+    const name = "root/" ++ @as([101]u8, @splat('a'));
     for ([_]i64{ -1, 123, std.math.maxInt(i64), std.math.minInt(i64) }) |epoch| {
         const tar = try buildTar(allocator, &.{
             .{ .name = name, .bytes = "independent\x00bytes", .mode = 0o644 },
@@ -1375,7 +1373,7 @@ test "release member reader rejects checksum size ownership mode order duplicate
     const allocator = arena.allocator();
     const first = try tarHeader("root/a", 0o644, 123, 0, '0', false);
     const second = try tarHeader("root/b", 0o644, 123, 0, '0', false);
-    const valid = try std.mem.concat(allocator, u8, &.{ &first, &second, &([_]u8{0} ** 1024) });
+    const valid = try std.mem.concat(allocator, u8, &.{ &first, &second, &@as([1024]u8, @splat(0)) });
     try std.testing.expectEqual(@as(usize, 2), (try readTar(allocator, valid)).len);
     const corrupt = try allocator.dupe(u8, valid);
     corrupt[0] ^= 1;
@@ -1386,12 +1384,12 @@ test "release member reader rejects checksum size ownership mode order duplicate
         .{ .kind = '2' },         .{ .kind = '3' },      .{ .kind = 'L' },
     }) |mutation| {
         const header = try tarHeader(mutation.name, mutation.mode, mutation.epoch, mutation.size, mutation.kind, false);
-        const bytes = try std.mem.concat(allocator, u8, &.{ &first, &header, &([_]u8{0} ** 1024) });
+        const bytes = try std.mem.concat(allocator, u8, &.{ &first, &header, &@as([1024]u8, @splat(0)) });
         try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
     }
 
     const wrong_owner = try tarHeader("root/b", 0o644, 123, 0, '0', true);
-    const bytes = try std.mem.concat(allocator, u8, &.{ &first, &wrong_owner, &([_]u8{0} ** 1024) });
+    const bytes = try std.mem.concat(allocator, u8, &.{ &first, &wrong_owner, &@as([1024]u8, @splat(0)) });
     try std.testing.expectError(error.InvalidReleaseInput, readTar(allocator, bytes));
 }
 

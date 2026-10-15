@@ -245,21 +245,21 @@ pub fn main(init: std.process.Init) !void {
     if (verb == .break_base_cycle) {
         var paths: [base_cycle.len][:0]const u8 = undefined;
         for (&paths) |*path| {
-            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+            path.* = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
         }
         cycle_archives = paths;
     }
     if (verb == .configure_openssl_cycle) {
         var paths: [openssl_cycle.len][:0]const u8 = undefined;
         for (&paths) |*path| {
-            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+            path.* = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
         }
         openssl_archives = paths;
     }
     if (verb == .break_kbd_cycle) {
         var paths: [kbd_cycle.len][:0]const u8 = undefined;
         for (&paths) |*path| {
-            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+            path.* = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
         }
         kbd_archives = paths;
     }
@@ -269,14 +269,14 @@ pub fn main(init: std.process.Init) !void {
     const size_text = if (normal) args.next() else null;
     if (args.next() != null) return error.InvalidArguments;
     const options: Options = .{
-        .root = try init.arena.allocator().dupeZ(u8, root),
-        .dpkg = try init.arena.allocator().dupeZ(u8, dpkg),
-        .runtime = try init.arena.allocator().dupeZ(u8, runtime_path),
+        .root = try init.arena.allocator().dupeSentinel(u8, root, 0),
+        .dpkg = try init.arena.allocator().dupeSentinel(u8, dpkg, 0),
+        .runtime = try init.arena.allocator().dupeSentinel(u8, runtime_path, 0),
         .architecture = architecture,
         .profile = profile,
         .verb = verb,
-        .selector = if (selector) |value| try init.arena.allocator().dupeZ(u8, value) else null,
-        .archive = if (archive) |value| try init.arena.allocator().dupeZ(u8, value) else null,
+        .selector = if (selector) |value| try init.arena.allocator().dupeSentinel(u8, value, 0) else null,
+        .archive = if (archive) |value| try init.arena.allocator().dupeSentinel(u8, value, 0) else null,
         .archive_sha512 = digest,
         .archive_size = if (size_text) |value| try std.fmt.parseInt(usize, value, 10) else null,
         .cycle_archives = cycle_archives,
@@ -649,7 +649,7 @@ fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
         .openssl => opensslGraphField,
         .kbd => kbdGraphField,
     };
-    var matched = [_]bool{false} ** bindings.len;
+    var matched: [bindings.len]bool = @splat(false);
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
         if (paragraph.len == 0) continue;
@@ -689,7 +689,7 @@ fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
             var version: []const u8 = "";
             var state: []const u8 = "";
             var depends: []const u8 = "";
-            var graph_seen = [_]bool{false} ** cycle_graph_keys.len;
+            var graph_seen: [cycle_graph_keys.len]bool = @splat(false);
             for (fields[0..count]) |field| {
                 if (std.ascii.eqlIgnoreCase(field.key, "Architecture")) architecture = field.value;
                 if (std.ascii.eqlIgnoreCase(field.key, "Version")) version = field.value;
@@ -1513,7 +1513,7 @@ fn monotonicMilliseconds() !u64 {
 fn killAndReap(pid: i32) !void {
     const signal = linux.errno(linux.kill(pid, .KILL));
     if (signal != .SUCCESS and signal != .SRCH) return error.ReferenceTeardownFailed;
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const waited = linux.waitpid(pid, &status, 0);
         if (linux.errno(waited) == .INTR) continue;
@@ -1528,12 +1528,12 @@ fn awaitNamespace(pid: i32, timeout_ms: u64) !u32 {
         try killAndReap(pid);
         return error.ReferenceClockFailed;
     };
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
         if (linux.errno(waited) == .INTR) continue;
         if (linux.errno(waited) != .SUCCESS) return error.ReferenceWaitFailed;
-        if (waited == @as(usize, @intCast(pid))) return status;
+        if (waited == @as(usize, @intCast(pid))) return @bitCast(status);
         if (waited != 0) return error.ReferenceWaitFailed;
         const now = monotonicMilliseconds() catch {
             try killAndReap(pid);
@@ -2028,10 +2028,10 @@ test "reference launcher rejects wider profiles and unsafe operation shapes" {
     changed = base;
     changed.verb = .unpack;
     changed.archive = "/root/proof/archive";
-    changed.archive_sha512 = "0" ** 128;
+    changed.archive_sha512 = &@as([128]u8, @splat('0'));
     changed.archive_size = 1;
     try validateOptions(changed);
-    changed.archive_sha512 = "G" ** 128;
+    changed.archive_sha512 = &@as([128]u8, @splat('G'));
     try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
     changed = base;
     try std.testing.expect(std.meta.stringToEnum(Verb, "configure_batch") == null);
@@ -2255,7 +2255,7 @@ test "reference deadline kills and reaps a hung child" {
     }
     const pid: i32 = @intCast(child);
     try std.testing.expectError(error.ReferenceDeadlineExceeded, awaitNamespace(pid, 30));
-    var status: u32 = 0;
+    var status: i32 = 0;
     try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, &status, linux.W.NOHANG)));
 }
 

@@ -137,7 +137,7 @@ test "published Draft 2020-12 scriptFailure closure validates compensation insta
     const bytes = try reader.interface.allocRemaining(a, .limited(256 * 1024));
     const schema = try std.json.parseFromSlice(std.json.Value, a, bytes, .{ .allocate = .alloc_always });
     var failure_spec = schema.value.object.get("$defs").?.object.get("scriptFailure").?;
-    const digest = [_]u8{'a'} ** 64;
+    const digest: [64]u8 = @splat('a');
     const example = try std.fmt.allocPrint(a,
         \\{{"state":"half_installed","unwind":null,"resume_after_unwind":false,
         \\"compensations":[{{"kind":"postinst","source":"installed_package",

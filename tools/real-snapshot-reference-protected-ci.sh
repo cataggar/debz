@@ -21,8 +21,8 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
 unset ZIG_LIB_DIR
 
-readonly zig_version=0.16.0
-readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.16.0
+readonly zig_version=0.17.0
+readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.17.0
 readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 # Pin source: ubuntu-keyring 2023.11.28.1build1 (Architecture: all) from
 # https://snapshot.ubuntu.com/ubuntu/20261001T000000Z, suite resolute:
@@ -85,14 +85,14 @@ readonly checkout=$tree/checkout
 case "$architecture/$(uname -m)/$(dpkg --print-architecture)" in
   amd64/x86_64/amd64)
     zig_name=zig-x86_64-linux-$zig_version
-    zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
-    zig_size=55478392
+    zig_sha256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+    zig_size=57332648
     other_architecture=arm64
     ;;
   arm64/aarch64/arm64)
     zig_name=zig-aarch64-linux-$zig_version
-    zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
-    zig_size=51211944
+    zig_sha256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+    zig_size=52877280
     other_architecture=amd64
     ;;
   *)
