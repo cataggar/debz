@@ -87,7 +87,7 @@ pub fn addStaticLibrary(
     b: *std.Build,
     xz: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
 ) *std.Build.Step.Compile {
     const module = b.createModule(.{
         .target = target,
@@ -132,7 +132,7 @@ pub fn addStaticEncoderLibrary(
     b: *std.Build,
     xz: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
 ) *std.Build.Step.Compile {
     const library = addStaticLibrary(b, xz, target, optimize);
     for ([_][]const u8{
