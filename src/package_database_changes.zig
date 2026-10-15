@@ -2442,7 +2442,7 @@ fn checkMetadataAllocations(allocator: std.mem.Allocator, source: database.Datab
 test "package_database_changes.test.inert metadata owns partial allocations" {
     var source = try importFixture();
     defer source.deinit();
-    try testing.checkAllAllocationFailures(testing.allocator, checkMetadataAllocations, .{source});
+    try testing.checkAllAllocationFailures(.{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } }, checkMetadataAllocations, .{source});
 }
 
 fn expectImportRejects(snapshot: database.Snapshot, code: database.Code) !void {
@@ -2670,7 +2670,7 @@ test "package_database_changes.test.planning stays sound when every allocation c
     var source = try importFixture();
     defer source.deinit();
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         planUnderAllocationFailure,
         .{source},
     );

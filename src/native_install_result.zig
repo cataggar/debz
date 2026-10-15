@@ -128,5 +128,5 @@ fn allocationCase(allocator: std.mem.Allocator) !void {
 }
 
 test "native_install_result.test.serializers report allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, allocationCase, .{});
 }

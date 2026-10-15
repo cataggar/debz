@@ -8281,8 +8281,18 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     const root = fixture.root();
     try seedRoot(root);
 
+    const deterministic_allocator: std.mem.Allocator = .{
+        .ptr = testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = testing.allocator.vtable.free,
+        },
+    };
+
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.preflightOnce,
         .{root},
     );
@@ -8301,9 +8311,9 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     );
     defer testing.allocator.free(log);
 
-    try testing.checkAllAllocationFailures(testing.allocator, Case.decodeOnce, .{canonical});
+    try testing.checkAllAllocationFailures(deterministic_allocator, Case.decodeOnce, .{canonical});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.replayOnce,
         .{ engine.journal(), log },
     );
@@ -8311,7 +8321,7 @@ test "root_mutation.test.preflight and decode stay sound when every allocation f
     // whose precondition an earlier step produces, so it is the path a
     // recovery takes and every allocation on it must fail closed.
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         Case.openOnce,
         .{ root, &fixture.attempt },
     );

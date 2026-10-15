@@ -766,7 +766,7 @@ test "native family version gates run before filesystem access" {
 }
 
 test "native family product refusal retains owned diagnostics and releases failed allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, struct {
         fn exercise(allocator: std.mem.Allocator) !void {
             const backend: NativeBackend = .{ .io = std.testing.io };
             var result = try backend.execute(allocator, .{
@@ -916,7 +916,7 @@ test "native update resolution is explicit and preserves ordinary request admiss
 }
 
 test "native update resolution releases invalid selector allocations without filesystem work" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, struct {
         fn exercise(allocator: std.mem.Allocator) !void {
             const backend: NativeBackend = .{ .io = std.testing.io };
             var result = try backend.resolveUpdateLock(allocator, .{
@@ -1085,7 +1085,7 @@ test "native family result verification refuses failed and retained completion b
 }
 
 test "native family verification request mapping propagates allocation failures without filesystem work" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, struct {
         fn exercise(allocator: std.mem.Allocator) !void {
             const backend: NativeBackend = .{ .io = std.testing.io };
             var result = backend.verifyCompletedSuccess(allocator, .{

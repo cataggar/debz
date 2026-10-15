@@ -677,7 +677,7 @@ fn roundTrip(allocator: std.mem.Allocator) !void {
 }
 
 test "native_execution_request.test.canonical ownership mapping survives allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, roundTrip, .{});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, roundTrip, .{});
 }
 
 test "native_execution_request.test.rejects rehashed invalid fields and changed policy" {
@@ -750,7 +750,7 @@ fn roundTripHelper(allocator: std.mem.Allocator) !void {
 }
 
 test "native_execution_request.test.helper wrapper preserves v1 bytes and handles allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, roundTripHelper, .{});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, roundTripHelper, .{});
 }
 
 fn roundTripBootstrap(allocator: std.mem.Allocator) !void {
@@ -864,7 +864,7 @@ fn roundTripBootstrap(allocator: std.mem.Allocator) !void {
 
 test "native_execution_request.test.fresh-root bootstrap binds attempt owner archive target and helper" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        .{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } },
         roundTripBootstrap,
         .{},
     );

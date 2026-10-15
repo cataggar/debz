@@ -17432,7 +17432,16 @@ fn compileLifecycleProgram(
     errdefer program.deinit();
     if (!program.program.matchesAuthorization(authorization.authorization))
         return error.InvalidLifecycleProgram;
-    return .{ .authorization = authorization, .program = program, .removal_retry = retry };
+    var owned_retry = retry;
+    if (owned_retry) |*proof| {
+        const program_owned = program.arena.allocator();
+        proof.package = .{
+            .name = try program_owned.dupe(u8, proof.package.name),
+            .version = try program_owned.dupe(u8, proof.package.version),
+            .architecture = try program_owned.dupe(u8, proof.package.architecture),
+        };
+    }
+    return .{ .authorization = authorization, .program = program, .removal_retry = owned_retry };
 }
 
 fn lifecycleArchiveIndex(
@@ -35701,8 +35710,20 @@ fn testStatOverrideAllocations(allocator: std.mem.Allocator) !void {
     }, "_fixture:x:42420:42421::/:/bin/sh\n", "_fixture:x:42421:\n");
 }
 
+fn deterministicTestingAllocator() std.mem.Allocator {
+    return .{
+        .ptr = testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = testing.allocator.vtable.free,
+        },
+    };
+}
+
 test "native_unpack.test.statoverride resolution releases partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testStatOverrideAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testStatOverrideAllocations, .{});
 }
 
 test "native_unpack.test.statoverride recovery identity blobs have exact bounded roles" {
@@ -35868,7 +35889,7 @@ fn testDiversionCacheAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "native_unpack.test.diversion cache preserves ownership on allocation failure" {
-    try testing.checkAllAllocationFailures(testing.allocator, testDiversionCacheAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testDiversionCacheAllocations, .{});
 }
 
 test "native_unpack.test.diversion cache evidence retains loaded bytes and binds the invocation" {
@@ -36084,7 +36105,7 @@ test "native_unpack.test.unpack backup inputs retain symlink clocks and reject m
 }
 
 test "native_unpack.test.unpack diversion inputs release partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testUnpackDiversionAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testUnpackDiversionAllocations, .{});
 }
 
 test "native_unpack.test.deferred removals are bound without changing legacy inputs" {
@@ -36192,7 +36213,7 @@ test "native_unpack.test.post-script recipe retains binary control and original 
 }
 
 test "native_unpack.test.post-script recipe releases partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testUnpackSettlementAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testUnpackSettlementAllocations, .{});
 }
 
 test "native_unpack.test.post-script recipe refuses malformed or unbound late intents" {
@@ -36504,7 +36525,7 @@ fn testDiversionCacheEvidenceAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "native_unpack.test.diversion cache evidence releases partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testDiversionCacheEvidenceAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testDiversionCacheEvidenceAllocations, .{});
 }
 
 test "native_unpack.test.route recovery cache requires private stable metadata" {
@@ -36663,7 +36684,7 @@ fn testDiversionIndexAllocations(allocator: std.mem.Allocator) !void {
 }
 
 test "native_unpack.test.diversion indexes release partial allocations" {
-    try testing.checkAllAllocationFailures(testing.allocator, testDiversionIndexAllocations, .{});
+    try testing.checkAllAllocationFailures(deterministicTestingAllocator(), testDiversionIndexAllocations, .{});
 }
 
 test "native_unpack.test.diversion updates require atomic replacement when bytes change" {
@@ -46605,7 +46626,7 @@ test "native_unpack.test.planner owns every allocation failure path" {
     var artifacts: [1]native_program.ProgramArtifact = undefined;
     const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministicTestingAllocator(),
         planUnderAllocationFailure,
         .{ &fixture, &program, bytes },
     );
@@ -47309,7 +47330,7 @@ test "native_unpack.test.merged usr alias detection owns every OOM path" {
     );
     try root.createSymbolicLink(try root_fs.Path.init("lib"), "usr/lib");
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministicTestingAllocator(),
         detectAliasesUnderAllocationFailure,
         .{root},
     );

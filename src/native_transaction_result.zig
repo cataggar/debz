@@ -1937,7 +1937,7 @@ test "native_transaction_result.test.projected root external fixture" {
 }
 
 test "native_transaction_result.test.summary preserves distinct request domains and native empty counts" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testSummaries, .{});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, testSummaries, .{});
 }
 
 test "native_transaction_result.test.empty closures retain only authorized residual configurations" {
@@ -2335,7 +2335,15 @@ test "native_transaction_result.test.known failure cannot become success or acce
 
 fn testOwnedBoundaries(comptime state: OwnershipState) !void {
     const testing = std.testing;
-    const allocator = testing.allocator;
+    const allocator: std.mem.Allocator = .{
+        .ptr = testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = testing.allocator.vtable.free,
+        },
+    };
     const verify_success = if (state == .pending) verifyPendingSuccess else verifyReleasedSuccess;
     const missing_owner = if (state == .pending) error.PendingOwnerRequired else error.ReleasedOwnerRequired;
     var temporary = testing.tmpDir(.{});

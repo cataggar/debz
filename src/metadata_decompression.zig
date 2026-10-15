@@ -554,7 +554,7 @@ fn decompressMicrosoftWithAllocator(allocator: std.mem.Allocator) !void {
 
 test "gzip allocation failures return without leaks" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        .{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } },
         decompressMicrosoftWithAllocator,
         .{},
     );

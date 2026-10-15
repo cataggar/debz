@@ -2407,7 +2407,7 @@ test "root_fs.test.pinned directory observation owns allocation failures" {
     try root.createDirectory(path, default_directory_permissions);
     try root.publishFile(try testPath("directory/child"), "x", .{});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         observeDirectoryUnderAllocationFailure,
         .{ root, path },
     );
@@ -2499,7 +2499,7 @@ test "root_fs.test.stable pinned reads own allocation failures" {
     const path = try testPath("file");
     try root.publishFile(path, "content\n", .{});
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        .{ .ptr = testing.allocator.ptr, .vtable = &.{ .alloc = testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = testing.allocator.vtable.free } },
         stableReadUnderAllocationFailure,
         .{ root, path },
     );

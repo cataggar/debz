@@ -712,7 +712,7 @@ test "native_preparation.test.operation-scoped preparation owns every allocation
     fixture.installed[2].state = .installed;
     var request = fixture.request();
     request.policy.exact_lock_verification = .locked_packages;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{ request, true });
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, allocationCase, .{ request, true });
 }
 
 test "native_preparation.test.compiler retains missing archive and lifecycle diagnostics" {
@@ -865,10 +865,19 @@ fn allocationCase(allocator: std.mem.Allocator, request: Request, succeeds: bool
 test "native_preparation.test.all preparation and diagnostic allocation failures are owned" {
     const fixture = try Fixture.init(std.testing.allocator, false);
     defer fixture.deinit(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{ fixture.request(), true });
+    const deterministic_allocator: std.mem.Allocator = .{
+        .ptr = std.testing.allocator.ptr,
+        .vtable = &.{
+            .alloc = std.testing.allocator.vtable.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.testing.allocator.vtable.free,
+        },
+    };
+    try std.testing.checkAllAllocationFailures(deterministic_allocator, allocationCase, .{ fixture.request(), true });
     var request = fixture.request();
     request.archives = &.{};
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{ request, false });
+    try std.testing.checkAllAllocationFailures(deterministic_allocator, allocationCase, .{ request, false });
 }
 
 /// Unlike the fixture compiler, every hash here has its production meaning:

@@ -1157,7 +1157,7 @@ test "apt_system_state.test.completed state decoding preserves allocation failur
             defer decoded.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{source});
+    try std.testing.checkAllAllocationFailures(.{ .ptr = std.testing.allocator.ptr, .vtable = &.{ .alloc = std.testing.allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.testing.allocator.vtable.free } }, Case.run, .{source});
 }
 
 test "apt_system_state.test.success cannot omit root completion evidence" {
