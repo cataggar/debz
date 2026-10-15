@@ -747,6 +747,20 @@ elif [[ $architecture == arm64 ]]; then
     "-Darm64-bash-postinst-proof=$bash_workspace/evidence/bash-postinst-proof.txt" \
     -Doptimize=ReleaseSafe -j2 --summary all
   grep -Fx "signed arm64 bash native postinst and independent pinned dpkg agree without skips" "$bash_workspace/evidence/bash-postinst-proof.txt"
+  step arm64-util-linux-postinst 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-arm64-util-linux-postinst-protected \
+    "-Darm64-util-linux-postinst-root=$bash_workspace/util-linux/source" \
+    "-Darm64-util-linux-postinst-native-root=$bash_workspace/util-linux/native" \
+    "-Darm64-util-linux-postinst-dpkg-root=$bash_workspace/util-linux/dpkg-after" \
+    "-Darm64-util-linux-postinst-bad-script=$bash_workspace/util-linux/bad-script" \
+    "-Darm64-util-linux-postinst-bad-mode=$bash_workspace/util-linux/bad-mode" \
+    "-Darm64-util-linux-postinst-bad-tool=$bash_workspace/util-linux/bad-tool" \
+    "-Darm64-util-linux-postinst-bad-alias=$bash_workspace/util-linux/bad-alias" \
+    "-Darm64-util-linux-postinst-bad-prestate=$bash_workspace/util-linux/bad-prestate" \
+    "-Darm64-util-linux-postinst-bad-cache=$bash_workspace/util-linux/bad-cache" \
+    "-Darm64-util-linux-postinst-proof=$bash_workspace/evidence/util-linux-postinst-proof.txt" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed arm64 util-linux native postinst and independent pinned dpkg agree without skips" "$bash_workspace/evidence/util-linux-postinst-proof.txt"
   find "$bash_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
     -exec install -m 0644 -t "$evidence" {} +
   if grep -F " $bash_workspace" /proc/self/mountinfo; then

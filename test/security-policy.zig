@@ -2886,6 +2886,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    \"-Darm64-bash-postinst-bad-prestate=$bash_workspace/bad-prestate\" \\\n",
         "    \"-Darm64-bash-postinst-bad-cache=$bash_workspace/bad-cache\" \\\n",
         "  grep -Fx \"signed arm64 bash native postinst and independent pinned dpkg agree without skips\" \"$bash_workspace/evidence/bash-postinst-proof.txt\"\n",
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-util-linux-postinst-protected \\\n",
+        "    \"-Darm64-util-linux-postinst-bad-prestate=$bash_workspace/util-linux/bad-prestate\" \\\n",
+        "    \"-Darm64-util-linux-postinst-bad-cache=$bash_workspace/util-linux/bad-cache\" \\\n",
+        "  grep -Fx \"signed arm64 util-linux native postinst and independent pinned dpkg agree without skips\" \"$bash_workspace/evidence/util-linux-postinst-proof.txt\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-bash-protected-stage.sh", &.{
         "      /var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu\n",
