@@ -351,7 +351,7 @@ test "security: native-only production candidate refuses shipped routes and exac
     const updated_hash = std.fmt.bytesToHex(digest, .lower);
     const reviewed = try f.replace(
         inventory,
-        "73c3b5707811b3d6d9835c7303c45bb90dd4e0d103521620e4ddfc12963a8ab97790702f886e5489d27c7cee698524d5f38fdc6ebff85b7393290a28cad10c61",
+        "0ad4e9b9ad614d218f7d69516b8e5145afd844f6b4d1c2429eb16d49d90c91c5bac35ae35b88f7a5e7b1b65dbb610560b9e7e5ff15444286bac2f117ba2621f5",
         updated_hash[0..],
     );
     var overrides: std.json.ObjectMap = .empty;
@@ -1799,7 +1799,7 @@ test "security: native signed baseline regeneration preserves original bytes and
     defer f.deinit();
     try nativeMutations(&f, "native-baseline-fixture", "build.zig", &.{
         "baseline_fixture_smoke.setEnvironmentVariable(\"PATH\", \"/no-host-interpreters\");",
-        "baseline_fixture_test_options.addOptionPath(\"generated\", generated_baseline_fixture);",
+        "baseline_fixture_test_options.addOptionPathDirectory(\"generated\", generated_baseline_fixture);",
         "workload_core.dependOn(&baseline_fixture_tests.step);",
     });
     try nativeMutations(&f, "native-baseline-fixture", "tools/generate-native-baseline-fixture.zig", &.{
@@ -1963,7 +1963,7 @@ test "security: actual integration archive encoding and every fixture consumer r
     try nativeMutations(&f, "native-integration-archive", "tools/integration-archive.zig", &.{
         ".argv = &.{ \"/usr/bin/gzip\", \"-n\", \"-9\", \"-c\", absolute }",
         "result.stdout[9] = 255;",
-        "std.hash.crc.Crc32.hash(raw)",
+        "std.hash.Crc32.hash(raw)",
         "debz.deb_payload.inspectControlAlloc(allocator, bytes",
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
         "return error.ExtraControlRepositoryFields;",
@@ -2011,7 +2011,7 @@ test "security: native OpenPGP regeneration executes original signing and refuse
         "workload_core.dependOn(&openpgp_fixture_tests.step);",
     });
     try nativeMutations(&f, "native-openpgp-fixtures", "tools/generate-openpgp-fixtures.zig", &.{
-        "try std.testing.expectEqualSlices(u8, &@field(original, field.name), @field(actual, field.name));",
+        "try std.testing.expectEqualSlices(u8, &@field(original, field_name), @field(actual, field_name));",
         "if (point == .before_rename) try self.check();",
         "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
     });

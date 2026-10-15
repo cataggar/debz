@@ -1184,7 +1184,12 @@ fn execute(init: std.process.Init) !void {
                     .cwd = try std.Io.Dir.cwd().realPathFileAlloc(init.io, ".", allocator),
                 };
                 const source = try allocator.dupeSentinel(u8, try context.read(args[index + 1], 1024 * 1024), 0);
-                const metadata = std.zon.parse.fromSlice(struct { version: []const u8 }, allocator, source, null, .{
+                var diagnostics: std.zon.parse.Diagnostics = undefined;
+                const metadata = std.zon.parse.fromSlice(struct { version: []const u8 }, .{
+                    .gpa = allocator,
+                    .arena = allocator,
+                    .source = source,
+                    .diagnostics = &diagnostics,
                     .ignore_unknown_fields = true,
                 }) catch return refuse("invalid release ZON metadata", .{});
                 if (!std.mem.eql(u8, metadata.version, version))

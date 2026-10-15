@@ -4647,8 +4647,11 @@ fn importUnderAllocationFailure(allocator: std.mem.Allocator, snapshot: Snapshot
 }
 
 test "package_database.test.import stays sound when every allocation can fail" {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    const deterministic_allocator = debug_allocator.allocator();
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         importUnderAllocationFailure,
         .{test_fixtures.snapshot()},
     );
@@ -4656,7 +4659,7 @@ test "package_database.test.import stays sound when every allocation can fail" {
     var repeated = test_fixtures.snapshot();
     repeated.triggers_unincorp = regularFile("/usr/share/toolz toolz toolz:amd64\n");
     try testing.checkAllAllocationFailures(
-        testing.allocator,
+        deterministic_allocator,
         importUnderAllocationFailure,
         .{repeated},
     );

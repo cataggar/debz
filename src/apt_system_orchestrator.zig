@@ -11017,6 +11017,7 @@ pub const Engine = struct {
                 prepared,
             ),
         };
+        retained = current.state.transaction_result.?;
         self.hitCompletionBoundary(.after_verifying_state) catch
             return self.reconcilePreparedError(allocator, prepared);
         const durable_acknowledgment = native_owner orelse durableLowerAcknowledgment(
@@ -14377,7 +14378,7 @@ test "apt_system_orchestrator.test.backend-specific locks preserve shared owners
         try std.testing.expectEqualStrings(selected.directory, std.fs.path.dirname(selected.exact_lock).?);
         if (backend == .legacy_dpkg)
             try std.testing.expectEqualStrings(legacy.exact_lock, selected.exact_lock);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, operationPathsAllocationCase, .{backend});
+        try checkAllAllocationFailuresDeterministic(std.testing.allocator, operationPathsAllocationCase, .{backend});
     }
 }
 
@@ -14557,7 +14558,7 @@ test "apt_system_orchestrator.test.receipt retention is backend-bound before fil
         legacy.result.digest_sha256,
     );
     try std.testing.expectEqualStrings(transaction_provenance.schema_id, legacy_binding.schema);
-    try std.testing.checkAllAllocationFailures(
+    try checkAllAllocationFailuresDeterministic(
         allocator,
         retainedTransactionAllocationCase,
         .{ .legacy_dpkg, legacy_bytes, legacy.result.digest_sha256 },
@@ -14582,7 +14583,7 @@ test "apt_system_orchestrator.test.receipt retention is backend-bound before fil
         try std.testing.expectEqualStrings(native_provenance.schema_id, binding.schema);
         try std.testing.expectEqual(native_provenance.schema_version, binding.version);
         try std.testing.expectEqualStrings(paths.transaction_result, binding.path);
-        try std.testing.checkAllAllocationFailures(
+        try checkAllAllocationFailuresDeterministic(
             allocator,
             retainedTransactionAllocationCase,
             .{ .native, source, digest },
@@ -14850,7 +14851,7 @@ test "apt_system_orchestrator.test.backend-bound locks preserve schema identity 
                 @splat(7),
             ),
         );
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{ backend, source });
+        try checkAllAllocationFailuresDeterministic(std.testing.allocator, verifyLockAllocationCase, .{ backend, source });
     }
 }
 
@@ -14944,7 +14945,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
             @splat(7),
         ),
     );
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{
+    try checkAllAllocationFailuresDeterministic(std.testing.allocator, verifyLockAllocationCase, .{
         system_profile.TransactionBackend.native, source,
     });
 }
@@ -15094,7 +15095,7 @@ test "apt_system_orchestrator.test.native owned transport preserves owner outcom
             if (failed and state == .released) continue;
             const fixture = try ownedNativeTransportFixture(allocator, failed, state, null);
             defer allocator.free(fixture.source);
-            try std.testing.checkAllAllocationFailures(allocator, testOwnedNativeDecode, .{ fixture.request, fixture.source });
+            try checkAllAllocationFailuresDeterministic(allocator, testOwnedNativeDecode, .{ fixture.request, fixture.source });
             var changed = fixture.request;
             changed.owner.acknowledgment_id[0] ^= 1;
             changed.owner = try root_operation.createDeferredAcknowledgment(changed.owner);
@@ -15150,7 +15151,7 @@ test "apt_system_orchestrator.test.native owned transport requires exact v2 revi
     const owner_end = std.mem.indexOfScalar(u8, fixture.source, '\n').?;
     const source = try std.mem.concat(allocator, u8, &.{ owner, fixture.source[owner_end..] });
     defer allocator.free(source);
-    try std.testing.checkAllAllocationFailures(allocator, testOwnedNativeDecode, .{ request, source });
+    try checkAllAllocationFailuresDeterministic(allocator, testOwnedNativeDecode, .{ request, source });
     var other_claim = claim;
     other_claim.nonce[0] ^= 1;
     other_claim = try root_operation.createRecoveryReviewClaim(other_claim);
@@ -16801,7 +16802,7 @@ test "apt_system_orchestrator.test.native unchanged history preserves allocation
             defer history.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ &harness.engine, prepared, loaded.view, retained.state, lock });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ &harness.engine, prepared, loaded.view, retained.state, lock });
 }
 
 test "apt_system_orchestrator.test.native recovery options preserve caller identity without replacement inputs" {
@@ -26721,6 +26722,164 @@ const NativeCompletionScenario = enum {
     verify_allocations,
 };
 
+fn checkAllAllocationFailuresDeterministic(
+    _: std.mem.Allocator,
+    comptime func: anytype,
+    extra_args: anytype,
+) !void {
+    const ResettingAllocator = struct {
+        buf: []align(4096) u8,
+        offset: usize = 0,
+        live_count: usize = 0,
+
+        fn slotSize(len: usize, alignment: std.mem.Alignment) usize {
+            return std.math.ceilPowerOfTwoAssert(usize, @max(len, alignment.toByteUnits()));
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const slot_size = slotSize(len, alignment);
+            if (slot_size <= 4096) {
+                const aligned = std.mem.alignForward(usize, self.offset, slot_size);
+                if (aligned + slot_size <= self.buf.len) {
+                    self.offset = aligned + slot_size;
+                    self.live_count += 1;
+                    return self.buf.ptr + aligned;
+                }
+            }
+            const ptr = std.heap.page_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+            self.live_count += 1;
+            return ptr;
+        }
+
+        fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) bool {
+            if (new_len == 0) return false;
+            const old_slot = slotSize(memory.len, alignment);
+            if (old_slot > 4096) return false;
+            return slotSize(new_len, alignment) <= old_slot;
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            return if (resize(ctx, memory, alignment, new_len, ra)) memory.ptr else null;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const addr = @intFromPtr(memory.ptr);
+            const start = @intFromPtr(self.buf.ptr);
+            if (addr < start or addr >= start + self.buf.len) {
+                std.heap.page_allocator.rawFree(memory, alignment, ret_addr);
+            }
+            self.live_count -= 1;
+            if (self.live_count == 0) self.offset = 0;
+        }
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+    };
+
+    const FastFailingAllocator = struct {
+        internal_allocator: std.mem.Allocator,
+        alloc_index: usize = 0,
+        fail_index: usize = std.math.maxInt(usize),
+        allocated_bytes: usize = 0,
+        freed_bytes: usize = 0,
+        has_induced_failure: bool = false,
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.alloc_index == self.fail_index) {
+                self.has_induced_failure = true;
+                return null;
+            }
+            const result = self.internal_allocator.rawAlloc(len, alignment, return_address) orelse return null;
+            self.allocated_bytes += len;
+            self.alloc_index += 1;
+            return result;
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.internal_allocator.rawResize(memory, alignment, new_len, ra)) return false;
+            if (new_len < memory.len) {
+                self.freed_bytes += memory.len - new_len;
+            } else {
+                self.allocated_bytes += new_len - memory.len;
+            }
+            return true;
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const new_ptr = self.internal_allocator.rawRemap(memory, alignment, new_len, ra) orelse return null;
+            if (new_len < memory.len) {
+                self.freed_bytes += memory.len - new_len;
+            } else {
+                self.allocated_bytes += new_len - memory.len;
+            }
+            return new_ptr;
+        }
+
+        fn free(ctx: *anyopaque, old_mem: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.internal_allocator.rawFree(old_mem, alignment, ra);
+            self.freed_bytes += old_mem.len;
+        }
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+    };
+
+    const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), 8 * 1024 * 1024);
+    defer std.heap.page_allocator.free(buf);
+    var resetting: ResettingAllocator = .{ .buf = buf };
+    const backing = resetting.allocator();
+
+    const needed_alloc_count = blk: {
+        var inst: FastFailingAllocator = .{ .internal_allocator = backing };
+        try @call(.auto, func, .{inst.allocator()} ++ extra_args);
+        std.debug.assert(inst.allocated_bytes == inst.freed_bytes);
+        std.debug.assert(resetting.live_count == 0);
+        break :blk inst.alloc_index;
+    };
+
+    for (0..needed_alloc_count) |fail_index| {
+        var inst: FastFailingAllocator = .{
+            .internal_allocator = backing,
+            .fail_index = fail_index,
+        };
+        if (@call(.auto, func, .{inst.allocator()} ++ extra_args)) |_| {
+            if (inst.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            return error.NondeterministicMemoryUsage;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                if (inst.allocated_bytes != inst.freed_bytes or resetting.live_count != 0) {
+                    return error.MemoryLeakDetected;
+                }
+            },
+            else => |e| return e,
+        }
+    }
+}
+
 fn testNativeEngineCompletion(
     allocator: std.mem.Allocator,
     owner_state: root_operation.DeferredAcknowledgmentState,
@@ -26871,7 +27030,7 @@ fn testNativeEngineCompletionAtPhase(
                 defer verified.deinit();
             }
         };
-        try std.testing.checkAllAllocationFailures(
+        try checkAllAllocationFailuresDeterministic(
             allocator,
             Case.run,
             .{ &harness.engine, prepared, loaded.view, fixture.request.owner },
@@ -27165,7 +27324,7 @@ fn testNativePendingFailureDiagnostic(
             try std.testing.expect(diagnostic.changed);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{
         &harness.engine, prepared, loaded.view, state, lock, record.record, failure.completion.document, failure.owner,
     });
     for (0..2) |_| {
@@ -27636,7 +27795,7 @@ fn testNativeFailureCleanup(
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
     if (failure.owner.document_version == 2)
-        try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
+        try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
 }
 
 fn testCommittedNativeFailureReview(
@@ -28083,7 +28242,7 @@ fn testCommittedNativeFailureReview(
                 try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, owner_state, with_record, .committed);
             }
             if (failure.owner.document_version == 2)
-                try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, owner_state, with_record, SourceKind.committed });
+                try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, owner_state, with_record, SourceKind.committed });
         }
     }
     for ([_]SourceKind{ .retained, .unretained }) |source_kind| {
@@ -28102,7 +28261,7 @@ fn testCommittedNativeFailureReview(
             try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, .pending, true, source_kind);
         }
         if (failure.owner.document_version == 2)
-            try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, OwnerState.pending, true, source_kind });
+            try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, OwnerState.pending, true, source_kind });
     }
 }
 
@@ -28300,8 +28459,8 @@ fn testNativeFailureHistory(
     };
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.after_final_publication });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.after_final_publication });
 }
 
 fn testNativeFailureHistoryRefusals(
@@ -28645,8 +28804,8 @@ fn testNativeFailureRetention(
     };
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.bound_receipt });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.bound_receipt });
 }
 
 fn testClearedNativeReconciliation(
@@ -29109,7 +29268,7 @@ fn testSettledNativePendingRecovery(
             try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(owner, verified.marker.?));
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ prepared, loaded.view, state.state, lock, record.record, live.completion.document, live.owner, token });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ prepared, loaded.view, state.state, lock, record.record, live.completion.document, live.owner, token });
     var foreign_token = token;
     foreign_token.profile_sha256[0] ^= 1;
     try std.testing.expectError(error.InvalidNativePendingOwner, nativePendingSuccessAcknowledgment(
@@ -29306,7 +29465,7 @@ fn testUnretainedNativeRecovery(
             _ = try engine.verifyUnretainedNativeCompletion(failing_allocator, preparation, profile, outer, verified_lock);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ &harness.engine, prepared, loaded.view, state, lock });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ &harness.engine, prepared, loaded.view, state, lock });
     var diagnostic = try harness.engine.recoveryFromVerifiedActiveWithProfile(allocator, prepared, state, null, loaded);
     defer diagnostic.deinit();
     try std.testing.expect(diagnostic.changed);
@@ -29403,7 +29562,7 @@ fn testUnretainedNativeRecovery(
         },
         .cleanup_required => return error.TestUnexpectedResult,
     }
-    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{ &harness.engine, recovery.prepared, loaded.view, state, lock });
+    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ &harness.engine, recovery.prepared, loaded.view, state, lock });
     const input: RecoveryReviewInput = .{
         .prepared = &recovery.prepared,
         .outer_state = state,
@@ -29484,7 +29643,7 @@ fn testNativeRecoveryEvidenceRouting(
             try std.testing.expect(documentEqual(state.transaction_result.?, verified.binding));
         }
     };
-    try std.testing.checkAllAllocationFailures(
+    try checkAllAllocationFailuresDeterministic(
         allocator,
         Case.run,
         .{ &harness.engine, prepared, loaded.view, final.state, lock },
@@ -29531,7 +29690,7 @@ fn testNativeRecoveryEvidenceRouting(
         harness.store.active_bytes = null;
     }
     const committed_checks = harness.verifier.committed_checks;
-    try std.testing.checkAllAllocationFailures(
+    try checkAllAllocationFailuresDeterministic(
         allocator,
         Case.run,
         .{ &harness.engine, prepared, loaded.view, active.state, lock },
@@ -29725,7 +29884,7 @@ fn testNativeCommittedHistory(
             try engine.verifyRetainedFinalEvidence(failing_allocator, preparation, profile, state, verified_lock, acknowledgment);
         }
     };
-    try std.testing.checkAllAllocationFailures(
+    try checkAllAllocationFailuresDeterministic(
         allocator,
         Case.run,
         .{ &harness.engine, prepared, loaded, retained.state, lock, owner },
@@ -30207,7 +30366,7 @@ test "apt_system_orchestrator.test.native recovery-produced failure commits befo
                 const live_checks = harness.runner.native_verification_calls;
                 if (published_interruption) harness.runner.native_verification_source = null;
                 if (scenario == .after_final_publication)
-                    try std.testing.checkAllAllocationFailures(allocator, preparePublishedFailure, .{ &harness, &loaded });
+                    try checkAllAllocationFailuresDeterministic(allocator, preparePublishedFailure, .{ &harness, &loaded });
                 const source_state = try failing_allocator.dupe(u8, harness.store.active_bytes.?);
                 defer failing_allocator.free(source_state);
                 var restart_outcome = try harness.engine.prepareRecoveryWithProfile(failing_allocator, prepared.request.profile_path, &loaded);
@@ -30291,7 +30450,7 @@ test "apt_system_orchestrator.test.native recovery-produced failure commits befo
     };
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(std.testing.allocator, scenario);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{Scenario.fresh});
+    try checkAllAllocationFailuresDeterministic(std.testing.allocator, Case.run, .{Scenario.fresh});
 }
 
 test "apt_system_orchestrator.test.native engine live verification preserves allocation failures" {

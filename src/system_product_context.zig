@@ -372,7 +372,9 @@ test "system_product_context allocation failures retain the published configurat
     var fixture = try Fixture.init("amd64", "/var/lib/debz");
     defer fixture.deinit();
     try fixture.activate();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    try std.testing.checkAllAllocationFailures(debug_allocator.allocator(), struct {
         fn exercise(allocator: std.mem.Allocator, path: []const u8) !void {
             const context = try resolve(allocator, std.testing.io, .{ .root = path });
             defer context.deinit();

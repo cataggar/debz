@@ -35494,7 +35494,7 @@ fn readAbsoluteFile(
     var reader = file.reader(io, &.{});
     return reader.interface.allocRemaining(
         allocator,
-        .limited(maximum_bytes +| 1),
+        .limited(maximum_bytes),
     ) catch |err| switch (err) {
         error.StreamTooLong => error.FileTooLarge,
         error.ReadFailed => reader.err.?,

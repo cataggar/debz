@@ -247,12 +247,12 @@ pub fn build(b: *std.Build) void {
     const baseline_fixture_smoke = b.addRunArtifact(baseline_fixture);
     baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
     baseline_fixture_smoke.addArg("--output");
-    const generated_baseline_fixture = baseline_fixture_smoke.addOutputDirectoryArg("fixtures");
+    const generated_baseline_fixture = baseline_fixture_smoke.addOutputDirectoryArg2("fixtures", .{ .make_absolute = true });
     baseline_fixture_smoke.expectExitCode(0);
     baseline_fixture_smoke.expectStdOutEqual("");
     baseline_fixture_smoke.expectStdErrEqual("");
     const baseline_fixture_test_options = b.addOptions();
-    baseline_fixture_test_options.addOptionPath("generated", generated_baseline_fixture);
+    baseline_fixture_test_options.addOptionPathDirectory("generated", generated_baseline_fixture);
     const baseline_fixture_test_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
         .target = target,
@@ -447,7 +447,7 @@ pub fn build(b: *std.Build) void {
     const openpgp_fixture_smoke = b.addRunArtifact(openpgp_fixture);
     openpgp_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");
     openpgp_fixture_smoke.addArg("--output");
-    const generated_openpgp_fixture = openpgp_fixture_smoke.addOutputFileArg("openpgp.zig");
+    const generated_openpgp_fixture = openpgp_fixture_smoke.addOutputFileArg2("openpgp.zig", .{ .make_absolute = true });
     openpgp_fixture_smoke.expectExitCode(0);
     openpgp_fixture_smoke.expectStdOutEqual("");
     openpgp_fixture_smoke.expectStdErrEqual("");

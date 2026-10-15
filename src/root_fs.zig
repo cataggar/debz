@@ -413,7 +413,7 @@ pub const PinnedRegularFile = struct {
         var reader = self.file.reader(self.io, &.{});
         const bytes = reader.interface.allocRemaining(
             allocator,
-            .limited(maximum_bytes +| 1),
+            .limited(maximum_bytes),
         ) catch |err| switch (err) {
             error.StreamTooLong => return error.FileTooLarge,
             error.ReadFailed => return reader.err.?,
@@ -968,9 +968,7 @@ pub const Root = struct {
     }
 
     /// Reads the whole file when it is at most `maximum_bytes` long and fails
-    /// with `error.FileTooLarge` otherwise. The saturating probe limit keeps a
-    /// file of exactly `maximum_bytes` readable, because `allocRemaining`
-    /// fails once its own limit is reached.
+    /// with `error.FileTooLarge` otherwise.
     pub fn readFileAlloc(
         self: Root,
         allocator: std.mem.Allocator,
@@ -980,7 +978,7 @@ pub const Root = struct {
         var file = try self.openRegularFile(path);
         defer file.close(self.io);
         var reader = file.reader(self.io, &.{});
-        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes +| 1)) catch |err|
+        return reader.interface.allocRemaining(allocator, .limited(maximum_bytes)) catch |err|
             switch (err) {
                 error.StreamTooLong => error.FileTooLarge,
                 error.ReadFailed => reader.err.?,

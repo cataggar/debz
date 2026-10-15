@@ -962,7 +962,9 @@ test "native_provenance.test.canonical byte decoding preserves outcomes and allo
         seal(&document);
         const source = try document.canonicalJson(allocator);
         defer allocator.free(source);
-        try std.testing.checkAllAllocationFailures(allocator, testDecodeAllocation, .{source});
+        var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+        defer std.debug.assert(debug_allocator.deinit() == .ok);
+        try std.testing.checkAllAllocationFailures(debug_allocator.allocator(), testDecodeAllocation, .{source});
         var decoded = try decode(allocator, source);
         defer decoded.deinit();
         try std.testing.expectEqual(outcome, decoded.document.outcome);

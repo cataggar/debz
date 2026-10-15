@@ -5863,7 +5863,7 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
         '.argv = &.{ "/usr/bin/gzip", "-n", "-9", "-c", absolute }',
         "std.mem.writeInt(u32, result.stdout[4..8], epoch, .little)",
         "result.stdout[9] = 255;",
-        "std.hash.crc.Crc32.hash(raw)",
+        "std.hash.Crc32.hash(raw)",
         "return error.IntegrationScratchExists;",
         "debz.deb_payload.inspectControlAlloc(allocator, bytes",
         "try pin.observeStableAlloc(allocator, maximum_bytes)",
@@ -5956,7 +5956,7 @@ def native_baseline_fixture_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/generate-native-baseline-fixture.zig")',
             'b.step("generate-native-baseline-fixture",',
             'baseline_fixture_smoke.setEnvironmentVariable("PATH", "/no-host-interpreters");',
-            'baseline_fixture_test_options.addOptionPath("generated", generated_baseline_fixture);',
+            'baseline_fixture_test_options.addOptionPathDirectory("generated", generated_baseline_fixture);',
             "workload_core.dependOn(&baseline_fixture_tests.step);",
         ),
         BASELINE_FIXTURE_PATHS[1]: (
@@ -5998,7 +5998,7 @@ def native_openpgp_fixture_failures(texts: dict[str, str]) -> list[str]:
         OPENPGP_FIXTURE_PATHS[1]: (
             'const pgp = @import("fixture-openpgp.zig");',
             'const original = @import("debz").test_fixtures.openpgp;',
-            "try std.testing.expectEqualSlices(u8, &@field(original, field.name), @field(actual, field.name));",
+            "try std.testing.expectEqualSlices(u8, &@field(original, field_name), @field(actual, field_name));",
             "try std.testing.expectEqualSlices(u8, expected, generated);",
             "try target.check();",
             "if (point == .before_rename) try self.check();",
