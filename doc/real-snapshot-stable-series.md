@@ -574,7 +574,7 @@ These differences are reviewed once, in the migration PR.
 ### Tool
 
 `tools/real-snapshot-repin.py` uses only the Python standard library, like
-`tools/prepare-native-dpkg.zig` and #289's `tools/debian-stable-closure.py`.
+`tools/prepare-native-dpkg.zig` and #289's `tools/debian-stable-closure.zig`.
 Its subcommands (`probe`, `diff`, `record`, `check`) follow the latter's
 `run`/`compare`/`record`/`check` pattern, so the Debian lane can adopt it
 through a second series profile.

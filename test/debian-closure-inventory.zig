@@ -1,6 +1,6 @@
 //! Pre-mutation feature inventory of an authenticated Debian closure (#261).
 //!
-//! The input manifest is written by `tools/debian-stable-closure.py` only after
+//! The input manifest is written by `tools/debian-stable-closure.zig` only after
 //! every package was matched to its signed Packages record. Each archive is read
 //! once from the verified package cache, rechecked against its declared size,
 //! signed SHA256, and derived SHA512, and then prepared with the same native
@@ -1147,7 +1147,7 @@ test "debian closure inventory: committed Debian locks are canonical signed-SHA2
 // required `test-workload-core` partition and never reads the wall clock: the
 // evidence is evaluated at its recorded day, so required CI keeps passing after
 // the pin's bounded missing-Valid-Until freshness lapses (2026-10-13T07:55:41Z).
-// Live re-resolution is manual only (`tools/debian-stable-closure.py run`).
+// Live re-resolution is manual only (`debz-debian-stable-closure run`).
 
 const committed_evidence = @embedFile("debian_closure_evidence");
 const committed_pin = @embedFile("debian_stable_pin");

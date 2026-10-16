@@ -393,10 +393,36 @@ pub fn build(b: *std.Build) void {
     const debian_readiness = b.addExecutable(.{ .name = "debz-debian-stable-readiness", .root_module = debian_readiness_module });
     const install_debian_readiness = b.addInstallArtifact(debian_readiness, .{});
     b.getInstallStep().dependOn(&install_debian_readiness.step);
-    b.step("build-debian-stable-readiness", "Build native pinned Debian signed-input readiness tooling").dependOn(&install_debian_readiness.step);
+    const debian_readiness_step = b.step("build-debian-stable-readiness", "Build native pinned Debian signed-input readiness tooling");
+    debian_readiness_step.dependOn(&install_debian_readiness.step);
     const debian_readiness_tests = b.addRunArtifact(b.addTest(.{ .root_module = debian_readiness_module }));
-    b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals").dependOn(&debian_readiness_tests.step);
+    const test_debian_readiness_step = b.step("test-debian-stable-readiness", "Test native Debian key, Release, index and freshness refusals");
+    test_debian_readiness_step.dependOn(&debian_readiness_tests.step);
     workload_core.dependOn(&debian_readiness_tests.step);
+
+    const debian_closure_options = b.addOptions();
+    debian_closure_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
+    const debian_closure_module = b.createModule(.{
+        .root_source_file = b.path("tools/debian-stable-closure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debian_closure_module.link_libc = true;
+    debian_closure_module.addImport("debz", debz);
+    debian_closure_module.addOptions("debian_closure_options", debian_closure_options);
+    const debian_closure = b.addExecutable(.{ .name = "debz-debian-stable-closure", .root_module = debian_closure_module });
+    const install_debian_closure = b.addInstallArtifact(debian_closure, .{});
+    b.getInstallStep().dependOn(&install_debian_closure.step);
+    debian_readiness_step.dependOn(&install_debian_closure.step);
+    b.step("build-debian-stable-closure", "Build native Debian stable closure and evidence tooling").dependOn(&install_debian_closure.step);
+    const debian_closure_tests = b.addRunArtifact(b.addTest(.{ .root_module = debian_closure_module }));
+    debian_closure_tests.step.dependOn(&install_debian_readiness.step);
+    debian_closure_tests.step.dependOn(&install_debian_closure.step);
+    debian_closure_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));
+    debian_closure_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_CLOSURE", getInstallPath(b, .bin, "debz-debian-stable-closure"));
+    test_debian_readiness_step.dependOn(&debian_closure_tests.step);
+    b.step("test-debian-stable-closure", "Test native Debian stable closure locks, signed records and evidence refusals").dependOn(&debian_closure_tests.step);
+    workload_core.dependOn(&debian_closure_tests.step);
 
     const release_tool_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency);
     // Unoptimized level-9 gzip/XZ encoding of a complete release tree takes
@@ -899,17 +925,15 @@ pub fn build(b: *std.Build) void {
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
-            "tools/test_debian_stable_closure.py",
             "tools/test_real_snapshot_repin.py",
         },
     );
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
-    audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
-    audit_tests.step.dependOn(&install_debian_readiness.step);
     audit_step.dependOn(&audit_tests.step);
+    audit_step.dependOn(&debian_closure_tests.step);
     audit_step.dependOn(&run_release_workflow_policy_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),

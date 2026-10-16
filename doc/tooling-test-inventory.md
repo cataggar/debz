@@ -191,7 +191,12 @@ Native tests retain the original Python compressed refusal fixtures and exact
 key test input, including Ubuntu substitution, stale/future Release and partial
 SHA512 refusal. The preflight still performs a real authenticated debz refresh
 and refuses root mutation; it publishes no exact lock or package CAS authority.
-The separate closure driver and its observation tests remain Python.
+`zig build build-debian-stable-closure test-debian-stable-closure` builds and
+tests `debz-debian-stable-closure` (`tools/debian-stable-closure.zig`),
+retiring `tools/debian-stable-closure.py` and `tools/test_debian_stable_closure.py`
+while preserving the `run`, `compare`, `record` and `check` CLI contracts and
+all offline lock, signed-record, freshness, keyring, retry, workspace and
+gap-aggregation refusal tests.
 This port does not complete PY3, #262 or #420.
 
 `zig build generate-native-baseline-fixture` replaces the actual Python

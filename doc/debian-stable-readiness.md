@@ -207,7 +207,7 @@ That indexing fix and multi-signature InRelease revalidation are
 
 ## Reproducible bound closure locks
 
-`tools/debian-stable-closure.py` resolves, locks, downloads and inventories
+`tools/debian-stable-closure.zig` (`debz-debian-stable-closure`) resolves, locks, downloads and inventories
 one architecture per run. It never installs or executes package content, so
 both architectures run on either host. This evidence was recorded on aarch64
 with `--architecture amd64` and `--architecture arm64`.
@@ -229,20 +229,20 @@ zig build -Doptimize=ReleaseSafe -j4
 zig build test-debian-closure-inventory -Doptimize=ReleaseSafe -j4
 for arch in amd64 arm64; do
   for n in 1 2; do
-    python3 tools/debian-stable-closure.py run \
+    ./zig-out/bin/debz-debian-stable-closure run \
       --debz "$PWD/zig-out/bin/debz" \
       --inventory "$PWD/zig-out/bin/debian-closure-inventory" \
       --architecture "$arch" \
       --workspace "$PWD/.tmp/debian-261-closure-$arch-$n"
   done
-  python3 tools/debian-stable-closure.py compare \
+  ./zig-out/bin/debz-debian-stable-closure compare \
     ".tmp/debian-261-closure-$arch-1" ".tmp/debian-261-closure-$arch-2"
 done
-python3 tools/debian-stable-closure.py record \
+./zig-out/bin/debz-debian-stable-closure record \
   --amd64 .tmp/debian-261-closure-amd64-1 .tmp/debian-261-closure-amd64-2 \
   --arm64 .tmp/debian-261-closure-arm64-1 .tmp/debian-261-closure-arm64-2 \
   --program-version 0.3.0 --source-commit <commit> --recorded-on <date>
-python3 tools/debian-stable-closure.py check
+./zig-out/bin/debz-debian-stable-closure check
 ```
 
 Each `run` creates a new workspace with empty `root`, `cache` and `state`
@@ -352,7 +352,7 @@ reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
 
 **Fail-closed tests.**
 
-- `tools/test_debian_stable_closure.py` refuses:
+- `zig build test-debian-stable-closure` (`tools/debian-stable-closure.zig`) refuses:
   - tampered committed evidence;
   - Ubuntu signers;
   - stripped or relabelled bindings;
