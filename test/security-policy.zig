@@ -1097,7 +1097,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 64), members);
+    try testing.expectEqual(@as(usize, 65), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1939,8 +1939,11 @@ test "security: native Debian readiness keeps pinned freshness, bounded input an
     defer f.deinit();
     try nativeMutations(&f, "native-debian-readiness", "build.zig", &.{
         "workload_core.dependOn(&debian_readiness_tests.step);",
-        "audit_tests.step.dependOn(&install_debian_readiness.step);",
-        "audit_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", getInstallPath(b, .bin, \"debz-debian-stable-readiness\"));",
+        "workload_core.dependOn(&debian_closure_tests.step);",
+        "debian_closure_tests.step.dependOn(&install_debian_readiness.step);",
+        "debian_closure_tests.step.dependOn(&install_debian_closure.step);",
+        "debian_closure_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_READINESS\", getInstallPath(b, .bin, \"debz-debian-stable-readiness\"));",
+        "debian_closure_tests.setEnvironmentVariable(\"DEBZ_DEBIAN_STABLE_CLOSURE\", getInstallPath(b, .bin, \"debz-debian-stable-closure\"));",
     });
     try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-readiness.zig", &.{
         "return error.SignerFingerprintChanged;",
@@ -1953,14 +1956,20 @@ test "security: native Debian readiness keeps pinned freshness, bounded input an
         ".maximum_decompressed_bytes = maximum_packages_bytes,",
         "if (now != null or published != null or index_identity != null) return error.InvalidReadinessArguments;",
     });
-    try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-closure.py", &.{
-        "key = native_readiness(\"--check-key\", input=readiness_fetch(\"key\"))",
-        "native_readiness(\"--check-release\", \"--architecture\", architecture, \"--now\"",
-        "readiness_fetch(\"index\", architecture)",
+    try nativeMutations(&f, "native-debian-readiness", "tools/debian-stable-closure.zig", &.{
+        "const key = try nativeReadiness(io, allocator, readiness, &.{\"--check-key\"}, try readinessFetch(io, allocator, readiness, \"key\", null));",
+        "_ = try nativeReadiness(io, allocator, readiness, &.{ \"--check-release\", \"--architecture\", opts.architecture, \"--now\", now_text }, armored);",
+        "try readinessFetch(io, allocator, readiness, \"index\", opts.architecture)",
     });
-    const restored = try nativeCheck(&f, "native-debian-readiness", "tools/debian-stable-readiness.py", "def fetch(url, limit):\n    return b''\n");
-    defer restored.deinit();
-    try restored.failsWith("retired Python Debian readiness implementation");
+    for ([_][]const u8{
+        "tools/debian-stable-readiness.py",
+        "tools/debian-stable-closure.py",
+        "tools/test_debian_stable_closure.py",
+    }) |retired_path| {
+        const restored = try nativeCheck(&f, "native-debian-readiness", retired_path, "def fetch(url, limit):\n    return b''\n");
+        defer restored.deinit();
+        try restored.failsWith("retired Python Debian readiness implementation");
+    }
 }
 
 test "security: actual integration archive encoding and every fixture consumer require the native repository producer" {

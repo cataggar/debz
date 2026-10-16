@@ -66,6 +66,7 @@ REMOVED_TEST_ENTRY_POINTS = {
     "tools/test_release.py",
     "tools/test_security_audit.py",
     "tools/test_real_snapshot_acceptance.py",
+    "tools/test_debian_stable_closure.py",
 }
 
 SHA256_TOKEN = re.compile(
@@ -2110,7 +2111,7 @@ WORKLOAD_PARTITIONS = {
         "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
-        "run_debian_closure_inventory_tests", "debian_readiness_tests",
+        "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
     "workload_production": ("test-workload-production", (
@@ -5586,7 +5587,8 @@ ACTION_EMPTY_LOCK_PATHS = (
 
 DEBIAN_READINESS_PATHS = (
     "build.zig", "tools/debian-stable-readiness.zig", "tools/debian-stable-readiness.py",
-    "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.py",
+    "tools/test_debian_stable_readiness.py", "tools/debian-stable-closure.zig",
+    "tools/debian-stable-closure.py", "tools/test_debian_stable_closure.py",
 )
 
 def liblzma_decoder_configuration_failures(text: str) -> list[str]:
@@ -5803,8 +5805,13 @@ def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/debian-stable-readiness.zig")',
             "b.getInstallStep().dependOn(&install_debian_readiness.step);",
             "workload_core.dependOn(&debian_readiness_tests.step);",
-            'audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));',
-            "audit_tests.step.dependOn(&install_debian_readiness.step);",
+            'b.path("tools/debian-stable-closure.zig")',
+            "b.getInstallStep().dependOn(&install_debian_closure.step);",
+            "workload_core.dependOn(&debian_closure_tests.step);",
+            'debian_closure_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));',
+            'debian_closure_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_CLOSURE", getInstallPath(b, .bin, "debz-debian-stable-closure"));',
+            "debian_closure_tests.step.dependOn(&install_debian_readiness.step);",
+            "debian_closure_tests.step.dependOn(&install_debian_closure.step);",
         ),
         "tools/debian-stable-readiness.zig": (
             '@embedFile("fixtures/debian-stable-readiness-v1.json")',
@@ -5826,13 +5833,13 @@ def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
             "if (now != null or published != null or index_identity != null) return error.InvalidReadinessArguments;",
             '.exclusive = true,',
         ),
-        "tools/debian-stable-closure.py": (
+        "tools/debian-stable-closure.zig": (
             'DEBZ_DEBIAN_STABLE_READINESS',
-            '"PATH": "/no-host-interpreters"',
-            'readiness_index_counts(compressed, index)',
-            'key = native_readiness("--check-key", input=readiness_fetch("key"))',
-            'native_readiness("--check-release", "--architecture", architecture, "--now"',
-            'readiness_fetch("index", architecture)',
+            'try env.put("PATH", "/no-host-interpreters");',
+            '_ = try readinessIndexCounts(io, allocator, readiness, compressed, index);',
+            'const key = try nativeReadiness(io, allocator, readiness, &.{"--check-key"}, try readinessFetch(io, allocator, readiness, "key", null));',
+            '_ = try nativeReadiness(io, allocator, readiness, &.{ "--check-release", "--architecture", opts.architecture, "--now", now_text }, armored);',
+            'try readinessFetch(io, allocator, readiness, "index", opts.architecture)',
         ),
     }
     failures = [
@@ -5842,10 +5849,15 @@ def native_debian_readiness_failures(texts: dict[str, str]) -> list[str]:
     ]
     if not re.search(r'\bbinary,\s+"refresh",\s+"--install-root",', texts.get("tools/debian-stable-readiness.zig", "")):
         failures.append("tools/debian-stable-readiness.zig: actual debz read-only refresh invocation is missing")
-    for path in ("tools/debian-stable-readiness.py", "tools/test_debian_stable_readiness.py"):
+    for path in (
+        "tools/debian-stable-readiness.py",
+        "tools/test_debian_stable_readiness.py",
+        "tools/debian-stable-closure.py",
+        "tools/test_debian_stable_closure.py",
+    ):
         if path in texts:
             failures.append(f"{path}: retired Python Debian readiness implementation or imported test was restored")
-    if "debian-stable-readiness.py" in texts.get("tools/debian-stable-closure.py", ""):
+    if "debian-stable-readiness.py" in texts.get("tools/debian-stable-closure.zig", ""):
         failures.append("Debian closure must not import the retired Python readiness implementation")
     return failures
 
