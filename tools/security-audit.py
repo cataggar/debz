@@ -2124,7 +2124,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_native": ("test-workload-native", (
         "native_dpkg_tests",
-        "run_native_program_corpus_tests", "native_outcome_tests", "run_native_phase_summary_tests",
+        "run_native_program_corpus_tests", "native_outcome_tests", "run_native_phase_summary_tests", "run_exec_audit_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",
@@ -2829,6 +2829,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real_snapshot_reference_paths.py",
     "tools/real-snapshot-native-outcome.zig",
     "tools/native-phase-summary.zig",
+    "tools/real-snapshot-exec-audit.zig",
     "tools/native-database-performance-hosted.sh",
     "tools/real-snapshot-python3-protected-stage.sh",
     "tools/real-snapshot-python3-reference.sh",
@@ -3274,7 +3275,8 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     '[[ $mode == proof ]] || prefix=native-ci',
     'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
     'step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome \\\n'
-    '    build-native-phase-summary test-native-phase-summary -Doptimize="$native_optimize" -j2',
+    '    build-native-phase-summary test-native-phase-summary build-exec-audit test-exec-audit \\\n'
+    '    -Doptimize="$native_optimize" -j2',
     'native_optimize=ReleaseSafe\nif [[ $mode == native-staging ]]; then\n'
     '  native_optimize=${DEBZ_NATIVE_SNAPSHOT_OPTIMIZE:-ReleaseSafe}\n'
     '  [[ $native_optimize == Debug || $native_optimize == ReleaseSafe ]]',
@@ -3415,6 +3417,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "protected(optimize_file)",
         'export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}',
         '"zig-out/bin/debz-native-outcome",',
+        '"zig-out/bin/debz-exec-audit",',
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
         'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
@@ -3438,13 +3441,23 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-acceptance.sh": (
         "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
         '--check-keyring "$keyring" >/dev/null',
+        'PATH=/no-host-interpreters zig-out/bin/debz-exec-audit "$@" || status=$?',
         'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
         'protected(repository, directory=True)',
         'protected(repository / ".real-snapshot", directory=True)',
+        'repository / "zig-out/bin/debz-exec-audit",',
         'local wrapper_status=$?',
         'printf \'%s\\n\' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"',
         'printf \'{"stage":"%s","command_exit_status":null}\\n\' "$name" >"$evidence/native-stage-v1.json"',
         'printf \'{"stage":"%s","command_exit_status":%s}\\n\' "$name" "$status" >"$evidence/native-stage-v1.json"',
+    ),
+    "tools/real-snapshot-exec-audit.zig": (
+        "const maximum_trace_bytes = 256 * 1024 * 1024;",
+        "const maximum_status_bytes = 64 * 1024 * 1024;",
+        "const fresh_divert_shapes = [_][]const []const u8{",
+        "const lifecycle_divert_shapes = [_]LifecycleShape{",
+        "fn openBeneathNoFollow(root_path: []const u8, relative: []const u8) OpenBeneathError!linux.fd_t {",
+        "fn existsBeneath(allocator: std.mem.Allocator, root_path: []const u8, relative: []const u8) OpenBeneathError!bool {",
     ),
     "tools/real-snapshot-native-outcome.zig": (
         'const maximum_result_bytes = 128 * 1024 * 1024;',

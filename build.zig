@@ -210,6 +210,21 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-phase-summary", "Verify monotonic progress bindings, restart counters and invalid evidence refusals").dependOn(&run_native_phase_summary_tests.step);
     workload_native.dependOn(&run_native_phase_summary_tests.step);
 
+    const exec_audit_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-exec-audit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const exec_audit = b.addExecutable(.{
+        .name = "debz-exec-audit",
+        .root_module = exec_audit_module,
+    });
+    const install_exec_audit = b.addInstallArtifact(exec_audit, .{});
+    b.step("build-exec-audit", "Build the native real-snapshot exec-trace auditor").dependOn(&install_exec_audit.step);
+    const run_exec_audit_tests = b.addRunArtifact(b.addTest(.{ .root_module = exec_audit_module }));
+    b.step("test-exec-audit", "Test native exec-trace lineage, shape and root-identity auditing").dependOn(&run_exec_audit_tests.step);
+    workload_native.dependOn(&run_exec_audit_tests.step);
+
     const native_action_empty_lock_module = b.createModule(.{
         .root_source_file = b.path("tools/native-action-empty-lock.zig"),
         .target = target,
@@ -797,6 +812,7 @@ pub fn build(b: *std.Build) void {
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
     audit_step.dependOn(&run_native_phase_summary_tests.step);
+    audit_step.dependOn(&run_exec_audit_tests.step);
     const write_digest_inventory_step = b.step(
         "write-digest-inventory",
         "Regenerate the digest cutover inventories",
@@ -823,8 +839,11 @@ pub fn build(b: *std.Build) void {
     const run_snapshot_policy_tests = b.addRunArtifact(snapshot_policy_tests);
     const snapshot_policy_options = b.addOptions();
     snapshot_policy_options.addOptionPath("native_outcome", native_outcome.getEmittedBin());
+    snapshot_policy_options.addOptionPath("exec_audit", exec_audit.getEmittedBin());
     snapshot_policy_tests.root_module.addOptions("snapshot_policy_options", snapshot_policy_options);
     run_snapshot_policy_tests.setCwd(b.path("."));
+    b.step("test-real-snapshot-policy", "Run real-snapshot policy and exec-trace audit tests")
+        .dependOn(&run_snapshot_policy_tests.step);
     audit_step.dependOn(&run_snapshot_policy_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());

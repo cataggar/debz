@@ -531,10 +531,15 @@ DEP17 diversion of the same path; for a top-level directory such as `/lib32`,
 | `dpkg-statoverride` | `--update --add ACCOUNT ACCOUNT MODE PATH` | chrony postinst |
 
 Shapes that only upgrades, removals or local administrator setups reach stay
-refused: any `--rename` (gzip, dash and coreutils-from-gnu), `--local` and
-`--list` (init-system-helpers), dash's `--remove` without `--divert`,
-`dpkg-statoverride --remove` (postrm only), and `--test`. Widening the list
-needs new evidence and review.
+refused in the default fresh-install audit (`--audit-exec-trace`): any
+`--rename` (gzip, dash and coreutils-from-gnu), `--local` and `--list`
+(init-system-helpers), dash's `--remove` without `--divert`,
+`dpkg-statoverride --remove` (postrm only), and `--test`. The native Zig
+auditor `tools/real-snapshot-exec-audit.zig` (`debz-exec-audit`) also supports
+explicit lifecycle auditing (`--lifecycle` / `--audit-exec-trace-lifecycle`),
+which admits the closure's reviewed upgrade, removal and purge shapes only when
+the traced maintainer script's action and phase arguments match that lifecycle
+transition. Widening either list needs new evidence and review.
 
 None of these calls hands a transaction step to dpkg. dpkg would run the same
 scripts the same way. The reviewed dpkg actions only compare or validate

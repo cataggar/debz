@@ -62,6 +62,20 @@ const Driver = struct {
             \\    return path.stat()
         ++ "\n");
         try work.directory.dir.createDirPath(support.io, ".real-snapshot");
+        try work.directory.dir.createDirPath(support.io, "zig-out/bin");
+        const exec_audit_bytes = try std.Io.Dir.cwd().readFileAlloc(
+            support.io,
+            @import("snapshot_policy_options").exec_audit,
+            support.allocator,
+            .limited(64 * 1024 * 1024),
+        );
+        defer support.allocator.free(exec_audit_bytes);
+        try work.write("zig-out/bin/debz-exec-audit", exec_audit_bytes);
+        const exec_audit_bin = try work.path("zig-out/bin/debz-exec-audit");
+        defer support.allocator.free(exec_audit_bin);
+        const exec_audit_mode = try support.run(&.{ "chmod", "0700", exec_audit_bin });
+        defer exec_audit_mode.deinit();
+        try exec_audit_mode.ok();
         const script = try work.path("tools/real-snapshot-acceptance.sh");
         errdefer support.allocator.free(script);
         const fixture_script = try std.fmt.allocPrint(support.allocator, "#!/bin/sh\nprintf called > '{s}/called'\nexit 77\n", .{work.root});
@@ -1590,6 +1604,86 @@ test "snapshot: exec audit refuses dpkg-divert and dpkg-statoverride outside the
     }
 }
 
+test "snapshot: lifecycle exec audit admits reviewed upgrade, remove and purge shapes" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    const identities = try auditIdentities("", "");
+    defer support.allocator.free(identities);
+    for ([_]struct {
+        script: []const u8,
+        script_args: []const u8,
+        tool: []const u8,
+        argv: []const u8,
+    }{
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/gzip.preinst",
+            .script_args = "\"upgrade\", \"1.12-1\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--rename\", \"--package\", \"zutils\", \"--divert\", \"/usr/bin/zcat.usr-is-merged\", \"--remove\", \"/usr/bin/zcat\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/dash.prerm",
+            .script_args = "\"remove\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--package\", \"dash\", \"--rename\", \"--remove\", \"/bin/sh\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/dash.postinst",
+            .script_args = "\"configure\", \"0.5.12-6\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--package\", \"dash\", \"--no-rename\", \"--remove\", \"/bin/sh\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/coreutils-from-gnu.postinst",
+            .script_args = "\"configure\", \"0.0.0\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/cat.remove-bak\", \"--rename\", \"--remove\", \"/usr/bin/cat\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/coreutils-switch.prerm",
+            .script_args = "\"remove\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/cat.remove-bak\", \"--no-rename\", \"--add\", \"/usr/bin/cat\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/init-system-helpers.postinst",
+            .script_args = "\"configure\", \"1.66\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--quiet\", \"--local\", \"--remove\", \"--no-rename\", \"/etc/os-release\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/init-system-helpers.postinst",
+            .script_args = "\"configure\", \"1.66\"",
+            .tool = "dpkg-divert",
+            .argv = "\"dpkg-divert\", \"--list\", \"/etc/os-release\"",
+        },
+        .{
+            .script = "/var/lib/debz-lifecycle-scripts/chrony.postrm",
+            .script_args = "\"purge\"",
+            .tool = "dpkg-statoverride",
+            .argv = "\"dpkg-statoverride\", \"--remove\", \"/var/lib/chrony\"",
+        },
+    }) |case| {
+        const trace = try std.fmt.allocPrint(support.allocator,
+            \\700 execve("{s}", ["debz"], 0x1 /* 1 var */) = 0
+            \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+            \\702 execve("{s}", ["{s}", {s}], 0x1 /* 1 var */) = 0
+            \\702 vfork() = 703
+            \\703 execve("/usr/bin/{s}", [{s}], 0x1 /* 1 var */) = 0
+            \\
+        , .{ audit_debz, case.script, case.script, case.script_args, case.tool, case.argv });
+        defer support.allocator.free(trace);
+        const fresh_refused = try auditFixture(&f, trace);
+        defer fresh_refused.deinit();
+        try expectRefused(fresh_refused, "shape");
+        const lifecycle_allowed = try auditWith(&f, "--audit-exec-trace-lifecycle-fixture", trace, identities);
+        defer lifecycle_allowed.deinit();
+        try lifecycle_allowed.ok();
+        try support.contains(lifecycle_allowed.stdout, "forbidden_dpkg_exec=false\n");
+    }
+}
+
 test "snapshot: exec audit refuses dpkg-divert and dpkg-statoverride outside a debz-started script" {
     var f = try Driver.init();
     defer f.deinit();
@@ -1821,15 +1915,23 @@ test "snapshot: script dpkg pins are per architecture and bound to the pinned sn
         "    amd64:dpkg-statoverride) echo \"$script_dpkg_statoverride_amd64\" ;;\n",
         "    arm64:dpkg-statoverride) echo \"$script_dpkg_statoverride_arm64\" ;;\n",
         "  for tool in dpkg dpkg-divert dpkg-statoverride; do\n",
-        "TOOLS = (\"dpkg\", \"dpkg-divert\", \"dpkg-statoverride\")\n",
-        "ACTIONS = (\"--compare-versions\", \"--validate-version\", \"--print-architecture\", \"-s\", \"-L\", \"-l\")\n",
-        "REFUSED_OPTIONS = (\"--root\", \"--admindir\", \"--instdir\", \"--force\")\n",
-        "tool = path[len(\"/usr/bin/\"):] if path.startswith(\"/usr/bin/\") else None\n",
-        "elif tool not in TOOLS:",
-        "elif not argv or argv[0] not in (tool, path):",
+        "PATH=/no-host-interpreters zig-out/bin/debz-exec-audit \"$@\" || status=$?\n",
         "native-exec-audit.txt",
         "exec-audit-summary.txt",
     }) |required| try support.contains(runner, required);
+    const auditor = try source("tools/real-snapshot-exec-audit.zig");
+    defer support.allocator.free(auditor);
+    for ([_][]const u8{
+        "const dpkg_actions = [_][]const u8{\n",
+        "const refused_options = [_][]const u8{\n",
+        "const shadow_directories = [_][]const u8{\n",
+        "const fresh_divert_shapes = [_][]const []const u8{\n",
+        "const fresh_statoverride_shapes = [_][]const []const u8{\n",
+        "const lifecycle_divert_shapes = [_]LifecycleShape{\n",
+        "const lifecycle_statoverride_shapes = [_]LifecycleShape{\n",
+        "Tool.fromPath(exec_info.path)",
+        "(!std.mem.eql(u8, exec_info.argv[0], tool.?.name()) and !std.mem.eql(u8, exec_info.argv[0], exec_info.path))",
+    }) |required| try support.contains(auditor, required);
     const workflow = try source(".github/workflows/ci.yml");
     defer support.allocator.free(workflow);
     const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
