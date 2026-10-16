@@ -153,12 +153,15 @@ cutover blockers remain.
 
 ## Opt-in production candidate (#276)
 
-Run `python3 tools/security-audit.py native-only-candidate` only when rehearsing
+Run `zig-out/bin/debz-native-only-candidate native-only-candidate` (or
+`python3 tools/security-audit.py native-only-candidate`, which delegates to the
+compiled `debz-native-only-candidate` binary) only when rehearsing
 the **future** cutover. It must fail on this legacy-capable release. The output
 names remaining deletion/default tasks by exact source path (#280–#285), not a
 claim of #274 readiness. Ordinary `zig build security-audit` continues to
 check the shipped legacy-capable policy and tests the candidate's expected
-failure and negative mutations; it does not enable native-only defaults.
+failure and negative mutations via `tools/native-only-candidate.zig`; it does
+not enable native-only defaults.
 
 `security/native-only-production-policy.json` pins reviewed child-process
 allowances and source/bundle fingerprints. The candidate scans *all* production

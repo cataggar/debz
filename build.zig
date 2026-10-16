@@ -482,6 +482,34 @@ pub fn build(b: *std.Build) void {
     b.step("test-release-workflow-policy", "Test native release and CI workflow policy audit").dependOn(&run_release_workflow_policy_tests.step);
     workload_release.dependOn(&run_release_workflow_policy_tests.step);
 
+    const native_only_candidate_module = b.createModule(.{
+        .root_source_file = b.path("tools/native-only-candidate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const native_only_candidate = b.addExecutable(.{
+        .name = "debz-native-only-candidate",
+        .root_module = native_only_candidate_module,
+    });
+    const install_native_only_candidate = b.addInstallArtifact(native_only_candidate, .{});
+    b.getInstallStep().dependOn(&install_native_only_candidate.step);
+    b.step("build-native-only-candidate", "Build the native-only production candidate auditor").dependOn(&install_native_only_candidate.step);
+    b.step("build-security-audit", "Build native security-audit policy helpers").dependOn(&install_native_only_candidate.step);
+    const native_only_candidate_options = b.addOptions();
+    native_only_candidate_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-native-only-candidate"));
+    const native_only_candidate_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/native-only-candidate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_only_candidate_test_module.addOptions("native_only_candidate_options", native_only_candidate_options);
+    const run_native_only_candidate_tests = b.addRunArtifact(b.addTest(.{ .root_module = native_only_candidate_test_module }));
+    run_native_only_candidate_tests.setCwd(b.path("."));
+    run_native_only_candidate_tests.step.dependOn(&install_native_only_candidate.step);
+    b.step("test-native-only-candidate", "Test native-only production candidate and Actions contract auditing").dependOn(&run_native_only_candidate_tests.step);
+    b.step("test-native-only-policy", "Test native-only production candidate and Actions policy without host interpreters").dependOn(&run_native_only_candidate_tests.step);
+    workload_release.dependOn(&run_native_only_candidate_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -879,6 +907,8 @@ pub fn build(b: *std.Build) void {
         "Run hermeticity, dependency-policy, license, secret, and docs gates",
     );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
+    audit.setEnvironmentVariable("DEBZ_NATIVE_ONLY_CANDIDATE", getInstallPath(b, .bin, "debz-native-only-candidate"));
+    audit.step.dependOn(&install_native_only_candidate.step);
     audit_step.dependOn(&audit.step);
     audit_step.dependOn(&run_native_phase_summary_tests.step);
     audit_step.dependOn(&run_exec_audit_tests.step);
@@ -895,9 +925,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const security_policy_options = b.addOptions();
+    security_policy_options.addOptionPath("native_only_candidate", native_only_candidate.getEmittedBin());
+    security_policy_tests.root_module.addOptions("security_policy_options", security_policy_options);
     const run_security_policy_tests = b.addRunArtifact(security_policy_tests);
     run_security_policy_tests.setCwd(b.path("."));
     audit_step.dependOn(&run_security_policy_tests.step);
+    audit_step.dependOn(&run_native_only_candidate_tests.step);
     const snapshot_policy_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/real-snapshot-policy.zig"),

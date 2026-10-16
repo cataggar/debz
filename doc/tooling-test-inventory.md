@@ -211,6 +211,14 @@ refusal before any existing file is changed. The required core partition runs
 this suite in both modes on both architectures. The test-only RSA key is not
 production signing authority; this port does not complete PY3 or #420.
 
+`zig build build-native-only-candidate test-native-only-policy` (and
+`build-security-audit`) builds and tests `debz-native-only-candidate`
+(`tools/native-only-candidate.zig`), retiring `tools/native_only_candidate.py`
+and `actions_native_only_candidate_failures` in `tools/security-audit.py` while
+preserving the `native-only-candidate`, `check native-only-candidate` and
+`check actions-native-only` contracts under a no-interpreter `PATH`. This port
+does not complete PY1 or #420.
+
 | Previous case | Zig test (`test/security-policy.zig`, `security:` prefix) |
 | --- | --- |
 | `test_digest_cutover_rejects_new_raw_package_authority` | new raw package authority, schema digest field and fixed cache layout are rejected |

@@ -33,6 +33,20 @@ const Fixture = struct {
 
     fn check(self: *Fixture, kind: []const u8, text: []const u8) !support.Result {
         try self.work.write("check-input", text);
+        if (std.mem.eql(u8, kind, "native-only-candidate") or std.mem.eql(u8, kind, "actions-native-only")) {
+            return support.runWithTimeout(
+                &.{
+                    "env",
+                    "PATH=/no-host-interpreters",
+                    @import("security_policy_options").native_only_candidate,
+                    "check",
+                    kind,
+                    try self.path("check-input"),
+                },
+                .inherit,
+                30,
+            );
+        }
         return support.runWithTimeout(
             &.{ "python3", "tools/security-audit.py", "check", kind, try self.path("check-input") },
             .inherit,
@@ -1097,7 +1111,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 66), members);
+    try testing.expectEqual(@as(usize, 67), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2860,7 +2874,7 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         "tools/test-native-recovery.py",                "tools/test_native_recovery.py",
         "tools/native-trigger-fixtures.py",             "tools/native_diversion_settlement_oracle.py",
         "tools/test_real_snapshot_reference_triggers.py", "tools/native-lifecycle-fixtures.py",
-        "tools/native-differential.py",
+        "tools/native-differential.py",                 "tools/native_only_candidate.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();
