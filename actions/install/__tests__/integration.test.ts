@@ -186,7 +186,7 @@ def load(name, filename):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-lifecycle = load("install_lifecycle", "native-lifecycle-fixtures.py")
+m = load("install_materialization", "native-materialization-fixtures.py")
 repository = workspace / "repository"
 subprocess.run([
     str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository),
@@ -199,13 +199,13 @@ source.write_text(f"Types: deb\\nURIs: file://{repository}\\nSuites: debian-stab
 for name in ("plan", "cold", "warm-fresh", "offline", "failure", "receiptless", "cross-backend"):
     root = runner / f"root-{name}"
     root.mkdir()
-    lifecycle.m.make_root(root, arch)
-    lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+    m.make_root(root, arch)
+    m.copy_program(root, Path("/bin/sh"), "/bin/sh")
     seeds = ["native-helper-target", "essential-core"]
     if name == "receiptless":
         seeds += ["base-dep", "scenario-main"]
     archives = [repository / f"pool/main/{package}_1.0-1_{arch}.deb" for package in seeds]
-    assert lifecycle.reference_phase(root, archives, "install", dict(os.environ), root, packages=[]) == 0
+    assert m.reference_phase(root, archives, "install", dict(os.environ), root, packages=[]) == 0
 for selector, filename, backend in (
     ("scenario-main", "lock.json", "native"), ("fail-script", "fail.lock.json", "native"),
     ("scenario-main", "legacy.lock.json", "legacy_dpkg"),

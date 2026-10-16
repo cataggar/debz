@@ -77,8 +77,8 @@
     "src/transaction_provenance_v2.zig": "77590023eb89adae8138268c1febd4bb14d7f07e5bc5601b8c413ca32856fa776775e2a35e4a380078f5fb59639b6fa929537d1e19cf384eead14e45c74e388b",
     "src/transaction_recovery.zig": "ffa106804985ab2590833ca7bccf5714651966bd986f47ed35d50396f3b2f249ae2216532aa481a9ff400ecf16ebcf4f646199fe9246a78a7eec9efe1f849231",
     "src/transaction_result_summary.zig": "75512b49dd61c2f70db8d2372623ac534950e65ac05e15ad525ba586d30a25aae8f00ab331af1e30f9c7e8e6a8eb1ab64f40b7ae094b41c4f50b93fddef7f271",
+    "test/native_differential_cli.zig": "193d95ab4652f7b79265ee0fe7720b6a600a81e20106c4fbbd817e1c8cec43285443297c0ea5dc8710022f0a8194a49bb3c3ed552af82b2d970a73fcc8bb76b1",
     "tools/debian-stable-readiness.zig": "9405eb6d34ac1ac3fdbd59218d0f594321fb2321c564934bcaf2382a00153d4325cbb0937461012d08efdf18b6128d7eb5b274b46bae8d3e1b9521f1f8aeedbe",
-    "tools/native-differential.py": "46e715fc4c3210deba0fc4141f85de46adef7edfbcc3c3e25ef0c9d67f4d27e4f383ee504ab5abd07b2406815bfe0afec5a8d1396dda02924a458b19bd6ecccd",
     "tools/prepare-native-dpkg.zig": "af8b32c395ea40a108f572cbecfe23ea98da749d12e11d8c90a453bd67df5301556dc2669796050499e704dd6b664d1e3ad4a9e0fc203fd69ea70d673c5296fa"
   },
   "schema": "https://debz.dev/schema/native-only-production-candidate-v1",

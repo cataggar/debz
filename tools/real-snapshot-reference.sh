@@ -67,7 +67,8 @@ for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real_snapshot_reference_paths.py",
              repository / "tools/prepare-native-dpkg.zig",
              repository / "zig-out/bin/debz-native-dpkg-reference",
-             repository / "tools/native-differential.py",
+             repository / "test/native_differential_cli.zig",
+             repository / "zig-out/bin/native-differential",
              dpkg, lock, workspace / "evidence/create.json"):
     protected(path)
 protected(workspace / "evidence", directory=True)

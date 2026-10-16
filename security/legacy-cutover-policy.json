@@ -541,7 +541,7 @@
       "retain_after_cutover": true
     },
     {
-      "path": "tools/native-differential.py",
+      "path": "test/native_differential_cli.zig",
       "role": "reference_oracle_comparison",
       "retain_after_cutover": true
     }
