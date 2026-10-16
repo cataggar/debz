@@ -297,7 +297,7 @@ test "security: native-only production candidate refuses shipped routes and exac
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |message| try baseline.failsWith(message);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.zig:") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/native-differential.py:") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "test/native_differential_cli.zig:") == null);
 
     for ([_]struct { path: []const u8, from: []const u8, to: []const u8, message: []const u8 }{
         .{ .path = "src/main.zig", .from = "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;", .to = "var transaction_backend: debz.transaction_engine.Kind = .native;", .message = "src/main.zig: stale reviewed inventory fingerprint" },
@@ -310,7 +310,7 @@ test "security: native-only production candidate refuses shipped routes and exac
         .{ .path = "src/transaction_executor.zig", .from = ".argv = invocation.argv,", .to = ".argv = &.{ \"/usr/bin/dpkg\" },", .message = "src/transaction_executor.zig: stale reviewed inventory fingerprint" },
         .{ .path = "src/live_root.zig", .from = "const forked = linux.fork();", .to = "const other = linux.syscall5(.execveat, fd, path, argv, envp, flags);\n        const forked = linux.fork();", .message = "src/live_root.zig: unreviewed/stale child-process allowance" },
         .{ .path = "src/package_family_backend.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\nfn unreviewedLaunch() void { _ = std.process.run(allocator, io, args); }", .message = "src/package_family_backend.zig: unreviewed production child-process launch" },
-        .{ .path = "tools/native-differential.py", .from = "#!/usr/bin/env python3", .to = "#!/usr/bin/env python3\n# changed oracle", .message = "tools/native-differential.py: stale reviewed inventory fingerprint" },
+        .{ .path = "test/native_differential_cli.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\n// changed oracle", .message = "test/native_differential_cli.zig: stale reviewed inventory fingerprint" },
     }) |mutation| {
         const source = try f.source(mutation.path);
         const changed = try f.replace(source, mutation.from, mutation.to);
@@ -2855,17 +2855,18 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
     var f = try Fixture.init();
     defer f.deinit();
     for ([_][]const u8{
-        "tools/test-native-lifecycle.py",            "tools/test_native_lifecycle.py",
-        "tools/test-native-triggers.py",             "tools/test_native_triggers.py",
-        "tools/test-native-recovery.py",             "tools/test_native_recovery.py",
-        "tools/native-trigger-fixtures.py",          "tools/native_diversion_settlement_oracle.py",
-        "tools/test_real_snapshot_reference_triggers.py",
+        "tools/test-native-lifecycle.py",               "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",                "tools/test_native_triggers.py",
+        "tools/test-native-recovery.py",                "tools/test_native_recovery.py",
+        "tools/native-trigger-fixtures.py",             "tools/native_diversion_settlement_oracle.py",
+        "tools/test_real_snapshot_reference_triggers.py", "tools/native-lifecycle-fixtures.py",
+        "tools/native-differential.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();
         try restored.failsWith("retired Python test entry point still exists");
     }
-    for ([_][]const u8{"tools/native-lifecycle-fixtures.py"}) |path| {
+    for ([_][]const u8{"tools/native-materialization-fixtures.py"}) |path| {
         const source = try f.source(path);
         const valid = try nativeCheck(&f, "native-fixtures", path, source);
         defer valid.deinit();
@@ -2888,7 +2889,7 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         "actions/install/__tests__/integration.test.ts",
     }) |path| {
         const source = try f.source(path);
-        const altered = try f.replace(source, "native-lifecycle-fixtures.py", "missing.py");
+        const altered = try f.replace(source, "native-materialization-fixtures.py", "missing.py");
         const refused = try nativeCheck(&f, "native-fixtures", path, altered);
         defer refused.deinit();
         try refused.failsWith("required fixture import is missing");

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reusable disposable-root fixture helpers for Python lifecycle acceptance."""
 
 from __future__ import annotations
@@ -6,12 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from functools import lru_cache
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -28,14 +25,6 @@ DISPOSABLE_RUNTIME = Path(os.environ.get(
 NATIVE_REFERENCE = Path(os.environ.get(
     "DEBZ_NATIVE_DPKG_REFERENCE", REPOSITORY / "zig-out/bin/debz-native-dpkg-reference",
 ))
-
-SPEC = importlib.util.spec_from_file_location(
-    "debz_native_differential", REPOSITORY / "tools/native-differential.py"
-)
-assert SPEC and SPEC.loader
-oracle = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = oracle
-SPEC.loader.exec_module(oracle)
 
 
 def native_reference(*arguments: str) -> str:
@@ -222,86 +211,39 @@ def reference_command(root: Path) -> list[str]:
     ]
 
 
-def reference(
+def reference_phase(
     root: Path,
-    archive: Path,
-    environment: dict[str, str],
-    log: Path,
-    *,
-    configure: bool = False,
-) -> None:
-    run(
-        [*reference_command(root), "--install" if configure else "--unpack", str(archive)],
-        environment,
-        log,
-    )
-
-
-def snapshot(root: Path) -> dict:
-    return oracle.capture(root, excludes=(*oracle.DEFAULT_EXCLUDES, GUARD))
-
-
-def compare_roots(reference_root: Path, candidate: Path, destination: Path) -> None:
-    expected = snapshot(reference_root)
-    observed = snapshot(candidate)
-    write(destination / "reference.snapshot.json", oracle.canonical_json(expected).encode())
-    write(destination / "native.snapshot.json", oracle.canonical_json(observed).encode())
-    mismatches = oracle.differences(expected, observed, maximum=30)
-    if mismatches:
-        raise AssertionError("native/dpkg mismatch:\n" + "\n".join(mismatches))
-
-
-def assert_parity(reference_root: Path, candidate: Path, destination: Path) -> None:
-    compare_roots(reference_root, candidate, destination)
-    expected_empty = (reference_root / PAYLOAD / "empty").stat()
-    observed_empty = (candidate / PAYLOAD / "empty").stat()
-    if expected_empty.st_mtime_ns != observed_empty.st_mtime_ns:
-        raise AssertionError(
-            "archive empty-directory mtime differs: "
-            f"{expected_empty.st_mtime_ns} != {observed_empty.st_mtime_ns}"
-        )
-
-
-def native(
-    executable: Path,
-    root: Path,
-    archive: Path | None,
-    architecture: str,
+    archives: list[Path],
     operation: str,
     environment: dict[str, str],
     destination: Path,
     *,
-    conffiles: bool = False,
+    packages: list[dict[str, str]],
     policy: str = "keep_existing",
-    packages: list[dict[str, str]] | None = None,
-) -> dict:
-    report = destination / "native.report.json"
-    request = destination / "native.request.json"
-    document = {
-        "root": str(root),
-        "architecture": architecture,
-        "archives": [str(archive)] if archive else [],
-        "operation": operation,
-        "report": str(report),
-    }
-    if conffiles:
-        document.update(conffiles=True, policy=policy)
-    if packages is not None:
-        document["packages"] = packages
-    write(request, json.dumps(document).encode())
-    run(
-        [str(executable)],
-        {**environment, "DEBZ_NATIVE_MATERIALIZATION_REQUEST": str(request)},
-        destination / "native.log",
-    )
-    if not report.is_file() or report.stat().st_size > 64 * 1024:
-        raise AssertionError("native test driver did not produce a bounded outcome report")
-    result = json.loads(report.read_bytes())
-    if result.get("outcome") not in {
-        "applied", "rolled_back", "recovery_required", "handoff", "refused",
-    }:
-        raise AssertionError(f"invalid native report: {result}")
-    return result
+) -> int:
+    command = reference_command(root)
+    command.append("--force-confold" if policy == "keep_existing" else "--force-confnew")
+    if operation in ("install", "upgrade", "downgrade", "reinstall", "unpack"):
+        if not archives:
+            raise ValueError("archive lifecycle requires an archive")
+        command += ["--unpack" if operation == "unpack" else "--install"]
+        command += [str(path) for path in archives]
+    elif operation in ("configure", "remove", "purge"):
+        if not packages:
+            raise ValueError("existing-package lifecycle requires selected packages")
+        command += [f"--{operation}"]
+        command += [f"{p['name']}:{p['architecture']}" for p in packages]
+    else:
+        raise ValueError(f"unsupported lifecycle reference operation: {operation}")
+    log = destination / "reference.log"
+    with log.open("wb") as output:
+        result = subprocess.run(
+            command, env=environment, stdin=subprocess.DEVNULL,
+            stdout=output, stderr=subprocess.STDOUT, timeout=120, check=False,
+        )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"reference exited unexpectedly: {result.returncode}; {log}")
+    return result.returncode
 
 
 def fixture_environment(workspace: Path) -> dict[str, str]:

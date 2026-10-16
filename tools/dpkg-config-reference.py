@@ -109,13 +109,12 @@ def limit_contract() -> dict[str, int]:
     }
 
 
-LIFECYCLE_SPEC = importlib.util.spec_from_file_location(
-    "debz_config_lifecycle", ROOT / "tools/native-lifecycle-fixtures.py",
+MATERIALIZATION_SPEC = importlib.util.spec_from_file_location(
+    "debz_config_materialization", ROOT / "tools/native-materialization-fixtures.py",
 )
-assert LIFECYCLE_SPEC and LIFECYCLE_SPEC.loader
-lifecycle = importlib.util.module_from_spec(LIFECYCLE_SPEC)
-LIFECYCLE_SPEC.loader.exec_module(lifecycle)
-m = lifecycle.m
+assert MATERIALIZATION_SPEC and MATERIALIZATION_SPEC.loader
+m = importlib.util.module_from_spec(MATERIALIZATION_SPEC)
+MATERIALIZATION_SPEC.loader.exec_module(m)
 
 
 def canonical_json(document: Any) -> str:
@@ -300,7 +299,7 @@ def verify_source_bindings(reference: dict[str, Any]) -> None:
         raise OracleError("vendor config execution requirement identities changed")
 
     dpkg = source["dpkg"]
-    description = lifecycle.m.reference_description()
+    description = m.reference_description()
     if dpkg["version"] != description["version"]:
         raise OracleError("dpkg reference version binding changed")
     if dpkg["configuration_sha256"] != sha256_bytes(PINNED_DPKG_CONFIG):
@@ -732,10 +731,10 @@ def make_vendor_packages(
 def make_root(path: Path, architecture: str, *, instrumented: bool) -> None:
     m.make_root(path, architecture)
     (path / "var/log").mkdir(parents=True, exist_ok=True)
-    lifecycle.runtime.copy_program(path, Path("/bin/sh"), "/bin/sh")
+    m.copy_program(path, Path("/bin/sh"), "/bin/sh")
     if instrumented:
-        lifecycle.runtime.copy_program(path, Path("/usr/bin/env"), "/oracle-env")
-        lifecycle.runtime.copy_program(path, Path("/bin/sleep"), "/oracle-sleep")
+        m.copy_program(path, Path("/usr/bin/env"), "/oracle-env")
+        m.copy_program(path, Path("/bin/sleep"), "/oracle-sleep")
     for relative in FORBIDDEN_FRONTEND_PATHS:
         if os.path.lexists(path / relative):
             raise OracleError(f"ambient frontend contaminated fixture root: {relative}")
@@ -1807,7 +1806,7 @@ def select_reference(path: Path | None, architecture: str) -> str:
         selected = (
             ROOT
             / ".cache/native-dpkg-reference"
-            / lifecycle.m.reference_description()["version"]
+            / m.reference_description()["version"]
             / architecture
             / "usr/bin/dpkg"
         )
@@ -1816,7 +1815,7 @@ def select_reference(path: Path | None, architecture: str) -> str:
                 "missing pinned dpkg reference; run "
                 "zig-out/bin/debz-native-dpkg-reference as the build user"
             )
-    return lifecycle.m.select_reference(selected, architecture)
+    return m.select_reference(selected, architecture)
 
 
 def write_capture(path: Path, observed: dict[str, Any]) -> None:

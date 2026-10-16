@@ -277,5 +277,6 @@ remain separate from these hermetic required tests.
 `zig build build-real-snapshot-reference-triggers test-real-snapshot-reference-triggers`
 builds and tests `debz-real-snapshot-reference-triggers` (`tools/real-snapshot-reference-triggers.zig`),
 retiring `tools/test_real_snapshot_reference_triggers.py`, `tools/native-trigger-fixtures.py`,
-and `tools/native_diversion_settlement_oracle.py`.
+`tools/native_diversion_settlement_oracle.py`, `tools/native-differential.py`, and
+`tools/native-lifecycle-fixtures.py`.
 

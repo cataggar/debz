@@ -447,14 +447,25 @@ test "real-root capture matches the Python snapshot schema and semantics" {
     try Io.Dir.hardLink(fixture.dir, "root/usr/share/demo/data", fixture.dir, "root/usr/share/demo/hardlink", io, .{});
     try fixture.dir.symLink(io, "data", "root/usr/share/demo/link", .{});
     try fixture.write("root/var/log/debz-native-differential.trace", "install\n\nupgrade\n", 0o644);
-    const expected = try fixture.absolute("python.json");
-    const program = try std.fs.path.join(a, &.{ options.repository, "tools/native-differential.py" });
-    try fixture.run(&.{
-        "python3", program, "capture", "--root", root, "--exclude", "dev/null", "--output", expected,
-    }, "python.log", 30);
-    const python = try readJson(a, io, expected, 1024 * 1024);
+    const captured_path = try fixture.absolute("captured.json");
+    try std.testing.expectEqual(@as(u8, 0), try run(a, io, &.{
+        "capture", "--root", root, "--exclude", "dev/null", "--output", captured_path,
+    }));
+    const captured = try readJson(a, io, captured_path, 1024 * 1024);
     const zig = try snapshot(a, io, root, .{}, &.{"dev/null"});
-    try std.testing.expect(try compare(a, python, zig, 20));
+    try std.testing.expect(try compare(a, captured, zig, 20));
+    try std.testing.expectEqual(@as(u8, 0), try run(a, io, &.{
+        "compare", "--reference", captured_path, "--candidate", captured_path,
+    }));
+    const trace = try field(captured, "trace");
+    try std.testing.expectEqual(@as(usize, 3), trace.array.items.len);
+    try std.testing.expectEqualStrings("install", try string(trace.array.items[0]));
+    try std.testing.expectEqualStrings("", try string(trace.array.items[1]));
+    try std.testing.expectEqualStrings("upgrade", try string(trace.array.items[2]));
+    const dpkg = try field(captured, "dpkg");
+    const status = try field(dpkg, "status");
+    try std.testing.expectEqual(@as(usize, 1), status.array.items.len);
+    try std.testing.expectEqualStrings("first\nsecond", try string(try field(status.array.items[0], "description")));
 }
 
 test "snapshot CLI normalizes semantic status and database order" {
