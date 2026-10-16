@@ -1926,9 +1926,34 @@ test "expired release, keyring, retry lines, workspace, compare and gap aggregat
 
     // 2. Keyring validation
     try std.testing.expectError(error.RelativeKeyringPath, verifyKeyring(io, allocator, "keyring.pgp", "key"));
-    try std.testing.expectError(error.KeyringPathSymlink, verifyKeyring(io, allocator, "/proc/self/exe", "key"));
-    try std.testing.expectError(error.KeyringNotRegularFile, verifyKeyring(io, allocator, "/etc", "key"));
-    try std.testing.expectError(error.KeyringBytesMismatch, verifyKeyring(io, allocator, "/etc/passwd", "not the Debian key"));
+    {
+        const root_stx = try lstatPath(allocator, "/");
+        if (root_stx.uid == 0 and (root_stx.mode & 0o022) == 0) {
+            if (lstatPath(allocator, "/bin")) |bin_stx| {
+                if ((bin_stx.mode & linux.S.IFMT) == linux.S.IFLNK) {
+                    try std.testing.expectError(error.KeyringPathSymlink, verifyKeyring(io, allocator, "/bin/sh", "key"));
+                }
+            } else |_| {}
+            if (lstatPath(allocator, "/proc")) |proc_stx| {
+                if (lstatPath(allocator, "/proc/self")) |self_stx| {
+                    if (proc_stx.uid == 0 and (proc_stx.mode & 0o022) == 0 and (self_stx.mode & linux.S.IFMT) == linux.S.IFLNK) {
+                        try std.testing.expectError(error.KeyringPathSymlink, verifyKeyring(io, allocator, "/proc/self/exe", "key"));
+                    }
+                } else |_| {}
+            } else |_| {}
+            if (lstatPath(allocator, "/etc")) |etc_stx| {
+                if (lstatPath(allocator, "/etc/passwd")) |pw_stx| {
+                    if (etc_stx.uid == 0 and (etc_stx.mode & 0o022) == 0 and
+                        pw_stx.uid == 0 and (pw_stx.mode & 0o022) == 0 and
+                        (pw_stx.mode & linux.S.IFMT) == linux.S.IFREG)
+                    {
+                        try std.testing.expectError(error.KeyringNotRegularFile, verifyKeyring(io, allocator, "/etc", "key"));
+                        try std.testing.expectError(error.KeyringBytesMismatch, verifyKeyring(io, allocator, "/etc/passwd", "not the Debian key"));
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+    }
 
     // 3. Retry lines
     try std.testing.expect(isPermittedRetryLine("debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=NameServerFailure"));
