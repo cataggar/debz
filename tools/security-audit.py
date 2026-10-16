@@ -2137,7 +2137,7 @@ WORKLOAD_PARTITIONS = {
     )),
     "workload_release": ("test-workload-release", (
         "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests", "release_tool_tests",
-        "run_release_policy_tests",
+        "run_release_policy_tests", "run_release_workflow_policy_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
@@ -5604,6 +5604,8 @@ def liblzma_decoder_configuration_failures(text: str) -> list[str]:
 
 NATIVE_RELEASE_CORE_PATHS = (
     "build.zig", "build/liblzma.zig", "tools/release.zig", "tools/release.py",
+    "tools/release-workflow-policy.zig", "tools/release-workflow-policy.py",
+    "tools/test_release_workflow_policy.py", ".github/workflows/ci.yml",
     "test/release-tooling.zig", "tools/test-release-install.sh",
 )
 
@@ -5614,12 +5616,31 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
             'b.path("tools/release.zig")',
             "b.getInstallStep().dependOn(&install_release_tool.step);",
             "workload_release.dependOn(&release_tool_tests.step);",
+            'b.path("tools/release-workflow-policy.zig")',
+            "b.getInstallStep().dependOn(&install_release_workflow_policy.step);",
+            "workload_release.dependOn(&run_release_workflow_policy_tests.step);",
+            "audit_step.dependOn(&run_release_workflow_policy_tests.step);",
+            "run_release_workflow_policy_tests.step.dependOn(&install_release_tool.step);",
+            "run_release_workflow_policy_tests.step.dependOn(&install_release_workflow_policy.step);",
             'release_test_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-release"));',
             'release_policy_tests.root_module.addOptions("release_test_options", release_test_options);',
             "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
             "const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);",
             "const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);",
             "release_tool_module.linkLibrary(release_liblzma);",
+        ),
+        "tools/release-workflow-policy.zig": (
+            "pub fn auditReleaseCoreBootstrap(",
+            "pub fn auditZigInstallation(",
+            "pub fn auditCiConcurrency(",
+            "pub fn auditGhrSmoke(",
+            "pub fn auditRepository(",
+            'try cleaned.put("PATH", "/no-host-interpreters");',
+            '.argv = &.{ release_tool_path, "dry-run", "--tag", "v0.1.0" },',
+        ),
+        ".github/workflows/ci.yml": (
+            "zig build build-release-workflow-policy -j2",
+            "PATH=/no-host-interpreters zig-out/bin/debz-release-workflow-policy",
         ),
         "build/liblzma.zig": (
             "pub fn addStaticEncoderLibrary(",
@@ -5664,7 +5685,13 @@ def native_release_core_failures(texts: dict[str, str]) -> list[str]:
         for path, tokens in required.items()
         if any(token not in texts.get(path, "") for token in tokens)
     ]
-    if texts.get("tools/release.py", ""):
+    if (
+        texts.get("tools/release.py", "")
+        or texts.get("tools/release-workflow-policy.py", "")
+        or texts.get("tools/test_release_workflow_policy.py", "")
+        or "tools/release-workflow-policy.py" in texts.get(".github/workflows/ci.yml", "")
+        or "tools/test_release_workflow_policy.py" in texts.get("build.zig", "")
+    ):
         failures.append("tools/release.py: retired Python release implementation was restored")
     build = texts.get("build.zig", "")
     release_module = build.partition("\nfn addReleaseToolModule(")[2].partition("\n}\n")[0]
