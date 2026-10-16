@@ -413,6 +413,35 @@ pub fn build(b: *std.Build) void {
     b.step("test-release-tool", "Test native release tags and complete static ELF mapping refusals").dependOn(&release_tool_tests.step);
     workload_release.dependOn(&release_tool_tests.step);
 
+    const release_workflow_policy_module = b.createModule(.{
+        .root_source_file = b.path("tools/release-workflow-policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const release_workflow_policy = b.addExecutable(.{
+        .name = "debz-release-workflow-policy",
+        .root_module = release_workflow_policy_module,
+    });
+    const install_release_workflow_policy = b.addInstallArtifact(release_workflow_policy, .{});
+    b.getInstallStep().dependOn(&install_release_workflow_policy.step);
+    b.step("build-release-workflow-policy", "Build the native release workflow policy auditor").dependOn(&install_release_workflow_policy.step);
+    const release_workflow_policy_options = b.addOptions();
+    release_workflow_policy_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
+    release_workflow_policy_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-release-workflow-policy"));
+    release_workflow_policy_options.addOption([]const u8, "release_executable", getInstallPath(b, .bin, "debz-release"));
+    const release_workflow_policy_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/release-workflow-policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    release_workflow_policy_test_module.addOptions("release_workflow_policy_options", release_workflow_policy_options);
+    const run_release_workflow_policy_tests = b.addRunArtifact(b.addTest(.{ .root_module = release_workflow_policy_test_module }));
+    run_release_workflow_policy_tests.setCwd(b.path("."));
+    run_release_workflow_policy_tests.step.dependOn(&install_release_tool.step);
+    run_release_workflow_policy_tests.step.dependOn(&install_release_workflow_policy.step);
+    b.step("test-release-workflow-policy", "Test native release and CI workflow policy audit").dependOn(&run_release_workflow_policy_tests.step);
+    workload_release.dependOn(&run_release_workflow_policy_tests.step);
+
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
@@ -870,7 +899,6 @@ pub fn build(b: *std.Build) void {
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
-            "tools/test_release_workflow_policy.py",
             "tools/test_debian_stable_closure.py",
             "tools/test_real_snapshot_repin.py",
         },
@@ -878,12 +906,11 @@ pub fn build(b: *std.Build) void {
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
     audit_tests.setEnvironmentVariable("DEBZ_DEBIAN_STABLE_READINESS", getInstallPath(b, .bin, "debz-debian-stable-readiness"));
-    audit_tests.setEnvironmentVariable("DEBZ_RELEASE", getInstallPath(b, .bin, "debz-release"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_tests.step.dependOn(&install_debian_readiness.step);
-    audit_tests.step.dependOn(&install_release_tool.step);
     audit_step.dependOn(&audit_tests.step);
+    audit_step.dependOn(&run_release_workflow_policy_tests.step);
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),
         .target = target,
@@ -1004,9 +1031,11 @@ pub fn build(b: *std.Build) void {
     run_release_policy_tests.step.dependOn(&install_release_tool.step);
     release_test_step.dependOn(&release_tool_tests.step);
     release_test_step.dependOn(&run_release_policy_tests.step);
+    release_test_step.dependOn(&run_release_workflow_policy_tests.step);
     const release_consumer_step = b.step("test-release-consumers", "Run native release core and actual packaging consumers without rebuilding GNU install");
     release_consumer_step.dependOn(&release_tool_tests.step);
     release_consumer_step.dependOn(&run_release_policy_tests.step);
+    release_consumer_step.dependOn(&run_release_workflow_policy_tests.step);
     workload_release.dependOn(&run_release_policy_tests.step);
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),

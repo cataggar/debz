@@ -2862,7 +2862,8 @@ jobs:
       - name: Audit release workflow policy
         run: |
           zig build build-release-tool -j2
-          tools/release-workflow-policy.py
+          zig build build-release-workflow-policy -j2
+          PATH=/no-host-interpreters zig-out/bin/debz-release-workflow-policy
 
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)

@@ -1097,7 +1097,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 63), members);
+    try testing.expectEqual(@as(usize, 64), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1851,8 +1851,20 @@ test "security: actual release core consumes native tags plans ELF mappings and 
     defer f.deinit();
     try nativeMutations(&f, "native-release-core", "build.zig", &.{
         "workload_release.dependOn(&release_tool_tests.step);",
+        "workload_release.dependOn(&run_release_workflow_policy_tests.step);",
+        "audit_step.dependOn(&run_release_workflow_policy_tests.step);",
+        "run_release_workflow_policy_tests.step.dependOn(&install_release_workflow_policy.step);",
         "run_release_policy_tests.step.dependOn(&install_release_tool.step);",
         "release_tool_module.linkLibrary(release_liblzma);",
+    });
+    try nativeMutations(&f, "native-release-core", "tools/release-workflow-policy.zig", &.{
+        "pub fn auditReleaseCoreBootstrap(",
+        "pub fn auditZigInstallation(",
+        "try cleaned.put(\"PATH\", \"/no-host-interpreters\");",
+    });
+    try nativeMutations(&f, "native-release-core", ".github/workflows/ci.yml", &.{
+        "zig build build-release-workflow-policy -j2",
+        "PATH=/no-host-interpreters zig-out/bin/debz-release-workflow-policy",
     });
     try nativeMutationsIn(&f, "native-release-core", "test/release-tooling.zig", "fn release(", "fn releaseFile(", &.{
         "argv[0] = @import(\"release_test_options\").executable;",
