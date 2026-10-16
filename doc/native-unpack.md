@@ -285,8 +285,9 @@ targets. Their default workloads and CI still run all profiles.
 
 ### Mid-unpack reference specification
 
-`tools/native_diversion_settlement_oracle.py` codifies 24 pinned-dpkg upgrade
-profiles and 16 subsequent successful invocations. The default
+`test/native_diversion_settlement.zig` codifies 24 pinned-dpkg upgrade
+profiles and 16 subsequent successful invocations (replacing the retired
+`tools/native_diversion_settlement_oracle.py`). The default
 `test-native-triggers` workload executes every profile independently through
 native and reference roots, then compares exact outcomes and observations.
 The corpus covers successful, unwind, rollback and later-postinst-failure

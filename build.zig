@@ -424,6 +424,20 @@ pub fn build(b: *std.Build) void {
     b.step("test-debian-stable-closure", "Test native Debian stable closure locks, signed records and evidence refusals").dependOn(&debian_closure_tests.step);
     workload_core.dependOn(&debian_closure_tests.step);
 
+    const reference_triggers_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-triggers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_triggers = b.addExecutable(.{ .name = "debz-real-snapshot-reference-triggers", .root_module = reference_triggers_module });
+    const install_reference_triggers = b.addInstallArtifact(reference_triggers, .{});
+    b.getInstallStep().dependOn(&install_reference_triggers.step);
+    b.step("build-real-snapshot-reference-triggers", "Build unprivileged pinned-dpkg trigger scheduling proof tooling").dependOn(&install_reference_triggers.step);
+    const reference_triggers_tests = b.addRunArtifact(b.addTest(.{ .root_module = reference_triggers_module }));
+    reference_triggers_tests.step.dependOn(&install_reference_triggers.step);
+    b.step("test-real-snapshot-reference-triggers", "Test unprivileged pinned-dpkg trigger scheduling proof and verification refusals").dependOn(&reference_triggers_tests.step);
+    workload_core.dependOn(&reference_triggers_tests.step);
+
     const release_tool_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency);
     // Unoptimized level-9 gzip/XZ encoding of a complete release tree takes
     // minutes, so the installed packager and its encoder are always ReleaseSafe,
@@ -900,6 +914,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-real-snapshot-policy", "Run real-snapshot policy and exec-trace audit tests")
         .dependOn(&run_snapshot_policy_tests.step);
     audit_step.dependOn(&run_snapshot_policy_tests.step);
+    audit_step.dependOn(&reference_triggers_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{
