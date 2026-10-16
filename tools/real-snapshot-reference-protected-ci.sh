@@ -565,7 +565,8 @@ step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree
 stage_native_inputs() {
   step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize="$native_optimize" -j2
   step native-outcome-build 0 "" "${zenv[@]}" "$zig" build build-native-outcome test-native-outcome \
-    build-native-phase-summary test-native-phase-summary -Doptimize="$native_optimize" -j2
+    build-native-phase-summary test-native-phase-summary build-exec-audit test-exec-audit \
+    -Doptimize="$native_optimize" -j2
   "$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \
     --download-archive "$tree/reference-dpkg.deb"
   dpkg-deb --extract "$tree/reference-dpkg.deb" "$tree/reference-dpkg"

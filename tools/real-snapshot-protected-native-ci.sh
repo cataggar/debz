@@ -30,6 +30,7 @@ for relative in ("tools/real-snapshot-protected-native-ci.sh",
                  "tools/real_snapshot_reference_paths.py",
                  "zig-out/bin/debz-native-outcome",
                  "zig-out/bin/debz-native-phase-summary",
+                 "zig-out/bin/debz-exec-audit",
                  "zig-out/bin/debz", "zig-out/bin/native-differential",
                  "zig-out/bin/real-snapshot-comparator"):
     protected(checkout / relative)
