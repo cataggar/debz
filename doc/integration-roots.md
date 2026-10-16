@@ -1134,8 +1134,9 @@ lock, but a selected fixture postinst directly executed B's postinst
 Thus selector isolation applies only to dpkg's own scheduler, not to commands
 inside an authorized maintainer script. These disposable fixtures do not
 authorize arbitrary signed scripts.
-`tools/test_real_snapshot_reference_triggers.py` requires an explicitly
-selected, SHA256-checked pinned dpkg fixture and never runs as root.
+`tools/real-snapshot-reference-triggers.zig` (`debz-real-snapshot-reference-triggers`)
+requires an explicitly selected, SHA256-checked pinned dpkg fixture and never
+runs as root.
 
 For the amd64 reference closure (#265), `tools/real-snapshot-reference-order.py`
 and `tools/real-snapshot-reference-launcher.zig` process pending triggers one

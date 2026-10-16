@@ -1097,7 +1097,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 65), members);
+    try testing.expectEqual(@as(usize, 66), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -2855,15 +2855,17 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
     var f = try Fixture.init();
     defer f.deinit();
     for ([_][]const u8{
-        "tools/test-native-lifecycle.py", "tools/test_native_lifecycle.py",
-        "tools/test-native-triggers.py",  "tools/test_native_triggers.py",
-        "tools/test-native-recovery.py",  "tools/test_native_recovery.py",
+        "tools/test-native-lifecycle.py",            "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",             "tools/test_native_triggers.py",
+        "tools/test-native-recovery.py",             "tools/test_native_recovery.py",
+        "tools/native-trigger-fixtures.py",          "tools/native_diversion_settlement_oracle.py",
+        "tools/test_real_snapshot_reference_triggers.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();
         try restored.failsWith("retired Python test entry point still exists");
     }
-    for ([_][]const u8{ "tools/native-lifecycle-fixtures.py", "tools/native-trigger-fixtures.py" }) |path| {
+    for ([_][]const u8{"tools/native-lifecycle-fixtures.py"}) |path| {
         const source = try f.source(path);
         const valid = try nativeCheck(&f, "native-fixtures", path, source);
         defer valid.deinit();
@@ -2882,7 +2884,7 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         }
     }
     for ([_][]const u8{
-        "tools/native-trigger-fixtures.py",              "tools/dpkg-config-reference.py",
+        "tools/dpkg-config-reference.py",
         "actions/install/__tests__/integration.test.ts",
     }) |path| {
         const source = try f.source(path);

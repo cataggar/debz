@@ -67,6 +67,7 @@ REMOVED_TEST_ENTRY_POINTS = {
     "tools/test_security_audit.py",
     "tools/test_real_snapshot_acceptance.py",
     "tools/test_debian_stable_closure.py",
+    "tools/test_real_snapshot_reference_triggers.py",
 }
 
 SHA256_TOKEN = re.compile(
@@ -2112,6 +2113,7 @@ WORKLOAD_PARTITIONS = {
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
+        "reference_triggers_tests",
         "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
     "workload_production": ("test-workload-production", (
@@ -6301,13 +6303,15 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
         "tools/test_native_triggers.py",
         "tools/test-native-recovery.py",
         "tools/test_native_recovery.py",
+        "tools/native-trigger-fixtures.py",
+        "tools/native_diversion_settlement_oracle.py",
+        "tools/test_real_snapshot_reference_triggers.py",
     )
     for relative in retired:
         if relative in texts:
             failures.append(f"{relative}: retired Python test entry point still exists")
     for relative in (
         "tools/native-lifecycle-fixtures.py",
-        "tools/native-trigger-fixtures.py",
     ):
         source = texts.get(relative)
         if source is None:
@@ -6318,7 +6322,6 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
         ):
             failures.append(f"{relative}: fixture module restored a Python CLI entry point")
     for consumer, fixture in (
-        ("tools/native-trigger-fixtures.py", "native-lifecycle-fixtures.py"),
         ("tools/dpkg-config-reference.py", "native-lifecycle-fixtures.py"),
         ("actions/install/__tests__/integration.test.ts", "native-lifecycle-fixtures.py"),
     ):
@@ -6435,8 +6438,10 @@ def audit_ci_pins() -> None:
         "tools/test_native_triggers.py",
         "tools/test-native-recovery.py",
         "tools/test_native_recovery.py",
-        "tools/native-lifecycle-fixtures.py",
         "tools/native-trigger-fixtures.py",
+        "tools/native_diversion_settlement_oracle.py",
+        "tools/test_real_snapshot_reference_triggers.py",
+        "tools/native-lifecycle-fixtures.py",
         "tools/dpkg-config-reference.py",
         "actions/install/__tests__/integration.test.ts",
     )
@@ -6445,12 +6450,12 @@ def audit_ci_pins() -> None:
         for relative in fixture_paths
         if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
     }
-    for relative in fixture_paths[:6]:
+    for relative in fixture_paths[:9]:
         if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
             fixture_texts[relative] = ""
     for failure in native_lifecycle_fixture_failures(fixture_texts):
         fail(failure)
-    for relative in fixture_paths[6:8]:
+    for relative in fixture_paths[9:10]:
         path = ROOT / relative
         if path.is_symlink() or (path.is_file() and path.stat().st_mode & 0o111):
             fail(f"{relative}: import-only fixture must not be executable or a symlink")
@@ -7489,6 +7494,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             ),
             "native-fixtures": (
                 "tools/native-lifecycle-fixtures.py", "tools/native-trigger-fixtures.py",
+                "tools/native_diversion_settlement_oracle.py",
+                "tools/test_real_snapshot_reference_triggers.py",
                 "tools/dpkg-config-reference.py",
                 "actions/install/__tests__/integration.test.ts",
                 "tools/test-native-lifecycle.py", "tools/test_native_lifecycle.py",
