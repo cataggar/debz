@@ -1708,7 +1708,7 @@ fn observeManagedEntry(
                 maximum_managed_directory_name_bytes,
             );
             defer observation.deinit();
-            std.mem.sort(
+            std.sort.heap(
                 root_fs.DirectoryMember,
                 observation.members,
                 {},
@@ -1964,7 +1964,7 @@ pub fn updateManagedState(
     }
     if (paths.items.len > maximum_managed_paths)
         return error.ManagedStateLimit;
-    std.mem.sort([]const u8, paths.items, {}, lessManagedPath);
+    std.sort.heap([]const u8, paths.items, {}, lessManagedPath);
     const entries = try allocator.alloc(ManagedEntry, paths.items.len);
     var initialized: usize = 0;
     defer {
@@ -2713,7 +2713,7 @@ fn journalDirectoryMembership(
     defer pinned.close();
     var directory = try pinned.observeAlloc(allocator, maximum_managed_directory_entries, maximum_managed_directory_name_bytes);
     defer directory.deinit();
-    std.mem.sort(root_fs.DirectoryMember, directory.members, {}, lessDirectoryMember);
+    std.sort.heap(root_fs.DirectoryMember, directory.members, {}, lessDirectoryMember);
     const live_digest = try managedDirectoryDigest(allocator, directory.members);
     if (observed.directory_sha256 == null or
         !std.mem.eql(u8, &live_digest, &observed.directory_sha256.?))
@@ -2746,7 +2746,7 @@ fn journalDirectoryMembership(
         } });
     }
     if (normalized.items.len > maximum_managed_directory_entries) return error.ManagedStateLimit;
-    std.mem.sort(ManagedDirectoryMember, normalized.items, {}, struct {
+    std.sort.heap(ManagedDirectoryMember, normalized.items, {}, struct {
         fn less(_: void, left: ManagedDirectoryMember, right: ManagedDirectoryMember) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }

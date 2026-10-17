@@ -593,8 +593,8 @@ pub fn snapshot(
         );
     }
     if (exclusions.items.len > request.limits.max_exclusions) return error.TooManyExclusions;
-    std.mem.sort(KeyCandidate, candidates.items, {}, lessKeyCandidate);
-    std.mem.sort(Exclusion, exclusions.items, {}, lessExclusion);
+    std.sort.heap(KeyCandidate, candidates.items, {}, lessKeyCandidate);
+    std.sort.heap(Exclusion, exclusions.items, {}, lessExclusion);
 
     var keyring_materials: std.ArrayList(KeyringMaterial) = .empty;
     defer keyring_materials.deinit(allocator);
@@ -745,7 +745,7 @@ fn discoverSources(
         else => return err,
     };
     defer listing.deinit();
-    std.mem.sort(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
+    std.sort.heap(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
     for (listing.entries) |entry| {
         if (!safeLeaf(entry.name)) return error.UnsafeDirectoryEntry;
         if (!validAptFragmentFilename(entry.name)) continue;
@@ -774,7 +774,7 @@ fn discoverSources(
         );
     }
     if (materials.items.len > request.limits.max_sources) return error.TooManySources;
-    std.mem.sort(SourceMaterial, materials.items, {}, lessSourceMaterial);
+    std.sort.heap(SourceMaterial, materials.items, {}, lessSourceMaterial);
     return owned.dupe(SourceMaterial, materials.items);
 }
 
@@ -895,7 +895,7 @@ fn appendDirectoryExclusions(
         else => return err,
     };
     defer listing.deinit();
-    std.mem.sort(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
+    std.sort.heap(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
     for (listing.entries) |entry| {
         if (!safeLeaf(entry.name)) return error.UnsafeDirectoryEntry;
         const apt_filename = purpose != .source or validAptFragmentFilename(entry.name);
@@ -954,7 +954,7 @@ fn discoverGlobalKeyringCandidates(
         else => return err,
     };
     defer listing.deinit();
-    std.mem.sort(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
+    std.sort.heap(DirectoryEntry, listing.entries, {}, lessDirectoryEntry);
     for (listing.entries) |entry| {
         if (!safeLeaf(entry.name)) return error.UnsafeDirectoryEntry;
         const eligible = std.mem.endsWith(u8, entry.name, ".gpg") or
@@ -1112,7 +1112,7 @@ fn discoverArchitecture(
             if (!duplicate) try foreign.append(allocator, try owned.dupe(u8, value));
         }
     }
-    std.mem.sort([]const u8, foreign.items, {}, lessString);
+    std.sort.heap([]const u8, foreign.items, {}, lessString);
     return .{
         .native = native_value,
         .foreign = try owned.dupe([]const u8, foreign.items),
@@ -1155,7 +1155,7 @@ fn createManifestVersion(
             return error.InvalidArchitecture;
         foreign[index] = try owned.dupe(u8, architecture);
     }
-    std.mem.sort([]const u8, foreign, {}, lessString);
+    std.sort.heap([]const u8, foreign, {}, lessString);
     for (foreign, 0..) |architecture, index| {
         if (index != 0 and std.mem.eql(u8, architecture, foreign[index - 1]))
             return error.InvalidArchitecture;
@@ -1171,7 +1171,7 @@ fn createManifestVersion(
         sources[index] = record;
         sources[index].logical_path = try owned.dupe(u8, record.logical_path);
     }
-    std.mem.sort(SourceRecord, sources, {}, lessSourceRecord);
+    std.sort.heap(SourceRecord, sources, {}, lessSourceRecord);
     for (sources, 0..) |record, index| {
         if (index != 0 and std.mem.eql(u8, record.logical_path, sources[index - 1].logical_path))
             return error.DuplicateSource;
@@ -1179,7 +1179,7 @@ fn createManifestVersion(
 
     if (!validLowerHex(&input.configuration_id)) return error.InvalidIdentity;
     const repository_ids = try owned.dupe([64]u8, input.repository_ids);
-    std.mem.sort([64]u8, repository_ids, {}, lessId);
+    std.sort.heap([64]u8, repository_ids, {}, lessId);
     for (repository_ids, 0..) |id, index| {
         if (!validLowerHex(&id)) return error.InvalidIdentity;
         if (index != 0 and std.mem.eql(u8, &id, &repository_ids[index - 1]))
@@ -1199,7 +1199,7 @@ fn createManifestVersion(
         if (input.repository_policies.len != repository_ids.len)
             return error.InvalidIdentity;
         @memcpy(repository_policies, input.repository_policies);
-        std.mem.sort(
+        std.sort.heap(
             RepositoryPolicyRecord,
             repository_policies,
             {},
@@ -1220,7 +1220,7 @@ fn createManifestVersion(
         if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
         if (record.primary_fingerprints.len == 0) return error.MissingFingerprint;
         const fingerprints = try owned.dupe([20]u8, record.primary_fingerprints);
-        std.mem.sort([20]u8, fingerprints, {}, lessFingerprint);
+        std.sort.heap([20]u8, fingerprints, {}, lessFingerprint);
         for (fingerprints, 0..) |fingerprint, fingerprint_index| {
             if (fingerprint_index != 0 and std.mem.eql(
                 u8,
@@ -1232,7 +1232,7 @@ fn createManifestVersion(
         keyrings[index].logical_path = try owned.dupe(u8, record.logical_path);
         keyrings[index].primary_fingerprints = fingerprints;
     }
-    std.mem.sort(KeyringRecord, keyrings, {}, lessKeyringRecord);
+    std.sort.heap(KeyringRecord, keyrings, {}, lessKeyringRecord);
     for (keyrings, 0..) |record, index| {
         if (index != 0 and std.mem.eql(u8, record.logical_path, keyrings[index - 1].logical_path))
             return error.DuplicateKeyring;
@@ -1246,7 +1246,7 @@ fn createManifestVersion(
             .reason = exclusion.reason,
         };
     }
-    std.mem.sort(Exclusion, exclusions, {}, lessExclusion);
+    std.sort.heap(Exclusion, exclusions, {}, lessExclusion);
     for (exclusions, 0..) |exclusion, index| {
         if (index != 0 and
             std.mem.eql(u8, exclusion.logical_path, exclusions[index - 1].logical_path))

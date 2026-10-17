@@ -254,7 +254,7 @@ pub fn create(
         if (!validArchitecture(architecture)) return error.InvalidArchitecture;
         foreign[index] = try owned.dupe(u8, architecture);
     }
-    std.mem.sort([]const u8, foreign, {}, lessText);
+    std.sort.heap([]const u8, foreign, {}, lessText);
     for (foreign, 0..) |architecture, index| {
         if (index != 0 and std.mem.eql(u8, architecture, foreign[index - 1]))
             return error.DuplicateArchitecture;

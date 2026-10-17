@@ -1034,7 +1034,7 @@ const Builder = struct {
 
         const info_writes = try self.scratch.dupe(PlannedWrite, self.writes.items);
         defer self.scratch.free(info_writes);
-        std.mem.sort(PlannedWrite, info_writes, {}, lessWrite);
+        std.sort.heap(PlannedWrite, info_writes, {}, lessWrite);
         for (info_writes, 0..) |write, index| {
             if (index != 0 and std.mem.eql(u8, info_writes[index - 1].path, write.path)) {
                 return self.fail(.conflicting_change, "");
@@ -1080,8 +1080,8 @@ const Builder = struct {
                 if (interest.trigger.len != 0 and interest.trigger[0] != '/')
                     try new_named.append(self.scratch, interest.trigger);
             }
-            std.mem.sort([]const u8, old_named.items, {}, lessText);
-            std.mem.sort([]const u8, new_named.items, {}, lessText);
+            std.sort.heap([]const u8, old_named.items, {}, lessText);
+            std.sort.heap([]const u8, new_named.items, {}, lessText);
             var previous: ?[]const u8 = null;
             for (old_named.items) |name| {
                 if (previous) |value| {

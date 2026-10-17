@@ -596,7 +596,7 @@ pub const Context = opaque {
         const record_order = try state.allocator.alloc(usize, input.packages.records.len);
         defer state.allocator.free(record_order);
         for (record_order, 0..) |*slot, index| slot.* = index;
-        std.mem.sort(usize, record_order, input.packages.records, lessAvailableRecordIndex);
+        std.sort.heap(usize, record_order, input.packages.records, lessAvailableRecordIndex);
         for (record_order) |record_index| {
             const record = input.packages.records[record_index];
             const solvable_id = libsolv.repo_add_solvable(repo);
@@ -1122,8 +1122,8 @@ fn planTransactionInternal(
     defer allocator.free(repository_lookup_order);
     for (repository_order, 0..) |*slot, index| slot.* = index;
     @memcpy(repository_lookup_order, repository_order);
-    std.mem.sort(usize, repository_order, input.repositories, lessRepositoryIndex);
-    std.mem.sort(
+    std.sort.heap(usize, repository_order, input.repositories, lessRepositoryIndex);
+    std.sort.heap(
         usize,
         repository_lookup_order,
         input.repositories,
@@ -1191,7 +1191,7 @@ fn planTransactionInternal(
     defer context.destroy();
     const installed_records = try allocator.dupe(dpkg_status.Package, input.installed.records);
     defer allocator.free(installed_records);
-    std.mem.sort(dpkg_status.Package, installed_records, {}, lessInstalledRecord);
+    std.sort.heap(dpkg_status.Package, installed_records, {}, lessInstalledRecord);
     var installed_input = input.installed;
     installed_input.records = installed_records;
     const imported = try context.importInstalled(installed_input);
@@ -1249,7 +1249,7 @@ fn planTransactionInternal(
         const origin_order = try allocator.alloc(usize, state.origins.items.len);
         defer allocator.free(origin_order);
         for (origin_order, 0..) |*slot, index| slot.* = index;
-        std.mem.sort(usize, origin_order, state, lessOriginIndex);
+        std.sort.heap(usize, origin_order, state, lessOriginIndex);
         if (try addExactLockV2Jobs(
             allocator,
             arena_ptr,
@@ -1268,7 +1268,7 @@ fn planTransactionInternal(
         const origin_order = try allocator.alloc(usize, state.origins.items.len);
         defer allocator.free(origin_order);
         for (origin_order, 0..) |*slot, index| slot.* = index;
-        std.mem.sort(usize, origin_order, state, lessOriginIndex);
+        std.sort.heap(usize, origin_order, state, lessOriginIndex);
         if (try addExactLockV3Jobs(
             allocator,
             arena_ptr,
@@ -1422,7 +1422,7 @@ fn planTransactionInternal(
         }
     }
     const ordered_actions = try materializeOrdering(owned, actions.items, input.installed.records.len == 0);
-    std.mem.sort(PlanAction, actions.items, {}, lessAction);
+    std.sort.heap(PlanAction, actions.items, {}, lessAction);
     const action_slice = try actions.toOwnedSlice(owned);
     const summary = summarizeActions(action_slice, download_bytes, size_delta);
     const target = try owned.dupe(u8, input.target_architecture);
@@ -1534,7 +1534,7 @@ fn canonicalSelectorRequest(
     selectors: []const PackageSelector,
 ) !CanonicalPlanRequest {
     const canonical = try allocator.dupe(PackageSelector, selectors);
-    std.mem.sort(PackageSelector, canonical, {}, lessPackageSelector);
+    std.sort.heap(PackageSelector, canonical, {}, lessPackageSelector);
     return .{
         .request = @unionInit(PlanRequest, @tagName(tag), canonical),
         .selectors = canonical,
@@ -2718,7 +2718,7 @@ fn materializeProblems(
     if (problems.items.len == 0) {
         try problems.append(owned, .{ .kind = .conflict, .detail = "solver reported an unclassified contradiction" });
     }
-    std.mem.sort(ProblemNode, problems.items, {}, lessProblem);
+    std.sort.heap(ProblemNode, problems.items, {}, lessProblem);
     for (problems.items, 0..) |*item, index| item.id = index;
     return .{
         .problems = try problems.toOwnedSlice(owned),

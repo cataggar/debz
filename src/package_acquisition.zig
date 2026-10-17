@@ -491,7 +491,7 @@ pub const Cache = struct {
         }
         const retained = try allocator.dupe(Digest, options.retained);
         defer allocator.free(retained);
-        std.mem.sort(Digest, retained, {}, lessDigest);
+        std.sort.heap(Digest, retained, {}, lessDigest);
         var iterator = self.objects.iterate();
         while (try iterator.next(self.io)) |entry| {
             if (names.items.len == options.maximum_directory_entries)
@@ -853,7 +853,7 @@ fn validCacheKey(value: []const u8) bool {
 }
 
 fn sortNames(names: [][]u8) void {
-    std.mem.sort([]u8, names, {}, struct {
+    std.sort.heap([]u8, names, {}, struct {
         fn less(_: void, a: []u8, b: []u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

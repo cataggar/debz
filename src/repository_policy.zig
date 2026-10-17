@@ -360,7 +360,7 @@ fn normalizeInternal(
         }
     }
 
-    std.mem.sort(NormalizedRepository, repositories.items, {}, lessRepository);
+    std.sort.heap(NormalizedRepository, repositories.items, {}, lessRepository);
     for (repositories.items, 0..) |repository, index| {
         for (repositories.items[0..index]) |previous| {
             if (sameTarget(previous, repository)) {
@@ -416,18 +416,18 @@ fn appendNormalized(
         var keyrings = try allocator.alloc([]const u8, parsed.signed_by.len);
         for (parsed.signed_by, 0..) |value, index|
             keyrings[index] = try allocator.dupe(u8, value.value);
-        std.mem.sort([]const u8, keyrings, {}, lessString);
+        std.sort.heap([]const u8, keyrings, {}, lessString);
         const pins = try allocator.alloc(PinRule, policy.pins.len);
         for (policy.pins, 0..) |pin, index| pins[index] = .{
             .suite = if (pin.suite) |value| try allocator.dupe(u8, value) else null,
             .component = if (pin.component) |value| try allocator.dupe(u8, value) else null,
             .priority = pin.priority,
         };
-        std.mem.sort(PinRule, pins, {}, lessPin);
+        std.sort.heap(PinRule, pins, {}, lessPin);
         const witnesses = try allocator.alloc([]const u8, policy.freshness_witnesses.len);
         for (policy.freshness_witnesses, 0..) |value, index|
             witnesses[index] = try allocator.dupe(u8, value);
-        std.mem.sort([]const u8, witnesses, {}, lessString);
+        std.sort.heap([]const u8, witnesses, {}, lessString);
         var normalized: NormalizedRepository = .{
             .id = undefined,
             .enabled = parsed.enabled,
@@ -1075,7 +1075,7 @@ pub fn refreshAll(
         return .{ .failed = failed };
     }
 
-    std.mem.sort(PublishedRepositoryState, states.items, {}, lessState);
+    std.sort.heap(PublishedRepositoryState, states.items, {}, lessState);
     const snapshot_slice = try snapshots.toOwnedSlice(allocator);
     errdefer {
         for (snapshot_slice) |*snapshot| snapshot.deinit();
@@ -1490,8 +1490,8 @@ pub fn buildUniverse(
             });
         }
     }
-    std.mem.sort(solver.RepositoryInput, repositories.items, {}, lessSolverRepository);
-    std.mem.sort(Candidate, candidates.items, {}, lessCandidate);
+    std.sort.heap(solver.RepositoryInput, repositories.items, {}, lessSolverRepository);
+    std.sort.heap(Candidate, candidates.items, {}, lessCandidate);
     return .{
         .repositories = try repositories.toOwnedSlice(allocator),
         .candidates = try candidates.toOwnedSlice(allocator),

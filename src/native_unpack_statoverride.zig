@@ -107,7 +107,7 @@ pub fn encode(
             .gid = item.value_ptr.gid,
         };
     }
-    std.mem.sort(Entry, entries, {}, struct {
+    std.sort.heap(Entry, entries, {}, struct {
         fn less(_: void, left: Entry, right: Entry) bool {
             return std.mem.lessThan(u8, left.path, right.path);
         }

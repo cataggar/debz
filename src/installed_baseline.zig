@@ -212,7 +212,7 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     if (std.mem.eql(u8, path, "var/lib/dpkg/updates") and observed.members.len != 0)
         return error.InstalledBaselineRecoveryRequired;
     const Member = std.meta.Elem(@TypeOf(observed.members));
-    std.mem.sort(Member, observed.members, {}, struct {
+    std.sort.heap(Member, observed.members, {}, struct {
         fn less(_: void, left: Member, right: Member) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -273,7 +273,7 @@ fn make(
         slot.value_ptr.* = package;
     }
     const saved = try owned.dupe(Package, packages);
-    std.mem.sort(Package, saved, {}, lessThan);
+    std.sort.heap(Package, saved, {}, lessThan);
     for (saved, 0..) |*destination, index| {
         const package = destination.*;
         if (index != 0 and !lessThan({}, saved[index - 1], package))

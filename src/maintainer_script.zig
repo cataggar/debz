@@ -1315,7 +1315,7 @@ fn buildEnvironment(arena: std.mem.Allocator, request: Request) ![]const Environ
     for (request.variables) |variable|
         try entries.append(arena, .{ .key = variable.name.key(), .value = variable.value });
     const owned = try entries.toOwnedSlice(arena);
-    std.mem.sort(EnvironmentEntry, owned, {}, lessThanKey);
+    std.sort.heap(EnvironmentEntry, owned, {}, lessThanKey);
     return owned;
 }
 

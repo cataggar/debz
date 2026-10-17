@@ -414,7 +414,7 @@ pub fn create(
         if (!validIdentity(architecture)) return error.InvalidIdentity;
         foreign_architectures[index] = try owned.dupe(u8, architecture);
     }
-    std.mem.sort([]const u8, foreign_architectures, {}, lessString);
+    std.sort.heap([]const u8, foreign_architectures, {}, lessString);
     for (foreign_architectures, 0..) |architecture, index| {
         if (std.mem.eql(u8, architecture, target_architecture) or
             std.mem.eql(u8, architecture, "all"))
@@ -425,7 +425,7 @@ pub fn create(
     }
 
     const force = try owned.dupe(transaction_executor.ForceRisk, input.policy.force);
-    std.mem.sort(transaction_executor.ForceRisk, force, {}, lessForce);
+    std.sort.heap(transaction_executor.ForceRisk, force, {}, lessForce);
     for (force, 0..) |risk, index|
         if (index != 0 and risk == force[index - 1]) return error.DuplicateForceRisk;
 
@@ -467,7 +467,7 @@ pub fn create(
             .triggers_awaited = awaited,
         };
     }
-    std.mem.sort(FinalPackage, final_state, {}, lessFinalPackage);
+    std.sort.heap(FinalPackage, final_state, {}, lessFinalPackage);
     for (final_state, 0..) |package, index| {
         if (index != 0 and sameIdentity(
             package.name,
@@ -549,7 +549,7 @@ pub fn create(
             actions[index].artifact = copied;
         }
     }
-    std.mem.sort(Action, actions, {}, lessAction);
+    std.sort.heap(Action, actions, {}, lessAction);
     for (actions, 0..) |action, index| {
         if (action.sequence != index) return error.NonCanonicalSequence;
         for (actions[0..index]) |prior| {
@@ -602,7 +602,7 @@ pub fn create(
                 .declarations_sha256 = handler.declarations_sha256,
             };
         }
-        std.mem.sort(TriggerHandler, handlers, {}, lessTriggerHandler);
+        std.sort.heap(TriggerHandler, handlers, {}, lessTriggerHandler);
         if (handlers.len > 1)
             for (handlers[1..], 1..) |handler, index| {
                 const previous = handlers[index - 1];
@@ -633,7 +633,7 @@ pub fn create(
                 .script_sha256 = caller.script_sha256,
             };
         }
-        std.mem.sort(TriggerCaller, callers, {}, lessTriggerCaller);
+        std.sort.heap(TriggerCaller, callers, {}, lessTriggerCaller);
         if (callers.len > 1)
             for (callers[1..], 1..) |caller, index| {
                 const previous = callers[index - 1];
@@ -651,7 +651,7 @@ pub fn create(
             if (!validTriggerToken(name)) return error.InvalidTriggerAuthority;
             allowed[index] = try owned.dupe(u8, name);
         }
-        std.mem.sort([]const u8, allowed, {}, lessString);
+        std.sort.heap([]const u8, allowed, {}, lessString);
         if (allowed.len > 1)
             for (allowed[1..], 1..) |name, index| {
                 if (std.mem.eql(u8, allowed[index - 1], name))

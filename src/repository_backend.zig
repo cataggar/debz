@@ -5939,7 +5939,7 @@ fn inspectDescriptorMaterial(
         });
     }
     if (source_files.items.len == 0) return error.DynamicRepositoryMaterial;
-    std.mem.sort(MaterialFile, source_files.items, {}, lessMaterialFile);
+    std.sort.heap(MaterialFile, source_files.items, {}, lessMaterialFile);
 
     const documents = try allocator.alloc(
         repository_policy.SourceDocument,
@@ -6017,7 +6017,7 @@ fn inspectDescriptorMaterial(
         configuration.deinit();
         configuration = replacement;
     }
-    std.mem.sort(MaterialFile, files.items, {}, lessMaterialFile);
+    std.sort.heap(MaterialFile, files.items, {}, lessMaterialFile);
     const owned_files = try files.toOwnedSlice(allocator);
     errdefer {
         for (owned_files) |file| allocator.free(file.logical_path);

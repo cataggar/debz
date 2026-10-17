@@ -331,7 +331,7 @@ pub fn inspectKeyringWithTotals(
         if (key.is_primary) try fingerprints.append(allocator, key.fingerprint);
     }
     if (fingerprints.items.len == 0) return error.NoSupportedPrimaryKeys;
-    std.mem.sort([20]u8, fingerprints.items, {}, struct {
+    std.sort.heap([20]u8, fingerprints.items, {}, struct {
         fn less(_: void, left: [20]u8, right: [20]u8) bool {
             return std.mem.order(u8, &left, &right) == .lt;
         }

@@ -127,7 +127,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
         if (!validLowerHex(&repository.id)) return error.InvalidIdentity;
         if (repository.signer_fingerprints.len == 0) return error.MissingSigner;
         const fingerprints = try owned.dupe([20]u8, repository.signer_fingerprints);
-        std.mem.sort([20]u8, fingerprints, {}, lessBytes20);
+        std.sort.heap([20]u8, fingerprints, {}, lessBytes20);
         for (fingerprints, 0..) |fingerprint, signer_index| {
             if (signer_index != 0 and std.mem.eql(u8, &fingerprint, &fingerprints[signer_index - 1]))
                 return error.DuplicateSigner;
@@ -135,7 +135,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
         repositories[index] = repository;
         repositories[index].signer_fingerprints = fingerprints;
     }
-    std.mem.sort(Repository, repositories, {}, lessRepository);
+    std.sort.heap(Repository, repositories, {}, lessRepository);
     for (repositories, 0..) |repository, index| {
         if (index != 0 and std.mem.eql(u8, &repository.id, &repositories[index - 1].id))
             return error.DuplicateRepository;
@@ -160,7 +160,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Err
         packages[index].version = try owned.dupe(u8, package.version);
         packages[index].architecture = try owned.dupe(u8, package.architecture);
     }
-    std.mem.sort(Package, packages, {}, lessPackage);
+    std.sort.heap(Package, packages, {}, lessPackage);
     for (packages, 0..) |package, index| {
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;

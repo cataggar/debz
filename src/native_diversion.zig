@@ -93,7 +93,7 @@ pub const CachedRecords = struct {
             self.records,
         );
         defer self.allocator.free(records);
-        std.mem.sort(
+        std.sort.heap(
             package_database.DiversionRecord,
             records,
             {},
