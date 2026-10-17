@@ -805,6 +805,43 @@ pub fn build(b: *std.Build) void {
     reference_order_test_step.dependOn(&run_reference_order_tests.step);
     workload_core.dependOn(&run_reference_order_tests.step);
 
+    const reference_protected_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_protected_module.addImport("reference_paths", reference_paths_module);
+    reference_protected_module.addImport("reference_order", reference_order_module);
+    const reference_protected = b.addExecutable(.{
+        .name = "debz-reference-protected",
+        .root_module = reference_protected_module,
+    });
+    const install_reference_protected = b.addInstallArtifact(reference_protected, .{});
+    b.getInstallStep().dependOn(&install_reference_protected.step);
+    const reference_protected_step = b.step(
+        "build-reference-protected",
+        "Build the protected pinned-dpkg namespace proof runner",
+    );
+    reference_protected_step.dependOn(&install_reference_protected.step);
+    const reference_protected_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_protected_test_module.addImport("reference_paths", reference_paths_module);
+    reference_protected_test_module.addImport("reference_order", reference_order_module);
+    const reference_protected_tests = b.addTest(.{
+        .root_module = reference_protected_test_module,
+    });
+    const run_reference_protected_tests = b.addRunArtifact(reference_protected_tests);
+    run_reference_protected_tests.step.dependOn(&install_reference_protected.step);
+    const reference_protected_test_step = b.step(
+        "test-real-snapshot-reference-protected-pure",
+        "Test protected pinned-dpkg namespace proof profile staging, probe parsing, network controls, and runtime preflight",
+    );
+    reference_protected_test_step.dependOn(&run_reference_protected_tests.step);
+    workload_core.dependOn(&run_reference_protected_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
@@ -1016,6 +1053,7 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&reference_triggers_tests.step);
     audit_step.dependOn(&run_reference_paths_tests.step);
     audit_step.dependOn(&run_reference_order_tests.step);
+    audit_step.dependOn(&run_reference_protected_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{
