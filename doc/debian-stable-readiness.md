@@ -397,7 +397,7 @@ uses). It records:
   and cron.
 
 Nothing is unpacked into a root and no script runs.
-`tools/capture-vendor-state.py` inventories an *installed* Ubuntu root, so
+`tools/vendor-snapshot-tools.zig` inventories an *installed* Ubuntu root, so
 it cannot run before mutation. The gap categories reuse its vocabulary.
 
 Findings are identical for both architectures unless noted:

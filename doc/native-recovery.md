@@ -1997,7 +1997,7 @@ There were 56 Python methods: all have Zig assertions for the portable behavior,
 targets instead invoke the emitted `debz-integration-repository`, which
 directly reuses the native archive/parser and original test-key signer, not Python cryptography,
 the recovery acceptance module or `jsonschema`. Remaining required Python schema checks
-(`test_vendor_state_capture.py`, `test_dpkg_config_reference.py`,
+(`test_dpkg_config_reference.py`,
 `test_dpkg_alternatives_reference.py`) call `jsonschema.Draft202012Validator`
 directly on self-contained schemas; none imports the recovery fallback or
 resolves an external `$ref`. With both Python

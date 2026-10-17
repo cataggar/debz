@@ -1158,7 +1158,6 @@ pub fn build(b: *std.Build) void {
             "unittest",
             "tools/test_real_snapshot_reference_launcher.py",
             "tools/test_real_snapshot_reference_protected_ci.py",
-            "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
             "tools/test_real_snapshot_repin.py",

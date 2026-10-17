@@ -4422,3 +4422,45 @@ test "vendor-state reference derivation rejects malformed, unsafe, and mutated i
         try std.testing.expect(std.mem.indexOf(u8, diag.message, "public HTTPS URI") != null);
     }
 }
+
+test "ci workflow and schema wiring collect vendor state only from explicit root" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var diag: Diagnostic = .{};
+    const inv_schema_raw = try readRegularBytes(allocator, "schema/vendor-state-inventory-v1.json", MAX_INDEX_BYTES, "inventory schema", &diag);
+    const inv_schema = try std.json.parseFromSliceLeaky(std.json.Value, allocator, inv_schema_raw, .{});
+    try std.testing.expectEqualStrings(CAPTURE_SCHEMA, inv_schema.object.get("$id").?.string);
+    const ref_schema_raw = try readRegularBytes(allocator, "schema/vendor-state-reference-v1.json", MAX_INDEX_BYTES, "reference schema", &diag);
+    const ref_schema = try std.json.parseFromSliceLeaky(std.json.Value, allocator, ref_schema_raw, .{});
+    try std.testing.expectEqualStrings(REFERENCE_SCHEMA, ref_schema.object.get("$id").?.string);
+
+    const workflow = try readRegularBytes(allocator, ".github/workflows/ci.yml", 1024 * 1024, "ci.yml", &diag);
+    const job_start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:") orelse return error.TestUnexpectedResult;
+    const job_end = std.mem.indexOfPos(u8, workflow, job_start, "  protected-reference:") orelse return error.TestUnexpectedResult;
+    const job = workflow[job_start..job_end];
+
+    const collect_pos = std.mem.indexOf(u8, job, "      - name: Collect bounded protected native diagnostics\n        if: always()") orelse return error.TestUnexpectedResult;
+    const export_pos = std.mem.indexOf(u8, job, "      - name: Copy bounded native evidence") orelse return error.TestUnexpectedResult;
+    const cleanup_pos = std.mem.indexOf(u8, job, "      - name: Kill native descendants and remove only the named tree") orelse return error.TestUnexpectedResult;
+    const upload_pos = std.mem.indexOf(u8, job, "      - name: Upload real acceptance evidence\n        if: always()") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(collect_pos < export_pos);
+    try std.testing.expect(export_pos < cleanup_pos);
+    try std.testing.expect(cleanup_pos < upload_pos);
+    try std.testing.expect(std.mem.indexOf(u8, job, "chown") == null);
+
+    const collector = try readRegularBytes(allocator, "tools/real-snapshot-protected-native-ci.sh", 256 * 1024, "collector", &diag);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "zig-out/bin/debz-vendor-snapshot-tools capture") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "capture_status == 0 && differential_status == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "zig-out/bin/debz-native-outcome \"$evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "outcome_status == 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "\"$evidence/refresh.json\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "chown") == null);
+    try std.testing.expect(std.mem.indexOf(u8, collector, "du -sh \"$work\" >\"$evidence/disk-usage-final.txt\"") != null);
+
+    const build_zig = try readRegularBytes(allocator, "build.zig", 512 * 1024, "build.zig", &diag);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"vendor-state-inventory-v1.json\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_zig, "\"vendor-state-reference-v1.json\",") != null);
+}
+

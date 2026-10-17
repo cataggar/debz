@@ -3432,7 +3432,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
         'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
         'exec bash tools/real-snapshot-reference.sh "$REFERENCE_DPKG"',
-        'timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py',
+        'timeout --signal=TERM --kill-after=30s 5m zig-out/bin/debz-vendor-snapshot-tools capture',
         'if [[ -d "$work/root/var/lib/dpkg/info" ]]; then',
         'reference_snapshot_present=%s\\nnative_snapshot_present=%s',
         "not stat.S_ISREG(meta.st_mode) or meta.st_size > 128 * 1024 * 1024",

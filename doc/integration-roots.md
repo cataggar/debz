@@ -2876,8 +2876,8 @@ The wrapper's `umask 077` also reached the scripts. `arch-native` was written
 under dpkg too, because their scripts set the mode explicitly. Scripts now
 run under dpkg's `umask 022`.
 
-The historical legacy capture workflow ran
-`tools/capture-vendor-state.py` against the explicitly named staged reference
+The capture workflow runs
+`zig-out/bin/debz-vendor-snapshot-tools capture` (`tools/vendor-snapshot-tools.zig`) against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
 schema](../schema/vendor-state-inventory-v1.json) inventories every
 `var/lib/dpkg/info` member by classification and bounded metadata/hash,
@@ -2922,7 +2922,7 @@ specification](../schema/vendor-state-reference-v1.json) is committed as
 two reviewed manifests and their index:
 
 ```sh
-python3 tools/derive-vendor-state-reference.py \
+zig-out/bin/debz-vendor-snapshot-tools derive \
   --index tools/fixtures/vendor-state/index-v1.json \
   --check tools/fixtures/vendor-state/reference-v1.json
 ```
