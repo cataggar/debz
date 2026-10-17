@@ -59,7 +59,7 @@ fn stringArray(a: Allocator, contents: []const u8) !Value {
 
 fn lines(a: Allocator, contents: []const u8) !Value {
     const result = try stringArray(a, contents);
-    std.mem.sort(Value, result.array.items, {}, struct {
+    std.sort.heap(Value, result.array.items, {}, struct {
         fn less(_: void, left: Value, right: Value) bool {
             return std.mem.lessThan(u8, left.string, right.string);
         }
@@ -120,7 +120,7 @@ fn paragraphs(a: Allocator, contents: []const u8) !Value {
         }
         try append(a, &result, paragraph);
     }
-    std.mem.sort(Value, result.array.items, {}, paragraphLess);
+    std.sort.heap(Value, result.array.items, {}, paragraphLess);
     return result;
 }
 
@@ -284,7 +284,7 @@ fn showDifference(left: Value, right: Value, path: []const u8, remaining: *usize
             while (it.next()) |entry| {
                 if (!left.object.contains(entry.key_ptr.*)) try keys.append(a, entry.key_ptr.*);
             }
-            std.mem.sort([]const u8, keys.items, {}, struct {
+            std.sort.heap([]const u8, keys.items, {}, struct {
                 fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
                     return std.mem.lessThan(u8, lhs, rhs);
                 }

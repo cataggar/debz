@@ -328,8 +328,16 @@ const LaunchMatch = struct {
 };
 
 fn matchZigLaunchAt(prod: []const u8, start: usize) ?LaunchMatch {
-    if (start > 0 and isWordChar(prod[start - 1])) return null;
     const rem = prod[start..];
+    switch (rem[0]) {
+        's' => if (!std.mem.startsWith(u8, rem, "std.") and !std.mem.startsWith(u8, rem, "system")) return null,
+        'l' => if (!std.mem.startsWith(u8, rem, "linux.")) return null,
+        'p' => if (!std.mem.startsWith(u8, rem, "po")) return null,
+        'e' => if (!std.mem.startsWith(u8, rem, "execv")) return null,
+        '@' => if (!std.mem.startsWith(u8, rem, "@field")) return null,
+        else => return null,
+    }
+    if (start > 0 and isWordChar(prod[start - 1])) return null;
 
     if (std.mem.startsWith(u8, rem, "std.process.")) {
         const after_prefix = start + "std.process.".len;
@@ -444,8 +452,14 @@ fn matchZigLaunchAt(prod: []const u8, start: usize) ?LaunchMatch {
 }
 
 fn matchTsLaunchAt(prod: []const u8, start: usize) ?LaunchMatch {
-    if (start > 0 and isWordChar(prod[start - 1])) return null;
     const rem = prod[start..];
+    switch (rem[0]) {
+        's' => if (!std.mem.startsWith(u8, rem, "spawn")) return null,
+        'e' => if (!std.mem.startsWith(u8, rem, "exec")) return null,
+        'f' => if (!std.mem.startsWith(u8, rem, "fork")) return null,
+        else => return null,
+    }
+    if (start > 0 and isWordChar(prod[start - 1])) return null;
     for ([_][]const u8{ "spawnSync", "spawn", "execFileAsync", "execFile", "execSync", "fork" }) |func| {
         if (std.mem.startsWith(u8, rem, func)) {
             const func_end = start + func.len;
@@ -518,6 +532,7 @@ fn hasBundleNativeDefaultAndGuard(bundle: []const u8) bool {
 
     var i: usize = 0;
     while (i < bundle.len) : (i += 1) {
+        if (bundle[i] != 'o' and bundle[i] != 'e') continue;
         const prefix_len: usize = if (std.mem.startsWith(u8, bundle[i..], "optionalScalar("))
             "optionalScalar(".len
         else if (std.mem.startsWith(u8, bundle[i..], "exactScalar("))
@@ -920,7 +935,7 @@ pub fn candidateFailures(
         var removed_list: std.ArrayList([]const u8) = .empty;
         var rit = removed_paths.keyIterator();
         while (rit.next()) |k| try removed_list.append(allocator, k.*);
-        std.mem.sort([]const u8, removed_list.items, {}, lessThanString);
+        std.sort.heap([]const u8, removed_list.items, {}, lessThanString);
         for (removed_list.items) |path| {
             if (root_dir.statFile(io, path, .{ .follow_symlinks = false })) |_| {
                 try failures.print("{s}: declared deleted but production path still exists", .{path});
@@ -1110,7 +1125,7 @@ pub fn candidateFailures(
         var it = to_load_set.keyIterator();
         while (it.next()) |k| try to_load_list.append(allocator, k.*);
     }
-    std.mem.sort([]const u8, to_load_list.items, {}, lessThanString);
+    std.sort.heap([]const u8, to_load_list.items, {}, lessThanString);
     for (to_load_list.items) |relative| {
         _ = try readExactSource(allocator, io, root_dir, relative, overrides, &texts, failures);
     }
@@ -1120,7 +1135,7 @@ pub fn candidateFailures(
         var fit = fingerprints.iterator();
         while (fit.next()) |entry| try fp_keys.append(allocator, entry.key_ptr.*);
     }
-    std.mem.sort([]const u8, fp_keys.items, {}, lessThanString);
+    std.sort.heap([]const u8, fp_keys.items, {}, lessThanString);
     for (fp_keys.items) |relative| {
         const expected_val = fingerprints.get(relative).?;
         if (expected_val != .string or !isHex128Lower(expected_val.string)) {
@@ -1171,12 +1186,12 @@ pub fn candidateFailures(
 
     var scoped: std.ArrayList([]const u8) = .empty;
     try collectFilesByExtension(allocator, io, root_dir, "src", ".zig", &scoped);
-    std.mem.sort([]const u8, scoped.items, {}, lessThanString);
+    std.sort.heap([]const u8, scoped.items, {}, lessThanString);
     for ([_][]const u8{ "setup", "download", "install" }) |action| {
         var action_files: std.ArrayList([]const u8) = .empty;
         const action_src = try std.fmt.allocPrint(allocator, "actions/{s}/src", .{action});
         try collectFilesByExtension(allocator, io, root_dir, action_src, ".ts", &action_files);
-        std.mem.sort([]const u8, action_files.items, {}, lessThanString);
+        std.sort.heap([]const u8, action_files.items, {}, lessThanString);
         try scoped.appendSlice(allocator, action_files.items);
     }
 
@@ -1232,7 +1247,7 @@ pub fn candidateFailures(
                 try missing_launches.append(allocator, entry.key_ptr.*);
             }
         }
-        std.mem.sort([]const u8, missing_launches.items, {}, lessThanString);
+        std.sort.heap([]const u8, missing_launches.items, {}, lessThanString);
         for (missing_launches.items) |relative| {
             try failures.print("{s}: missing production child-process allowance path", .{relative});
         }

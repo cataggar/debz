@@ -278,7 +278,7 @@ fn canonicalValue(value: std.json.Value, stream: *std.json.Stringify, allocator:
         .object => |object| {
             const keys = try allocator.dupe([]const u8, object.keys());
             defer allocator.free(keys);
-            std.mem.sort([]const u8, keys, {}, struct {
+            std.sort.heap([]const u8, keys, {}, struct {
                 fn less(_: void, left: []const u8, right: []const u8) bool {
                     return std.mem.order(u8, left, right) == .lt;
                 }

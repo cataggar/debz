@@ -275,7 +275,7 @@ pub fn buildTar(allocator: std.mem.Allocator, entries: []const Entry, epoch: i64
     var iterator = directories.keyIterator();
     while (iterator.next()) |name| try records.append(allocator, .{ .name = name.*, .bytes = null, .mode = 0o755 });
     try records.appendSlice(allocator, entries);
-    std.mem.sort(Entry, records.items, {}, struct {
+    std.sort.heap(Entry, records.items, {}, struct {
         fn less(_: void, left: Entry, right: Entry) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -623,7 +623,7 @@ fn policyDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![]Librar
         // A minimum alone is not an installed version, just as in the original manifest validator.
         library.* = .{ .name = name, .version = string(field(item, "version")) orelse "", .linkage = linkage, .license = license };
     }
-    std.mem.sort(Library, result, {}, libraryLess);
+    std.sort.heap(Library, result, {}, libraryLess);
     return result;
 }
 
@@ -636,7 +636,7 @@ fn validateRuntime(allocator: std.mem.Allocator, bytes: []const u8, dependencies
         return refuse("invalid installed runtime dependency manifest", .{});
     const runtime = parsed.value;
     const linux = runtime.linux_release_runtime;
-    std.mem.sort(Library, linux.included_libraries, {}, libraryLess);
+    std.sort.heap(Library, linux.included_libraries, {}, libraryLess);
     var matches = runtime.schema_version == 1 and std.mem.eql(u8, runtime.package, "debz") and
         std.mem.eql(u8, linux.binary_kind, "fully_static") and linux.fully_static and
         std.mem.eql(u8, linux.libc.implementation, "musl") and std.mem.eql(u8, linux.libc.linkage, "static") and

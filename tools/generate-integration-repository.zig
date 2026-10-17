@@ -544,7 +544,7 @@ test "repository CLI reproduces independently original complete amd64 and arm64 
         var size: u64 = 0;
         for ([_][]const u8{ "pool", "dists", "fixture-keyring.gpg", "fixture-provenance.txt" }) |path|
             try tree(root.root, allocator, try fs.Path.init(path), &observed, &size, 0);
-        std.mem.sort(Observed, observed.items, {}, struct {
+        std.sort.heap(Observed, observed.items, {}, struct {
             fn less(_: void, a: Observed, b: Observed) bool {
                 return std.mem.lessThan(u8, a.path.text, b.path.text);
             }

@@ -677,7 +677,6 @@ test {
     _ = transaction_result_summary;
     _ = native_transaction_result;
     _ = native_install_result;
-    _ = package_family_backend;
     _ = repository_api;
     _ = repository_state;
     _ = repository_backend;

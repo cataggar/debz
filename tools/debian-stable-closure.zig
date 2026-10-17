@@ -668,7 +668,7 @@ fn writeCanonicalValue(writer: anytype, value: std.json.Value, indent: usize) !v
             const keys = try allocator.alloc([]const u8, obj.count());
             defer allocator.free(keys);
             for (obj.keys(), 0..) |k, idx| keys[idx] = k;
-            std.mem.sort([]const u8, keys, {}, struct {
+            std.sort.heap([]const u8, keys, {}, struct {
                 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                     return std.mem.order(u8, a, b) == .lt;
                 }
@@ -770,7 +770,7 @@ fn appendUniqueString(allocator: std.mem.Allocator, list: *std.ArrayList([]const
 fn aggregateGaps(allocator: std.mem.Allocator, inventories: std.json.ObjectMap) !std.json.Value {
     const arch_keys = try allocator.alloc([]const u8, inventories.count());
     for (inventories.keys(), 0..) |k, idx| arch_keys[idx] = k;
-    std.mem.sort([]const u8, arch_keys, {}, struct {
+    std.sort.heap([]const u8, arch_keys, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
@@ -814,7 +814,7 @@ fn aggregateGaps(allocator: std.mem.Allocator, inventories: std.json.ObjectMap) 
 
     const ordered_entries = try allocator.alloc(AggregatedGap, entries.count());
     for (entries.values(), 0..) |v, idx| ordered_entries[idx] = v;
-    std.mem.sort(AggregatedGap, ordered_entries, {}, struct {
+    std.sort.heap(AggregatedGap, ordered_entries, {}, struct {
         fn lessThan(_: void, a: AggregatedGap, b: AggregatedGap) bool {
             const p = std.mem.order(u8, a.priority, b.priority);
             if (p != .eq) return p == .lt;
@@ -824,7 +824,7 @@ fn aggregateGaps(allocator: std.mem.Allocator, inventories: std.json.ObjectMap) 
 
     var out_array = std.json.Array.init(allocator);
     for (ordered_entries) |*entry| {
-        std.mem.sort([]const u8, entry.evidence.items, {}, struct {
+        std.sort.heap([]const u8, entry.evidence.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
             }
@@ -833,7 +833,7 @@ fn aggregateGaps(allocator: std.mem.Allocator, inventories: std.json.ObjectMap) 
         var pkgs_obj: std.json.ObjectMap = .empty;
         for (entry.packages.keys()) |arch| {
             const list = entry.packages.getPtr(arch).?;
-            std.mem.sort([]const u8, list.items, {}, struct {
+            std.sort.heap([]const u8, list.items, {}, struct {
                 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                     return std.mem.order(u8, a, b) == .lt;
                 }

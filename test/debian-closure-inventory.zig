@@ -762,7 +762,7 @@ fn countInto(arena: std.mem.Allocator, counts: *std.StringArrayHashMapUnmanaged(
 fn sortedCounts(arena: std.mem.Allocator, counts: std.StringArrayHashMapUnmanaged(usize)) ![]const NamedCount {
     const out = try arena.alloc(NamedCount, counts.count());
     for (counts.keys(), counts.values(), out) |key, value, *slot| slot.* = .{ .name = key, .count = value };
-    std.mem.sort(NamedCount, out, {}, struct {
+    std.sort.heap(NamedCount, out, {}, struct {
         fn lessThan(_: void, left: NamedCount, right: NamedCount) bool {
             return std.mem.order(u8, left.name, right.name) == .lt;
         }

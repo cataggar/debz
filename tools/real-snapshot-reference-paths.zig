@@ -665,7 +665,7 @@ pub fn packageFailures(
         for (entries) |entry| entry.deinit(allocator);
         allocator.free(entries);
     }
-    std.mem.sort(WalkEntry, entries, {}, lessThanWalkEntry);
+    std.sort.heap(WalkEntry, entries, {}, lessThanWalkEntry);
     var manifest_bytes: std.ArrayList(u8) = .empty;
     defer manifest_bytes.deinit(allocator);
     var lines_count: usize = 0;

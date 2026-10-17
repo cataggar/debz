@@ -40,7 +40,7 @@ fn names(allocator: std.mem.Allocator, root: debz.root_fs.Root, comptime directo
         }
         try collected.append(allocator, try allocator.dupe(u8, entry.name));
     }
-    std.mem.sort([]const u8, collected.items, {}, struct {
+    std.sort.heap([]const u8, collected.items, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }

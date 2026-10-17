@@ -329,7 +329,7 @@ pub const Fixture = struct {
                 try files.append(self.allocator, .{ .path = relative, .digest = std.fmt.bytesToHex(md5, .lower) });
             }
         }
-        std.mem.sort(Manifest, files.items, {}, struct {
+        std.sort.heap(Manifest, files.items, {}, struct {
             fn less(_: void, left: Manifest, right: Manifest) bool {
                 return std.mem.lessThan(u8, left.path, right.path);
             }
@@ -641,7 +641,7 @@ fn normalizedLines(allocator: std.mem.Allocator, content: []const u8, path_list:
             return error.UnsafePackagePath;
         try lines.append(allocator, line);
     }
-    std.mem.sort([]const u8, lines.items, {}, lessText);
+    std.sort.heap([]const u8, lines.items, {}, lessText);
     if (path_list and lines.items.len > 1) for (lines.items[1..], lines.items[0 .. lines.items.len - 1]) |after, before| {
         if (std.mem.eql(u8, after, before)) return error.DuplicatePackagePath;
     };
@@ -669,7 +669,7 @@ fn normalizedMd5(allocator: std.mem.Allocator, content: []const u8) ![]const u8 
         }
         try lines.append(allocator, try std.fmt.allocPrint(allocator, "{s} {s}", .{ line[34..], line[0..32] }));
     }
-    std.mem.sort([]const u8, lines.items, {}, lessText);
+    std.sort.heap([]const u8, lines.items, {}, lessText);
     return std.mem.join(allocator, "\n", lines.items);
 }
 
@@ -702,7 +702,7 @@ fn normalizedDiversions(allocator: std.mem.Allocator, content: []const u8) ![]co
             return error.InvalidDiversions;
         try records.append(allocator, .{ .path = line[0], .destination = line[1], .package_name = line[2] });
     }
-    std.mem.sort(Diversion, records.items, {}, lessDiversion);
+    std.sort.heap(Diversion, records.items, {}, lessDiversion);
     var normalized: std.ArrayList([]const u8) = .empty;
     for (records.items, 0..) |record, index| {
         if (index > 0 and std.mem.eql(u8, record.path, records.items[index - 1].path))
@@ -748,7 +748,7 @@ fn normalizedStatoverride(allocator: std.mem.Allocator, content: []const u8) ![]
             .path = line[c + 1 ..],
         });
     }
-    std.mem.sort(Override, records.items, {}, lessOverride);
+    std.sort.heap(Override, records.items, {}, lessOverride);
     var normalized: std.ArrayList([]const u8) = .empty;
     for (records.items, 0..) |record, index| {
         if (index > 0 and std.mem.eql(u8, record.path, records.items[index - 1].path))
@@ -792,7 +792,7 @@ fn normalizedDeb822(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8
         previous = key;
     }
     if (fields.count() != 0) try paragraphs.append(allocator, try sortedFields(allocator, &fields));
-    std.mem.sort([]const u8, paragraphs.items, {}, lessText);
+    std.sort.heap([]const u8, paragraphs.items, {}, lessText);
     return std.mem.join(allocator, "\n\n", paragraphs.items);
 }
 
@@ -800,7 +800,7 @@ fn sortedFields(allocator: std.mem.Allocator, fields: *std.StringHashMap([]const
     var keys: std.ArrayList([]const u8) = .empty;
     var iterator = fields.keyIterator();
     while (iterator.next()) |key| try keys.append(allocator, key.*);
-    std.mem.sort([]const u8, keys.items, {}, lessText);
+    std.sort.heap([]const u8, keys.items, {}, lessText);
     var lines: std.ArrayList([]const u8) = .empty;
     for (keys.items) |key| {
         const value = try std.mem.replaceOwned(u8, allocator, fields.get(key).?, "\n", "\n ");
@@ -848,7 +848,7 @@ fn captureXattrs(allocator: std.mem.Allocator, absolute: []const u8) ![]const At
         });
         start = end + 1;
     }
-    std.mem.sort(Attribute, attributes.items, {}, lessAttribute);
+    std.sort.heap(Attribute, attributes.items, {}, lessAttribute);
     return attributes.items;
 }
 
@@ -969,7 +969,7 @@ fn captureFilesystem(
         const group = groups.get(.{ .device = identity.device, .inode = identity.inode }).?;
         if (group.count > 1) entry.hardlink_to = group.first;
     }
-    std.mem.sort(FilesystemEntry, entries.items, {}, lessPath);
+    std.sort.heap(FilesystemEntry, entries.items, {}, lessPath);
     return entries.items;
 }
 
@@ -1126,7 +1126,7 @@ fn captureDatabaseDirectory(
             .size = if (std.mem.eql(u8, kind, "opaque")) bytes.len else null,
         });
     }
-    std.mem.sort(DatabaseEntry, result.items, {}, lessDatabase);
+    std.sort.heap(DatabaseEntry, result.items, {}, lessDatabase);
     return result.items;
 }
 
@@ -1195,7 +1195,7 @@ fn captureDpkg(allocator: std.mem.Allocator, io: std.Io, root: root_fs.Root, lim
             .size = if (std.mem.eql(u8, kind, "opaque")) bytes.len else null,
         });
     }
-    std.mem.sort(DatabaseEntry, files.items, {}, lessDatabase);
+    std.sort.heap(DatabaseEntry, files.items, {}, lessDatabase);
     return .{
         .present = true,
         .status = try normalizedDeb822(allocator, status_bytes),

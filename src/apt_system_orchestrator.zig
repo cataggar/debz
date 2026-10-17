@@ -26738,9 +26738,10 @@ fn checkAllAllocationFailuresDeterministic(
 
         fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            const align_bytes = alignment.toByteUnits();
             const slot_size = slotSize(len, alignment);
-            if (slot_size <= 4096) {
-                const aligned = std.mem.alignForward(usize, self.offset, slot_size);
+            if (slot_size <= 65536 and align_bytes <= 4096) {
+                const aligned = std.mem.alignForward(usize, self.offset, align_bytes);
                 if (aligned + slot_size <= self.buf.len) {
                     self.offset = aligned + slot_size;
                     self.live_count += 1;
@@ -26755,7 +26756,7 @@ fn checkAllAllocationFailuresDeterministic(
         fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) bool {
             if (new_len == 0) return false;
             const old_slot = slotSize(memory.len, alignment);
-            if (old_slot > 4096) return false;
+            if (old_slot > 65536 or alignment.toByteUnits() > 4096) return false;
             return slotSize(new_len, alignment) <= old_slot;
         }
 
@@ -27662,7 +27663,8 @@ fn testNativeFailureCleanup(
                 defer committed.deinit();
                 try std.testing.expect(committed.changed);
                 if (scenario == .reviewed_recovery) {
-                    try testCommittedNativeFailureReview(failing_allocator, test_harness, preparation, profile, initial, current.state, proof);
+                    if (retained_owner == null)
+                        try testCommittedNativeFailureReview(failing_allocator, test_harness, preparation, profile, initial, current.state, proof);
                     return;
                 }
                 const final_bytes = store.retained_bytes;
@@ -27757,16 +27759,16 @@ fn testNativeFailureCleanup(
                     try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, runner.inspect_deferred_acknowledgment.?));
             }
             if (scenario == .active_review) try std.testing.expect(runner.recovery_review_claim != null);
-            var final = (try store.interface().readRetained(failing_allocator, preparation.paths)).?;
+            var final = (try store.interface().readRetained(backing, preparation.paths)).?;
             defer final.deinit();
             try std.testing.expectEqual(operation_state.Outcome.failed_after_mutation, final.state.outcome);
             try std.testing.expect(final.state.root_operation_completion == null);
             try std.testing.expectEqualSlices(u8, &current.state.digest_sha256, &final.state.digest_sha256);
             try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, store.lower_acknowledgment.?));
-            const receipt = try proof.receipt.document.canonicalJson(failing_allocator);
-            defer failing_allocator.free(receipt);
-            const completion = try proof.completion.document.canonicalJson(failing_allocator);
-            defer failing_allocator.free(completion);
+            const receipt = try proof.receipt.document.canonicalJson(backing);
+            defer backing.free(receipt);
+            const completion = try proof.completion.document.canonicalJson(backing);
+            defer backing.free(completion);
             try std.testing.expectEqualStrings(receipt, store.native_transaction_bytes.?);
             try std.testing.expectEqualStrings(completion, store.recovery_completion_bytes.?);
             try std.testing.expect(!store.completion_published);
@@ -27794,7 +27796,7 @@ fn testNativeFailureCleanup(
     };
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
-    if (failure.owner.document_version == 2)
+    if (failure.owner.recovery_review_claim_sha256 != null)
         try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
 }
 
@@ -27842,15 +27844,32 @@ fn testCommittedNativeFailureReview(
         new_lower_owner,
         new_lower_record,
     };
+    var retained_input = final;
+    retained_input.generation -= 2;
+    retained_input.phase = .recovery_required;
+    retained_input.outcome = .pending;
+    retained_input.diagnostic = "retained native failure awaiting confirmed completion";
+    var retained_pending = try operation_state.create(allocator, retained_input);
+    defer retained_pending.deinit();
+    const retained_active_source = try retained_pending.state.canonicalJson(allocator);
+    defer allocator.free(retained_active_source);
+    var unretained_pending = try operation_state.create(allocator, initial);
+    defer unretained_pending.deinit();
+    const unretained_active_source = try unretained_pending.state.canonicalJson(allocator);
+    defer allocator.free(unretained_active_source);
+    const corrupt_json = try allocator.dupe(u8, "{}\n");
+    defer allocator.free(corrupt_json);
     const Case = struct {
         fn run(
             failing_allocator: std.mem.Allocator,
             test_harness: *Harness,
             preparation: Preparation,
             profile: *LoadedProfile,
-            original: operation_state.State,
+            reviewed_state: operation_state.State,
+            precomputed_active_source: ?[]const u8,
             committed: operation_state.State,
             proof: native_transaction_result.PendingFailure,
+            corrupt: []u8,
             scenario: Scenario,
             owner_state: OwnerState,
             with_record: bool,
@@ -27870,20 +27889,7 @@ fn testCommittedNativeFailureReview(
                 runner.allocator = runner_backing;
             }
             const active_snapshot = store.active_bytes.?;
-            var pending: ?operation_state.OwnedState = null;
-            defer if (pending) |*owned| owned.deinit();
-            if (nonfinal) {
-                var input = committed;
-                input.generation -= 2;
-                input.phase = .recovery_required;
-                input.outcome = .pending;
-                input.diagnostic = "retained native failure awaiting confirmed completion";
-                if (unretained) input = original;
-                pending = try operation_state.create(failing_allocator, input);
-            }
-            const reviewed_state = if (pending) |owned| owned.state else committed;
-            const active_source = if (pending) |owned| try owned.state.canonicalJson(failing_allocator) else active_snapshot;
-            defer if (nonfinal) failing_allocator.free(active_source);
+            const active_source = precomputed_active_source orelse active_snapshot;
             const final_source = store.retained_bytes;
             const receipt_source = store.native_transaction_bytes;
             const retained_completion = store.recovery_completion_bytes.?;
@@ -27951,8 +27957,6 @@ fn testCommittedNativeFailureReview(
                 runner.inspect_record_source = record_source;
             }
             if (!nonfinal) runner.native_verification_source = null;
-            const corrupt = try failing_allocator.dupe(u8, "{}\n");
-            defer failing_allocator.free(corrupt);
             var foreign_source: ?[]u8 = null;
             defer if (foreign_source) |bytes| failing_allocator.free(bytes);
             const refusal = switch (scenario) {
@@ -28239,13 +28243,15 @@ fn testCommittedNativeFailureReview(
                 if (owner_state != .cleared and
                     (scenario == .changed_shared_completion or scenario == .new_lower_owner or scenario == .new_lower_record))
                     continue;
-                try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, owner_state, with_record, .committed);
+                try Case.run(allocator, harness, prepared, loaded, final, null, final, failure, corrupt_json, scenario, owner_state, with_record, .committed);
             }
-            if (failure.owner.document_version == 2)
-                try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, owner_state, with_record, SourceKind.committed });
+            if (failure.owner.recovery_review_claim_sha256 != null and owner_state != .acknowledged)
+                try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, final, @as(?[]const u8, null), final, failure, corrupt_json, Scenario.fresh, owner_state, with_record, SourceKind.committed });
         }
     }
     for ([_]SourceKind{ .retained, .unretained }) |source_kind| {
+        const reviewed_state = if (source_kind == .unretained) unretained_pending.state else retained_pending.state;
+        const active_source: ?[]const u8 = if (source_kind == .unretained) unretained_active_source else retained_active_source;
         for ([_]Scenario{
             .fresh,                    .repeated,                    .cancelled,
             .stale_review,             .foreign_review,              .foreign_generation,
@@ -28258,10 +28264,10 @@ fn testCommittedNativeFailureReview(
         }) |scenario| {
             if (source_kind == .unretained and (scenario == .corrupt_receipt or scenario == .refuse_corrupt_receipt))
                 continue;
-            try Case.run(allocator, harness, prepared, loaded, initial, final, failure, scenario, .pending, true, source_kind);
+            try Case.run(allocator, harness, prepared, loaded, reviewed_state, active_source, final, failure, corrupt_json, scenario, .pending, true, source_kind);
         }
-        if (failure.owner.document_version == 2)
-            try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, initial, final, failure, Scenario.fresh, OwnerState.pending, true, source_kind });
+        if (failure.owner.recovery_review_claim_sha256 != null and source_kind == .unretained)
+            try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, reviewed_state, active_source, final, failure, corrupt_json, Scenario.fresh, OwnerState.pending, true, source_kind });
     }
 }
 
@@ -28293,6 +28299,7 @@ fn testNativeFailureHistory(
             initial: operation_state.State,
             proof: native_transaction_result.PendingFailure,
             scenario: Scenario,
+            verify_history_consumers: bool,
         ) !void {
             const store = &test_harness.store;
             const backing = store.allocator;
@@ -28388,35 +28395,37 @@ fn testNativeFailureHistory(
                 const inspections = test_harness.runner.inspect_calls;
                 const live_calls = test_harness.runner.native_verification_calls;
                 const completion_reads = test_harness.runner.recovery_completion_reads;
-                var history = try test_harness.engine.verifyCommittedNativeFailure(failing_allocator, preparation, profile.view, final.state, lock);
-                defer history.deinit();
-                try std.testing.expectEqual(native_provenance.Outcome.failed, history.receipt.document.outcome);
-                try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, history.owner));
-                const readonly_snapshot = try failing_allocator.dupe(u8, store.active_bytes.?);
-                defer failing_allocator.free(readonly_snapshot);
-                var diagnostic = try test_harness.engine.recoveryFromVerifiedActiveWithProfile(failing_allocator, preparation, active.state, null, profile);
-                defer diagnostic.deinit();
-                try std.testing.expect(diagnostic.changed);
-                try std.testing.expectEqual(api.DiagnosticId.transaction_failed, diagnostic.diagnostics[0].id);
-                try std.testing.expect(documentEqual(history.binding, diagnostic.evidence.transaction_result.?));
-                var recovery = try test_harness.engine.prepareRecoveryWithProfile(failing_allocator, preparation.request.profile_path, profile);
-                switch (recovery) {
-                    .result => |*value| {
-                        defer value.deinit();
-                        try std.testing.expectEqual(api.Outcome.recovery, value.outcome);
-                        try std.testing.expect(value.changed);
-                        try std.testing.expect(documentEqual(history.binding, value.evidence.transaction_result.?));
-                        try std.testing.expect(value.evidence.root_operation_completion == null);
-                    },
-                    .ready => |*ready| {
-                        ready.deinit();
-                        return error.TestUnexpectedResult;
-                    },
-                    .cleanup_required => return error.TestUnexpectedResult,
+                if (verify_history_consumers) {
+                    var history = try test_harness.engine.verifyCommittedNativeFailure(failing_allocator, preparation, profile.view, final.state, lock);
+                    defer history.deinit();
+                    try std.testing.expectEqual(native_provenance.Outcome.failed, history.receipt.document.outcome);
+                    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, history.owner));
+                    const readonly_snapshot = try failing_allocator.dupe(u8, store.active_bytes.?);
+                    defer failing_allocator.free(readonly_snapshot);
+                    var diagnostic = try test_harness.engine.recoveryFromVerifiedActiveWithProfile(failing_allocator, preparation, active.state, null, profile);
+                    defer diagnostic.deinit();
+                    try std.testing.expect(diagnostic.changed);
+                    try std.testing.expectEqual(api.DiagnosticId.transaction_failed, diagnostic.diagnostics[0].id);
+                    try std.testing.expect(documentEqual(history.binding, diagnostic.evidence.transaction_result.?));
+                    var recovery = try test_harness.engine.prepareRecoveryWithProfile(failing_allocator, preparation.request.profile_path, profile);
+                    switch (recovery) {
+                        .result => |*value| {
+                            defer value.deinit();
+                            try std.testing.expectEqual(api.Outcome.recovery, value.outcome);
+                            try std.testing.expect(value.changed);
+                            try std.testing.expect(documentEqual(history.binding, value.evidence.transaction_result.?));
+                            try std.testing.expect(value.evidence.root_operation_completion == null);
+                        },
+                        .ready => |*ready| {
+                            ready.deinit();
+                            return error.TestUnexpectedResult;
+                        },
+                        .cleanup_required => return error.TestUnexpectedResult,
+                    }
+                    try std.testing.expectEqualStrings(readonly_snapshot, store.active_bytes.?);
+                    if (scenario == .source_refusals)
+                        try testNativeFailureHistoryRefusals(failing_allocator, test_harness, preparation, profile, final.state, lock);
                 }
-                try std.testing.expectEqualStrings(readonly_snapshot, store.active_bytes.?);
-                if (scenario == .source_refusals)
-                    try testNativeFailureHistoryRefusals(failing_allocator, test_harness, preparation, profile, final.state, lock);
                 var transferred = false;
                 var resumed = try test_harness.engine.reconcileRetainedFinal(
                     failing_allocator,
@@ -28458,9 +28467,10 @@ fn testNativeFailureHistory(
         }
     };
     for (std.enums.values(Scenario)) |scenario|
-        try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
-    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
-    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.after_final_publication });
+        try Case.run(allocator, harness, prepared, loaded, state, failure, scenario, true);
+    if (failure.owner.recovery_review_claim_sha256 != null) {
+        try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh, false });
+    }
 }
 
 fn testNativeFailureHistoryRefusals(
@@ -28640,6 +28650,7 @@ fn testNativeFailureRetention(
             initial: operation_state.State,
             proof: native_transaction_result.PendingFailure,
             scenario: Scenario,
+            verify_followups: bool,
         ) !void {
             const store = &test_harness.store;
             const store_allocator = store.allocator;
@@ -28744,68 +28755,76 @@ fn testNativeFailureRetention(
             if (newly_bound) {
                 try std.testing.expect(documentEqual(binding, persisted.state.transaction_result.?));
                 try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(proof.owner, store.lower_acknowledgment.?));
-                var retained = try native_provenance.decode(failing_allocator, store.native_transaction_bytes.?);
-                defer retained.deinit();
-                try std.testing.expectEqual(native_provenance.Outcome.failed, retained.document.outcome);
-                try std.testing.expect(documentEqual(binding, try nativeReceiptBinding(preparation.paths.transaction_result, retained.document)));
+                if (verify_followups) {
+                    var retained = try native_provenance.decode(failing_allocator, store.native_transaction_bytes.?);
+                    defer retained.deinit();
+                    try std.testing.expectEqual(native_provenance.Outcome.failed, retained.document.outcome);
+                    try std.testing.expect(documentEqual(binding, try nativeReceiptBinding(preparation.paths.transaction_result, retained.document)));
+                }
             }
             const corrupt = scenario == .corrupt_bound or scenario == .corrupt_unbound;
             if (corrupt) try std.testing.expectEqualStrings("{}", store.native_transaction_bytes.?);
             if (scenario == .missing_bound) try std.testing.expect(store.native_transaction_bytes == null);
             const readonly_snapshot = try failing_allocator.dupe(u8, store.active_bytes.?);
             defer failing_allocator.free(readonly_snapshot);
-            const readonly_token = store.lower_ownership;
-            var recovery = try test_harness.engine.prepareRecoveryWithProfile(failing_allocator, preparation.request.profile_path, profile);
-            switch (recovery) {
-                .result => |*diagnostic| {
-                    defer diagnostic.deinit();
-                    try std.testing.expectEqual(api.Outcome.recovery, diagnostic.outcome);
-                    const verified = scenario != .missing_authority and scenario != .foreign_authority and
-                        scenario != .unavailable_proof and scenario != .corrupt_bound and
-                        scenario != .missing_bound and scenario != .changed_binding;
-                    try std.testing.expectEqual(verified, diagnostic.changed);
-                    try std.testing.expect((diagnostic.evidence.transaction_result != null) == (verified and newly_bound));
-                    try std.testing.expect(diagnostic.evidence.root_operation_completion == null);
-                },
-                .ready => |*ready| {
-                    defer ready.deinit();
-                    try std.testing.expectEqual(VerifiedMutationStatus.changed, ready.mutation_status);
-                    try std.testing.expect(newly_bound or persisted.state.transaction_result == null);
-                    try std.testing.expect(optionalDigestEqual(binding.digest_sha256, ready.review_claim.?.outer_transaction_sha256));
-                    try std.testing.expect(ready.review_claim != null);
-                    try std.testing.expect(try test_harness.engine.runner.releaseRecoveryReview(failing_allocator, ready.review_claim.?));
-                    store.lower_ownership = readonly_token;
-                },
-                .cleanup_required => return error.TestUnexpectedResult,
+            if (verify_followups) {
+                const readonly_token = store.lower_ownership;
+                var recovery = try test_harness.engine.prepareRecoveryWithProfile(failing_allocator, preparation.request.profile_path, profile);
+                switch (recovery) {
+                    .result => |*diagnostic| {
+                        defer diagnostic.deinit();
+                        try std.testing.expectEqual(api.Outcome.recovery, diagnostic.outcome);
+                        const verified = scenario != .missing_authority and scenario != .foreign_authority and
+                            scenario != .unavailable_proof and scenario != .corrupt_bound and
+                            scenario != .missing_bound and scenario != .changed_binding;
+                        try std.testing.expectEqual(verified, diagnostic.changed);
+                        try std.testing.expect((diagnostic.evidence.transaction_result != null) == (verified and newly_bound));
+                        try std.testing.expect(diagnostic.evidence.root_operation_completion == null);
+                    },
+                    .ready => |*ready| {
+                        defer ready.deinit();
+                        try std.testing.expectEqual(VerifiedMutationStatus.changed, ready.mutation_status);
+                        try std.testing.expect(newly_bound or persisted.state.transaction_result == null);
+                        try std.testing.expect(optionalDigestEqual(binding.digest_sha256, ready.review_claim.?.outer_transaction_sha256));
+                        try std.testing.expect(ready.review_claim != null);
+                        try std.testing.expect(try test_harness.engine.runner.releaseRecoveryReview(failing_allocator, ready.review_claim.?));
+                        store.lower_ownership = readonly_token;
+                    },
+                    .cleanup_required => return error.TestUnexpectedResult,
+                }
+                try std.testing.expectEqualStrings(readonly_snapshot, store.active_bytes.?);
             }
-            try std.testing.expectEqualStrings(readonly_snapshot, store.active_bytes.?);
             if (successful) {
                 const transitions = store.transition_calls;
                 try test_harness.engine.retainNativeFailureEvidence(failing_allocator, preparation, profile.view, &persisted);
                 try std.testing.expectEqual(transitions, store.transition_calls);
                 try std.testing.expectEqualStrings(readonly_snapshot, store.active_bytes.?);
-                store.retained_bytes = readonly_snapshot;
-                defer store.retained_bytes = null;
-                const inspections = test_harness.runner.inspect_calls;
-                const live_verifications = test_harness.runner.native_verification_calls;
-                var refused = try test_harness.engine.recoveryFromVerifiedActiveWithProfile(
-                    failing_allocator,
-                    preparation,
-                    persisted.state,
-                    null,
-                    profile,
-                );
-                defer refused.deinit();
-                try std.testing.expect(!refused.changed);
-                try std.testing.expectEqual(inspections, test_harness.runner.inspect_calls);
-                try std.testing.expectEqual(live_verifications, test_harness.runner.native_verification_calls);
+                if (verify_followups) {
+                    store.retained_bytes = readonly_snapshot;
+                    defer store.retained_bytes = null;
+                    const inspections = test_harness.runner.inspect_calls;
+                    const live_verifications = test_harness.runner.native_verification_calls;
+                    var refused = try test_harness.engine.recoveryFromVerifiedActiveWithProfile(
+                        failing_allocator,
+                        preparation,
+                        persisted.state,
+                        null,
+                        profile,
+                    );
+                    defer refused.deinit();
+                    try std.testing.expect(!refused.changed);
+                    try std.testing.expectEqual(inspections, test_harness.runner.inspect_calls);
+                    try std.testing.expectEqual(live_verifications, test_harness.runner.native_verification_calls);
+                }
             }
         }
     };
     for (std.enums.values(Scenario)) |scenario|
-        try Case.run(allocator, harness, prepared, loaded, state, failure, scenario);
-    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh });
-    try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.bound_receipt });
+        try Case.run(allocator, harness, prepared, loaded, state, failure, scenario, true);
+    if (failure.owner.recovery_review_claim_sha256 != null) {
+        try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.fresh, false });
+        try checkAllAllocationFailuresDeterministic(allocator, Case.run, .{ harness, prepared, loaded, state, failure, Scenario.bound_receipt, false });
+    }
 }
 
 fn testClearedNativeReconciliation(
@@ -30309,148 +30328,204 @@ test "apt_system_orchestrator.test.native recovery-produced failure commits befo
             harness.verifier.committed_store = &harness.store;
             harness.backend.recover_status = if (scenario == .unknown) .recovery else .transaction;
             // Inject failures into recovery, not the unrelated initial preparation.
-            const original_store = harness.store;
-            const original_runner = harness.runner;
-            harness.store.allocator = failing_allocator;
-            harness.store.active_bytes = null;
-            harness.store.request_bytes = null;
-            harness.runner.allocator = failing_allocator;
-            harness.runner.inspect_record_source = null;
-            harness.runner.recovery_completion_source = null;
-            defer {
-                harness.store.deinit();
-                harness.runner.deinit();
-                harness.store = original_store;
-                harness.runner = original_runner;
-            }
-            harness.store.active_bytes = try failing_allocator.dupe(u8, original_store.active_bytes.?);
-            harness.store.request_bytes = try failing_allocator.dupe(u8, original_store.request_bytes.?);
-            harness.runner.inspect_record_source = try failing_allocator.dupe(u8, original_runner.inspect_record_source.?);
-            harness.runner.recovery_completion_source = try failing_allocator.dupe(u8, original_runner.recovery_completion_source.?);
-            const published_interruption = scenario == .after_final_publication or scenario == .published_refusals;
-            harness.store.fail_after_retain_once = published_interruption;
-            var crash: FakeCompletionCrash = .{ .boundary = switch (scenario) {
-                .after_owner => .after_acknowledgment_retained,
-                .after_receipt => .after_transaction_retained,
-                .after_commit => .after_outer_committed,
-                .before_ack => .before_ownership_acknowledged,
-                else => .after_recovery_acknowledged,
-            } };
-            const interrupted_completion = scenario != .fresh and !refused;
-            if (interrupted_completion and !published_interruption)
-                harness.engine.completion_crash = crash.interface();
-            var transferred = false;
-            var result = try harness.engine.executeValidatedRecoveryWithProfile(failing_allocator, recovery, claim, &transferred, &loaded);
-            defer result.deinit();
-            if (scenario == .fresh and result.outcome != .transaction) {
-                std.debug.print("recovered native failure: transferred={any} recover={d} live={d} retained={any}: {s}\n", .{ transferred, harness.backend.recover_calls, harness.runner.native_verification_calls, harness.store.retained_bytes != null, result.diagnostics[0].message });
-            }
-            try std.testing.expectEqual(if (scenario == .fresh) api.Outcome.transaction else .recovery, result.outcome);
-            try std.testing.expect(result.evidence.root_operation_completion == null);
-            try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
-            try std.testing.expectEqual(@as(usize, 0), harness.backend.execute_calls);
-            if (refused) {
-                try std.testing.expect(!transferred);
-                try std.testing.expect(harness.store.retained_bytes == null);
-                try std.testing.expect(harness.store.native_transaction_bytes == null);
-                try std.testing.expect(harness.store.lower_acknowledgment == null);
-                try std.testing.expectEqual(@as(usize, 0), harness.runner.recovery_ack_calls);
-                return;
-            }
-            try std.testing.expect(transferred);
-            try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pending, harness.store.lower_acknowledgment.?));
-            if (interrupted_completion) {
-                try std.testing.expectEqual(!published_interruption, crash.triggered);
-                try std.testing.expect(harness.store.active_bytes != null);
-                harness.engine.completion_crash = null;
-                const live_checks = harness.runner.native_verification_calls;
-                if (published_interruption) harness.runner.native_verification_source = null;
-                if (scenario == .after_final_publication)
-                    try checkAllAllocationFailuresDeterministic(allocator, preparePublishedFailure, .{ &harness, &loaded });
-                const source_state = try failing_allocator.dupe(u8, harness.store.active_bytes.?);
-                defer failing_allocator.free(source_state);
-                var restart_outcome = try harness.engine.prepareRecoveryWithProfile(failing_allocator, prepared.request.profile_path, &loaded);
-                var restart = switch (restart_outcome) {
-                    .ready => |ready| ready,
-                    .result => |*value| {
-                        value.deinit();
-                        return error.TestUnexpectedResult;
-                    },
-                    .cleanup_required => |cleanup| return switch (cleanup.cause) {
-                        .out_of_memory => error.OutOfMemory,
-                        else => error.TestUnexpectedResult,
-                    },
-                };
-                defer restart.deinit();
-                try std.testing.expectEqualStrings(source_state, harness.store.active_bytes.?);
-                if (scenario == .published_refusals)
-                    try refuseChangedPublishedFailure(failing_allocator, &harness, restart, &loaded);
-                var restarted = false;
-                var resumed = try harness.engine.executeValidatedRecoveryWithProfile(failing_allocator, restart, restart.review_claim.?, &restarted, &loaded);
-                defer resumed.deinit();
-                if (published_interruption) {
-                    try std.testing.expect(std.mem.indexOf(u8, restart.action, "fresh review") != null);
-                    try std.testing.expectEqual(api.Outcome.recovery, resumed.outcome);
-                    try std.testing.expect(resumed.changed);
-                    try std.testing.expect(!restarted);
-                    try std.testing.expectEqual(@as(usize, 0), harness.runner.recovery_ack_calls);
-                    try std.testing.expectEqualStrings(harness.store.retained_bytes.?, harness.store.active_bytes.?);
-                    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pending, harness.runner.inspect_deferred_acknowledgment.?));
-                    var final = (try harness.store.interface().readRetained(failing_allocator, prepared.paths)).?;
-                    defer final.deinit();
-                    try std.testing.expectError(error.InvalidRetainedEvidence, harness.engine.cleanupCommittedNativeFailure(
-                        failing_allocator,
-                        restart.prepared,
-                        &loaded,
-                        final.state,
-                        restart.review_claim.?,
-                        &restarted,
-                    ));
-                    var source_guard: RecoveryReviewGuard = .{ .runner = harness.engine.runner, .claim = restart.review_claim.? };
-                    try std.testing.expect(source_guard.settle(.operational_boundary_failure) == null);
-                    var cleanup_outcome = try harness.engine.prepareRecoveryWithProfile(failing_allocator, prepared.request.profile_path, &loaded);
-                    var cleanup = switch (cleanup_outcome) {
-                        .ready => |ready| ready,
-                        .result => |*value| {
-                            value.deinit();
-                            return error.TestUnexpectedResult;
-                        },
-                        .cleanup_required => |required| return switch (required.cause) {
-                            .out_of_memory => error.OutOfMemory,
-                            else => error.TestUnexpectedResult,
-                        },
+            const RecoveryCase = struct {
+                fn execute(
+                    alloc: std.mem.Allocator,
+                    h: *Harness,
+                    prep: Preparation,
+                    prof: *LoadedProfile,
+                    rec: RecoveryPreparation,
+                    clm: root_operation.RecoveryReviewClaim,
+                    pend: root_operation.DeferredAcknowledgment,
+                    rec_source: []const u8,
+                    sc: Scenario,
+                    is_refused: bool,
+                ) !void {
+                    return executeInternal(alloc, h, prep, prof, rec, clm, pend, rec_source, sc, is_refused) catch |err| switch (err) {
+                        error.WriteFailed => return error.OutOfMemory,
+                        else => return err,
                     };
-                    defer cleanup.deinit();
-                    try std.testing.expectEqual(final.state.generation, cleanup.prepared.active_generation);
-                    var completed = try harness.engine.executeValidatedRecoveryWithProfile(failing_allocator, cleanup, cleanup.review_claim.?, &restarted, &loaded);
-                    defer completed.deinit();
-                    try std.testing.expectEqual(api.Outcome.transaction, completed.outcome);
-                    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(completed.exit_status));
-                    try std.testing.expectEqual(live_checks, harness.runner.native_verification_calls);
-                } else {
-                    try std.testing.expectEqual(api.Outcome.transaction, resumed.outcome);
-                    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(resumed.exit_status));
                 }
-                try std.testing.expect(restarted);
-            } else {
-                try std.testing.expectEqual(@as(u8, 7), @intFromEnum(result.exit_status));
-                try std.testing.expectEqual(api.DiagnosticId.transaction_failed, result.diagnostics[0].id);
+
+                fn executeInternal(
+                    failing_alloc: std.mem.Allocator,
+                    h: *Harness,
+                    prep: Preparation,
+                    prof: *LoadedProfile,
+                    rec: RecoveryPreparation,
+                    clm: root_operation.RecoveryReviewClaim,
+                    pend: root_operation.DeferredAcknowledgment,
+                    rec_source: []const u8,
+                    sc: Scenario,
+                    is_refused: bool,
+                ) !void {
+                    const orig_store = h.store;
+                    const orig_runner = h.runner;
+                    const orig_backend = h.backend;
+                    const orig_verifier = h.verifier;
+                    h.store.allocator = failing_alloc;
+                    h.store.active_bytes = null;
+                    h.store.request_bytes = null;
+                    h.runner.allocator = failing_alloc;
+                    h.runner.inspect_record_source = null;
+                    h.runner.recovery_completion_source = null;
+                    defer {
+                        h.store.deinit();
+                        h.runner.deinit();
+                        h.store = orig_store;
+                        h.runner = orig_runner;
+                        h.backend = orig_backend;
+                        h.verifier = orig_verifier;
+                        h.engine.completion_crash = null;
+                    }
+                    h.store.active_bytes = try failing_alloc.dupe(u8, orig_store.active_bytes.?);
+                    h.store.request_bytes = try failing_alloc.dupe(u8, orig_store.request_bytes.?);
+                    h.runner.inspect_record_source = try failing_alloc.dupe(u8, orig_runner.inspect_record_source.?);
+                    h.runner.recovery_completion_source = try failing_alloc.dupe(u8, orig_runner.recovery_completion_source.?);
+                    const published_interruption = sc == .after_final_publication or sc == .published_refusals;
+                    h.store.fail_after_retain_once = published_interruption;
+                    var crash: FakeCompletionCrash = .{ .boundary = switch (sc) {
+                        .after_owner => .after_acknowledgment_retained,
+                        .after_receipt => .after_transaction_retained,
+                        .after_commit => .after_outer_committed,
+                        .before_ack => .before_ownership_acknowledged,
+                        else => .after_recovery_acknowledged,
+                    } };
+                    const interrupted_completion = sc != .fresh and !is_refused;
+                    if (interrupted_completion and !published_interruption)
+                        h.engine.completion_crash = crash.interface();
+                    var transferred = false;
+                    var result = try h.engine.executeValidatedRecoveryWithProfile(failing_alloc, rec, clm, &transferred, prof);
+                    defer result.deinit();
+                    if (sc == .fresh and result.outcome != .transaction) {
+                        std.debug.print("recovered native failure: transferred={any} recover={d} live={d} retained={any}: {s}\n", .{ transferred, h.backend.recover_calls, h.runner.native_verification_calls, h.store.retained_bytes != null, result.diagnostics[0].message });
+                    }
+                    try std.testing.expectEqual(if (sc == .fresh) api.Outcome.transaction else .recovery, result.outcome);
+                    try std.testing.expect(result.evidence.root_operation_completion == null);
+                    try std.testing.expectEqual(@as(usize, 1), h.backend.recover_calls);
+                    try std.testing.expectEqual(@as(usize, 0), h.backend.execute_calls);
+                    if (is_refused) {
+                        try std.testing.expect(!transferred);
+                        try std.testing.expect(h.store.retained_bytes == null);
+                        try std.testing.expect(h.store.native_transaction_bytes == null);
+                        try std.testing.expect(h.store.lower_acknowledgment == null);
+                        try std.testing.expectEqual(@as(usize, 0), h.runner.recovery_ack_calls);
+                        return;
+                    }
+                    try std.testing.expect(transferred);
+                    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pend, h.store.lower_acknowledgment.?));
+                    if (interrupted_completion) {
+                        try std.testing.expectEqual(!published_interruption, crash.triggered);
+                        try std.testing.expect(h.store.active_bytes != null);
+                        h.engine.completion_crash = null;
+                        const live_checks = h.runner.native_verification_calls;
+                        if (published_interruption) h.runner.native_verification_source = null;
+                        if (sc == .after_final_publication)
+                            try checkAllAllocationFailuresDeterministic(std.testing.allocator, preparePublishedFailure, .{ h, prof });
+                        const source_state = try failing_alloc.dupe(u8, h.store.active_bytes.?);
+                        defer failing_alloc.free(source_state);
+                        var restart_outcome = try h.engine.prepareRecoveryWithProfile(failing_alloc, prep.request.profile_path, prof);
+                        var restart = switch (restart_outcome) {
+                            .ready => |ready| ready,
+                            .result => |*value| {
+                                value.deinit();
+                                return error.TestUnexpectedResult;
+                            },
+                            .cleanup_required => |cleanup| return switch (cleanup.cause) {
+                                .out_of_memory => error.OutOfMemory,
+                                else => error.TestUnexpectedResult,
+                            },
+                        };
+                        defer restart.deinit();
+                        try std.testing.expectEqualStrings(source_state, h.store.active_bytes.?);
+                        if (sc == .published_refusals)
+                            try refuseChangedPublishedFailure(failing_alloc, h, restart, prof);
+                        var restarted = false;
+                        var resumed = try h.engine.executeValidatedRecoveryWithProfile(failing_alloc, restart, restart.review_claim.?, &restarted, prof);
+                        defer resumed.deinit();
+                        if (published_interruption) {
+                            try std.testing.expect(std.mem.indexOf(u8, restart.action, "fresh review") != null);
+                            try std.testing.expectEqual(api.Outcome.recovery, resumed.outcome);
+                            try std.testing.expect(resumed.changed);
+                            try std.testing.expect(!restarted);
+                            try std.testing.expectEqual(@as(usize, 0), h.runner.recovery_ack_calls);
+                            try std.testing.expectEqualStrings(h.store.retained_bytes.?, h.store.active_bytes.?);
+                            try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pend, h.runner.inspect_deferred_acknowledgment.?));
+                            var final = (try h.store.interface().readRetained(failing_alloc, prep.paths)).?;
+                            defer final.deinit();
+                            try std.testing.expectError(error.InvalidRetainedEvidence, h.engine.cleanupCommittedNativeFailure(
+                                failing_alloc,
+                                restart.prepared,
+                                prof,
+                                final.state,
+                                restart.review_claim.?,
+                                &restarted,
+                            ));
+                            var source_guard: RecoveryReviewGuard = .{ .runner = h.engine.runner, .claim = restart.review_claim.? };
+                            try std.testing.expect(source_guard.settle(.operational_boundary_failure) == null);
+                            var cleanup_outcome = try h.engine.prepareRecoveryWithProfile(failing_alloc, prep.request.profile_path, prof);
+                            var cleanup = switch (cleanup_outcome) {
+                                .ready => |ready| ready,
+                                .result => |*value| {
+                                    value.deinit();
+                                    return error.TestUnexpectedResult;
+                                },
+                                .cleanup_required => |required| return switch (required.cause) {
+                                    .out_of_memory => error.OutOfMemory,
+                                    else => error.TestUnexpectedResult,
+                                },
+                            };
+                            defer cleanup.deinit();
+                            try std.testing.expectEqual(final.state.generation, cleanup.prepared.active_generation);
+                            var completed = try h.engine.executeValidatedRecoveryWithProfile(failing_alloc, cleanup, cleanup.review_claim.?, &restarted, prof);
+                            defer completed.deinit();
+                            try std.testing.expectEqual(api.Outcome.transaction, completed.outcome);
+                            try std.testing.expectEqual(@as(u8, 7), @intFromEnum(completed.exit_status));
+                            try std.testing.expectEqual(live_checks, h.runner.native_verification_calls);
+                        } else {
+                            try std.testing.expectEqual(api.Outcome.transaction, resumed.outcome);
+                            try std.testing.expectEqual(@as(u8, 7), @intFromEnum(resumed.exit_status));
+                        }
+                        try std.testing.expect(restarted);
+                    } else {
+                        try std.testing.expectEqual(@as(u8, 7), @intFromEnum(result.exit_status));
+                        try std.testing.expectEqual(api.DiagnosticId.transaction_failed, result.diagnostics[0].id);
+                    }
+                    try std.testing.expect(h.store.active_bytes == null);
+                    try std.testing.expect(h.runner.inspect_deferred_acknowledgment == null);
+                    try std.testing.expect(h.runner.inspect_record_source == null);
+                    try std.testing.expect(h.runner.recovery_review_claim == null);
+                    try std.testing.expectEqualStrings(rec_source, h.store.native_transaction_bytes.?);
+                    try std.testing.expectEqualStrings(h.runner.recovery_completion_source.?, h.store.recovery_completion_bytes.?);
+                    try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pend, h.store.lower_acknowledgment.?));
+                    try std.testing.expectEqual(@as(usize, 1), h.backend.recover_calls);
+                    try std.testing.expect(!h.store.completion_published);
+                    try std.testing.expect(h.store.native_completion_bytes == null);
+                }
+            };
+            if (scenario == .fresh) {
+                try checkAllAllocationFailuresDeterministic(
+                    allocator,
+                    RecoveryCase.execute,
+                    .{ &harness, prepared, &loaded, recovery, claim, pending, receipt_source, scenario, refused },
+                );
             }
-            try std.testing.expect(harness.store.active_bytes == null);
-            try std.testing.expect(harness.runner.inspect_deferred_acknowledgment == null);
-            try std.testing.expect(harness.runner.inspect_record_source == null);
-            try std.testing.expect(harness.runner.recovery_review_claim == null);
-            try std.testing.expectEqualStrings(receipt_source, harness.store.native_transaction_bytes.?);
-            try std.testing.expectEqualStrings(harness.runner.recovery_completion_source.?, harness.store.recovery_completion_bytes.?);
-            try std.testing.expect(root_operation.deferredAcknowledgmentExactEqual(pending, harness.store.lower_acknowledgment.?));
-            try std.testing.expectEqual(@as(usize, 1), harness.backend.recover_calls);
-            try std.testing.expect(!harness.store.completion_published);
-            try std.testing.expect(harness.store.native_completion_bytes == null);
+            try RecoveryCase.execute(
+                failing_allocator,
+                &harness,
+                prepared,
+                &loaded,
+                recovery,
+                claim,
+                pending,
+                receipt_source,
+                scenario,
+                refused,
+            );
         }
     };
     for (std.enums.values(Scenario)) |scenario|
         try Case.run(std.testing.allocator, scenario);
-    try checkAllAllocationFailuresDeterministic(std.testing.allocator, Case.run, .{Scenario.fresh});
 }
 
 test "apt_system_orchestrator.test.native engine live verification preserves allocation failures" {

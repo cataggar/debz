@@ -489,7 +489,7 @@ fn boundedChildren(
         diag.set(allocator, "{s} directory changed while scanning", .{label});
         return error.CaptureFailed;
     }
-    std.mem.sort([]const u8, children.items, {}, stringLessThan);
+    std.sort.heap([]const u8, children.items, {}, stringLessThan);
     return .{ .children = children.items, .stat = before };
 }
 
@@ -764,7 +764,7 @@ fn extractReferences(
             i += 1;
         }
     }
-    std.mem.sort([]const u8, list.items, {}, stringLessThan);
+    std.sort.heap([]const u8, list.items, {}, stringLessThan);
     return list.items;
 }
 
@@ -949,7 +949,7 @@ fn scanMetadata(
             try encoded_etc_map.put(allocator, with_slash, reference);
         }
     }
-    std.mem.sort([]const u8, etc_refs.items, {}, stringLessThan);
+    std.sort.heap([]const u8, etc_refs.items, {}, stringLessThan);
 
     var owned_etc_set: std.StringHashMapUnmanaged(void) = .empty;
     var owned_etc_list: std.ArrayList([]const u8) = .empty;
@@ -968,7 +968,7 @@ fn scanMetadata(
             }
         }
     }
-    std.mem.sort([]const u8, owned_etc_list.items, {}, stringLessThan);
+    std.sort.heap([]const u8, owned_etc_list.items, {}, stringLessThan);
 
     return .{
         .control_members = control_members.items,
@@ -1395,7 +1395,7 @@ fn captureLinkedFilesystem(
     while (ref_it.next()) |key_ptr| {
         try requested.append(allocator, key_ptr.*);
     }
-    std.mem.sort([]const u8, requested.items, {}, stringLessThan);
+    std.sort.heap([]const u8, requested.items, {}, stringLessThan);
 
     var entries: std.StringHashMapUnmanaged(std.json.Value) = .empty;
     var identities: std.StringHashMapUnmanaged(?StatIdentity) = .empty;
@@ -1413,7 +1413,7 @@ fn captureLinkedFilesystem(
     while (entry_it.next()) |k| {
         try entry_keys.append(allocator, k.*);
     }
-    std.mem.sort([]const u8, entry_keys.items, {}, stringLessThan);
+    std.sort.heap([]const u8, entry_keys.items, {}, stringLessThan);
 
     var sorted_entries: std.ArrayList(std.json.Value) = .empty;
     for (entry_keys.items) |k| {
@@ -1636,7 +1636,7 @@ fn writeCanonicalValue(
             for (obj.keys(), 0..) |k, idx| {
                 keys[idx] = k;
             }
-            std.mem.sort([]const u8, keys, {}, stringLessThan);
+            std.sort.heap([]const u8, keys, {}, stringLessThan);
             try out.appendSlice(allocator, "{\n");
             for (keys, 0..) |k, i| {
                 try writeIndent(out, allocator, depth + 1);
@@ -3160,7 +3160,7 @@ fn deriveControlMembers(
             return error.DerivationFailed;
         }
     }
-    std.mem.sort([]const u8, identities.items, {}, stringLessThan);
+    std.sort.heap([]const u8, identities.items, {}, stringLessThan);
 
     var members = std.json.Array.init(allocator);
     var path_qualifications = std.json.Array.init(allocator);
@@ -3315,7 +3315,7 @@ fn deriveAlternatives(
         diag.set(allocator, "linked filesystem paths differ by architecture", .{});
         return error.DerivationFailed;
     }
-    std.mem.sort([]const u8, linked_paths.items, {}, stringLessThan);
+    std.sort.heap([]const u8, linked_paths.items, {}, stringLessThan);
     for (linked_paths.items) |path| {
         const amd_item = amd64_linked.get(path).?;
         const arm_item = arm64_linked.get(path) orelse {
@@ -3458,8 +3458,8 @@ fn deriveAlternatives(
             try links.append(allocator, .{ .object = link_obj });
         }
 
-        std.mem.sort(std.json.Value, links.items, {}, linkObjLessThan);
-        std.mem.sort(std.json.Value, candidates.items, {}, candidateObjLessThan);
+        std.sort.heap(std.json.Value, links.items, {}, linkObjLessThan);
+        std.sort.heap(std.json.Value, candidates.items, {}, candidateObjLessThan);
 
         var seen_selectors: std.StringHashMapUnmanaged(void) = .empty;
         var group_masters: usize = 0;
@@ -3493,7 +3493,7 @@ fn deriveAlternatives(
             }
             try cand_terminals.put(allocator, tp, {});
             if (selected_terminals.get(tp)) |sel_list| {
-                std.mem.sort([]const u8, sel_list.items, {}, stringLessThan);
+                std.sort.heap([]const u8, sel_list.items, {}, stringLessThan);
                 try cval.object.put(allocator, "selected_by", try makeStringArrayJson(allocator, sel_list.items));
             }
         }
@@ -3564,7 +3564,7 @@ fn deriveAlternatives(
             diag.set(allocator, "linked entry has no derived role: {s}", .{path});
             return error.DerivationFailed;
         }
-        std.mem.sort([]const u8, role_list.items, {}, roleLessThan);
+        std.sort.heap([]const u8, role_list.items, {}, roleLessThan);
         const kind = amd_item.get("kind").?.string;
         if (std.mem.eql(u8, kind, "regular")) regular_count += 1 else if (std.mem.eql(u8, kind, "symlink")) symlink_count += 1;
 

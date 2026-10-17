@@ -5,12 +5,20 @@ const support = @import("tooling-test-support.zig");
 const Fixture = struct {
     work: support.Work,
     arena: std.heap.ArenaAllocator,
+    server: ?std.process.Child = null,
 
     fn init() !Fixture {
         return .{ .work = try support.Work.init(), .arena = std.heap.ArenaAllocator.init(support.allocator) };
     }
 
     fn deinit(self: *Fixture) void {
+        if (self.server) |*child| {
+            if (child.stdin) |*stdin_file| {
+                stdin_file.close(support.io);
+                child.stdin = null;
+            }
+            _ = child.wait(support.io) catch {};
+        }
         self.work.deinit();
         self.arena.deinit();
     }
@@ -47,11 +55,36 @@ const Fixture = struct {
                 30,
             );
         }
-        return support.runWithTimeout(
-            &.{ "python3", "tools/security-audit.py", "check", kind, try self.path("check-input") },
-            .inherit,
-            if (std.mem.startsWith(u8, kind, "digest-")) 120 else 30,
+        if (self.server == null) {
+            self.server = try std.process.spawn(support.io, .{
+                .argv = &.{ "python3", "-u", "tools/security-audit.py", "--check-server" },
+                .stdin = .pipe,
+                .stdout = .pipe,
+                .stderr = .inherit,
+            });
+        }
+        const req = try std.fmt.allocPrint(
+            self.arena.allocator(),
+            "{s}\t{s}\t{s}\n",
+            .{ kind, try self.path("check-input"), try self.path("check-output") },
         );
+        try self.server.?.stdin.?.writeStreamingAll(support.io, req);
+        var ack: [3]u8 = undefined;
+        var reader = self.server.?.stdout.?.reader(support.io, &.{});
+        try reader.interface.readSliceAll(&ack);
+        const raw_out = try self.work.read("check-output");
+        defer support.allocator.free(raw_out);
+        const ServerResponse = struct {
+            code: u8,
+            stdout: []const u8,
+            stderr: []const u8,
+        };
+        const parsed = try std.json.parseFromSlice(ServerResponse, self.arena.allocator(), raw_out, .{});
+        return .{
+            .code = parsed.value.code,
+            .stdout = try support.allocator.dupe(u8, parsed.value.stdout),
+            .stderr = try support.allocator.dupe(u8, parsed.value.stderr),
+        };
     }
 };
 

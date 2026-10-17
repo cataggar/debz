@@ -15733,7 +15733,10 @@ const ExternalLifecycleRequest = struct {
     acknowledge_native: bool = false,
     caller_verification: ?native_provenance.Digest = null,
     core_product: bool = false,
-    core_completion_crash: ?@import("production_backend.zig").CompletionPoint = null,
+    core_completion_crash: ?if (@import("debz_build_options").enable_external_lifecycle_fixtures)
+        @import("production_backend.zig").CompletionPoint
+    else
+        enum { unused } = null,
     isolated_helper: bool = false,
     deadline_after_ms: ?u64 = null,
     helper_bootstrap_expectation: ?HelperBootstrapExpectation = null,
@@ -39460,6 +39463,8 @@ test "native_unpack.test.lifecycle external fixture" {
                 return error.InvalidExternalLifecycleRequest;
         }
         if (external.core_product) {
+            if (comptime !@import("debz_build_options").enable_external_lifecycle_fixtures)
+                return error.InvalidExternalLifecycleRequest;
             const product = @import("production_backend.zig");
             const api = @import("product_api.zig");
             const Crash = struct {

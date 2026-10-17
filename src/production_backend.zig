@@ -7279,6 +7279,8 @@ fn writeExternalNativeWorkflowReport(path: []const u8, output: []const u8) !void
 }
 
 fn verifyExternalOwnedNativeWorkflow(allocator: std.mem.Allocator, external: anytype) ![]const u8 {
+    if (comptime !@import("debz_build_options").enable_external_lifecycle_fixtures)
+        return error.InvalidExternalWorkflowRequest;
     const facade = @import("apt_system_orchestrator.zig");
     const check = external.owned_verification.?;
     const owner = try root_operation.decodeDeferredAcknowledgment(
@@ -7464,6 +7466,8 @@ fn recoverExternalNativeWorkflow(allocator: std.mem.Allocator, external: anytype
         allocator,
         try readFile(allocator, std.testing.io, external.owner_evidence orelse return error.InvalidExternalWorkflowRequest, root_operation.maximum_document_bytes),
     );
+    if (comptime !@import("debz_build_options").enable_external_lifecycle_fixtures)
+        return error.InvalidExternalWorkflowRequest;
     const facade = @import("apt_system_orchestrator.zig");
     const RejectLegacy = struct {
         fn run(_: *anyopaque, _: transaction_executor.Invocation) anyerror!transaction_executor.ProcessResult {
@@ -13896,3 +13900,9 @@ test "production backend mutation uses injected process runner" {
         directory.dir.openFile(std.testing.io, "state/recovery-request.json", .{}),
     );
 }
+
+test {
+    _ = @import("package_family_backend.zig");
+    _ = @import("product_api.zig");
+}
+

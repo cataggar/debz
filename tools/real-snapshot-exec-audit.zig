@@ -1289,7 +1289,7 @@ fn auditTraceBytes(
     while (ev_it.next()) |key| {
         try sorted_seqs.append(allocator, key.*);
     }
-    std.mem.sort(usize, sorted_seqs.items, {}, std.sort.asc(usize));
+    std.sort.heap(usize, sorted_seqs.items, {}, std.sort.asc(usize));
 
     for (sorted_seqs.items) |ev_seq| {
         const ev = state.events.get(ev_seq).?;
@@ -1350,8 +1350,8 @@ fn auditTraceBytes(
             return a.line < b.line;
         }
     };
-    std.mem.sort(CandidateRecord, allowed_all.items, {}, RecordSort.lessThan);
-    std.mem.sort(CandidateRecord, refused.items, {}, RecordSort.lessThan);
+    std.sort.heap(CandidateRecord, allowed_all.items, {}, RecordSort.lessThan);
+    std.sort.heap(CandidateRecord, refused.items, {}, RecordSort.lessThan);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     for (allowed_all.items) |record| {
