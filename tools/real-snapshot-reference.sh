@@ -63,7 +63,8 @@ for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real-snapshot-reference-launcher.zig",
              repository / "tools/real-snapshot-reference-runtime.zig",
              repository / "src/private_network.zig",
-             repository / "tools/real-snapshot-reference-order.py",
+             repository / "tools/real-snapshot-reference-order.zig",
+             repository / "tools/real-snapshot-reference-paths.zig",
              repository / "tools/real_snapshot_reference_paths.py",
              repository / "tools/prepare-native-dpkg.zig",
              repository / "zig-out/bin/debz-native-dpkg-reference",
@@ -194,7 +195,7 @@ launcher="$workspace/reference-launcher"
   --global-cache-dir "$workspace/reference-zig-global-cache" \
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
-"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+"$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
   --cache-dir "$workspace/reference-zig-cache" \
   --global-cache-dir "$workspace/reference-zig-global-cache" \
   --prefix "$workspace/runtime-tool"
@@ -203,11 +204,11 @@ runtime="$workspace/reference-runtime"
   "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
 timeout --signal=TERM --kill-after=30s 40m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$workspace/runtime-tool/bin/debz-reference-order" \
     --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
     --cache "$cache" --evidence "$evidence"
-python3 tools/real-snapshot-reference-order.py \
+"$workspace/runtime-tool/bin/debz-reference-order" \
   --report-only --architecture "$architecture" \
   --root "$reference_root" --cache "$cache" --evidence "$evidence"
 grep -Eq '^ii  ubuntu-minimal(:[^ ]+)? ' "$evidence/reference-installed.txt"

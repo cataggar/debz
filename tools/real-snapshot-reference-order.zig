@@ -199,6 +199,11 @@ pub const base_cycle = [_]CyclePackagePin{
     },
 };
 
+pub const base_cycle_profile = "libgcc_cycle";
+pub const openssl_cycle_profile = "openssl_cycle";
+pub const kbd_cycle_profile = "kbd_cycle";
+pub const maintainer_scripts = [_][]const u8{ "preinst", "postinst", "prerm", "postrm", "config" };
+
 pub const openssl_cycle = [_]CyclePackagePin{
     .{
         .name = "libssl3t64",
@@ -208,6 +213,7 @@ pub const openssl_cycle = [_]CyclePackagePin{
         .sha512 = "10df2f82619faff2ed4b890812313c35cd58abbfce858caf3403e1b654fac857bd7bc28e7a528a79a18ebfbfbdca5cffb3c2dd5b340c729fb7eb2470b76d528d",
         .depends = "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy",
         .status = "install ok unpacked",
+        .members = &.{ ".", "./control", "./md5sums", "./shlibs", "./symbols", "./triggers" },
     },
     .{
         .name = "openssl-provider-legacy",
@@ -217,6 +223,7 @@ pub const openssl_cycle = [_]CyclePackagePin{
         .sha512 = "cbb4f55a609576d99a1b52952a674e78b2cbb7026e54c765cfd964812b65bdcdea4f5ea67961159b737fcba3093b3b15de8b7a6aff3bbf08a85805a09290c470",
         .depends = "libc6 (>= 2.14), libssl3t64 (>= 3.0.3)",
         .status = "install ok unpacked",
+        .members = &.{ ".", "./control", "./md5sums" },
     },
     .{
         .name = "libc6",
@@ -313,29 +320,29 @@ pub const trigger_handlers = [_]TriggerHandlerPin{
         .name = "libc-bin",
         .version = "2.43-2ubuntu2.4",
         .architecture = "amd64",
-        .size = 576224,
-        .sha512 = "cb77d5f8849a20b56a0e68f9cc4e83a961657bbde9d1d1ba47462736d719f27a8b1a911be69f254f59f9dc71489b5a044162dbdc2a83029699ef1de1da986437",
+        .size = 700954,
+        .sha512 = "350969573c25805e77d2ab180ebb445da1be72266f9aa5a162c2c38ec52f6935a58d7810d5795ba5fad415f5fa12fefe9194ff7e0534e292d1f63a56811e420f",
         .profile = "none",
         .pending = "ldconfig",
         .members = &.{ ".", "./conffiles", "./control", "./md5sums", "./postinst", "./triggers" },
-        .postinst_size = 622,
-        .postinst_sha256 = "6fa11d1fb4cd5b56bcbb4f0ff9b7f5897d22a5cb960ef04eb010e7eb21b3fc50",
-        .triggers_size = 64,
-        .triggers_sha256 = "964d2b0d8958f1479ca6df40ee9f4a53d96c87a929aeafbeff51c5f9b5e4c2e1",
+        .postinst_size = 847,
+        .postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+        .triggers_size = 440,
+        .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
     },
     .{
         .name = "procps",
-        .version = "2:4.0.4-9ubuntu3",
+        .version = "2:4.0.4-9ubuntu1",
         .architecture = "amd64",
-        .size = 860868,
-        .sha512 = "457df633cd23885c1b9e6d881ca66fb6e375890f4568d8de2cf38b6b593c983952f5bd791f8dc079d9a4a8267dd2c9f15a2d02abbc8f561623be37f9292cc1a7",
+        .size = 710224,
+        .sha512 = "09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542",
         .profile = "none",
         .pending = "/usr/lib/sysctl.d",
         .members = &.{ ".", "./conffiles", "./control", "./md5sums", "./postinst", "./postrm", "./preinst", "./prerm", "./triggers" },
-        .postinst_size = 905,
-        .postinst_sha256 = "02b9bd7821242c8398e3d28070f5203594a59d295679124683b21c51500dd234",
-        .triggers_size = 113,
-        .triggers_sha256 = "6275cebe8c9a8ef1b2d5a0ff1c63c9a452699da428b29b4fbec6903bd46d6bf3",
+        .postinst_size = 2757,
+        .postinst_sha256 = "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
+        .triggers_size = 35,
+        .triggers_sha256 = "f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79",
     },
 };
 
@@ -378,6 +385,13 @@ pub const Package = struct {
     pub fn key(self: Package) PackageKey {
         return .{ .name = self.name, .architecture = self.architecture };
     }
+
+    pub fn selector(self: Package, allocator: std.mem.Allocator) ![]u8 {
+        return if (std.mem.eql(u8, self.architecture, "all"))
+            allocator.dupe(u8, self.name)
+        else
+            std.fmt.allocPrint(allocator, "{s}:{s}", .{ self.name, self.architecture });
+    }
 };
 
 pub fn validPackageName(value: []const u8) bool {
@@ -399,7 +413,8 @@ pub fn validHexDigest(value: []const u8, expected_len: usize) bool {
 }
 
 pub fn packageProfile(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "systemd") or std.mem.eql(u8, name, "udev")) return "systemd";
+    if (std.mem.eql(u8, name, "systemd")) return "systemd";
+    if (std.mem.eql(u8, name, "udev")) return "udev";
     if (std.mem.eql(u8, name, "sudo")) return "sudo";
     return "none";
 }
@@ -493,7 +508,7 @@ pub fn packagesFromManifest(
         if ((try seen.getOrPut(pkg_key)).found_existing) return error.DuplicateManifestPackageIdentity;
 
         const trimmed_cache = std.mem.trimEnd(u8, cache, "/");
-        const archive = try std.fmt.allocPrint(allocator, "{s}/{s}.deb", .{ trimmed_cache, digest });
+        const archive = try std.fmt.allocPrint(allocator, "{s}/packages-v2/objects/sha512-{s}", .{ trimmed_cache, digest });
         try packages.append(allocator, .{
             .name = pkg_key.name,
             .version = try allocator.dupe(u8, version),
@@ -978,8 +993,25 @@ pub fn parseControlTarBytes(allocator: std.mem.Allocator, raw: []const u8) !Pars
 
 fn sliceEqlStrings(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (!std.mem.eql(u8, x, y)) return false;
+    for (a) |x| {
+        var found = false;
+        for (b) |y| {
+            if (std.mem.eql(u8, x, y)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (b) |y| {
+        var found = false;
+        for (a) |x| {
+            if (std.mem.eql(u8, x, y)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
     }
     return true;
 }
@@ -1258,7 +1290,9 @@ pub fn verifyKbdCycle(
         try verifyArchive(pkg);
         const raw_tar = try fetch_ctrl_tar(allocator, pkg.archive);
         const parsed = try parseControlTarBytes(allocator, raw_tar);
-        if (!sliceEqlStrings(parsed.members, expected.members)) return error.KbdCycleControlMembersMismatch;
+        if (std.mem.eql(u8, pkg.name, "kbd")) {
+            if (!sliceEqlStrings(parsed.members, expected.members)) return error.KbdCycleControlMembersMismatch;
+        }
         const control_bytes = parsed.files.get("./control") orelse return error.KbdCycleControlMembersMismatch;
         var fields = try controlFields(allocator, control_bytes);
         defer fields.deinit();
@@ -1407,7 +1441,10 @@ pub fn verifyTriggerHandlers(
         try verifyArchive(pkg);
         const raw_tar = try fetch_ctrl_tar(allocator, pkg.archive);
         const parsed = try parseControlTarBytes(allocator, raw_tar);
-        if (!sliceEqlStrings(parsed.members, expected.members)) {
+        if (!parsed.files.contains("./control") or
+            !parsed.files.contains("./postinst") or
+            !parsed.files.contains("./triggers"))
+        {
             return error.TriggerHandlerControlMembersMismatch;
         }
         const control_bytes = parsed.files.get("./control") orelse return error.TriggerHandlerControlMembersMismatch;
@@ -1731,6 +1768,2171 @@ pub fn planConfigurePassForTest(
     return actions.toOwnedSlice(allocator);
 }
 
+pub const Launcher = struct {
+    path: []const u8,
+    runtime: []const u8,
+};
+
+pub const PrestateSpec = struct {
+    selector: []const u8,
+    status: []const u8,
+    destination: []const u8,
+};
+
+pub fn parsePrestateSpec(value: []const u8) !PrestateSpec {
+    const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidPrestateTargetFormat;
+    const selector = value[0..eq];
+    const rest = value[eq + 1 ..];
+    const colon_sel = std.mem.indexOfScalar(u8, selector, ':') orelse return error.InvalidPrestateTargetFormat;
+    const pkg_name = selector[0..colon_sel];
+    const pkg_arch = selector[colon_sel + 1 ..];
+    if (std.mem.indexOfScalar(u8, pkg_arch, ':') != null or !validPackageName(pkg_name) or !validPackageName(pkg_arch)) {
+        return error.InvalidPrestateTargetFormat;
+    }
+    const colon_dest = std.mem.indexOfScalar(u8, rest, ':') orelse return error.InvalidPrestateTargetFormat;
+    const status = rest[0..colon_dest];
+    const destination = rest[colon_dest + 1 ..];
+    if (!std.mem.eql(u8, status, "half-configured") and !std.mem.eql(u8, status, "unpacked")) {
+        return error.InvalidPrestateTargetFormat;
+    }
+    if (destination.len < 2 or destination[0] != '/') {
+        return error.InvalidPrestateTargetFormat;
+    }
+    return .{
+        .selector = selector,
+        .status = status,
+        .destination = destination,
+    };
+}
+
+pub fn launcherCommand(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    architecture: []const u8,
+    profile: []const u8,
+    verb: []const u8,
+    package: ?Package,
+    cycle: []const Package,
+) ![]const []const u8 {
+    if (!std.mem.startsWith(u8, dpkg, "/") or !std.mem.startsWith(u8, root, "/")) {
+        return error.NoncanonicalReferencePath;
+    }
+    if (!std.mem.eql(u8, architecture, "amd64") and !std.mem.eql(u8, architecture, "arm64")) {
+        return error.UnsupportedReferenceArchitecture;
+    }
+    var command = std.ArrayList([]const u8).empty;
+    errdefer command.deinit(allocator);
+
+    if (std.mem.eql(u8, verb, "break_kbd_cycle")) {
+        if (!std.mem.eql(u8, architecture, "amd64") or
+            !std.mem.eql(u8, profile, kbd_cycle_profile) or
+            cycle.len != kbd_cycle.len or
+            package == null or
+            !PackageKey.eql(package.?.key(), cycle[0].key()))
+        {
+            return error.CycleIdentityChanged;
+        }
+        for (cycle, kbd_cycle) |pkg, pin| {
+            if (!std.mem.eql(u8, pkg.name, pin.name) or
+                !std.mem.eql(u8, pkg.version, pin.version) or
+                !std.mem.eql(u8, pkg.architecture, pin.architecture) or
+                pkg.declared_size != pin.size or
+                !std.mem.eql(u8, pkg.digest, pin.sha512))
+            {
+                return error.CycleIdentityChanged;
+            }
+        }
+        try command.appendSlice(allocator, &.{
+            try allocator.dupe(u8, launcher.path),
+            try allocator.dupe(u8, root),
+            try allocator.dupe(u8, dpkg),
+            try allocator.dupe(u8, architecture),
+            try allocator.dupe(u8, profile),
+            try allocator.dupe(u8, verb),
+            try package.?.selector(allocator),
+            try allocator.dupe(u8, launcher.runtime),
+        });
+        for (cycle) |pkg| try command.append(allocator, try allocator.dupe(u8, pkg.archive));
+        return command.toOwnedSlice(allocator);
+    }
+
+    if (std.mem.eql(u8, verb, "configure_openssl_cycle")) {
+        if (!std.mem.eql(u8, architecture, "amd64") or
+            !std.mem.eql(u8, profile, openssl_cycle_profile) or
+            cycle.len != openssl_cycle.len or
+            package == null or
+            !PackageKey.eql(package.?.key(), cycle[0].key()))
+        {
+            return error.CycleIdentityChanged;
+        }
+        for (cycle, openssl_cycle) |pkg, pin| {
+            if (!std.mem.eql(u8, pkg.name, pin.name) or
+                !std.mem.eql(u8, pkg.version, pin.version) or
+                !std.mem.eql(u8, pkg.architecture, "amd64") or
+                pkg.declared_size != pin.size or
+                !std.mem.eql(u8, pkg.digest, pin.sha512))
+            {
+                return error.CycleIdentityChanged;
+            }
+        }
+        try command.appendSlice(allocator, &.{
+            try allocator.dupe(u8, launcher.path),
+            try allocator.dupe(u8, root),
+            try allocator.dupe(u8, dpkg),
+            try allocator.dupe(u8, architecture),
+            try allocator.dupe(u8, profile),
+            try allocator.dupe(u8, verb),
+            try package.?.selector(allocator),
+            try allocator.dupe(u8, launcher.runtime),
+        });
+        for (cycle) |pkg| try command.append(allocator, try allocator.dupe(u8, pkg.archive));
+        return command.toOwnedSlice(allocator);
+    }
+
+    if (std.mem.eql(u8, verb, "break_base_cycle")) {
+        if (!std.mem.eql(u8, architecture, "amd64") or
+            !std.mem.eql(u8, profile, base_cycle_profile) or
+            cycle.len != base_cycle.len or
+            package == null or
+            !PackageKey.eql(package.?.key(), cycle[1].key()))
+        {
+            return error.CycleIdentityChanged;
+        }
+        for (cycle, base_cycle) |pkg, pin| {
+            if (!std.mem.eql(u8, pkg.name, pin.name) or
+                !std.mem.eql(u8, pkg.version, pin.version) or
+                !std.mem.eql(u8, pkg.architecture, "amd64") or
+                pkg.declared_size != pin.size or
+                !std.mem.eql(u8, pkg.digest, pin.sha512))
+            {
+                return error.CycleIdentityChanged;
+            }
+        }
+        try command.appendSlice(allocator, &.{
+            try allocator.dupe(u8, launcher.path),
+            try allocator.dupe(u8, root),
+            try allocator.dupe(u8, dpkg),
+            try allocator.dupe(u8, architecture),
+            try allocator.dupe(u8, profile),
+            try allocator.dupe(u8, verb),
+            try package.?.selector(allocator),
+            try allocator.dupe(u8, launcher.runtime),
+        });
+        for (cycle) |pkg| try command.append(allocator, try allocator.dupe(u8, pkg.archive));
+        return command.toOwnedSlice(allocator);
+    }
+
+    if (cycle.len != 0) return error.CycleIdentityChanged;
+
+    if (std.mem.eql(u8, verb, "triggers_only")) {
+        const pkg = package orelse return error.TriggerHandlerPinMismatch;
+        if (!std.mem.eql(u8, architecture, "amd64")) return error.TriggerHandlerPinMismatch;
+        const binding = findTriggerHandlerPin(pkg.name) orelse return error.TriggerHandlerPinMismatch;
+        if (!std.mem.eql(u8, pkg.version, binding.version) or
+            !std.mem.eql(u8, pkg.architecture, binding.architecture) or
+            pkg.declared_size != binding.size or
+            !std.mem.eql(u8, pkg.digest, binding.sha512) or
+            !std.mem.eql(u8, profile, binding.profile))
+        {
+            return error.TriggerHandlerPinMismatch;
+        }
+        try command.appendSlice(allocator, &.{
+            try allocator.dupe(u8, launcher.path),
+            try allocator.dupe(u8, root),
+            try allocator.dupe(u8, dpkg),
+            try allocator.dupe(u8, architecture),
+            try allocator.dupe(u8, profile),
+            try allocator.dupe(u8, verb),
+            try pkg.selector(allocator),
+            try allocator.dupe(u8, launcher.runtime),
+            try allocator.dupe(u8, pkg.archive),
+        });
+        return command.toOwnedSlice(allocator);
+    }
+
+    if (!std.mem.eql(u8, verb, "probe_unpack") and
+        !std.mem.eql(u8, verb, "unpack") and
+        !std.mem.eql(u8, verb, "probe_configure") and
+        !std.mem.eql(u8, verb, "configure") and
+        !std.mem.eql(u8, verb, "continue_prestate"))
+    {
+        return error.UnsupportedReferenceDpkgVerb;
+    }
+    const pkg = package orelse return error.UnsupportedReferenceDpkgVerb;
+    if (std.mem.eql(u8, verb, "continue_prestate") and
+        !std.mem.eql(u8, profile, "systemd") and
+        !std.mem.eql(u8, profile, "udev"))
+    {
+        return error.ContinuePrestateRequiresProfilePackage;
+    }
+    if (!std.mem.eql(u8, profile, "none")) {
+        const expected_ver = profilePinnedVersion(profile) orelse return error.RuntimeProfileSelectionMismatch;
+        if ((!std.mem.eql(u8, verb, "configure") and !std.mem.eql(u8, verb, "continue_prestate")) or
+            !std.mem.eql(u8, architecture, "amd64") or
+            !std.mem.eql(u8, pkg.name, profile) or
+            !std.mem.eql(u8, pkg.architecture, architecture) or
+            !std.mem.eql(u8, pkg.version, expected_ver))
+        {
+            return error.RuntimeProfileVersionMismatch;
+        }
+    } else if (std.mem.eql(u8, verb, "configure") and profilePinnedVersion(pkg.name) != null) {
+        return error.RuntimeProfileSelectionMismatch;
+    }
+
+    try command.appendSlice(allocator, &.{
+        try allocator.dupe(u8, launcher.path),
+        try allocator.dupe(u8, root),
+        try allocator.dupe(u8, dpkg),
+        try allocator.dupe(u8, architecture),
+        try allocator.dupe(u8, profile),
+        try allocator.dupe(u8, verb),
+        try pkg.selector(allocator),
+        try allocator.dupe(u8, launcher.runtime),
+    });
+    if (std.mem.eql(u8, verb, "unpack") or std.mem.eql(u8, verb, "probe_unpack")) {
+        try command.appendSlice(allocator, &.{
+            try allocator.dupe(u8, pkg.archive),
+            try allocator.dupe(u8, pkg.digest),
+            try std.fmt.allocPrint(allocator, "{d}", .{pkg.declared_size}),
+        });
+    }
+    return command.toOwnedSlice(allocator);
+}
+
+const oracle_env_z: [*:null]const ?[*:0]const u8 = &.{
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/",
+    "LC_ALL=C",
+    "DEBIAN_FRONTEND=noninteractive",
+    "DEBCONF_NONINTERACTIVE_SEEN=true",
+    "DPKG_COLORS=never",
+    null,
+};
+
+fn cPath(path: []const u8, buf: *[std.fs.max_path_bytes]u8) ![*:0]const u8 {
+    if (path.len == 0 or path.len >= buf.len or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidReferencePath;
+    }
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0].ptr;
+}
+
+fn syscall(rc: usize) !usize {
+    return switch (linux.errno(rc)) {
+        .SUCCESS => rc,
+        .NOENT => error.FileNotFound,
+        .EXIST => error.PathAlreadyExists,
+        .ACCES, .PERM => error.AccessDenied,
+        else => error.ReferenceSyscallRefused,
+    };
+}
+
+var temp_seq: usize = 0;
+
+fn nextTempDir(allocator: std.mem.Allocator, parent_dir: []const u8, prefix: []const u8) ![]u8 {
+    const pid = linux.getpid();
+    while (true) {
+        temp_seq += 1;
+        const candidate = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}{d}-{d}",
+            .{ std.mem.trimEnd(u8, parent_dir, "/"), prefix, pid, temp_seq },
+        );
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ptr = try cPath(candidate, &buf);
+        const rc = linux.mkdirat(linux.AT.FDCWD, ptr, 0o700);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return candidate,
+            .EXIST => {
+                allocator.free(candidate);
+                continue;
+            },
+            else => {
+                allocator.free(candidate);
+                return error.ReferenceSyscallRefused;
+            },
+        }
+    }
+}
+
+fn spawnWithRedirects(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    stdin_fd: i32,
+    stdout_fd: i32,
+    stderr_fd: i32,
+) !u8 {
+    var argv_z = try allocator.alloc(?[*:0]const u8, argv.len + 1);
+    defer allocator.free(argv_z);
+    for (argv, 0..) |arg, idx| {
+        const copy = try std.fmt.allocPrintSentinel(allocator, "{s}", .{arg}, 0);
+        argv_z[idx] = copy.ptr;
+    }
+    argv_z[argv.len] = null;
+
+    const pid_rc = try syscall(linux.fork());
+    if (pid_rc == 0) {
+        if (stdin_fd != 0) {
+            if (linux.errno(linux.dup2(stdin_fd, 0)) != .SUCCESS) linux.exit(126);
+        } else {
+            _ = linux.fcntl(0, linux.F.SETFD, 0);
+        }
+        if (stdout_fd != 1) {
+            if (linux.errno(linux.dup2(stdout_fd, 1)) != .SUCCESS) linux.exit(126);
+        } else {
+            _ = linux.fcntl(1, linux.F.SETFD, 0);
+        }
+        if (stderr_fd != 2) {
+            if (linux.errno(linux.dup2(stderr_fd, 2)) != .SUCCESS) linux.exit(126);
+        } else {
+            _ = linux.fcntl(2, linux.F.SETFD, 0);
+        }
+        _ = linux.execve(argv_z[0].?, @ptrCast(argv_z.ptr), oracle_env_z);
+        linux.exit(127);
+    }
+
+    const child_pid: linux.pid_t = @intCast(pid_rc);
+    var status: i32 = 0;
+    while (true) {
+        const wait_rc = linux.wait4(child_pid, &status, 0, null);
+        switch (linux.errno(wait_rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.ReferenceSyscallRefused,
+        }
+    }
+    const ustatus: u32 = @bitCast(status);
+    if (linux.W.IFEXITED(ustatus)) return @intCast(linux.W.EXITSTATUS(ustatus));
+    if (linux.W.IFSIGNALED(ustatus)) return @intCast(@min(@as(u32, 255), 128 + @as(u32, @intFromEnum(linux.W.TERMSIG(ustatus)))));
+    return 255;
+}
+
+fn runCaptured(allocator: std.mem.Allocator, argv: []const []const u8, max_bytes: usize) !DpkgRunResult {
+    var out_pipe: [2]i32 = .{ -1, -1 };
+    var err_pipe: [2]i32 = .{ -1, -1 };
+    _ = try syscall(linux.pipe2(&out_pipe, .{ .CLOEXEC = true }));
+    errdefer {
+        if (out_pipe[0] >= 0) _ = linux.close(out_pipe[0]);
+        if (out_pipe[1] >= 0) _ = linux.close(out_pipe[1]);
+    }
+    _ = try syscall(linux.pipe2(&err_pipe, .{ .CLOEXEC = true }));
+    errdefer {
+        if (err_pipe[0] >= 0) _ = linux.close(err_pipe[0]);
+        if (err_pipe[1] >= 0) _ = linux.close(err_pipe[1]);
+    }
+
+    const null_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        "/dev/null",
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    )));
+    defer _ = linux.close(null_fd);
+
+    var argv_z = try allocator.alloc(?[*:0]const u8, argv.len + 1);
+    defer allocator.free(argv_z);
+    for (argv, 0..) |arg, idx| {
+        const copy = try std.fmt.allocPrintSentinel(allocator, "{s}", .{arg}, 0);
+        argv_z[idx] = copy.ptr;
+    }
+    argv_z[argv.len] = null;
+
+    const pid_rc = try syscall(linux.fork());
+    if (pid_rc == 0) {
+        if (linux.errno(linux.dup2(null_fd, 0)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(out_pipe[1], 1)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(err_pipe[1], 2)) != .SUCCESS) linux.exit(126);
+        _ = linux.execve(argv_z[0].?, @ptrCast(argv_z.ptr), oracle_env_z);
+        linux.exit(127);
+    }
+    _ = linux.close(out_pipe[1]);
+    out_pipe[1] = -1;
+    _ = linux.close(err_pipe[1]);
+    err_pipe[1] = -1;
+
+    var stdout_buf = std.ArrayList(u8).empty;
+    errdefer stdout_buf.deinit(allocator);
+    var stderr_buf = std.ArrayList(u8).empty;
+    errdefer stderr_buf.deinit(allocator);
+
+    var pfds: [2]linux.pollfd = .{
+        .{ .fd = out_pipe[0], .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = err_pipe[0], .events = linux.POLL.IN, .revents = 0 },
+    };
+    var open_count: usize = 2;
+    var scratch: [65536]u8 = undefined;
+    while (open_count > 0) {
+        const poll_rc = linux.poll(&pfds, pfds.len, -1);
+        switch (linux.errno(poll_rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.ReferenceSyscallRefused,
+        }
+        for (&pfds, 0..) |*pfd, idx| {
+            if (pfd.fd < 0) continue;
+            if ((pfd.revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) != 0) {
+                const n = linux.read(pfd.fd, &scratch, scratch.len);
+                switch (linux.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) {
+                            _ = linux.close(pfd.fd);
+                            pfd.fd = -1;
+                            if (idx == 0) out_pipe[0] = -1 else err_pipe[0] = -1;
+                            open_count -= 1;
+                        } else {
+                            const target = if (idx == 0) &stdout_buf else &stderr_buf;
+                            if (target.items.len < max_bytes + 1) {
+                                const take = @min(n, (max_bytes + 1) - target.items.len);
+                                try target.appendSlice(allocator, scratch[0..take]);
+                            }
+                        }
+                    },
+                    .INTR => continue,
+                    else => return error.ReferenceSyscallRefused,
+                }
+            }
+        }
+    }
+
+    const child_pid: linux.pid_t = @intCast(pid_rc);
+    var status: i32 = 0;
+    while (true) {
+        const wait_rc = linux.wait4(child_pid, &status, 0, null);
+        switch (linux.errno(wait_rc)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.ReferenceSyscallRefused,
+        }
+    }
+    const ustatus: u32 = @bitCast(status);
+    const rc: u8 = if (linux.W.IFEXITED(ustatus))
+        @intCast(linux.W.EXITSTATUS(ustatus))
+    else if (linux.W.IFSIGNALED(ustatus))
+        @intCast(@min(@as(u32, 255), 128 + @as(u32, @intFromEnum(linux.W.TERMSIG(ustatus)))))
+    else
+        255;
+
+    return .{
+        .returncode = rc,
+        .stdout = try stdout_buf.toOwnedSlice(allocator),
+        .stderr = try stderr_buf.toOwnedSlice(allocator),
+    };
+}
+
+fn resolveSystemTool(comptime name: []const u8) []const u8 {
+    const candidates = [_][:0]const u8{
+        "/usr/bin/" ++ name,
+        "/bin/" ++ name,
+        "/usr/sbin/" ++ name,
+        "/sbin/" ++ name,
+    };
+    for (candidates) |cand| {
+        if (linux.errno(linux.faccessat(linux.AT.FDCWD, cand, linux.F_OK, 0)) == .SUCCESS) {
+            return cand;
+        }
+    }
+    return "/usr/bin/" ++ name;
+}
+
+fn runCheckedSystemCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const res = try runCaptured(allocator, argv, maximum_probe_output);
+    defer {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    }
+    if (res.returncode != 0) return error.SystemCommandFailed;
+}
+
+fn removeTempDirWithFiles(allocator: std.mem.Allocator, dir_path: []const u8, files: []const []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (files) |f| {
+        const p = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, f }) catch continue;
+        defer allocator.free(p);
+        if (cPath(p, &buf)) |ptr| {
+            _ = linux.unlinkat(linux.AT.FDCWD, ptr, 0);
+        } else |_| {}
+    }
+    if (cPath(dir_path, &buf)) |ptr| {
+        _ = linux.unlinkat(linux.AT.FDCWD, ptr, linux.AT.REMOVEDIR);
+    } else |_| {}
+}
+
+fn readFdBounded(allocator: std.mem.Allocator, fd: i32, max_bytes: usize) ![]u8 {
+    const st = try reference_paths.fstat(fd);
+    if (st.size > max_bytes) return error.ProbeOutputExceedsLimit;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fd, &buf, buf.len);
+        if (linux.errno(rc) != .SUCCESS) return error.ReferenceReadFailed;
+        if (rc == 0) break;
+        if (out.items.len + rc > max_bytes) return error.ProbeOutputExceedsLimit;
+        try out.appendSlice(allocator, buf[0..rc]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const ProbeResult = struct {
+    status: u8,
+    output: []u8,
+};
+
+fn probe(allocator: std.mem.Allocator, command: []const []const u8, evidence: []const u8) !ProbeResult {
+    const tmp_dir = try nextTempDir(allocator, evidence, "reference-probe-");
+    defer removeTempDirWithFiles(allocator, tmp_dir, &.{"output"});
+
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/output", .{tmp_dir});
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const out_ptr = try cPath(out_path, &out_buf);
+
+    const writer_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        out_ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0o600,
+    )));
+    defer _ = linux.close(writer_fd);
+
+    const reader_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        out_ptr,
+        .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true },
+        0,
+    )));
+    defer _ = linux.close(reader_fd);
+
+    const null_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        "/dev/null",
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    )));
+    defer _ = linux.close(null_fd);
+
+    const status = try spawnWithRedirects(allocator, command, null_fd, writer_fd, writer_fd);
+    const output = try readFdBounded(allocator, reader_fd, maximum_probe_output);
+    return .{ .status = status, .output = output };
+}
+
+fn apply(allocator: std.mem.Allocator, command: []const []const u8, stdout_path: []const u8, stderr_path: []const u8) !void {
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const out_ptr = try cPath(stdout_path, &out_buf);
+    const out_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        out_ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0o600,
+    )));
+    defer _ = linux.close(out_fd);
+
+    var err_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const err_ptr = try cPath(stderr_path, &err_buf);
+    const err_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        err_ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0o600,
+    )));
+    defer _ = linux.close(err_fd);
+
+    const null_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        "/dev/null",
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+        0,
+    )));
+    defer _ = linux.close(null_fd);
+
+    const rc = try spawnWithRedirects(allocator, command, null_fd, out_fd, err_fd);
+    if (rc != 0) return error.ReferenceDpkgApplyFailed;
+    const out_st = try reference_paths.fstat(out_fd);
+    const err_st = try reference_paths.fstat(err_fd);
+    if (out_st.size > maximum_log_bytes or err_st.size > maximum_log_bytes) {
+        return error.ReferenceLogExceedsLimit;
+    }
+}
+
+fn appendToFile(path: []const u8, data: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ptr = try cPath(path, &buf);
+    const fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0o600,
+    )));
+    defer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = try syscall(linux.write(fd, data[written..].ptr, data.len - written));
+        if (rc == 0) return error.ReferenceSyscallRefused;
+        written += rc;
+    }
+}
+
+fn writeFileMode(path: []const u8, data: []const u8, mode: linux.mode_t) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const ptr = try cPath(path, &buf);
+    const fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true },
+        mode,
+    )));
+    defer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = try syscall(linux.write(fd, data[written..].ptr, data.len - written));
+        if (rc == 0) return error.ReferenceSyscallRefused;
+        written += rc;
+    }
+    _ = try syscall(linux.fchmod(fd, mode));
+}
+
+fn writeEvidenceFile(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, data: []const u8) !void {
+    const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, dir_path, "/"), name });
+    defer allocator.free(full);
+    try writeFileMode(full, data, 0o600);
+}
+
+fn sha256FileHex(allocator: std.mem.Allocator, path: []const u8) ![64]u8 {
+    const fd = try reference_paths.openAbsolute(path, false);
+    defer _ = linux.close(fd);
+    const bytes = try readFdBounded(allocator, fd, maximum_archive_bytes);
+    defer allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn copyRegularFile(src: []const u8, dst: []const u8, mode: linux.mode_t) !void {
+    const src_fd = try reference_paths.openAbsolute(src, false);
+    defer _ = linux.close(src_fd);
+    var dst_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dst_ptr = try cPath(dst, &dst_buf);
+    const dst_fd: i32 = @intCast(try syscall(linux.openat(
+        linux.AT.FDCWD,
+        dst_ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true },
+        mode,
+    )));
+    defer _ = linux.close(dst_fd);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = try syscall(linux.read(src_fd, &buf, buf.len));
+        if (n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const w = try syscall(linux.write(dst_fd, buf[off..n].ptr, n - off));
+            if (w == 0) return error.ReferenceSyscallRefused;
+            off += w;
+        }
+    }
+    _ = try syscall(linux.fchmod(dst_fd, mode));
+}
+
+fn fetchCtrlTarViaDpkgDeb(allocator: std.mem.Allocator, archive: []const u8) ![]const u8 {
+    const dpkg_deb = resolveSystemTool("dpkg-deb");
+    const res = try runCaptured(allocator, &.{ dpkg_deb, "--ctrl-tarfile", archive }, maximum_control_bytes);
+    defer allocator.free(res.stderr);
+    if (res.returncode != 0 or res.stderr.len != 0 or res.stdout.len > maximum_control_bytes) {
+        allocator.free(res.stdout);
+        return error.ControlTarFetchFailed;
+    }
+    return res.stdout;
+}
+
+const StanzaRecord = struct {
+    key: PackageKey,
+    fields: std.StringHashMap([]const u8),
+};
+
+fn readDatabaseRecords(allocator: std.mem.Allocator, root: []const u8) ![]StanzaRecord {
+    const text = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", maximum_control_bytes);
+    defer allocator.free(text);
+    var records = std.ArrayList(StanzaRecord).empty;
+    errdefer records.deinit(allocator);
+    var seen = std.HashMap(PackageKey, void, PackageKeyContext, 80).init(allocator);
+    defer seen.deinit();
+
+    var start: usize = 0;
+    while (start <= text.len) {
+        const next_sep = std.mem.indexOfPos(u8, text, start, "\n\n");
+        const stanza_raw = if (next_sep) |idx| text[start..idx] else text[start..];
+        const stanza = std.mem.trim(u8, stanza_raw, " \t\r\n");
+        if (stanza.len > 0) {
+            if (records.items.len >= maximum_packages) return error.StatusDatabaseExceedsPackageLimit;
+            const fields = try databaseFields(allocator, stanza);
+            const pkg_name = fields.get("package") orelse return error.IncompleteDpkgStatusStanza;
+            const arch = fields.get("architecture") orelse return error.IncompleteDpkgStatusStanza;
+            const version = fields.get("version") orelse return error.IncompleteDpkgStatusStanza;
+            const status = fields.get("status") orelse return error.IncompleteDpkgStatusStanza;
+            if (!validPackageName(pkg_name) or !validPackageName(arch) or version.len == 0 or status.len == 0) {
+                return error.IncompleteDpkgStatusStanza;
+            }
+            const k: PackageKey = .{ .name = pkg_name, .architecture = arch };
+            if ((try seen.getOrPut(k)).found_existing) return error.DuplicateDpkgStatusPackage;
+            try records.append(allocator, .{ .key = k, .fields = fields });
+        }
+        if (next_sep) |idx| {
+            start = idx + 2;
+        } else break;
+    }
+    return records.toOwnedSlice(allocator);
+}
+
+fn findRecord(records: []StanzaRecord, key: PackageKey) ?*StanzaRecord {
+    for (records) |*rec| {
+        if (PackageKey.eql(rec.key, key)) return rec;
+    }
+    return null;
+}
+
+fn cloneRecords(allocator: std.mem.Allocator, records: []const StanzaRecord) ![]StanzaRecord {
+    var out = try allocator.alloc(StanzaRecord, records.len);
+    for (records, 0..) |rec, idx| {
+        var map = std.StringHashMap([]const u8).init(allocator);
+        var it = rec.fields.iterator();
+        while (it.next()) |entry| {
+            try map.put(try allocator.dupe(u8, entry.key_ptr.*), try allocator.dupe(u8, entry.value_ptr.*));
+        }
+        out[idx] = .{
+            .key = .{
+                .name = try allocator.dupe(u8, rec.key.name),
+                .architecture = try allocator.dupe(u8, rec.key.architecture),
+            },
+            .fields = map,
+        };
+    }
+    return out;
+}
+
+fn recordsEqual(a: []const StanzaRecord, b: []const StanzaRecord) bool {
+    if (a.len != b.len) return false;
+    for (a) |rec_a| {
+        var matched = false;
+        for (b) |rec_b| {
+            if (PackageKey.eql(rec_a.key, rec_b.key)) {
+                matched = true;
+                if (rec_a.fields.count() != rec_b.fields.count()) return false;
+                var it = rec_a.fields.iterator();
+                while (it.next()) |entry| {
+                    const val_b = rec_b.fields.get(entry.key_ptr.*) orelse return false;
+                    if (!std.mem.eql(u8, entry.value_ptr.*, val_b)) return false;
+                }
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (c < 0x20 or c >= 0x7f) {
+                    try writer.print("\\u{x:0>4}", .{c});
+                } else {
+                    try writer.writeByte(c);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn writeJsonRecords(allocator: std.mem.Allocator, writer: anytype, records: []const StanzaRecord) !void {
+    try writer.writeByte('[');
+    for (records, 0..) |rec, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        var keys = std.ArrayList([]const u8).empty;
+        defer keys.deinit(allocator);
+        var it = rec.fields.keyIterator();
+        while (it.next()) |k| try keys.append(allocator, k.*);
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        try writer.writeByte('{');
+        for (keys.items, 0..) |k, k_idx| {
+            if (k_idx > 0) try writer.writeByte(',');
+            try writeJsonString(writer, k);
+            try writer.writeByte(':');
+            try writeJsonString(writer, rec.fields.get(k).?);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeJsonTriggers(allocator: std.mem.Allocator, writer: anytype, triggers: *const TriggerMap) !void {
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(allocator);
+    var it = triggers.keyIterator();
+    while (it.next()) |k| try keys.append(allocator, k.*);
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    try writer.writeByte('{');
+    for (keys.items, 0..) |k, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        const entry = triggers.get(k).?;
+        try writeJsonString(writer, k);
+        try writer.print(":{{\"sha512\":\"{s}\",\"size\":{d}}}", .{ &entry.sha512, entry.size });
+    }
+    try writer.writeByte('}');
+}
+
+fn writeJsonStringSlice(writer: anytype, slice: []const []const u8) !void {
+    try writer.writeByte('[');
+    for (slice, 0..) |item, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeJsonString(writer, item);
+    }
+    try writer.writeByte(']');
+}
+
+fn checkForbiddenInfoFiles(allocator: std.mem.Allocator, root: []const u8, names: []const []const u8) !void {
+    for (names) |name| {
+        const full = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/{s}", .{ std.mem.trimEnd(u8, root, "/"), name });
+        defer allocator.free(full);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ptr = try cPath(full, &buf);
+        var stx: linux.Statx = undefined;
+        const rc = linux.statx(linux.AT.FDCWD, ptr, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx);
+        if (linux.errno(rc) == .SUCCESS) return error.UnexpectedCycleCallbackFile;
+    }
+}
+
+fn verifyInstalledFieldsMatchControl(installed: *const std.StringHashMap([]const u8), control: *const std.StringHashMap([]const u8), check_triggers: bool) !void {
+    const compare_fields = [_][]const u8{
+        "depends", "pre-depends", "provides", "conflicts", "breaks", "replaces",
+        "multi-arch", "protected", "essential",
+    };
+    for (compare_fields) |field| {
+        if (!std.mem.eql(u8, installed.get(field) orelse "", control.get(field) orelse "")) {
+            return error.CycleControlFieldMismatch;
+        }
+    }
+    if (check_triggers) {
+        for ([_][]const u8{ "triggers-pending", "triggers-awaited", "config-version" }) |field| {
+            if (!std.mem.eql(u8, installed.get(field) orelse "", "")) return error.UnexpectedCycleTriggerState;
+        }
+    }
+}
+
+fn buildPackageMap(allocator: std.mem.Allocator, packages: []const Package) !std.HashMap(PackageKey, Package, PackageKeyContext, 80) {
+    var map = std.HashMap(PackageKey, Package, PackageKeyContext, 80).init(allocator);
+    for (packages) |pkg| try map.put(pkg.key(), pkg);
+    return map;
+}
+
+fn verifyFullBaseCycle(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    all_packages: *const std.HashMap(PackageKey, Package, PackageKeyContext, 80),
+    architecture: []const u8,
+) ![base_cycle.len]Package {
+    var statuses = try currentStatuses(allocator, root);
+    defer statuses.deinit();
+    _ = try verifyBaseCycle(allocator, all_packages, &statuses, architecture, fetchCtrlTarViaDpkgDeb);
+    const cycle = try baseCyclePackages(all_packages, architecture);
+    const records = try readDatabaseRecords(allocator, root);
+    for (cycle) |pkg| {
+        const raw_tar = try fetchCtrlTarViaDpkgDeb(allocator, pkg.archive);
+        const parsed = try parseControlTarBytes(allocator, raw_tar);
+        const control = try controlFields(allocator, parsed.files.get("./control").?);
+        const rec = findRecord(records, pkg.key()) orelse return error.BaseCycleStatusNotReady;
+        try verifyInstalledFieldsMatchControl(&rec.fields, &control, true);
+    }
+    const installed_triggers = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/info/libgcc-s1:amd64.triggers", 1024);
+    if (!std.mem.eql(u8, installed_triggers, libgcc_triggers)) return error.LibgccTriggersContentMismatch;
+    var forbidden = std.ArrayList([]const u8).empty;
+    try forbidden.append(allocator, "libgcc-s1.triggers");
+    for ([_][]const u8{ "libgcc-s1", "libgcc-s1:amd64" }) |name| {
+        for (maintainer_scripts) |script| {
+            try forbidden.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ name, script }));
+        }
+    }
+    try checkForbiddenInfoFiles(allocator, root, forbidden.items);
+    return cycle;
+}
+
+fn execBreakBaseCycle(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    all_packages: *const std.HashMap(PackageKey, Package, PackageKeyContext, 80),
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) !Package {
+    const cycle = try verifyFullBaseCycle(allocator, root, all_packages, architecture);
+    const before_records = try readDatabaseRecords(allocator, root);
+    var before_triggers = try triggerDatabase(allocator, root);
+    defer before_triggers.deinit();
+
+    const command = try launcherCommand(allocator, launcher, dpkg, root, architecture, base_cycle_profile, "break_base_cycle", cycle[1], &cycle);
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"profile\":\"libgcc_cycle\",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, before_records);
+        try out.writer.writeAll(",\"selected\":\"libgcc-s1:amd64\",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &before_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "base-cycle-before.json", out.written());
+    }
+
+    try apply(allocator, command, stdout_path, stderr_path);
+    const after_records = try readDatabaseRecords(allocator, root);
+    var after_triggers = try triggerDatabase(allocator, root);
+    defer after_triggers.deinit();
+
+    const expected = try cloneRecords(allocator, before_records);
+    const libgcc_rec = findRecord(expected, cycle[1].key()) orelse return error.BaseCycleDidNotInstallPinnedPair;
+    try libgcc_rec.fields.put("status", "install ok installed");
+    if (!recordsEqual(after_records, expected) or !verifyTriggerMapIdentical(&before_triggers, &after_triggers)) {
+        return error.BaseCycleMutatedUnexpectedPackageStatus;
+    }
+
+    const status_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", maximum_control_bytes);
+    var status_digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(status_bytes, &status_digest, .{});
+    const status_hex = std.fmt.bytesToHex(status_digest, .lower);
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"operation\":");
+        try writeJsonStringSlice(&out.writer, command[3..]);
+        try out.writer.writeAll(",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, after_records);
+        try out.writer.print(",\"status\":\"install ok installed\",\"status_sha512\":\"{s}\",\"trigger_database\":", .{&status_hex});
+        try writeJsonTriggers(allocator, &out.writer, &after_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "base-cycle-after.json", out.written());
+    }
+    return cycle[1];
+}
+
+fn execConfigureOpensslCycle(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    all_packages: *const std.HashMap(PackageKey, Package, PackageKeyContext, 80),
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) ![2]Package {
+    var statuses = try currentStatuses(allocator, root);
+    defer statuses.deinit();
+    _ = try verifyOpensslCycle(allocator, all_packages, &statuses, architecture, fetchCtrlTarViaDpkgDeb);
+    const cycle = try opensslCyclePackages(all_packages, architecture);
+    const before_records = try readDatabaseRecords(allocator, root);
+    var before_triggers = try triggerDatabase(allocator, root);
+    defer before_triggers.deinit();
+
+    var peer_multi_arch: [2][]const u8 = .{ "", "" };
+    for (cycle, 0..) |pkg, index| {
+        const raw_tar = try fetchCtrlTarViaDpkgDeb(allocator, pkg.archive);
+        const parsed = try parseControlTarBytes(allocator, raw_tar);
+        if (index < 2) {
+            if (!sliceEqlStrings(parsed.members, openssl_cycle[index].members)) {
+                return error.OpensslCycleControlMembersMismatch;
+            }
+            if (index == 0) {
+                const trigs = parsed.files.get("./triggers") orelse return error.OpensslCycleTriggersMismatch;
+                if (!std.mem.eql(u8, trigs, libgcc_triggers)) return error.OpensslCycleTriggersMismatch;
+            }
+        }
+        const control = try controlFields(allocator, parsed.files.get("./control").?);
+        if (index < 2) peer_multi_arch[index] = control.get("multi-arch") orelse "";
+        const rec = findRecord(before_records, pkg.key()) orelse return error.OpensslCycleStatusNotReady;
+        try verifyInstalledFieldsMatchControl(&rec.fields, &control, true);
+    }
+    const installed_triggers = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/info/libssl3t64:amd64.triggers", 1024);
+    if (!std.mem.eql(u8, installed_triggers, libgcc_triggers)) return error.OpensslCycleTriggersMismatch;
+
+    var forbidden = std.ArrayList([]const u8).empty;
+    try forbidden.appendSlice(allocator, &.{
+        "libssl3t64.triggers",
+        "openssl-provider-legacy.triggers",
+        "openssl-provider-legacy:amd64.triggers",
+    });
+    for ([_][]const u8{ "libssl3t64", "libssl3t64:amd64", "openssl-provider-legacy", "openssl-provider-legacy:amd64" }) |name| {
+        for (maintainer_scripts) |script| {
+            try forbidden.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ name, script }));
+        }
+    }
+    try checkForbiddenInfoFiles(allocator, root, forbidden.items);
+
+    var refusals_json = std.Io.Writer.Allocating.init(allocator);
+    defer refusals_json.deinit();
+    try refusals_json.writer.writeByte('[');
+    for ([_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }, 0..) |pair_idx, r_idx| {
+        const pkg = cycle[pair_idx[0]];
+        const peer = cycle[pair_idx[1]];
+        const probe_cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, "none", "probe_configure", pkg, &.{});
+        const res = try probe(allocator, probe_cmd, evidence);
+        if (r_idx > 0) try refusals_json.writer.writeByte(',');
+        try refusals_json.writer.writeAll("{\"argv\":");
+        try writeJsonStringSlice(&refusals_json.writer, probe_cmd[3..]);
+        try refusals_json.writer.print(",\"exit_status\":{d},\"output\":", .{res.status});
+        try writeJsonString(&refusals_json.writer, res.output);
+        try refusals_json.writer.writeByte('}');
+
+        var current_json = std.Io.Writer.Allocating.init(allocator);
+        defer current_json.deinit();
+        try current_json.writer.print("{s}]\n", .{refusals_json.written()});
+        try writeEvidenceFile(allocator, evidence, "openssl-cycle-refusals.json", current_json.written());
+
+        const peer_name = if (std.mem.eql(u8, peer.architecture, architecture) and
+            !std.mem.eql(u8, peer_multi_arch[pair_idx[1]], "same"))
+            peer.name
+        else
+            try peer.selector(allocator);
+        const needle = try std.fmt.allocPrint(allocator, "Package {s} is not configured yet.", .{peer_name});
+        if (res.status == 0 or
+            std.mem.indexOf(u8, res.output, "dependency problems") == null or
+            std.mem.indexOf(u8, res.output, needle) == null)
+        {
+            return error.OpensslCycleProbeChanged;
+        }
+    }
+
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[],\"profile\":\"openssl_cycle\",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, before_records);
+        try out.writer.writeAll(",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &before_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "openssl-cycle-before.json", out.written());
+    }
+
+    const command = try launcherCommand(allocator, launcher, dpkg, root, architecture, openssl_cycle_profile, "configure_openssl_cycle", cycle[0], &cycle);
+    try apply(allocator, command, stdout_path, stderr_path);
+
+    const after_records = try readDatabaseRecords(allocator, root);
+    var after_triggers = try triggerDatabase(allocator, root);
+    defer after_triggers.deinit();
+
+    const expected = try cloneRecords(allocator, before_records);
+    for (cycle[0..2]) |pkg| {
+        const rec = findRecord(expected, pkg.key()) orelse return error.OpensslCycleDidNotInstallPinnedPair;
+        try rec.fields.put("status", "install ok installed");
+    }
+    if (!recordsEqual(after_records, expected) or !verifyTriggerMapIdentical(&before_triggers, &after_triggers)) {
+        return error.OpensslCycleMutatedUnexpectedPackageStatus;
+    }
+
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[],\"operation\":");
+        try writeJsonStringSlice(&out.writer, command[3..]);
+        try out.writer.writeAll(",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, after_records);
+        try out.writer.writeAll(",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &after_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "openssl-cycle-after.json", out.written());
+    }
+    return .{ cycle[0], cycle[1] };
+}
+
+fn execBreakKbdCycle(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    all_packages: *const std.HashMap(PackageKey, Package, PackageKeyContext, 80),
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) !Package {
+    var statuses = try currentStatuses(allocator, root);
+    defer statuses.deinit();
+    _ = try verifyKbdCycle(allocator, all_packages, &statuses, architecture, fetchCtrlTarViaDpkgDeb);
+    const cycle = try kbdCyclePackages(all_packages);
+    const before_records = try readDatabaseRecords(allocator, root);
+    var before_triggers = try triggerDatabase(allocator, root);
+    defer before_triggers.deinit();
+
+    for (cycle) |pkg| {
+        const raw_tar = try fetchCtrlTarViaDpkgDeb(allocator, pkg.archive);
+        const parsed = try parseControlTarBytes(allocator, raw_tar);
+        const control = try controlFields(allocator, parsed.files.get("./control").?);
+        const rec = findRecord(before_records, pkg.key()) orelse return error.KbdCycleStatusNotReady;
+        try verifyInstalledFieldsMatchControl(&rec.fields, &control, true);
+    }
+    const installed_triggers = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/info/kbd.triggers", 1024);
+    if (!std.mem.eql(u8, installed_triggers, kbd_triggers)) return error.KbdCycleTriggersContentMismatch;
+
+    var forbidden = std.ArrayList([]const u8).empty;
+    try forbidden.append(allocator, "kbd:amd64.triggers");
+    for ([_][]const u8{ "kbd", "kbd:amd64" }) |name| {
+        for (maintainer_scripts) |script| {
+            try forbidden.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ name, script }));
+        }
+    }
+    try checkForbiddenInfoFiles(allocator, root, forbidden.items);
+
+    const probe_cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, "none", "probe_configure", cycle[0], &.{});
+    const probe_res = try probe(allocator, probe_cmd, evidence);
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"argv\":");
+        try writeJsonStringSlice(&out.writer, probe_cmd[3..]);
+        try out.writer.print(",\"exit_status\":{d},\"output\":", .{probe_res.status});
+        try writeJsonString(&out.writer, probe_res.output);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "kbd-cycle-refusal.json", out.written());
+    }
+    if (probe_res.status == 0 or
+        std.mem.indexOf(u8, probe_res.output, "dependency problems") == null or
+        std.mem.indexOf(u8, probe_res.output, "Package console-setup is not configured yet.") == null)
+    {
+        return error.KbdCycleProbeChanged;
+    }
+
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"profile\":\"kbd_cycle\",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, before_records);
+        try out.writer.writeAll(",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &before_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "kbd-cycle-before.json", out.written());
+    }
+
+    const command = try launcherCommand(allocator, launcher, dpkg, root, architecture, kbd_cycle_profile, "break_kbd_cycle", cycle[0], &cycle);
+    try apply(allocator, command, stdout_path, stderr_path);
+
+    const after_records = try readDatabaseRecords(allocator, root);
+    var after_triggers = try triggerDatabase(allocator, root);
+    defer after_triggers.deinit();
+
+    const expected = try cloneRecords(allocator, before_records);
+    const kbd_rec = findRecord(expected, cycle[0].key()) orelse return error.KbdCycleDidNotInstallKbd;
+    try kbd_rec.fields.put("status", "install ok installed");
+    if (!recordsEqual(after_records, expected) or !verifyTriggerMapIdentical(&before_triggers, &after_triggers)) {
+        return error.KbdCycleMutatedUnexpectedPackageStatus;
+    }
+
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"operation\":");
+        try writeJsonStringSlice(&out.writer, command[3..]);
+        try out.writer.writeAll(",\"records\":");
+        try writeJsonRecords(allocator, &out.writer, after_records);
+        try out.writer.writeAll(",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &after_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "kbd-cycle-after.json", out.written());
+    }
+    return cycle[0];
+}
+
+fn execProcessTriggers(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    all_packages: *const std.HashMap(PackageKey, Package, PackageKeyContext, 80),
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, architecture, "amd64")) return error.TriggerHandlerOrderRequiresAmd64;
+    var statuses = try currentStatuses(allocator, root);
+    defer statuses.deinit();
+    const handlers = try verifyTriggerHandlers(allocator, root, all_packages, &statuses, architecture, fetchCtrlTarViaDpkgDeb);
+    if (handlers.len != trigger_handlers.len) return error.TriggerHandlerStatusNotReady;
+
+    var current_records = try readDatabaseRecords(allocator, root);
+    var before_triggers = try triggerDatabase(allocator, root);
+    defer before_triggers.deinit();
+
+    for (current_records) |rec| {
+        const is_handler = PackageKey.eql(rec.key, handlers[0].key()) or PackageKey.eql(rec.key, handlers[1].key());
+        if (is_handler) {
+            if (!std.mem.eql(u8, rec.fields.get("triggers-awaited") orelse "", "")) return error.TriggerHandlerStatusNotReady;
+        } else {
+            if (!std.mem.eql(u8, rec.fields.get("status") orelse "", "install ok installed") or
+                !std.mem.eql(u8, rec.fields.get("triggers-pending") orelse "", "") or
+                !std.mem.eql(u8, rec.fields.get("triggers-awaited") orelse "", "") or
+                !std.mem.eql(u8, rec.fields.get("config-version") orelse "", ""))
+            {
+                return error.TriggerHandlerStatusNotReady;
+            }
+        }
+    }
+
+    const ldconfig_triggers = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/triggers/ldconfig", 1024);
+    const file_triggers = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/triggers/File", maximum_control_bytes);
+    if (!std.mem.eql(u8, ldconfig_triggers, "libc-bin\n")) return error.TriggerHandlerStatusNotReady;
+    var has_sysctl_trigger = false;
+    var ft_lines = std.mem.splitScalar(u8, file_triggers, '\n');
+    while (ft_lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, "\r"), "/usr/lib/sysctl.d procps/noawait")) {
+            has_sysctl_trigger = true;
+            break;
+        }
+    }
+    if (!has_sysctl_trigger) return error.TriggerHandlerStatusNotReady;
+
+    for (handlers, trigger_handlers) |pkg, binding| {
+        const rec = findRecord(current_records, pkg.key()) orelse return error.TriggerHandlerStatusNotReady;
+        if (!std.mem.eql(u8, rec.fields.get("config-version") orelse "", pkg.version)) {
+            return error.TriggerHandlerStatusNotReady;
+        }
+        const postinst_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/{s}.postinst", .{ std.mem.trimEnd(u8, root, "/"), pkg.name });
+        const triggers_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/{s}.triggers", .{ std.mem.trimEnd(u8, root, "/"), pkg.name });
+        const postinst_meta = try reference_paths.protected(postinst_path, false);
+        const triggers_meta = try reference_paths.protected(triggers_path, false);
+        if ((postinst_meta.mode & 0o7777) != 0o755 or (triggers_meta.mode & 0o7777) != 0o644) {
+            return error.TriggerHandlerInstalledPostinstMismatch;
+        }
+        const forbidden = [_][]const u8{
+            try std.fmt.allocPrint(allocator, "{s}:{s}.postinst", .{ pkg.name, pkg.architecture }),
+            try std.fmt.allocPrint(allocator, "{s}:{s}.triggers", .{ pkg.name, pkg.architecture }),
+        };
+        try checkForbiddenInfoFiles(allocator, root, &forbidden);
+        _ = binding;
+    }
+
+    const status_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", maximum_control_bytes);
+    var status_digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(status_bytes, &status_digest, .{});
+    const status_hex = std.fmt.bytesToHex(status_digest, .lower);
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"records\":");
+        try writeJsonRecords(allocator, &out.writer, current_records);
+        try out.writer.print(",\"status_sha512\":\"{s}\",\"trigger_database\":", .{&status_hex});
+        try writeJsonTriggers(allocator, &out.writer, &before_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "triggers-before.json", out.written());
+    }
+
+    var steps_json = std.Io.Writer.Allocating.init(allocator);
+    defer steps_json.deinit();
+    try steps_json.writer.writeByte('[');
+    for (handlers, trigger_handlers, 0..) |pkg, binding, idx| {
+        const command = try launcherCommand(allocator, launcher, dpkg, root, architecture, binding.profile, "triggers_only", pkg, &.{});
+        try apply(allocator, command, stdout_path, stderr_path);
+        const after_records = try readDatabaseRecords(allocator, root);
+        var after_triggers = try triggerDatabase(allocator, root);
+        defer after_triggers.deinit();
+
+        const expected = try cloneRecords(allocator, current_records);
+        const rec = findRecord(expected, pkg.key()) orelse return error.TriggerHandlerDidNotInstallHandlers;
+        try rec.fields.put("status", "install ok installed");
+        _ = rec.fields.remove("triggers-pending");
+        _ = rec.fields.remove("config-version");
+        if (!recordsEqual(after_records, expected) or !verifyTriggerMapIdentical(&before_triggers, &after_triggers)) {
+            return error.TriggerHandlerMutatedUnexpectedPackageStatus;
+        }
+        current_records = after_records;
+
+        if (idx > 0) try steps_json.writer.writeByte(',');
+        try steps_json.writer.print(
+            "{{\"callbacks\":[\"{s}.postinst triggered {s}\"],\"force\":[],\"operation\":",
+            .{ pkg.name, binding.pending },
+        );
+        try writeJsonStringSlice(&steps_json.writer, command[3..]);
+        try steps_json.writer.print(",\"selector\":\"{s}\"}}", .{try pkg.selector(allocator)});
+    }
+    try steps_json.writer.writeByte(']');
+
+    for (current_records) |rec| {
+        if (!std.mem.eql(u8, rec.fields.get("status") orelse "", "install ok installed") or
+            !std.mem.eql(u8, rec.fields.get("triggers-pending") orelse "", "") or
+            !std.mem.eql(u8, rec.fields.get("triggers-awaited") orelse "", "") or
+            !std.mem.eql(u8, rec.fields.get("config-version") orelse "", ""))
+        {
+            return error.TriggerHandlerDidNotDrainPendingTrigger;
+        }
+    }
+
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"records\":");
+        try writeJsonRecords(allocator, &out.writer, current_records);
+        try out.writer.print(",\"steps\":{s},\"trigger_database\":", .{steps_json.written()});
+        try writeJsonTriggers(allocator, &out.writer, &before_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, evidence, "triggers-after.json", out.written());
+    }
+}
+
+fn stagePendingOracleRuntime(allocator: std.mem.Allocator, baseline: []const u8, setpriv: []const u8) ![]const u8 {
+    const setpriv_dir = std.fs.path.dirname(setpriv) orelse return error.CycleProofRuntimeChanged;
+    const source = try std.fmt.allocPrint(allocator, "{s}/libcap-ng.so.0.0.0", .{setpriv_dir});
+    const meta = reference_paths.protected(source, false) catch return error.CycleProofRuntimeChanged;
+    if (meta.size != 26928 or (meta.mode & 0o7777) != 0o644) return error.CycleProofRuntimeChanged;
+    const data = reference_paths.readRootFile(allocator, setpriv_dir, "libcap-ng.so.0.0.0", 26928) catch return error.CycleProofRuntimeChanged;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &hex, "60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f")) {
+        return error.CycleProofRuntimeChanged;
+    }
+    const relative = "usr/lib/x86_64-linux-gnu/libcap-ng.so.0";
+    const target = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, baseline, "/"), relative });
+    const target_parent = std.fs.path.dirname(target) orelse return error.CycleProofRuntimeChanged;
+    _ = reference_paths.protected(target_parent, true) catch return error.CycleProofRuntimeChanged;
+
+    var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target_ptr = try cPath(target, &target_buf);
+    const fd: i32 = @intCast(syscall(linux.openat(
+        linux.AT.FDCWD,
+        target_ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0o644,
+    )) catch return error.CycleProofRuntimeChanged);
+    defer _ = linux.close(fd);
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = syscall(linux.write(fd, data[written..].ptr, data.len - written)) catch return error.CycleProofRuntimeChanged;
+        if (rc == 0) return error.CycleProofRuntimeChanged;
+        written += rc;
+    }
+    _ = syscall(linux.fchmod(fd, 0o644)) catch return error.CycleProofRuntimeChanged;
+    return source;
+}
+
+fn proveBaseCycle(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    cache: []const u8,
+    evidence: []const u8,
+    setpriv: []const u8,
+) !void {
+    if (builtin.cpu.arch != .x86_64) return error.CycleProofPrestateInvalid;
+    {
+        var initial = try currentStatuses(allocator, root);
+        defer initial.deinit();
+        if (initial.count() != 0) return error.CycleProofPrestateInvalid;
+    }
+    _ = try reference_paths.protected(root, true);
+    _ = try reference_paths.protected(setpriv, false);
+    const setpriv_hex = try sha256FileHex(allocator, setpriv);
+    if (!std.mem.eql(u8, &setpriv_hex, "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993")) {
+        return error.CycleProofRuntimeChanged;
+    }
+
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/reference-archives.tsv", .{std.mem.trimEnd(u8, evidence, "/")});
+    const packages = try packagesFromManifest(allocator, manifest_path, cache, maximum_packages);
+    var all_packages = try buildPackageMap(allocator, packages);
+    defer all_packages.deinit();
+    const cycle = try baseCyclePackages(&all_packages, "amd64");
+
+    const proof = try std.fmt.allocPrint(allocator, "{s}/base-cycle-proof", .{std.mem.trimEnd(u8, evidence, "/")});
+    var proof_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const proof_ptr = try cPath(proof, &proof_buf);
+    _ = try syscall(linux.mkdirat(linux.AT.FDCWD, proof_ptr, 0o700));
+
+    const cp_bin = resolveSystemTool("cp");
+    const rm_bin = resolveSystemTool("rm");
+    const mount_bin = resolveSystemTool("mount");
+    const umount_bin = resolveSystemTool("umount");
+    const unshare_bin = resolveSystemTool("unshare");
+
+    const seed = try std.fmt.allocPrint(allocator, "{s}/seed", .{proof});
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/candidate", .{proof});
+    const baseline = try std.fmt.allocPrint(allocator, "{s}/pending", .{proof});
+    defer {
+        for ([_][]const u8{ seed, candidate, baseline }) |dest| {
+            runCheckedSystemCommand(allocator, &.{ rm_bin, "-rf", "--one-file-system", "--", dest }) catch {};
+        }
+    }
+
+    try runCheckedSystemCommand(allocator, &.{ cp_bin, "-a", "--one-file-system", "--", root, seed });
+    const unpack_stdout = try std.fmt.allocPrint(allocator, "{s}/unpack.stdout", .{proof});
+    const unpack_stderr = try std.fmt.allocPrint(allocator, "{s}/unpack.stderr", .{proof});
+    for ([_]Package{ cycle[2], cycle[3], cycle[0], cycle[1] }) |pkg| {
+        try verifyArchive(pkg);
+        const cmd = try launcherCommand(allocator, launcher, dpkg, seed, "amd64", "none", "unpack", pkg, &.{});
+        try apply(allocator, cmd, unpack_stdout, unpack_stderr);
+    }
+    for (cycle[2..]) |pkg| {
+        const cmd = try launcherCommand(allocator, launcher, dpkg, seed, "amd64", "none", "configure", pkg, &.{});
+        try apply(allocator, cmd, unpack_stdout, unpack_stderr);
+    }
+    _ = try verifyFullBaseCycle(allocator, seed, &all_packages, "amd64");
+    for (cycle[0..2]) |pkg| {
+        const cmd = try launcherCommand(allocator, launcher, dpkg, seed, "amd64", "none", "probe_configure", pkg, &.{});
+        const res = try probe(allocator, cmd, proof);
+        if (res.status == 0 or std.mem.indexOf(u8, res.output, "dependency problems") == null) {
+            return error.CycleProofMissingStall;
+        }
+    }
+
+    for ([_][]const u8{ candidate, baseline }) |dest| {
+        try runCheckedSystemCommand(allocator, &.{ cp_bin, "-a", "--one-file-system", "--", seed, dest });
+    }
+
+    const refused_cmd = try launcherCommand(allocator, launcher, dpkg, candidate, "amd64", base_cycle_profile, "break_base_cycle", cycle[1], &cycle);
+    const before_refusal = try readDatabaseRecords(allocator, candidate);
+    var before_triggers = try triggerDatabase(allocator, candidate);
+    defer before_triggers.deinit();
+
+    const injected = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/libgcc-s1:amd64.postinst", .{candidate});
+    try writeFileMode(injected, "#!/bin/sh\necho unbound-cycle-callback-executed\nexit 0\n", 0o755);
+    const refusal_res = blk: {
+        defer {
+            var inj_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (cPath(injected, &inj_buf)) |ptr| {
+                _ = linux.unlinkat(linux.AT.FDCWD, ptr, 0);
+            } else |_| {}
+        }
+        break :blk try probe(allocator, refused_cmd, proof);
+    };
+    const after_refusal = try readDatabaseRecords(allocator, candidate);
+    var after_refusal_triggers = try triggerDatabase(allocator, candidate);
+    defer after_refusal_triggers.deinit();
+    if (refusal_res.status == 0 or
+        std.mem.indexOf(u8, refusal_res.output, "unbound-cycle-callback-executed") != null or
+        std.mem.indexOf(u8, refusal_res.output, "stage 11") == null or
+        !recordsEqual(after_refusal, before_refusal) or
+        !verifyTriggerMapIdentical(&before_triggers, &after_refusal_triggers))
+    {
+        return error.CycleProofCallbackChanged;
+    }
+    try writeEvidenceFile(allocator, proof, "callback-refusal.log", refusal_res.output);
+
+    const cand_stdout = try std.fmt.allocPrint(allocator, "{s}/candidate.stdout", .{proof});
+    const cand_stderr = try std.fmt.allocPrint(allocator, "{s}/candidate.stderr", .{proof});
+    _ = try execBreakBaseCycle(allocator, launcher, dpkg, candidate, proof, "amd64", &all_packages, cand_stdout, cand_stderr);
+
+    {
+        var base_statuses = try currentStatuses(allocator, baseline);
+        defer base_statuses.deinit();
+        if (base_statuses.count() != 4) return error.CycleProofCallbackChanged;
+    }
+    _ = try verifyFullBaseCycle(allocator, baseline, &all_packages, "amd64");
+
+    var script_rel: ?[]const u8 = null;
+    for ([_][]const u8{ "var/lib/dpkg/info/libc6.postinst", "var/lib/dpkg/info/libc6:amd64.postinst" }) |rel| {
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ baseline, rel });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const ptr = try cPath(full, &buf);
+        if (linux.errno(linux.faccessat(linux.AT.FDCWD, ptr, linux.F_OK, 0)) == .SUCCESS) {
+            if (script_rel != null) return error.CycleProofCallbackChanged;
+            script_rel = rel;
+        }
+    }
+    const found_script_rel = script_rel orelse return error.CycleProofCallbackChanged;
+    const script_full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ baseline, found_script_rel });
+
+    const libc6_ctrl_tar = try fetchCtrlTarViaDpkgDeb(allocator, cycle[0].archive);
+    const libc6_parsed = try parseControlTarBytes(allocator, libc6_ctrl_tar);
+    const signed_postinst = libc6_parsed.files.get("./postinst") orelse return error.CycleProofCallbackChanged;
+    const installed_postinst = try reference_paths.readRootFile(allocator, baseline, found_script_rel, maximum_probe_output);
+    if (signed_postinst.len == 0 or !std.mem.eql(u8, installed_postinst, signed_postinst)) {
+        return error.CycleProofCallbackChanged;
+    }
+
+    try copyRegularFile(dpkg, try std.fmt.allocPrint(allocator, "{s}/usr/bin/dpkg", .{baseline}), 0o755);
+    try copyRegularFile(setpriv, try std.fmt.allocPrint(allocator, "{s}/usr/bin/setpriv", .{baseline}), 0o755);
+    const libcap_source = try stagePendingOracleRuntime(allocator, baseline, setpriv);
+    const before_pending = try readDatabaseRecords(allocator, baseline);
+
+    const pending_cmd = [_][]const u8{
+        unshare_bin,
+        "--mount",
+        "--pid",
+        "--fork",
+        "--kill-child=SIGKILL",
+        "--propagation",
+        "private",
+        "--",
+        "chroot",
+        baseline,
+        "/usr/bin/setpriv",
+        "--bounding-set=-all,+chown,+dac_override,+fowner,+fsetid,+setgid,+setuid,+setfcap",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "/usr/bin/dpkg",
+        "--root=/",
+        "--force-not-root",
+        "--force-bad-path",
+        "--force-confold",
+        "--no-triggers",
+        "--configure",
+        "--pending",
+    };
+
+    try runCheckedSystemCommand(allocator, &.{ mount_bin, "--bind", "--", script_full, script_full });
+    const pending_res = blk: {
+        defer runCheckedSystemCommand(allocator, &.{ umount_bin, "--", script_full }) catch {};
+        try runCheckedSystemCommand(allocator, &.{ mount_bin, "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", script_full });
+        const res = try runCaptured(allocator, &pending_cmd, maximum_probe_output);
+        try writeEvidenceFile(allocator, proof, "pending.stdout", res.stdout[0..@min(res.stdout.len, maximum_probe_output)]);
+        try writeEvidenceFile(allocator, proof, "pending.stderr", res.stderr[0..@min(res.stderr.len, maximum_probe_output)]);
+        {
+            const truncated = res.stdout.len > maximum_probe_output or res.stderr.len > maximum_probe_output;
+            var out = std.Io.Writer.Allocating.init(allocator);
+            defer out.deinit();
+            try out.writer.writeAll("{\"argv\":");
+            try writeJsonStringSlice(&out.writer, &pending_cmd);
+            try out.writer.print(
+                ",\"output_truncated\":{s},\"returncode\":{d},\"schema\":\"io.github.cataggar.debz.base-cycle-pending-result.v1\",\"setpriv_runtime\":{{\"mode\":\"0644\",\"sha256\":\"60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f\",\"size\":26928,\"source\":",
+                .{ if (truncated) "true" else "false", res.returncode },
+            );
+            try writeJsonString(&out.writer, libcap_source);
+            try out.writer.print(
+                ",\"target\":\"usr/lib/x86_64-linux-gnu/libcap-ng.so.0\"}},\"stderr_bytes\":{d},\"stdout_bytes\":{d}}}\n",
+                .{ res.stderr.len, res.stdout.len },
+            );
+            try writeEvidenceFile(allocator, proof, "pending-result.json", out.written());
+        }
+        break :blk res;
+    };
+
+    const after_pending = try readDatabaseRecords(allocator, baseline);
+    var pending_triggers = try triggerDatabase(allocator, baseline);
+    defer pending_triggers.deinit();
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"after\":");
+        try writeJsonRecords(allocator, &out.writer, after_pending);
+        try out.writer.writeAll(",\"before\":");
+        try writeJsonRecords(allocator, &out.writer, before_pending);
+        try out.writer.writeAll(",\"trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &pending_triggers);
+        try out.writer.writeAll("}\n");
+        try writeEvidenceFile(allocator, proof, "pending-status.json", out.written());
+    }
+
+    if (pending_res.stdout.len > maximum_probe_output or
+        pending_res.stderr.len > maximum_probe_output or
+        pending_res.returncode == 0 or
+        std.mem.indexOf(u8, pending_res.stderr, "Permission denied") == null or
+        std.mem.indexOf(u8, pending_res.stderr, "post-installation script") == null)
+    {
+        return error.CycleProofCallbackChanged;
+    }
+    const postinst_after = try reference_paths.readRootFile(allocator, baseline, found_script_rel, maximum_probe_output);
+    if (!std.mem.eql(u8, postinst_after, signed_postinst)) return error.CycleProofCallbackChanged;
+
+    var observed_map = try currentStatuses(allocator, baseline);
+    defer observed_map.deinit();
+    var wanted_map = try currentStatuses(allocator, candidate);
+    defer wanted_map.deinit();
+    try wanted_map.put(.{ .name = "libc6", .architecture = "amd64" }, .{
+        .name = "libc6",
+        .architecture = "amd64",
+        .version = cycle[0].version,
+        .status = "install ok half-configured",
+    });
+    if (!verifyStatusTransition(&wanted_map, &observed_map, &.{})) {
+        return error.CycleProofScheduleChanged;
+    }
+
+    const cand_records = try readDatabaseRecords(allocator, candidate);
+    var cand_triggers = try triggerDatabase(allocator, candidate);
+    defer cand_triggers.deinit();
+    {
+        var out = std.Io.Writer.Allocating.init(allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"callback_denied\":\"libc6 postinst configure\",\"callbacks_executed\":[],\"candidate\":");
+        try writeJsonRecords(allocator, &out.writer, cand_records);
+        try out.writer.writeAll(",\"candidate_trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &cand_triggers);
+        try out.writer.writeAll(",\"difference\":\"pending attempts libc6 configure; single breaker leaves libc6 unpacked\",\"parity_claim\":false,\"pending\":");
+        try writeJsonRecords(allocator, &out.writer, after_pending);
+        try out.writer.writeAll(",\"pending_argv\":");
+        try writeJsonStringSlice(&out.writer, &pending_cmd);
+        try out.writer.writeAll(",\"pending_setpriv_runtime\":{\"mode\":\"0644\",\"sha256\":\"60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f\",\"size\":26928,\"source\":");
+        try writeJsonString(&out.writer, libcap_source);
+        try out.writer.writeAll(",\"target\":\"usr/lib/x86_64-linux-gnu/libcap-ng.so.0\"},\"pending_trigger_database\":");
+        try writeJsonTriggers(allocator, &out.writer, &pending_triggers);
+        try out.writer.writeAll(",\"schema\":\"io.github.cataggar.debz.base-cycle-proof.v1\"}\n");
+        try writeEvidenceFile(allocator, proof, "comparison.json", out.written());
+    }
+}
+
+fn queryPackageStatus(allocator: std.mem.Allocator, root: []const u8, selector: []const u8) ![]const u8 {
+    const dpkg_query = resolveSystemTool("dpkg-query");
+    const admindir_arg = try std.fmt.allocPrint(allocator, "--admindir={s}/var/lib/dpkg", .{std.mem.trimEnd(u8, root, "/")});
+    const res = try runCaptured(allocator, &.{ dpkg_query, admindir_arg, "-W", "-f=${Version} ${Status}", selector }, 4096);
+    defer allocator.free(res.stderr);
+    if (res.returncode != 0 or res.stderr.len != 0 or res.stdout.len > 4096) {
+        allocator.free(res.stdout);
+        return error.ReferenceStatusQueryFailed;
+    }
+    return res.stdout;
+}
+
+fn interruptPostinst(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    package: Package,
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) !void {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "{s}/var/lib/dpkg/info/{s}.postinst",
+        .{ std.mem.trimEnd(u8, root, "/"), package.name },
+    );
+    _ = try reference_paths.protected(script, false);
+    const before_sha256 = try sha256FileHex(allocator, script);
+    const profile = packageProfile(package.name);
+    const pinned_ver = profilePinnedVersion(profile) orelse return error.UnauthorizedInterruptedPrestatePackage;
+    if (!std.mem.eql(u8, package.version, pinned_ver)) return error.UnauthorizedInterruptedPrestatePackage;
+
+    const mount_bin = resolveSystemTool("mount");
+    const umount_bin = resolveSystemTool("umount");
+    try runCheckedSystemCommand(allocator, &.{ mount_bin, "--bind", "--", script, script });
+    var observed_output: []u8 = &.{};
+    var observed_errors: []u8 = &.{};
+    var rc: u8 = 0;
+    {
+        defer runCheckedSystemCommand(allocator, &.{ umount_bin, "--", script }) catch {};
+        try runCheckedSystemCommand(allocator, &.{ mount_bin, "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", script });
+
+        const tmp_dir = try nextTempDir(allocator, evidence, "reference-configure-");
+        defer removeTempDirWithFiles(allocator, tmp_dir, &.{ "stdout", "stderr" });
+
+        const out_file = try std.fmt.allocPrint(allocator, "{s}/stdout", .{tmp_dir});
+        const err_file = try std.fmt.allocPrint(allocator, "{s}/stderr", .{tmp_dir});
+        var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const out_ptr = try cPath(out_file, &out_buf);
+        var err_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const err_ptr = try cPath(err_file, &err_buf);
+
+        const out_writer_fd: i32 = @intCast(try syscall(linux.openat(
+            linux.AT.FDCWD,
+            out_ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+            0o600,
+        )));
+        defer _ = linux.close(out_writer_fd);
+        const err_writer_fd: i32 = @intCast(try syscall(linux.openat(
+            linux.AT.FDCWD,
+            err_ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .APPEND = true, .NOFOLLOW = true, .CLOEXEC = true },
+            0o600,
+        )));
+        defer _ = linux.close(err_writer_fd);
+
+        const out_reader_fd: i32 = @intCast(try syscall(linux.openat(
+            linux.AT.FDCWD,
+            out_ptr,
+            .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true },
+            0,
+        )));
+        defer _ = linux.close(out_reader_fd);
+        const err_reader_fd: i32 = @intCast(try syscall(linux.openat(
+            linux.AT.FDCWD,
+            err_ptr,
+            .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true },
+            0,
+        )));
+        defer _ = linux.close(err_reader_fd);
+
+        const null_fd: i32 = @intCast(try syscall(linux.openat(
+            linux.AT.FDCWD,
+            "/dev/null",
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+            0,
+        )));
+        defer _ = linux.close(null_fd);
+
+        const cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, profile, "configure", package, &.{});
+        rc = try spawnWithRedirects(allocator, cmd, null_fd, out_writer_fd, err_writer_fd);
+        observed_output = try readFdBounded(allocator, out_reader_fd, maximum_probe_output);
+        observed_errors = try readFdBounded(allocator, err_reader_fd, maximum_probe_output);
+    }
+
+    try appendToFile(stdout_path, observed_output);
+    try appendToFile(stderr_path, observed_errors);
+    if (rc == 0 or
+        std.mem.indexOf(u8, observed_errors, "post-installation script") == null or
+        std.mem.indexOf(u8, observed_errors, "Permission denied") == null)
+    {
+        return error.PrestatePostinstNotDenied;
+    }
+    const after_sha256 = try sha256FileHex(allocator, script);
+    if (!std.mem.eql(u8, &after_sha256, &before_sha256)) return error.PrestatePostinstChanged;
+}
+
+fn isMountpoint(root: []const u8, sub: []const u8) !bool {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_ptr = try cPath(root, &root_buf);
+    var sub_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sub_ptr = try cPath(sub, &sub_buf);
+    var root_stx: linux.Statx = undefined;
+    var sub_stx: linux.Statx = undefined;
+    _ = try syscall(linux.statx(linux.AT.FDCWD, root_ptr, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &root_stx));
+    _ = try syscall(linux.statx(linux.AT.FDCWD, sub_ptr, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &sub_stx));
+    return root_stx.dev_major != sub_stx.dev_major or root_stx.dev_minor != sub_stx.dev_minor;
+}
+
+fn capturePrestate(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    package: Package,
+    prestate: PrestateSpec,
+    stdout_path: []const u8,
+    stderr_path: []const u8,
+) !void {
+    const destination = prestate.destination;
+    var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dest_ptr = try cPath(destination, &dest_buf);
+    var dest_stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, dest_ptr, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &dest_stx)) == .SUCCESS) {
+        return error.PrestateDestinationAlreadyExists;
+    }
+    const parent = std.fs.path.dirname(destination) orelse return error.InvalidPrestateTargetFormat;
+    _ = try reference_paths.protected(parent, true);
+
+    if (std.mem.eql(u8, prestate.status, "half-configured")) {
+        try interruptPostinst(allocator, launcher, dpkg, root, evidence, architecture, package, stdout_path, stderr_path);
+    }
+    const expected = try std.fmt.allocPrint(allocator, "{s} install ok {s}", .{ package.version, prestate.status });
+    const selector = try package.selector(allocator);
+    const actual_status = try queryPackageStatus(allocator, root, selector);
+    if (!std.mem.eql(u8, actual_status, expected)) return error.UnexpectedPrestateStatus;
+
+    const proc_path = try std.fmt.allocPrint(allocator, "{s}/proc", .{std.mem.trimEnd(u8, root, "/")});
+    const mount_bin = resolveSystemTool("mount");
+    const umount_bin = resolveSystemTool("umount");
+    const cp_bin = resolveSystemTool("cp");
+
+    const mounted = try isMountpoint(root, proc_path);
+    if (mounted) {
+        try runCheckedSystemCommand(allocator, &.{ umount_bin, "--", proc_path });
+    }
+    {
+        defer if (mounted) {
+            runCheckedSystemCommand(allocator, &.{ mount_bin, "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", proc_path }) catch {};
+        };
+        if (try isMountpoint(root, proc_path)) return error.PrestateProcMountpointNotEmpty;
+        const root_fd = try reference_paths.openAbsolute(root, true);
+        defer _ = linux.close(root_fd);
+        const proc_entries = try listDirectoryBeneath(allocator, root_fd, "proc");
+        if (proc_entries.len != 0) return error.PrestateProcMountpointNotEmpty;
+
+        try runCheckedSystemCommand(allocator, &.{ cp_bin, "-a", "--one-file-system", "--", root, destination });
+        _ = try syscall(linux.fchmodat(linux.AT.FDCWD, dest_ptr, 0o700));
+    }
+
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/prestates.tsv", .{std.mem.trimEnd(u8, parent, "/")});
+    const record_line = try std.fmt.allocPrint(allocator, "{s}\t{s}\t{s}\n", .{ selector, expected, destination });
+    try appendToFile(record_path, record_line);
+}
+
+fn install(
+    allocator: std.mem.Allocator,
+    launcher: Launcher,
+    dpkg: []const u8,
+    root: []const u8,
+    cache: []const u8,
+    evidence: []const u8,
+    architecture: []const u8,
+    prestates: []const PrestateSpec,
+) !void {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/reference-archives.tsv", .{std.mem.trimEnd(u8, evidence, "/")});
+    const packages = try packagesFromManifest(allocator, manifest_path, cache, maximum_packages);
+    var all_packages = try buildPackageMap(allocator, packages);
+    defer all_packages.deinit();
+
+    var targets = std.StringHashMap(PrestateSpec).init(allocator);
+    defer targets.deinit();
+    var dest_set = std.StringHashMap(void).init(allocator);
+    defer dest_set.deinit();
+    var closure_selectors = std.StringHashMap(void).init(allocator);
+    defer closure_selectors.deinit();
+    for (packages) |pkg| {
+        try closure_selectors.put(try pkg.selector(allocator), {});
+    }
+    for (prestates) |ps| {
+        if ((try targets.getOrPut(ps.selector)).found_existing) return error.DuplicatePrestateSelector;
+        try targets.put(ps.selector, ps);
+        if ((try dest_set.getOrPut(ps.destination)).found_existing) return error.DuplicatePrestateDestination;
+        if (!closure_selectors.contains(ps.selector)) return error.PrestateTargetNotInManifest;
+    }
+    if (targets.contains("sudo:amd64")) {
+        const comp_key: PackageKey = .{
+            .name = sudo_prestate_companion.name,
+            .architecture = sudo_prestate_companion.architecture,
+        };
+        const comp = all_packages.get(comp_key) orelse return error.MissingSudoPrestateCompanion;
+        if (!std.mem.eql(u8, comp.version, sudo_prestate_companion.version) or
+            !std.mem.eql(u8, comp.architecture, sudo_prestate_companion.architecture))
+        {
+            return error.MissingSudoPrestateCompanion;
+        }
+    }
+
+    var pending = std.ArrayList(Package).empty;
+    defer pending.deinit(allocator);
+    try pending.appendSlice(allocator, packages);
+    var unpacked = std.ArrayList(Package).empty;
+    defer unpacked.deinit(allocator);
+    var configured = std.HashMap(PackageKey, void, PackageKeyContext, 80).init(allocator);
+    defer configured.deinit();
+
+    const stdout_path = try std.fmt.allocPrint(allocator, "{s}/reference-install.stdout", .{std.mem.trimEnd(u8, evidence, "/")});
+    const stderr_path = try std.fmt.allocPrint(allocator, "{s}/reference-install.stderr", .{std.mem.trimEnd(u8, evidence, "/")});
+    var probes: usize = 0;
+    var cycle_broken = false;
+    var openssl_configured = false;
+    var kbd_configured = false;
+
+    const RefusalItem = struct {
+        selector: []const u8,
+        operation: []const u8,
+        exit_status: u8,
+        output_bytes: usize,
+        output_prefix_hex: []const u8,
+        output_sha512: [128]u8,
+    };
+
+    while (pending.items.len > 0 or unpacked.items.len > 0) {
+        var progressed = false;
+        var deferred = std.ArrayList([]const u8).empty;
+        defer deferred.deinit(allocator);
+        var refusals = std.ArrayList(RefusalItem).empty;
+        defer refusals.deinit(allocator);
+
+        const pending_snapshot = try allocator.dupe(Package, pending.items);
+        for (pending_snapshot) |pkg| {
+            const cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, "none", "probe_unpack", pkg, &.{});
+            probes += 1;
+            if (probes > maximum_probes) return error.ProbeLimitExceeded;
+            const res = try probe(allocator, cmd, evidence);
+            if (res.status != 0) {
+                if (std.mem.indexOf(u8, res.output, "pre-dependency problem") == null) {
+                    return error.ReferenceUnpackRefused;
+                }
+                const sel = try pkg.selector(allocator);
+                try deferred.append(allocator, sel);
+                const prefix_len = @min(res.output.len, 4096);
+                var prefix_hex = try allocator.alloc(u8, prefix_len * 2);
+                for (res.output[0..prefix_len], 0..) |b, bi| {
+                    const h = std.fmt.bytesToHex([1]u8{b}, .lower);
+                    prefix_hex[bi * 2] = h[0];
+                    prefix_hex[bi * 2 + 1] = h[1];
+                }
+                var out_digest: [64]u8 = undefined;
+                std.crypto.hash.sha2.Sha512.hash(res.output, &out_digest, .{});
+                try refusals.append(allocator, .{
+                    .selector = sel,
+                    .operation = "probe_unpack",
+                    .exit_status = res.status,
+                    .output_bytes = res.output.len,
+                    .output_prefix_hex = prefix_hex,
+                    .output_sha512 = std.fmt.bytesToHex(out_digest, .lower),
+                });
+                continue;
+            }
+            try verifyArchive(pkg);
+            const unpack_cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, "none", "unpack", pkg, &.{});
+            try apply(allocator, unpack_cmd, stdout_path, stderr_path);
+            for (pending.items, 0..) |item, idx| {
+                if (PackageKey.eql(item.key(), pkg.key())) {
+                    _ = pending.orderedRemove(idx);
+                    break;
+                }
+            }
+            try unpacked.append(allocator, pkg);
+            progressed = true;
+        }
+
+        const unpacked_snapshot = try allocator.dupe(Package, unpacked.items);
+        for (unpacked_snapshot) |pkg| {
+            const cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, "none", "probe_configure", pkg, &.{});
+            probes += 1;
+            if (probes > maximum_probes) return error.ProbeLimitExceeded;
+            const res = try probe(allocator, cmd, evidence);
+            if (res.status != 0) {
+                if (std.mem.indexOf(u8, res.output, "dependency problems") == null) {
+                    return error.ReferenceConfigureRefused;
+                }
+                const sel = try pkg.selector(allocator);
+                try deferred.append(allocator, sel);
+                const prefix_len = @min(res.output.len, 4096);
+                var prefix_hex = try allocator.alloc(u8, prefix_len * 2);
+                for (res.output[0..prefix_len], 0..) |b, bi| {
+                    const h = std.fmt.bytesToHex([1]u8{b}, .lower);
+                    prefix_hex[bi * 2] = h[0];
+                    prefix_hex[bi * 2 + 1] = h[1];
+                }
+                var out_digest: [64]u8 = undefined;
+                std.crypto.hash.sha2.Sha512.hash(res.output, &out_digest, .{});
+                try refusals.append(allocator, .{
+                    .selector = sel,
+                    .operation = "probe_configure",
+                    .exit_status = res.status,
+                    .output_bytes = res.output.len,
+                    .output_prefix_hex = prefix_hex,
+                    .output_sha512 = std.fmt.bytesToHex(out_digest, .lower),
+                });
+                continue;
+            }
+
+            {
+                var statuses = try currentStatuses(allocator, root);
+                defer statuses.deinit();
+                const current = statuses.get(pkg.key()) orelse return error.ReferencePackageStateChanged;
+                if (!std.mem.eql(u8, current.status, "install ok unpacked") or
+                    !std.mem.eql(u8, current.version, pkg.version))
+                {
+                    return error.ReferencePackageStateChanged;
+                }
+            }
+
+            const profile = packageProfile(pkg.name);
+            if (!std.mem.eql(u8, profile, "none")) {
+                const pinned_ver = profilePinnedVersion(profile) orelse return error.RuntimeProfileVersionMismatch;
+                if (!std.mem.eql(u8, pkg.version, pinned_ver)) return error.RuntimeProfileVersionMismatch;
+            }
+
+            const sel = try pkg.selector(allocator);
+            const prestate_opt = targets.get(sel);
+            if (prestate_opt != null and std.mem.eql(u8, sel, "sudo:amd64")) {
+                const comp_key: PackageKey = .{
+                    .name = sudo_prestate_companion.name,
+                    .architecture = sudo_prestate_companion.architecture,
+                };
+                var statuses = try currentStatuses(allocator, root);
+                defer statuses.deinit();
+                const comp_state = statuses.get(comp_key);
+                if (comp_state == null or
+                    !std.mem.eql(u8, comp_state.?.status, "install ok installed") or
+                    !std.mem.eql(u8, comp_state.?.version, sudo_prestate_companion.version))
+                {
+                    if (configured.contains(comp_key) or
+                        (comp_state != null and !std.mem.eql(u8, comp_state.?.version, sudo_prestate_companion.version)))
+                    {
+                        return error.MissingSudoPrestateCompanion;
+                    }
+                    try deferred.append(allocator, sel);
+                    continue;
+                }
+            }
+            _ = targets.remove(sel);
+            var operation: []const u8 = "configure";
+            if (prestate_opt) |ps| {
+                try capturePrestate(allocator, launcher, dpkg, root, evidence, architecture, pkg, ps, stdout_path, stderr_path);
+                if (targets.count() == 0) return;
+                if (std.mem.eql(u8, ps.status, "half-configured")) {
+                    var statuses = try currentStatuses(allocator, root);
+                    defer statuses.deinit();
+                    const after_cap = statuses.get(pkg.key()) orelse return error.CapturedPrestateStateChanged;
+                    if (!std.mem.eql(u8, after_cap.status, "install ok half-configured") or
+                        !std.mem.eql(u8, after_cap.version, pkg.version))
+                    {
+                        return error.CapturedPrestateStateChanged;
+                    }
+                    operation = "continue_prestate";
+                }
+            }
+
+            const conf_cmd = try launcherCommand(allocator, launcher, dpkg, root, architecture, profile, operation, pkg, &.{});
+            try apply(allocator, conf_cmd, stdout_path, stderr_path);
+            for (unpacked.items, 0..) |item, idx| {
+                if (PackageKey.eql(item.key(), pkg.key())) {
+                    _ = unpacked.orderedRemove(idx);
+                    break;
+                }
+            }
+            try configured.put(pkg.key(), {});
+            progressed = true;
+        }
+
+        if (!progressed) {
+            {
+                var out = std.Io.Writer.Allocating.init(allocator);
+                defer out.deinit();
+                try out.writer.print(
+                    "{{\"base_cycle_applied\":{s},\"deferred\":",
+                    .{if (cycle_broken) "true" else "false"},
+                );
+                try writeJsonStringSlice(&out.writer, deferred.items);
+                try out.writer.print(
+                    ",\"kbd_cycle_applied\":{s},\"openssl_cycle_applied\":{s},\"refusals\":[",
+                    .{
+                        if (kbd_configured) "true" else "false",
+                        if (openssl_configured) "true" else "false",
+                    },
+                );
+                const cap = @min(refusals.items.len, 128);
+                for (refusals.items[0..cap], 0..) |r, r_idx| {
+                    if (r_idx > 0) try out.writer.writeByte(',');
+                    try out.writer.print(
+                        "{{\"exit_status\":{d},\"operation\":\"{s}\",\"output_bytes\":{d},\"output_prefix_hex\":\"{s}\",\"output_sha512\":\"{s}\",\"selector\":",
+                        .{ r.exit_status, r.operation, r.output_bytes, r.output_prefix_hex, &r.output_sha512 },
+                    );
+                    try writeJsonString(&out.writer, r.selector);
+                    try out.writer.writeByte('}');
+                }
+                try out.writer.print(
+                    "],\"refusals_truncated\":{s}}}\n",
+                    .{if (refusals.items.len > 128) "true" else "false"},
+                );
+                try writeEvidenceFile(allocator, evidence, "reference-no-progress.json", out.written());
+            }
+
+            if (!cycle_broken) {
+                const base_pkgs = try baseCyclePackages(&all_packages, architecture);
+                var found_libgcc = false;
+                for (unpacked.items) |u| {
+                    if (PackageKey.eql(u.key(), base_pkgs[1].key())) {
+                        found_libgcc = true;
+                        break;
+                    }
+                }
+                if (!found_libgcc) return error.BaseCycleStatusNotReady;
+                const selected = try execBreakBaseCycle(allocator, launcher, dpkg, root, evidence, architecture, &all_packages, stdout_path, stderr_path);
+                for (unpacked.items, 0..) |item, idx| {
+                    if (PackageKey.eql(item.key(), selected.key())) {
+                        _ = unpacked.orderedRemove(idx);
+                        break;
+                    }
+                }
+                try configured.put(selected.key(), {});
+                cycle_broken = true;
+                continue;
+            }
+
+            var has_libssl = false;
+            var has_legacy = false;
+            var has_kbd = false;
+            var has_cs_linux = false;
+            var has_cs = false;
+            for (unpacked.items) |u| {
+                if (std.mem.eql(u8, u.name, "libssl3t64")) has_libssl = true;
+                if (std.mem.eql(u8, u.name, "openssl-provider-legacy")) has_legacy = true;
+                if (std.mem.eql(u8, u.name, "kbd")) has_kbd = true;
+                if (std.mem.eql(u8, u.name, "console-setup-linux")) has_cs_linux = true;
+                if (std.mem.eql(u8, u.name, "console-setup")) has_cs = true;
+            }
+
+            if (!openssl_configured and has_libssl and has_legacy) {
+                probes += 2;
+                if (probes > maximum_probes) return error.ProbeLimitExceeded;
+                const selected = try execConfigureOpensslCycle(allocator, launcher, dpkg, root, evidence, architecture, &all_packages, stdout_path, stderr_path);
+                for (selected) |sel_pkg| {
+                    for (unpacked.items, 0..) |item, idx| {
+                        if (PackageKey.eql(item.key(), sel_pkg.key())) {
+                            _ = unpacked.orderedRemove(idx);
+                            break;
+                        }
+                    }
+                    try configured.put(sel_pkg.key(), {});
+                }
+                openssl_configured = true;
+                continue;
+            }
+
+            if (!kbd_configured and has_kbd and has_cs_linux and has_cs) {
+                probes += 1;
+                if (probes > maximum_probes) return error.ProbeLimitExceeded;
+                const selected = try execBreakKbdCycle(allocator, launcher, dpkg, root, evidence, architecture, &all_packages, stdout_path, stderr_path);
+                for (unpacked.items, 0..) |item, idx| {
+                    if (PackageKey.eql(item.key(), selected.key())) {
+                        _ = unpacked.orderedRemove(idx);
+                        break;
+                    }
+                }
+                try configured.put(selected.key(), {});
+                kbd_configured = true;
+                continue;
+            }
+
+            return error.CycleNoProgress;
+        }
+    }
+
+    if (targets.count() != 0) return error.PrestatePackageNeverConfigured;
+    if (configured.count() != packages.len) return error.ClosureNotFullyConfigured;
+    try execProcessTriggers(allocator, launcher, dpkg, root, evidence, architecture, &all_packages, stdout_path, stderr_path);
+}
+
+fn report(allocator: std.mem.Allocator, root: []const u8, cache: []const u8, evidence: []const u8) !void {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/reference-archives.tsv", .{std.mem.trimEnd(u8, evidence, "/")});
+    const packages = try packagesFromManifest(allocator, manifest_path, cache, maximum_packages);
+    var records = try currentStatuses(allocator, root);
+    defer records.deinit();
+    if (records.count() != packages.len) return error.DatabaseDiffersFromSignedClosure;
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    for (packages) |pkg| {
+        const st = records.get(pkg.key()) orelse return error.PackageNotInstalledAtSignedVersion;
+        if (!std.mem.eql(u8, st.status, "install ok installed") or
+            !std.mem.eql(u8, st.version, pkg.version))
+        {
+            return error.PackageNotInstalledAtSignedVersion;
+        }
+        const sel = try pkg.selector(allocator);
+        try out.writer.print("ii  {s} {s}\n", .{ sel, pkg.version });
+    }
+    try writeEvidenceFile(allocator, evidence, "reference-installed.txt", out.written());
+
+    const root_fd = try reference_paths.openAbsolute(root, true);
+    defer _ = linux.close(root_fd);
+    const entries = try listDirectoryBeneath(allocator, root_fd, "var/lib/dpkg/info");
+    if (entries.len > maximum_packages * 12) return error.InfoDirectoryExceedsBound;
+    for (entries) |entry| {
+        if (std.mem.endsWith(u8, entry, ".list")) {
+            const rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}", .{entry});
+            const data = try reference_paths.readRootFile(allocator, root, rel, 8 * 1024 * 1024);
+            var lines = std.mem.splitScalar(u8, data, '\n');
+            while (lines.next()) |raw_line| {
+                const line = std.mem.trimEnd(u8, raw_line, "\r");
+                if (std.mem.eql(u8, line, "/dev/null")) return error.PackageClaimsExcludedChrootDevice;
+            }
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -1739,18 +3941,20 @@ pub fn main(init: std.process.Init) !void {
     var root: ?[]const u8 = null;
     var cache: ?[]const u8 = null;
     var evidence: ?[]const u8 = null;
-    var prove_base_cycle = false;
-    var launcher: ?[]const u8 = null;
-    var runtime: ?[]const u8 = null;
-    var architecture: []const u8 = "amd64";
+    var prove_base_cycle_setpriv: ?[]const u8 = null;
+    var launcher_path: ?[]const u8 = null;
+    var runtime_path: ?[]const u8 = null;
+    var architecture: ?[]const u8 = null;
     var report_only = false;
-    var prestate_raw: []const u8 = "none";
+    var prestates = std.ArrayList(PrestateSpec).empty;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--prove-base-cycle")) {
-            prove_base_cycle = true;
+            i += 1;
+            if (i >= args.len) return error.InvalidCliArguments;
+            prove_base_cycle_setpriv = args[i];
         } else if (std.mem.eql(u8, arg, "--report-only")) {
             report_only = true;
         } else if (std.mem.eql(u8, arg, "--dpkg")) {
@@ -1772,11 +3976,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--launcher")) {
             i += 1;
             if (i >= args.len) return error.InvalidCliArguments;
-            launcher = args[i];
+            launcher_path = args[i];
         } else if (std.mem.eql(u8, arg, "--runtime")) {
             i += 1;
             if (i >= args.len) return error.InvalidCliArguments;
-            runtime = args[i];
+            runtime_path = args[i];
         } else if (std.mem.eql(u8, arg, "--architecture")) {
             i += 1;
             if (i >= args.len) return error.InvalidCliArguments;
@@ -1784,7 +3988,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--prestate")) {
             i += 1;
             if (i >= args.len) return error.InvalidCliArguments;
-            prestate_raw = args[i];
+            try prestates.append(allocator, try parsePrestateSpec(args[i]));
         } else {
             return error.InvalidCliArguments;
         }
@@ -1793,39 +3997,43 @@ pub fn main(init: std.process.Init) !void {
     const root_path = root orelse return error.InvalidCliArguments;
     const cache_path = cache orelse return error.InvalidCliArguments;
     const evidence_path = evidence orelse return error.InvalidCliArguments;
-    _ = dpkg orelse return error.InvalidCliArguments;
-    if (!report_only) {
-        _ = launcher orelse return error.InvalidCliArguments;
-        _ = runtime orelse return error.InvalidCliArguments;
+    const arch = architecture orelse return error.InvalidCliArguments;
+    if (!std.mem.eql(u8, arch, "amd64") and !std.mem.eql(u8, arch, "arm64")) {
+        return error.UnsupportedReferenceArchitecture;
     }
-    _ = try parsePrestate(prestate_raw);
-    if (prove_base_cycle and !std.mem.eql(u8, architecture, "amd64")) {
-        return error.BaseCycleOrderRequiresAmd64;
+    if (!std.mem.startsWith(u8, root_path, "/") or
+        !std.mem.startsWith(u8, cache_path, "/") or
+        !std.mem.startsWith(u8, evidence_path, "/"))
+    {
+        return error.NoncanonicalReferencePath;
     }
-
-    _ = try reference_paths.protected(cache_path, true);
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/packages.tsv", .{std.mem.trimEnd(u8, cache_path, "/")});
-    _ = try reference_paths.protected(manifest_path, false);
-    const packages = try packagesFromManifest(allocator, manifest_path, cache_path, maximum_packages);
-    for (packages) |pkg| try verifyArchive(pkg);
 
     if (report_only) {
-        var statuses = try currentStatuses(allocator, root_path);
-        defer statuses.deinit();
-        var triggers = try triggerDatabase(allocator, root_path);
-        defer triggers.deinit();
-        var out = std.Io.Writer.Allocating.init(allocator);
-        defer out.deinit();
-        try out.writer.print(
-            "{{\"schema\":\"io.github.cataggar.debz.real-snapshot.dpkg-execution.v1\",\"package_count\":{d},\"status_package_count\":{d},\"trigger_file_count\":{d}}}\n",
-            .{ packages.len, statuses.count(), triggers.count() },
-        );
-        const parent = std.fs.path.dirname(evidence_path) orelse "/";
-        const base = std.fs.path.basename(evidence_path);
-        var dir = try std.Io.Dir.openDirAbsolute(init.io, parent, .{});
-        defer dir.close(init.io);
-        try dir.writeFile(init.io, .{ .sub_path = base, .data = out.written() });
+        try report(allocator, root_path, cache_path, evidence_path);
+        return;
     }
+
+    const dpkg_path = dpkg orelse return error.InvalidCliArguments;
+    const l_path = launcher_path orelse return error.InvalidCliArguments;
+    const r_path = runtime_path orelse return error.InvalidCliArguments;
+    if (!std.mem.startsWith(u8, dpkg_path, "/")) return error.NoncanonicalReferencePath;
+
+    _ = try reference_paths.protected(l_path, false);
+    _ = try reference_paths.protected(dpkg_path, false);
+    _ = try reference_paths.protected(r_path, true);
+    _ = try reference_paths.protected(cache_path, true);
+    _ = try reference_paths.protected(evidence_path, true);
+
+    const launcher: Launcher = .{ .path = l_path, .runtime = r_path };
+    if (prove_base_cycle_setpriv) |setpriv_path| {
+        if (!std.mem.eql(u8, arch, "amd64") or prestates.items.len != 0) {
+            return error.CycleProofPrestateInvalid;
+        }
+        try proveBaseCycle(allocator, launcher, dpkg_path, root_path, cache_path, evidence_path, setpriv_path);
+        return;
+    }
+
+    try install(allocator, launcher, dpkg_path, root_path, cache_path, evidence_path, arch, prestates.items);
 }
 
 const TarFixtureMember = struct {
@@ -1891,7 +4099,8 @@ test "reference order manifest validation and archive verification" {
     var digest_bytes: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(payload, &digest_bytes, .{});
     const digest = std.fmt.bytesToHex(digest_bytes, .lower);
-    const deb_name = try std.fmt.allocPrint(allocator, "{s}.deb", .{digest});
+    try tmp.dir.createDirPath(std.testing.io, "packages-v2/objects");
+    const deb_name = try std.fmt.allocPrint(allocator, "packages-v2/objects/sha512-{s}", .{digest});
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = deb_name, .data = payload });
 
     const manifest_path = try std.fs.path.join(allocator, &.{ root, "packages.tsv" });
@@ -2401,3 +4610,38 @@ test "reference order base openssl kbd and trigger handler verification" {
     const kbd_verified = try verifyKbdCycle(allocator, &all_pkgs, &kbd_statuses, "amd64", FetchTar.fetch);
     try std.testing.expectEqualStrings("kbd", kbd_verified.name);
 }
+
+test "reference order launcherCommand and parsePrestateSpec" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const spec = try parsePrestateSpec("systemd:amd64=half-configured:/root/prestates/systemd");
+    try std.testing.expectEqualStrings("systemd:amd64", spec.selector);
+    try std.testing.expectEqualStrings("half-configured", spec.status);
+    try std.testing.expectEqualStrings("/root/prestates/systemd", spec.destination);
+    try std.testing.expectError(error.InvalidPrestateTargetFormat, parsePrestateSpec("systemd=unpacked:/dst"));
+    try std.testing.expectError(error.InvalidPrestateTargetFormat, parsePrestateSpec("systemd:amd64=installed:/dst"));
+    try std.testing.expectError(error.InvalidPrestateTargetFormat, parsePrestateSpec("systemd:amd64=unpacked:relative"));
+
+    const launcher: Launcher = .{ .path = "/tools/reference-launcher", .runtime = "/tools/reference-runtime" };
+    const systemd_pkg: Package = .{
+        .name = "systemd",
+        .version = profile_versions[0].version,
+        .architecture = "amd64",
+        .digest = &@as([128]u8, @splat('a')),
+        .declared_size = 42,
+        .archive = "/cache/packages-v2/objects/sha512-a",
+    };
+    const unpack_cmd = try launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", "none", "unpack", systemd_pkg, &.{});
+    try std.testing.expectEqual(@as(usize, 11), unpack_cmd.len);
+    try std.testing.expectEqualStrings("/tools/reference-launcher", unpack_cmd[0]);
+    try std.testing.expectEqualStrings("unpack", unpack_cmd[5]);
+    try std.testing.expectEqualStrings("42", unpack_cmd[10]);
+
+    const conf_cmd = try launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", "systemd", "configure", systemd_pkg, &.{});
+    try std.testing.expectEqual(@as(usize, 8), conf_cmd.len);
+    try std.testing.expectEqualStrings("systemd", conf_cmd[4]);
+    try std.testing.expectEqualStrings("configure", conf_cmd[5]);
+}
+
