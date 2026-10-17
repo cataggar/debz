@@ -825,10 +825,12 @@ checkout is used only to confirm `GITHUB_SHA` and a clean tree and to write a
    into `TREE/checkout`;
 3. `tools/real-snapshot-reference-protected-ci.sh`, run from that checkout.
 
-The script downloads the pinned Zig 0.17.0 tarball and refuses it unless
-`tools/verify-minisign.py` accepts its pinned name, size, SHA-256 and the
-prehashed minisign signature (file and trusted-comment signatures) under the
-pinned Zig release key. It extracts it with Python's `data` filter. Zig
+The script downloads the pinned Zig 0.17.0 tarball, checks its pinned size and
+SHA-256 before extracting it with `tar --no-same-owner --no-same-permissions`,
+builds `debz-reference-paths`, and refuses the release unless
+`debz-reference-paths verify-minisign` accepts its pinned name, size, SHA-256
+and the prehashed minisign signature (file and trusted-comment signatures)
+under the pinned Zig release key. Zig
 0.16's `zig build --fetch` unpacks dependencies into `checkout/zig-pkg`
 with 24 world-writable (0777) shell scripts; the script records them,
 removes group/other write from `zig-pkg` and the global cache (it never

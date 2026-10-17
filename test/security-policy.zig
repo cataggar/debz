@@ -2949,7 +2949,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
         "trap collect EXIT\n",
         "test \"$(git -C \"$checkout\" rev-parse HEAD)\" = \"$commit\"\n",
-        "step zig-verify 0 \"\" python3 -I tools/verify-minisign.py --public-key \"$zig_public_key\" \\\n",
+        "step zig-verify 0 \"\" \"$reference_paths\" verify-minisign --public-key \"$zig_public_key\" \\\n",
+        "  \"$reference_paths\" stage-keyring \\\n",
         "chmod -R go-w zig-pkg \"$tree/zig-global\"\n",
         "step zig-pkg-verify 0 \"\" \"$reference_paths\" packages \\\n",
         "step tree-staged 0 \"\" \"$reference_paths\" tree \"$tree\"\n",
@@ -3066,6 +3067,9 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "            if (!isWithinPath(target, library)) return error.ToolchainSymlinkEscapes;\n",
         "    try ed25519Verify(key, &prehash_digest, file_sig);\n",
         "    try ed25519Verify(key, global_message, global_signature);\n",
+        "    const data_tar = zstdDecompressBounded(allocator, data_archive, keyring_decompressed_limit) catch |err| {\n",
+        "    const keyring = extractTarMember(data_tar, member, expected_keyring_size) catch |err| {\n",
+        "    try requireRootOwnedKeyringFile(allocator, evidence_path, \"staged-keyring\", target, target_stat, 0o644);\n",
         "        try openBeneathOptional(rfd, \"var/lib/debz\", true)\n",
         "        if ((before.mode & linux.S.IFMT) != linux.S.IFREG or before.nlink != 1 or before.size > 128 * 1024 * 1024)\n",
         "        if (coordination_bytes > 512 * 1024 * 1024) return error.CoordinationEvidenceExceedsLimit;\n",
@@ -3093,9 +3097,6 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
         "    report(\"proc-pid-only\", ",
         "    try network_probe.observe(\n",
-    });
-    try nativeMutations(&f, "protected-reference", "tools/verify-minisign.py", &.{
-        "    ed25519_verify(key, blob[10:] + trusted, global_signature)\n",
     });
     const workflow = try f.source(".github/workflows/ci.yml");
     const ci_script = try f.source("tools/real-snapshot-reference-protected-ci.sh");
