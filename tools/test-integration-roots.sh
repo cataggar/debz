@@ -148,55 +148,7 @@ run_json plan $native_common --lock-input "$native_lock" --lock-output "$workspa
 cmp "$native_lock" "$workspace/base-dep.native.copy.lock.json"
 run_json download $native_common --lock-input "$native_lock" base-dep | grep -q '"changed":false'
 run_json download $native_common --lock-input "$native_lock" --cache-only base-dep | grep -q '"changed":false'
-python3 - "$resolved_lock" "$native_lock" "$native_cache" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-legacy = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
-native = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
-assert native["schema"] == "https://debz.dev/schema/exact-closure-lock-v3"
-assert native["version"] == 3
-assert native["request_sha256"] == legacy["request_sha256"]
-assert native["policy_sha256"] == hashlib.sha256(
-    b"debz.product-native-solver-policy-v1\0" + bytes.fromhex(legacy["policy_sha256"])
-).hexdigest()
-assert len(native["repositories"]) == len(legacy["repositories"])
-for repository, previous in zip(native["repositories"], legacy["repositories"]):
-    for field in ("id", "snapshot_sha256", "release_sha256", "signer_fingerprints"):
-        assert repository[field] == previous[field]
-    assert repository["index_identity"]["primary"] == "sha256"
-    assert repository["index_identity"]["digests"] == [
-        {"algorithm": "sha256", "digest": previous["index_sha256"]}
-    ]
-assert all("archive_binding" not in repository for repository in native["repositories"])
-assert native["local_artifacts"] == []
-assert len(native["packages"]) == len(legacy["packages"])
-for package, previous in zip(native["packages"], legacy["packages"]):
-    origin = package["origin"]
-    assert origin["type"] == "authenticated_repository"
-    for field in ("repository_id", "repository_snapshot_sha256"):
-        assert origin[field] == previous[field]
-    for field in ("name", "version", "architecture", "declared_size", "retention", "dpkg_selection_hold"):
-        assert package[field] == previous[field]
-    identity = package["archive_identity"]
-    assert identity["primary"] == "sha512"
-    assert "derived_archive_identity" not in package
-    digests = {value["algorithm"]: value["digest"] for value in identity["digests"]}
-    assert digests["sha256"] == previous["sha256"]
-    assert len(digests["sha512"]) == 2 * hashlib.sha512().digest_size
-    data = (
-        pathlib.Path(sys.argv[3])
-        / "packages-v2/objects"
-        / f'{identity["primary"]}-{digests[identity["primary"]]}'
-    ).read_bytes()
-    assert len(data) == package["declared_size"]
-    for algorithm, expected in digests.items():
-        assert hashlib.new(algorithm, data).hexdigest() == expected
-expected = native.pop("digest_sha256")
-assert hashlib.sha256(json.dumps(native, separators=(",", ":")).encode()).hexdigest() == expected
-PY
+"$repository_generator" --check-roots native-lock "$resolved_lock" "$native_lock" "$native_cache"
 
 native_package_cache="$workspace/native-package-cache"
 native_package_archive="$workspace/native-package-cache.dbzcache"
@@ -206,34 +158,7 @@ native_prepared=$(run_json package-cache prepare $native_package_common \
   --source "$source_file" --keyring "$keyring" --archive-output "$native_package_archive")
 native_warm=$(run_json package-cache prepare $native_package_common \
   --source "$source_file" --keyring "$keyring" --offline)
-python3 - "$native_fingerprint" "$native_prepared" "$native_warm" "$native_lock" "$native_package_archive" <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import struct
-import sys
-
-import jsonschema
-
-fingerprint, prepared, warm = map(json.loads, sys.argv[1:4])
-lock = json.loads(Path(sys.argv[4]).read_bytes())
-for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (warm, "result")):
-    schema = json.loads(Path(f"schema/package-cache-{name}-v5.json").read_bytes())
-    jsonschema.Draft202012Validator.check_schema(schema)
-    jsonschema.validate(value, schema)
-    legacy = json.loads(Path(f"schema/package-cache-{name}-v4.json").read_bytes())
-    assert not jsonschema.Draft202012Validator(legacy).is_valid(value)
-    assert value["lock_digest"] == lock["digest_sha256"]
-assert prepared["fingerprint"] == warm["fingerprint"] == fingerprint["fingerprint"]
-assert prepared["downloaded_count"] == prepared["verified_count"] == len(lock["packages"])
-assert prepared["reused_count"] == warm["downloaded_count"] == 0
-assert warm["reused_count"] == prepared["verified_count"]
-archive = Path(sys.argv[5]).read_bytes()
-magic = b"debz-package-cache-archive-v3\n"
-assert archive.startswith(magic)
-assert struct.unpack(">I", archive[len(magic):len(magic) + 4])[0] == len(lock["packages"])
-assert hashlib.sha256(archive[:-32]).digest() == archive[-32:]
-PY
+"$repository_generator" --check-roots native-cache-prepare "$native_fingerprint" "$native_prepared" "$native_warm" "$native_lock" "$native_package_archive"
 
 native_scenario_lock="$workspace/scenario.native.lock.json"
 run_json plan $native_common --lock-output "$native_scenario_lock" scenario-main | grep -q '"exit_status":0'
@@ -248,65 +173,12 @@ native_exact=$(run_json package-cache prepare \
   --cache-path "$workspace/native-package-cache-exact" --architecture "$architecture" \
   --source "$source_file" --keyring "$keyring" \
   --archive-input "$workspace/native-scenario.dbzcache" --restored-cache exact --json)
-python3 - "$native_partial" "$native_exact" <<'PY'
-import json
-import sys
-partial, exact = map(json.loads, sys.argv[1:])
-assert partial["downloaded_count"] > 0 and partial["reused_count"] > 0
-assert exact["downloaded_count"] == 0
-assert exact["reused_count"] == exact["verified_count"]
-assert partial["fingerprint"] == exact["fingerprint"]
-PY
+"$repository_generator" --check-roots native-cache-partial-exact "$native_partial" "$native_exact"
 
 native_empty_lock="$workspace/empty.native.lock.json"
 native_mixed_lock="$workspace/mixed.native.lock.json"
 native_local_lock="$workspace/local.native.lock.json"
-python3 - "$native_lock" "$native_empty_lock" "$native_mixed_lock" "$native_local_lock" <<'PY'
-import copy
-import hashlib
-import json
-from pathlib import Path
-import sys
-
-original = json.loads(Path(sys.argv[1]).read_bytes())
-assert original["version"] == 3
-
-def write_cache_fixture(value, path, name):
-    # These v3 cache fixtures are not used as transaction authorization.
-    value.pop("digest_sha256")
-    value["request_sha256"] = hashlib.sha256(name.encode()).hexdigest()
-    encoded = json.dumps(value, separators=(",", ":")).encode()
-    value["digest_sha256"] = hashlib.sha256(encoded).hexdigest()
-    Path(path).write_bytes(json.dumps(value, separators=(",", ":")).encode())
-
-empty = copy.deepcopy(original)
-empty["repositories"] = []
-empty["local_artifacts"] = []
-empty["packages"] = []
-write_cache_fixture(empty, sys.argv[2], "native-cache-empty")
-
-mixed = copy.deepcopy(original)
-package = next(value for value in mixed["packages"] if value["name"] == "base-dep")
-artifact = {
-    "artifact_id": next(
-        value
-        for value in package["archive_identity"]["digests"]
-        if value["algorithm"] == package["archive_identity"]["primary"]
-    ),
-    "archive_identity": package["archive_identity"],
-    "size": package["declared_size"],
-    "package": {field: package[field] for field in ("name", "version", "architecture")},
-    "acquisition_url": "file:/unused-native-cache-artifact.deb?REDACTED",
-    "trust_mode": "pinned_content_digest",
-}
-package["origin"] = {"type": "local_artifact", **artifact}
-mixed["local_artifacts"] = [artifact]
-local = copy.deepcopy(mixed)
-local["repositories"] = []
-local["packages"] = [copy.deepcopy(package)]
-write_cache_fixture(mixed, sys.argv[3], "native-cache-mixed")
-write_cache_fixture(local, sys.argv[4], "native-cache-local")
-PY
+"$repository_generator" --check-roots write-native-cache-fixtures "$native_lock" "$native_empty_lock" "$native_mixed_lock" "$native_local_lock"
 native_empty_fingerprint=$(run_json package-cache fingerprint \
   --transaction-backend native --lock-input "$native_empty_lock" \
   --cache-path "$workspace/native-package-cache-empty" --architecture "$architecture" --json)
@@ -318,25 +190,7 @@ native_empty_restored=$(run_json package-cache prepare \
   --transaction-backend native --lock-input "$native_empty_lock" \
   --cache-path "$workspace/native-package-cache-empty-restored" --architecture "$architecture" \
   --archive-input "$workspace/native-empty.dbzcache" --restored-cache exact --offline --json)
-python3 - "$native_empty_fingerprint" "$native_empty_prepared" "$native_empty_restored" "$native_empty_lock" "$workspace/native-empty.dbzcache" <<'PY'
-import hashlib
-import json
-from pathlib import Path
-import sys
-
-import jsonschema
-
-fingerprint, prepared, restored = map(json.loads, sys.argv[1:4])
-lock = json.loads(Path(sys.argv[4]).read_bytes())
-assert lock["packages"] == lock["repositories"] == lock["local_artifacts"] == []
-for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (restored, "result")):
-    jsonschema.validate(value, json.loads(Path(f"schema/package-cache-{name}-v5.json").read_bytes()))
-    assert value["lock_digest"] == lock["digest_sha256"]
-assert prepared["verified_count"] == restored["verified_count"] == 0
-assert prepared["fingerprint"] == restored["fingerprint"] == fingerprint["fingerprint"]
-body = b"debz-package-cache-archive-v3\n" + bytes(4)
-assert Path(sys.argv[5]).read_bytes() == body + hashlib.sha256(body).digest()
-PY
+"$repository_generator" --check-roots native-cache-empty "$native_empty_fingerprint" "$native_empty_prepared" "$native_empty_restored" "$native_empty_lock" "$workspace/native-empty.dbzcache"
 
 native_mixed_prepared=$(run_json package-cache prepare \
   --transaction-backend native --lock-input "$native_mixed_lock" \
@@ -347,22 +201,7 @@ native_local_prepared=$(run_json package-cache prepare \
   --transaction-backend native --lock-input "$native_local_lock" \
   --cache-path "$workspace/native-package-cache-local" --architecture "$architecture" \
   --archive-input "$native_package_archive" --restored-cache partial --offline --json)
-python3 - "$native_mixed_prepared" "$native_local_prepared" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-import jsonschema
-
-mixed, local = map(json.loads, sys.argv[1:])
-schema = json.loads(Path("schema/package-cache-result-v5.json").read_bytes())
-for value in (mixed, local):
-    jsonschema.validate(value, schema)
-    assert value["downloaded_count"] == 0
-    assert value["reused_count"] == value["verified_count"]
-assert mixed["verified_count"] == 2
-assert local["verified_count"] == 1
-PY
+"$repository_generator" --check-roots native-cache-mixed-local "$native_mixed_prepared" "$native_local_prepared"
 set +e
 missing_local=$("$debz" package-cache prepare \
   --transaction-backend native --lock-input "$native_local_lock" \
@@ -472,45 +311,7 @@ run_json plan $sha256_common --config "$sha256_config" --transaction-backend nat
 run_json download $sha256_common --config "$sha256_config" --transaction-backend native \
   --lock-input "$sha256_bound_lock" --cache-only scenario-main | grep -q '"exit_status":0'
 sha256_forged_lock="$workspace/sha256-forged.native.lock.json"
-sha256_tampered=$(python3 - "$sha256_bound_lock" "$sha256_cache" "$workspace/sha256.legacy.lock.json" "$sha256_forged_lock" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-lock = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
-legacy = json.loads(pathlib.Path(sys.argv[3]).read_bytes())
-assert lock["version"] == 3
-assert [value["archive_binding"] for value in lock["repositories"]] == ["signed_sha256_derived_sha512"]
-assert lock["repositories"][0]["id"] != legacy["repositories"][0]["id"]
-assert len(lock["packages"]) == len(legacy["packages"])
-objects = pathlib.Path(sys.argv[2]) / "packages-v2/objects"
-for package, previous in zip(lock["packages"], legacy["packages"]):
-    identity = package["archive_identity"]
-    assert identity["primary"] == "sha256"
-    assert [value["algorithm"] for value in identity["digests"]] == ["sha256"]
-    signed = identity["digests"][0]["digest"]
-    assert signed == previous["sha256"]
-    derived = package["derived_archive_identity"]
-    assert derived["provenance"] == "derived_from_signed_sha256"
-    assert derived["algorithm"] == "sha512"
-    data = (objects / f"sha256-{signed}").read_bytes()
-    assert len(data) == package["declared_size"]
-    assert hashlib.sha256(data).hexdigest() == signed
-    assert hashlib.sha512(data).hexdigest() == derived["digest"]
-expected = lock.pop("digest_sha256")
-assert hashlib.sha256(json.dumps(lock, separators=(",", ":")).encode()).hexdigest() == expected
-forged = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
-forged.pop("digest_sha256")
-for repository in forged["repositories"]:
-    repository.pop("archive_binding")
-for package in forged["packages"]:
-    package.pop("derived_archive_identity")
-forged["digest_sha256"] = hashlib.sha256(json.dumps(forged, separators=(",", ":")).encode()).hexdigest()
-pathlib.Path(sys.argv[4]).write_text(json.dumps(forged, separators=(",", ":")))
-print(objects / f'sha256-{lock["packages"][0]["archive_identity"]["digests"][0]["digest"]}')
-PY
-)
+sha256_tampered=$("$repository_generator" --check-roots sha256-bound-lock "$sha256_bound_lock" "$sha256_cache" "$workspace/sha256.legacy.lock.json" "$sha256_forged_lock")
 set +e
 sha256_forged=$("$debz" plan $sha256_common --config "$sha256_config" --transaction-backend native \
   --lock-input "$sha256_forged_lock" scenario-main 2>"$stderr_file")
@@ -549,35 +350,7 @@ if [ "$mode" != smoke ]; then
   run_mutating_json install $native_execution --lock-input "$native_execution_lock" \
     --assume-yes --noninteractive --conffile keep-existing base-dep |
     grep -q '"changed":true'
-  $privileged python3 - "$native_root" "$native_execution_lock" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-lock = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
-assert {entry["name"] for entry in lock["packages"]} == {"base-dep", "essential-core", "native-helper-target"}
-namespace = root / "var/lib/debz"
-receipt = json.loads((namespace / "native-transaction-provenance-v2.json").read_bytes())
-completion = json.loads((namespace / "root-operation-completion-v2.json").read_bytes())
-assert receipt["outcome"] == "succeeded"
-assert receipt["backend"] == completion["backend"] == "native"
-assert receipt["attempt_id"] == completion["attempt_id"]
-assert receipt["install_root"] == str(root)
-assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
-assert completion["transaction_provenance"]["schema"] == receipt["schema"]
-assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
-assert completion["journal"]["status"] == "absent"
-for evidence in receipt["evidence_files"]:
-    data = (root / evidence["path"]).read_bytes()
-    assert len(data) == evidence["size"]
-    assert hashlib.sha256(data).hexdigest() == evidence["sha256"]
-assert (root / "usr/share/debz-fixtures/base-dep").is_file()
-assert (root / "usr/bin/dpkg-trigger").read_bytes().startswith(b"native-helper-target=")
-for path in ("root-operation-v1.json", "native-execution-intent-v2.json", "native-recovery-v1"):
-    assert not (namespace / path).exists()
-PY
+  $privileged "$repository_generator" --check-roots native-execution "$native_root" "$native_execution_lock"
   run_mutating_json install $native_execution --lock-input "$native_execution_lock" \
     --assume-yes --noninteractive --conffile keep-existing --cache-only base-dep |
     grep -q '"changed":true'
@@ -597,21 +370,7 @@ PY
   run_mutating_json install $native_execution --lock-input "$native_trigger_lock" \
     --assume-yes --noninteractive --conffile keep-existing native-trigger-pkg |
     grep -q '"changed":true'
-  $privileged python3 - "$native_root" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-trace = (root / "native-trigger-trace").read_text().splitlines()
-assert trace == ["configure ", "triggered native-fixture"], trace
-receipt = json.loads((root / "var/lib/debz/native-transaction-provenance-v2.json").read_bytes())
-assert receipt["outcome"] == "succeeded"
-authorization_file = next(entry for entry in receipt["evidence_files"] if entry["kind"] == "authorization")
-authorization = json.loads((root / authorization_file["path"]).read_bytes())
-assert authorization["trigger_authority"]["allowed_triggers"] == ["native-fixture"]
-assert not (root / "var/lib/debz/native-execution-intent-v2.json").exists()
-PY
+  $privileged "$repository_generator" --check-roots native-trigger "$native_root"
   # The per-repository opt-in lets native execution consume a Debian-like
   # signed SHA256 identity with its bound derived SHA-512 (#261).
   bound_root="$workspace/native-bound-root"
@@ -626,23 +385,7 @@ PY
   run_mutating_json install $bound_execution --lock-input "$bound_execution_lock" \
     --assume-yes --noninteractive --conffile keep-existing base-dep |
     grep -q '"changed":true'
-  $privileged python3 - "$bound_root" "$bound_execution_lock" <<'PY'
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-lock = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
-assert [entry["archive_binding"] for entry in lock["repositories"]] == ["signed_sha256_derived_sha512"]
-for package in lock["packages"]:
-    assert package["archive_identity"]["primary"] == "sha256"
-    assert package["derived_archive_identity"]["provenance"] == "derived_from_signed_sha256"
-receipt = json.loads((root / "var/lib/debz/native-transaction-provenance-v2.json").read_bytes())
-assert receipt["outcome"] == "succeeded"
-assert receipt["backend"] == "native"
-assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
-assert (root / "usr/share/debz-fixtures/base-dep").is_file()
-PY
+  $privileged "$repository_generator" --check-roots bound-execution "$bound_root" "$bound_execution_lock"
   if [ "$mode" = native ]; then
     printf 'integration-root: %s/%s native core passed\n' "$suite" "$architecture"
     exit 0
@@ -683,31 +426,16 @@ cold=$(run_json package-cache prepare $package_cache_common \
   --source "$sha256_source" --keyring "$sha256_keyring" \
   --archive-output "$package_cache_archives/base.dbzcache" --json)
 printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v3"'
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == value["verified_count"]; assert value["reused_count"] == 0' <<EOF
-$cold
-EOF
+"$repository_generator" --check-roots cache-result cold "$cold"
 
 retry_cache="$workspace/package-cache-retry"
-python3 - "$sha256_resolved_lock" "$retry_cache" <<'PY'
-import json
-import pathlib
-import sys
-lock = json.loads(pathlib.Path(sys.argv[1]).read_text())
-digest = lock["packages"][0]["sha256"]
-name = f"package-{digest[:8]}-0000000000000000.tmp"
-name += "_" * (96 - len(name))
-staging = pathlib.Path(sys.argv[2]) / "packages-v2" / "staging"
-staging.mkdir(parents=True)
-(staging / name).write_bytes(b"abandoned")
-PY
+"$repository_generator" --check-roots write-abandoned-staging "$sha256_resolved_lock" "$retry_cache"
 retried=$(run_json package-cache prepare \
   --lock-input "$sha256_resolved_lock" --cache-path "$retry_cache" \
   --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
   --archive-input "$package_cache_archives/base.dbzcache" \
   --restored-cache exact --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]; assert value["staging"]["deleted"] >= 1' <<EOF
-$retried
-EOF
+"$repository_generator" --check-roots cache-result retried "$retried"
 test -z "$(find "$retry_cache/packages-v2/staging" -mindepth 1 -print -quit)"
 
 limited_cache="$workspace/package-cache-cleanup-limit"
@@ -729,9 +457,7 @@ test -z "$(find "$limited_cache/packages-v2/objects" -mindepth 1 -type f -print 
 
 exact=$(run_json package-cache prepare $package_cache_common \
   --source "$sha256_source" --keyring "$sha256_keyring" --offline --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]' <<EOF
-$exact
-EOF
+"$repository_generator" --check-roots cache-result exact "$exact"
 
 scenario_lock="$workspace/scenario-main.lock.json"
 run_json plan $sha256_common --source "$sha256_source" --lock-output "$scenario_lock" scenario-main | grep -q '"exit_status":0'
@@ -741,18 +467,14 @@ archive_partial=$(run_json package-cache prepare \
   --archive-input "$package_cache_archives/base.dbzcache" \
   --archive-output "$package_cache_archives/scenario.dbzcache" \
   --restored-cache partial --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] > 0; assert value["reused_count"] > 0' <<EOF
-$archive_partial
-EOF
+"$repository_generator" --check-roots cache-result partial "$archive_partial"
 
 archive_exact=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-relocated-exact" \
   --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
   --archive-input "$package_cache_archives/scenario.dbzcache" \
   --restored-cache exact --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]' <<EOF
-$archive_exact
-EOF
+"$repository_generator" --check-roots cache-result exact "$archive_exact"
 
 cp "$package_cache_archives/base.dbzcache" "$package_cache_archives/corrupt.dbzcache"
 printf 'corrupt' >>"$package_cache_archives/corrupt.dbzcache"
@@ -771,15 +493,11 @@ printf '%s' "$corrupt_archive" | grep -q '"id":"corrupt_cache_archive"'
 partial=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$package_cache_root" \
   --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] > 0; assert value["reused_count"] > 0' <<EOF
-$partial
-EOF
+"$repository_generator" --check-roots cache-result partial "$partial"
 
 pruned=$(run_json package-cache prepare $package_cache_common \
   --source "$sha256_source" --keyring "$sha256_keyring" --offline --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["gc"]["deleted"] > 0; assert value["gc"]["complete"] is True' <<EOF
-$pruned
-EOF
+"$repository_generator" --check-roots cache-result pruned "$pruned"
 
 first_cache_object=$(find "$package_cache_root/packages-v2/objects" -type f | head -n 1 || true)
 test -n "$first_cache_object"
@@ -796,9 +514,7 @@ printf '%s' "$corrupt" | grep -q '"id":"corrupt_cache_object"'
 
 repaired=$(run_json package-cache prepare $package_cache_common \
   --source "$sha256_source" --keyring "$sha256_keyring" --repair-corrupt-cache --json)
-python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 1; assert value["reused_count"] + 1 == value["verified_count"]' <<EOF
-$repaired
-EOF
+"$repository_generator" --check-roots cache-result repaired "$repaired"
 rm -f "$workspace/package-cache-object.backup"
 
 offline_objects_only="$workspace/offline-objects-only"
