@@ -1203,8 +1203,10 @@ pub fn build(b: *std.Build) void {
     );
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
+    audit_tests.setEnvironmentVariable("DEBZ_REFERENCE_PROTECTED", getInstallPath(b, .bin, "debz-reference-protected"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
+    audit_tests.step.dependOn(&install_reference_protected.step);
     audit_step.dependOn(&audit_tests.step);
     audit_step.dependOn(&debian_closure_tests.step);
     audit_step.dependOn(&run_release_workflow_policy_tests.step);
@@ -1267,9 +1269,7 @@ pub fn build(b: *std.Build) void {
     });
     reference_escape_probe.root_module.addImport("network_probe", reference_network_probe_module);
     audit_step.dependOn(&reference_escape_probe.step);
-    const protected_reference = b.addSystemCommand(
-        &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },
-    );
+    const protected_reference = b.addRunArtifact(reference_protected);
     protected_reference.addArgs(&.{
         "--launcher",
         b.option([]const u8, "reference-protected-launcher", "Root-owned protected ReleaseSafe launcher") orelse "",
