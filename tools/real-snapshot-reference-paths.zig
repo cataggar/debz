@@ -35,6 +35,11 @@ pub const Error = error{
     ArtifactSizeOrDigestMismatch,
     Ed25519VerificationFailed,
     PackageManifestExists,
+    UnsafeOrOversizedCoordinationMember,
+    CoordinationMemberChanged,
+    CoordinationEvidenceExceedsLimit,
+    UnsafeOrOversizedEvidenceMember,
+    EvidenceExceedsLimit,
 };
 
 var test_root_override: ?[]const u8 = null;
@@ -170,6 +175,56 @@ pub fn openAbsolute(path: []const u8, directory: bool) !i32 {
         return @intCast(try syscall(linux.fcntl(root_fd, linux.F.DUPFD_CLOEXEC, @as(usize, 0))));
     }
     return openBeneath(root_fd, path[1..], directory);
+}
+
+fn openComponentAtOptional(dir_fd: i32, part: []const u8, directory: bool) !?i32 {
+    if (part.len == 0 or part.len > 255) return error.NoncanonicalReferencePath;
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..part.len], part);
+    buf[part.len] = 0;
+    const part_z: [*:0]const u8 = @ptrCast(&buf);
+    const flags: linux.O = .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+        .DIRECTORY = directory,
+    };
+    const rc = linux.openat(dir_fd, part_z, flags, 0);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        .NOENT => null,
+        else => error.ReferenceSyscallRefused,
+    };
+}
+
+pub fn openBeneathOptional(root_fd: i32, relative: []const u8, directory: bool) !?i32 {
+    try validateRelativeCanonical(relative);
+    var current: i32 = @intCast(try syscall(linux.fcntl(root_fd, linux.F.DUPFD_CLOEXEC, @as(usize, 0))));
+    errdefer if (current != -1) {
+        _ = linux.close(current);
+    };
+    var it = std.mem.splitScalar(u8, relative, '/');
+    while (it.next()) |part| {
+        const is_last = it.rest().len == 0;
+        const next_fd = (try openComponentAtOptional(current, part, !is_last or directory)) orelse return null;
+        _ = linux.close(current);
+        current = next_fd;
+    }
+    const result = current;
+    current = -1;
+    return result;
+}
+
+pub fn openAbsoluteOptional(path: []const u8, directory: bool) !?i32 {
+    if (!isCanonicalAbsolute(path)) return error.NoncanonicalReferencePath;
+    const root_flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true };
+    const root_fd: i32 = @intCast(try syscall(linux.openat(linux.AT.FDCWD, "/", root_flags, 0)));
+    defer _ = linux.close(root_fd);
+    if (std.mem.eql(u8, path, "/")) {
+        if (!directory) return error.NoncanonicalReferencePath;
+        return @intCast(try syscall(linux.fcntl(root_fd, linux.F.DUPFD_CLOEXEC, @as(usize, 0))));
+    }
+    return openBeneathOptional(root_fd, path[1..], directory);
 }
 
 pub fn openProtected(path: []const u8, directory: bool) !i32 {
@@ -838,6 +893,346 @@ fn writeAllFd(fd: i32, bytes: []const u8) !void {
     }
 }
 
+pub const coordination_names = [_][]const u8{
+    "root-operation-v1.json",
+    "native-execution-intent-v1.json",
+    "native-execution-progress-v1.log",
+    "native-managed-state-v1.json",
+    "native-lifecycle-script-v1.json",
+    "native-trigger-events-v1.json",
+    "native-transaction-authorization-v1.json",
+    "native-transaction-authorization-v2.json",
+    "native-transaction-authorization-v3.json",
+    "native-transaction-program-v1.json",
+    "native-transaction-program-v2.json",
+    "native-transaction-program-v3.json",
+    "root-mutation-v1.json",
+    "root-mutation-v2.log",
+};
+
+const CoordinationRow = struct {
+    name: []const u8,
+    status: enum { unread, absent, present },
+    size: usize = 0,
+    sha256: [64]u8 = undefined,
+};
+
+fn writeExclusiveAtFd(dir_fd: i32, name: []const u8, mode: u16, bytes: []const u8) !void {
+    if (name.len == 0 or name.len > 255) return error.NoncanonicalReferencePath;
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    const name_z: [*:0]const u8 = @ptrCast(&buf);
+    const flags: linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    const fd: i32 = @intCast(try syscall(linux.openat(dir_fd, name_z, flags, mode)));
+    defer _ = linux.close(fd);
+    try writeAllFd(fd, bytes);
+}
+
+fn writeCoordinationInventory(
+    allocator: std.mem.Allocator,
+    evidence_fd: i32,
+    capture_complete: bool,
+    rows: []const CoordinationRow,
+) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\n  \"version\": 1,\n  \"capture_complete\": ");
+    try out.appendSlice(allocator, if (capture_complete) "true" else "false");
+    if (rows.len == 0) {
+        try out.appendSlice(allocator, ",\n  \"files\": []\n}\n");
+    } else {
+        try out.appendSlice(allocator, ",\n  \"files\": [\n");
+        for (rows, 0..) |row, idx| {
+            const comma: []const u8 = if (idx + 1 < rows.len) "," else "";
+            switch (row.status) {
+                .unread => {
+                    const text = try std.fmt.allocPrint(
+                        allocator,
+                        "    {{\n      \"source\": \"var/lib/debz/{s}\",\n      \"status\": \"unread\"\n    }}{s}\n",
+                        .{ row.name, comma },
+                    );
+                    defer allocator.free(text);
+                    try out.appendSlice(allocator, text);
+                },
+                .absent => {
+                    const text = try std.fmt.allocPrint(
+                        allocator,
+                        "    {{\n      \"source\": \"var/lib/debz/{s}\",\n      \"status\": \"absent\"\n    }}{s}\n",
+                        .{ row.name, comma },
+                    );
+                    defer allocator.free(text);
+                    try out.appendSlice(allocator, text);
+                },
+                .present => {
+                    const text = try std.fmt.allocPrint(
+                        allocator,
+                        "    {{\n      \"source\": \"var/lib/debz/{s}\",\n      \"status\": \"present\",\n      \"file\": \"native-coordination/{s}\",\n      \"size\": {d},\n      \"sha256\": \"{s}\"\n    }}{s}\n",
+                        .{ row.name, row.name, row.size, row.sha256, comma },
+                    );
+                    defer allocator.free(text);
+                    try out.appendSlice(allocator, text);
+                },
+            }
+        }
+        try out.appendSlice(allocator, "  ]\n}\n");
+    }
+    try writeExclusiveAtFd(evidence_fd, "native-coordination-inventory-v1.json", 0o600, out.items);
+}
+
+pub fn captureCoordination(allocator: std.mem.Allocator, root: []const u8, evidence: []const u8) !void {
+    const evidence_fd = try openAbsolute(evidence, true);
+    defer _ = linux.close(evidence_fd);
+
+    var rows: std.ArrayList(CoordinationRow) = .empty;
+    defer rows.deinit(allocator);
+    var capture_complete = false;
+    errdefer if (!capture_complete) {
+        writeCoordinationInventory(allocator, evidence_fd, false, rows.items) catch {};
+    };
+
+    const root_fd_opt = try openAbsoluteOptional(root, true);
+    defer if (root_fd_opt) |rfd| {
+        _ = linux.close(rfd);
+    };
+    const source_fd_opt: ?i32 = if (root_fd_opt) |rfd|
+        try openBeneathOptional(rfd, "var/lib/debz", true)
+    else
+        null;
+    defer if (source_fd_opt) |sfd| {
+        _ = linux.close(sfd);
+    };
+
+    _ = try syscall(linux.mkdirat(evidence_fd, "native-coordination", 0o700));
+    const output_fd = try openBeneath(evidence_fd, "native-coordination", true);
+    defer _ = linux.close(output_fd);
+
+    var coordination_bytes: usize = 0;
+    for (coordination_names) |name| {
+        try rows.append(allocator, .{ .name = name, .status = .unread });
+        const row = &rows.items[rows.items.len - 1];
+        const source_fd = source_fd_opt orelse {
+            row.status = .absent;
+            continue;
+        };
+        var name_buf: [256]u8 = undefined;
+        @memcpy(name_buf[0..name.len], name);
+        name_buf[name.len] = 0;
+        const name_z: [*:0]const u8 = @ptrCast(&name_buf);
+        const open_flags: linux.O = .{
+            .ACCMODE = .RDONLY,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        };
+        const rc = linux.openat(source_fd, name_z, open_flags, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .NOENT => {
+                row.status = .absent;
+                continue;
+            },
+            else => return error.ReferenceSyscallRefused,
+        }
+        const fd: i32 = @intCast(rc);
+        defer _ = linux.close(fd);
+
+        const before = try fstat(fd);
+        if ((before.mode & linux.S.IFMT) != linux.S.IFREG or before.nlink != 1 or before.size > 128 * 1024 * 1024)
+            return error.UnsafeOrOversizedCoordinationMember;
+
+        const max_member_bytes: usize = 128 * 1024 * 1024;
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(allocator);
+        var chunk: [64 * 1024]u8 = undefined;
+        while (data.items.len <= max_member_bytes) {
+            const remaining = (max_member_bytes + 1) - data.items.len;
+            const ask = @min(chunk.len, remaining);
+            const got = try syscall(linux.read(fd, &chunk, ask));
+            if (got == 0) break;
+            try data.appendSlice(allocator, chunk[0..got]);
+        }
+        const after = try fstat(fd);
+        if (data.items.len != before.size or
+            before.mode != after.mode or
+            before.nlink != after.nlink or
+            before.size != after.size or
+            before.mtime.sec != after.mtime.sec or
+            before.mtime.nsec != after.mtime.nsec or
+            before.ctime.sec != after.ctime.sec or
+            before.ctime.nsec != after.ctime.nsec)
+        {
+            return error.CoordinationMemberChanged;
+        }
+        coordination_bytes += data.items.len;
+        if (coordination_bytes > 512 * 1024 * 1024) return error.CoordinationEvidenceExceedsLimit;
+
+        try writeExclusiveAtFd(output_fd, name, 0o600, data.items);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data.items, &digest, .{});
+        row.status = .present;
+        row.size = data.items.len;
+        row.sha256 = std.fmt.bytesToHex(digest, .lower);
+    }
+    capture_complete = true;
+    try writeCoordinationInventory(allocator, evidence_fd, true, rows.items);
+}
+
+fn writeTruncateNoFollow(path: []const u8, payload: []const u8) !void {
+    if (path.len == 0 or path.len >= maximum_path_bytes) return error.NoncanonicalReferencePath;
+    var buf: [maximum_path_bytes]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+    const flags: linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    const fd: i32 = @intCast(try syscall(linux.openat(linux.AT.FDCWD, path_z, flags, 0o644)));
+    defer _ = linux.close(fd);
+    try writeAllFd(fd, payload);
+}
+
+fn ensureParentDirsUnderTarget(target: []const u8, relative: []const u8) !void {
+    const dir_rel = std.fs.path.dirname(relative) orelse return;
+    const target_fd = try openAbsolute(target, true);
+    defer _ = linux.close(target_fd);
+    var current: i32 = @intCast(try syscall(linux.fcntl(target_fd, linux.F.DUPFD_CLOEXEC, @as(usize, 0))));
+    defer _ = linux.close(current);
+    var it = std.mem.splitScalar(u8, dir_rel, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or part.len > 255) return error.NoncanonicalReferencePath;
+        var buf: [256]u8 = undefined;
+        @memcpy(buf[0..part.len], part);
+        buf[part.len] = 0;
+        const part_z: [*:0]const u8 = @ptrCast(&buf);
+        const rc = linux.mkdirat(current, part_z, 0o755);
+        switch (linux.errno(rc)) {
+            .SUCCESS, .EXIST => {},
+            else => return error.ReferenceSyscallRefused,
+        }
+        const next_fd = try openComponentAt(current, part, true);
+        _ = linux.close(current);
+        current = next_fd;
+    }
+}
+
+fn writeTargetSha256Sums(allocator: std.mem.Allocator, target: []const u8) !void {
+    const entries = try collectWalkEntries(allocator, target);
+    defer {
+        for (entries) |entry| entry.deinit(allocator);
+        allocator.free(entries);
+    }
+    std.mem.sort(WalkEntry, entries, {}, lessThanWalkEntry);
+    var sums: std.ArrayList(u8) = .empty;
+    defer sums.deinit(allocator);
+    for (entries) |entry| {
+        if ((entry.meta.mode & linux.S.IFMT) != linux.S.IFREG) continue;
+        if (std.mem.eql(u8, std.fs.path.basename(entry.path), "SHA256SUMS")) continue;
+        const relative = entry.path[target.len + 1 ..];
+        const digest = try sha256RegularNoFollow(entry.path);
+        const line = try std.fmt.allocPrint(allocator, "{s}  {s}\n", .{ digest, relative });
+        defer allocator.free(line);
+        try sums.appendSlice(allocator, line);
+    }
+    if (sums.items.len == 0) try sums.append(allocator, '\n');
+    const sums_path = try std.fs.path.join(allocator, &.{ target, "SHA256SUMS" });
+    defer allocator.free(sums_path);
+    try writeTruncateNoFollow(sums_path, sums.items);
+}
+
+fn exportEvidenceInner(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    target: []const u8,
+    failure_detail: *?[]u8,
+) !void {
+    const entries = try collectWalkEntries(allocator, source);
+    defer {
+        for (entries) |entry| entry.deinit(allocator);
+        allocator.free(entries);
+    }
+    var total: u64 = 0;
+    for (entries) |entry| {
+        if ((entry.meta.mode & linux.S.IFMT) == linux.S.IFDIR) continue;
+        if ((entry.meta.mode & linux.S.IFMT) != linux.S.IFREG or entry.meta.size > 128 * 1024 * 1024) {
+            failure_detail.* = try std.fmt.allocPrint(allocator, "unsafe or oversized evidence member: {s}", .{entry.path});
+            return error.UnsafeOrOversizedEvidenceMember;
+        }
+        total += entry.meta.size;
+        if (total > 512 * 1024 * 1024) {
+            failure_detail.* = try allocator.dupe(u8, "evidence exceeds 512 MiB");
+            return error.EvidenceExceedsLimit;
+        }
+    }
+    for (entries) |entry| {
+        if ((entry.meta.mode & linux.S.IFMT) == linux.S.IFDIR) continue;
+        const relative = entry.path[source.len + 1 ..];
+        try ensureParentDirsUnderTarget(target, relative);
+        const destination = try std.fs.path.join(allocator, &.{ target, relative });
+        defer allocator.free(destination);
+
+        const src_fd = try openAbsolute(entry.path, false);
+        defer _ = linux.close(src_fd);
+
+        var dst_buf: [maximum_path_bytes]u8 = undefined;
+        @memcpy(dst_buf[0..destination.len], destination);
+        dst_buf[destination.len] = 0;
+        const dst_z: [*:0]const u8 = @ptrCast(&dst_buf);
+        const dst_flags: linux.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        };
+        const dst_fd: i32 = @intCast(try syscall(linux.openat(linux.AT.FDCWD, dst_z, dst_flags, 0o644)));
+        defer _ = linux.close(dst_fd);
+
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            const got = try syscall(linux.read(src_fd, &chunk, chunk.len));
+            if (got == 0) break;
+            try writeAllFd(dst_fd, chunk[0..got]);
+        }
+    }
+    const summary_path = try std.fs.path.join(allocator, &.{ target, "artifact-summary.txt" });
+    defer allocator.free(summary_path);
+    const summary_text = try std.fmt.allocPrint(allocator, "bytes_before_index={d}\n", .{total});
+    defer allocator.free(summary_text);
+    try writeTruncateNoFollow(summary_path, summary_text);
+}
+
+pub fn exportEvidence(allocator: std.mem.Allocator, source: []const u8, target: []const u8) !void {
+    defer writeTargetSha256Sums(allocator, target) catch {};
+    var failure_detail: ?[]u8 = null;
+    defer if (failure_detail) |msg| allocator.free(msg);
+    exportEvidenceInner(allocator, source, target, &failure_detail) catch |err| {
+        const msg = failure_detail orelse @errorName(err);
+        if (std.fs.path.join(allocator, &.{ target, "export-failure.txt" })) |failure_path| {
+            defer allocator.free(failure_path);
+            if (std.fmt.allocPrint(allocator, "{s}\n", .{msg})) |failure_line| {
+                defer allocator.free(failure_line);
+                writeTruncateNoFollow(failure_path, failure_line) catch {};
+            } else |_| {}
+        } else |_| {}
+        if (!builtin.is_test) {
+            writeAllFd(2, msg) catch {};
+            writeAllFd(2, "\n") catch {};
+        }
+        return err;
+    };
+}
+
 fn reportFailures(failures: []const []const u8) u8 {
     const limit = @min(failures.len, 50);
     for (failures[0..limit]) |failure| {
@@ -964,9 +1359,22 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
         try writeAllFd(1, "\n");
         return 0;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[0], "capture-coordination")) {
+        captureCoordination(allocator, args[1], args[2]) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "coordination capture failed: {s}\n", .{@errorName(err)}) catch "coordination capture failed\n";
+            try writeAllFd(2, msg);
+            return 1;
+        };
+        return 0;
+    }
+    if (args.len == 3 and std.mem.eql(u8, args[0], "export-evidence")) {
+        exportEvidence(allocator, args[1], args[2]) catch return 1;
+        return 0;
+    }
     try writeAllFd(
         2,
-        "usage: debz-reference-paths ancestry|tree TREE | packages DIR OUTPUT | verify-keyring PATH SIZE SHA256 | toolchain PATH | protected [--directory] PATH... | verify-minisign --public-key KEY --artifact PATH --signature PATH --name NAME --sha256 SHA256 --size SIZE\n",
+        "usage: debz-reference-paths ancestry|tree TREE | packages DIR OUTPUT | verify-keyring PATH SIZE SHA256 | toolchain PATH | protected [--directory] PATH... | verify-minisign --public-key KEY --artifact PATH --signature PATH --name NAME --sha256 SHA256 --size SIZE | capture-coordination ROOT EVIDENCE | export-evidence EVIDENCE UPLOAD\n",
     );
     return 2;
 }
@@ -1337,3 +1745,49 @@ test "keyring toolchain and readRootFile enforce descriptor-rooted no-follow pin
     try std.testing.expectEqualStrings("fixture", db_bytes);
     try std.testing.expectError(error.InvalidReferenceDatabaseFile, readRootFile(allocator, root, "lib/std.zig", 3));
 }
+
+test "captureCoordination and exportEvidence enforce bounds and refuse symlinks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try makeTempRoot(allocator, &tmp);
+    defer allocator.free(root);
+
+    try tmp.dir.createDirPath(std.testing.io, "candidate/var/lib/debz");
+    try tmp.dir.createDirPath(std.testing.io, "evidence/staging");
+    try tmp.dir.createDirPath(std.testing.io, "upload");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "candidate/var/lib/debz/root-operation-v1.json", .data = "{\"phase\":\"script\"}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "evidence/create.json", .data = "{\"exit_status\":8}\n" });
+
+    const candidate_dir = try std.fs.path.join(allocator, &.{ root, "candidate" });
+    defer allocator.free(candidate_dir);
+    const evidence_dir = try std.fs.path.join(allocator, &.{ root, "evidence" });
+    defer allocator.free(evidence_dir);
+    const upload_dir = try std.fs.path.join(allocator, &.{ root, "upload" });
+    defer allocator.free(upload_dir);
+
+    try captureCoordination(allocator, candidate_dir, evidence_dir);
+    const inv_path = try std.fs.path.join(allocator, &.{ evidence_dir, "native-coordination-inventory-v1.json" });
+    defer allocator.free(inv_path);
+    const inv = try readRegularNoFollowAlloc(allocator, inv_path, 64 * 1024);
+    defer allocator.free(inv);
+    try std.testing.expect(std.mem.indexOf(u8, inv, "\"capture_complete\": true") != null);
+
+    try exportEvidence(allocator, evidence_dir, upload_dir);
+    const sums_path = try std.fs.path.join(allocator, &.{ upload_dir, "SHA256SUMS" });
+    defer allocator.free(sums_path);
+    const sums = try readRegularNoFollowAlloc(allocator, sums_path, 64 * 1024);
+    defer allocator.free(sums);
+    try std.testing.expect(std.mem.indexOf(u8, sums, "  native-coordination/root-operation-v1.json\n") != null);
+
+    const untrusted_link = try std.fs.path.join(allocator, &.{ evidence_dir, "untrusted" });
+    defer allocator.free(untrusted_link);
+    try symlinkAtPath(inv_path, untrusted_link);
+    try std.testing.expectError(error.UnsafeOrOversizedEvidenceMember, exportEvidence(allocator, evidence_dir, upload_dir));
+    const failure_path = try std.fs.path.join(allocator, &.{ upload_dir, "export-failure.txt" });
+    defer allocator.free(failure_path);
+    const failure_txt = try readRegularNoFollowAlloc(allocator, failure_path, 64 * 1024);
+    defer allocator.free(failure_txt);
+    try std.testing.expect(std.mem.indexOf(u8, failure_txt, "unsafe or oversized evidence member") != null);
+}
+

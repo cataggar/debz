@@ -3016,14 +3016,11 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "  export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}\n",
         "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
         "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
-        "            if total > 512 * 1024 * 1024:\n",
         "  \"$checkout/zig-out/bin/debz-native-outcome\" \\\n",
         "PATH=/no-host-interpreters zig-out/bin/debz-native-outcome \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
         "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
-        "        source_fd = open_beneath(root_fd, \"var/lib/debz\", directory=True)\n",
-        "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=source_fd)\n",
-        "            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 128 * 1024 * 1024:\n",
-        "    inventory[\"capture_complete\"] = True\n",
+        "\"$checkout/zig-out/bin/debz-reference-paths\" capture-coordination \"$work/root\" \"$evidence\" \\\n",
+        "\"$checkout/zig-out/bin/debz-reference-paths\" export-evidence \"$evidence\" \"$upload\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
         "    --check-keyring \"$keyring\" >/dev/null\n",
@@ -3069,6 +3066,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "            if (!isWithinPath(target, library)) return error.ToolchainSymlinkEscapes;\n",
         "    try ed25519Verify(key, &prehash_digest, file_sig);\n",
         "    try ed25519Verify(key, global_message, global_signature);\n",
+        "        try openBeneathOptional(rfd, \"var/lib/debz\", true)\n",
+        "        if ((before.mode & linux.S.IFMT) != linux.S.IFREG or before.nlink != 1 or before.size > 128 * 1024 * 1024)\n",
+        "        if (coordination_bytes > 512 * 1024 * 1024) return error.CoordinationEvidenceExceedsLimit;\n",
+        "        if (total > 512 * 1024 * 1024) {\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-order.zig", &.{
         "pub fn verifyKbdCycle(",

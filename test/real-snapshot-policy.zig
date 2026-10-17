@@ -2045,10 +2045,16 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
         "real-snapshot-comparator compare",
         "comparison-unavailable.txt",
         "[[ -f \"$evidence/reference.snapshot.json\" && -f \"$evidence/native.snapshot.json\" ]]",
+        "\"$checkout/zig-out/bin/debz-reference-paths\" capture-coordination \"$work/root\" \"$evidence\"",
+        "\"$checkout/zig-out/bin/debz-reference-paths\" export-evidence \"$evidence\" \"$upload\"",
+    }) |required| try support.contains(collector, required);
+    const reference_paths = try source("tools/real-snapshot-reference-paths.zig");
+    defer support.allocator.free(reference_paths);
+    for ([_][]const u8{
         "128 * 1024 * 1024",
         "512 * 1024 * 1024",
         "artifact-summary.txt",
-    }) |required| try support.contains(collector, required);
+    }) |required| try support.contains(reference_paths, required);
     try testing.expect(std.mem.indexOf(u8, workflow[0..start], "schedule:\n") != null);
 }
 
@@ -2433,25 +2439,11 @@ test "snapshot: protected CI and stage scripts enforce offline refusals and pinn
 test "snapshot: protected native CI evidence export and coordination capture enforce bounds and refuse aliases" {
     const wrapper = try source("tools/real-snapshot-protected-native-ci.sh");
     defer support.allocator.free(wrapper);
-    const exp_marker = "python3 -I - \"$evidence\" \"$upload\" <<'PY'\n";
-    const exp_start = (std.mem.indexOf(u8, wrapper, exp_marker) orelse return error.MissingExporter) + exp_marker.len;
-    const exp_end = std.mem.indexOfPos(u8, wrapper, exp_start, "\nPY\n") orelse return error.MissingExporter;
-    const exporter = wrapper[exp_start..exp_end];
-
-    const col_marker = "<<'PY' || coordination_status=$?\n";
-    const col_start = (std.mem.indexOf(u8, wrapper, col_marker) orelse return error.MissingCollector) + col_marker.len;
-    const col_end = std.mem.indexOfPos(u8, wrapper, col_start, "\nPY\n") orelse return error.MissingCollector;
-    const raw_collector = wrapper[col_start..col_end];
+    try support.contains(wrapper, "\"$checkout/zig-out/bin/debz-reference-paths\" capture-coordination \"$work/root\" \"$evidence\"");
+    try support.contains(wrapper, "\"$checkout/zig-out/bin/debz-reference-paths\" export-evidence \"$evidence\" \"$upload\"");
 
     var work = try support.Work.init();
     defer work.deinit();
-    try work.write("exporter.py", exporter);
-    const exporter_py = try work.path("exporter.py");
-    defer support.allocator.free(exporter_py);
-
-    try work.write("collector.py", raw_collector);
-    const collector_py = try work.path("collector.py");
-    defer support.allocator.free(collector_py);
 
     try work.directory.dir.createDirPath(support.io, "evidence/staging");
     try work.directory.dir.createDirPath(support.io, "upload");
@@ -2469,7 +2461,7 @@ test "snapshot: protected native CI evidence export and coordination capture enf
     const upload_dir = try work.path("upload");
     defer support.allocator.free(upload_dir);
 
-    const cap_ok = try support.run(&.{ "python3", "-I", collector_py, "tools", candidate_dir, evidence_dir });
+    const cap_ok = try support.run(&.{ "zig-out/bin/debz-reference-paths", "capture-coordination", candidate_dir, evidence_dir });
     defer cap_ok.deinit();
     try cap_ok.ok();
     const inv = try work.read("evidence/native-coordination-inventory-v1.json");
@@ -2477,7 +2469,7 @@ test "snapshot: protected native CI evidence export and coordination capture enf
     try support.contains(inv, "\"capture_complete\": true");
     try testing.expectError(error.FileNotFound, work.read("evidence/native-coordination/native-recovery-v1-blob-unselected"));
 
-    const exp_ok = try support.run(&.{ "python3", "-I", exporter_py, evidence_dir, upload_dir });
+    const exp_ok = try support.run(&.{ "zig-out/bin/debz-reference-paths", "export-evidence", evidence_dir, upload_dir });
     defer exp_ok.deinit();
     try exp_ok.ok();
     const exported_op = try work.read("upload/native-coordination/root-operation-v1.json");
@@ -2493,7 +2485,7 @@ test "snapshot: protected native CI evidence export and coordination capture enf
     const secret_path = try work.path("outside-secret");
     defer support.allocator.free(secret_path);
     try work.directory.dir.symLink(support.io, secret_path, "evidence/untrusted", .{});
-    const exp_symlink = try support.run(&.{ "python3", "-I", exporter_py, evidence_dir, upload_dir });
+    const exp_symlink = try support.run(&.{ "zig-out/bin/debz-reference-paths", "export-evidence", evidence_dir, upload_dir });
     defer exp_symlink.deinit();
     try testing.expect(exp_symlink.code != 0);
     try exp_symlink.failsWith("unsafe or oversized evidence member");
