@@ -104,41 +104,75 @@ pub const Context = struct {
         const mutation = self.measurement(.mutation);
         const fsync = self.measurement(.fsync);
         const serialization = self.measurement(.progress_serialization);
-        std.log.info(
-            "native_phase attempt={s} process_epoch={s} invocation={d} sequence={d} kind={s} program_step={d} substep={d} ordinal={d} stage={s} result={s} elapsed_ns={d} capture_count={d} capture_ns={d} import_count={d} import_ns={d} hash_count={d} hash_ns={d} mutation_count={d} mutation_ns={d} fsync_count={d} fsync_ns={d} progress_serialization_count={d} progress_serialization_ns={d} schema={s} version=1 clock=awake published={s} progress_version={d} intent_sha256={s} progress_sequence={d} progress_record_sha256={s} progress_document_sha256={s}",
-            .{
-                std.fmt.bytesToHex(self.attempt_id, .lower),
-                std.fmt.bytesToHex(self.process_epoch, .lower),
-                self.invocation,
-                self.sequence,
-                kind,
-                step,
-                substep,
-                ordinal,
-                stage,
-                result,
-                elapsed(self.started, std.Io.Clock.awake.now(self.io)),
-                capture.count,
-                capture.nanoseconds,
-                imported.count,
-                imported.nanoseconds,
-                hash.count,
-                hash.nanoseconds,
-                mutation.count,
-                mutation.nanoseconds,
-                fsync.count,
-                fsync.nanoseconds,
-                serialization.count,
-                serialization.nanoseconds,
-                schema_id,
-                if (binding != null) "true" else "false",
-                if (binding) |value| value.version else 0,
-                if (binding) |value| &value.intent_sha256 else "-",
-                if (binding) |value| value.sequence else 0,
-                if (binding) |value| &value.record_sha256 else "-",
-                if (binding) |value| &value.document_sha256 else "-",
-            },
-        );
+        const attempt = std.fmt.bytesToHex(self.attempt_id, .lower);
+        const process_epoch_hex = std.fmt.bytesToHex(self.process_epoch, .lower);
+        const elapsed_ns = elapsed(self.started, std.Io.Clock.awake.now(self.io));
+        if (binding) |*value| {
+            std.log.info(
+                "native_phase attempt={s} process_epoch={s} invocation={d} sequence={d} kind={s} program_step={d} substep={d} ordinal={d} stage={s} result={s} elapsed_ns={d} capture_count={d} capture_ns={d} import_count={d} import_ns={d} hash_count={d} hash_ns={d} mutation_count={d} mutation_ns={d} fsync_count={d} fsync_ns={d} progress_serialization_count={d} progress_serialization_ns={d} schema={s} version=1 clock=awake published=true progress_version={d} intent_sha256={s} progress_sequence={d} progress_record_sha256={s} progress_document_sha256={s}",
+                .{
+                    &attempt,
+                    &process_epoch_hex,
+                    self.invocation,
+                    self.sequence,
+                    kind,
+                    step,
+                    substep,
+                    ordinal,
+                    stage,
+                    result,
+                    elapsed_ns,
+                    capture.count,
+                    capture.nanoseconds,
+                    imported.count,
+                    imported.nanoseconds,
+                    hash.count,
+                    hash.nanoseconds,
+                    mutation.count,
+                    mutation.nanoseconds,
+                    fsync.count,
+                    fsync.nanoseconds,
+                    serialization.count,
+                    serialization.nanoseconds,
+                    schema_id,
+                    value.version,
+                    &value.intent_sha256,
+                    value.sequence,
+                    &value.record_sha256,
+                    &value.document_sha256,
+                },
+            );
+        } else {
+            std.log.info(
+                "native_phase attempt={s} process_epoch={s} invocation={d} sequence={d} kind={s} program_step={d} substep={d} ordinal={d} stage={s} result={s} elapsed_ns={d} capture_count={d} capture_ns={d} import_count={d} import_ns={d} hash_count={d} hash_ns={d} mutation_count={d} mutation_ns={d} fsync_count={d} fsync_ns={d} progress_serialization_count={d} progress_serialization_ns={d} schema={s} version=1 clock=awake published=false progress_version=0 intent_sha256=- progress_sequence=0 progress_record_sha256=- progress_document_sha256=-",
+                .{
+                    &attempt,
+                    &process_epoch_hex,
+                    self.invocation,
+                    self.sequence,
+                    kind,
+                    step,
+                    substep,
+                    ordinal,
+                    stage,
+                    result,
+                    elapsed_ns,
+                    capture.count,
+                    capture.nanoseconds,
+                    imported.count,
+                    imported.nanoseconds,
+                    hash.count,
+                    hash.nanoseconds,
+                    mutation.count,
+                    mutation.nanoseconds,
+                    fsync.count,
+                    fsync.nanoseconds,
+                    serialization.count,
+                    serialization.nanoseconds,
+                    schema_id,
+                },
+            );
+        }
         self.sequence +|= 1;
     }
 };

@@ -808,6 +808,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
     });
     reference_order_module.addImport("reference_paths", reference_paths_module);
     const reference_order = b.addExecutable(.{
@@ -825,6 +826,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
     });
     reference_order_test_module.addImport("reference_paths", reference_paths_module);
     const reference_order_tests = b.addTest(.{
@@ -843,6 +845,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
     });
     reference_protected_module.addImport("reference_paths", reference_paths_module);
     reference_protected_module.addImport("reference_order", reference_order_module);
@@ -861,6 +864,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
     });
     reference_protected_test_module.addImport("reference_paths", reference_paths_module);
     reference_protected_test_module.addImport("reference_order", reference_order_module);
@@ -880,6 +884,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
     });
     const vendor_snapshot_tools = b.addExecutable(.{
         .name = "debz-vendor-snapshot-tools",
@@ -897,6 +902,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = !native_helper_debug_info,
         }),
     });
     const run_vendor_snapshot_tools_tests = b.addRunArtifact(vendor_snapshot_tools_tests);
