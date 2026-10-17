@@ -466,6 +466,97 @@ pub fn mutateNegativeRoots(allocator: std.mem.Allocator, roots: []const []const 
     try createExclusive(bad_prestate, "etc/ld.so.cache", "unbound loader cache\n", 0o644);
 }
 
+pub fn mutateBashNegativeRoots(allocator: std.mem.Allocator, workspace: []const u8) !void {
+    const relative = "var/lib/dpkg/info/bash.postinst";
+    const bad_script = try std.fs.path.join(allocator, &.{ workspace, "bad-script" });
+    defer allocator.free(bad_script);
+    const bad_mode = try std.fs.path.join(allocator, &.{ workspace, "bad-mode" });
+    defer allocator.free(bad_mode);
+    const bad_tool = try std.fs.path.join(allocator, &.{ workspace, "bad-tool" });
+    defer allocator.free(bad_tool);
+    const bad_alias = try std.fs.path.join(allocator, &.{ workspace, "bad-alias" });
+    defer allocator.free(bad_alias);
+    const bad_prestate = try std.fs.path.join(allocator, &.{ workspace, "bad-prestate" });
+    defer allocator.free(bad_prestate);
+    const bad_cache = try std.fs.path.join(allocator, &.{ workspace, "bad-cache" });
+    defer allocator.free(bad_cache);
+
+    const script = try readRegular(allocator, bad_script, relative, 1024);
+    defer allocator.free(script);
+    const mutated_script = try std.fmt.allocPrint(allocator, "{s}\nunreviewed callback\n", .{script});
+    defer allocator.free(mutated_script);
+    try overwriteRegular(bad_script, relative, mutated_script);
+    try chmodRegular(bad_mode, relative, 0o644);
+    try overwriteRegular(bad_tool, "usr/bin/update-alternatives", "foreign alternatives tool\n");
+    try replaceSymlink(bad_alias, "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo");
+    try createExclusive(bad_prestate, "usr/bin/update-menus", "#!/bin/sh\nexit 0\n", 0o755);
+    const cache = try readRegular(allocator, bad_cache, "etc/ld.so.cache", 1024 * 1024);
+    defer allocator.free(cache);
+    if (std.mem.indexOf(u8, cache, "/lib/aarch64-linux-gnu/libc.so.6") == null)
+        return error.MissingBashLibcCacheProvider;
+    const mutated_cache = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        cache,
+        "/lib/aarch64-linux-gnu/libc.so.6",
+        "/bad/aarch64-linux-gnu/libc.so.6",
+    );
+    defer allocator.free(mutated_cache);
+    try overwriteRegular(bad_cache, "etc/ld.so.cache", mutated_cache);
+}
+
+pub fn mutateUtilLinuxNegativeRoots(allocator: std.mem.Allocator, workspace: []const u8) !void {
+    const relative = "var/lib/dpkg/info/util-linux.postinst";
+    const bad_script = try std.fs.path.join(allocator, &.{ workspace, "bad-script" });
+    defer allocator.free(bad_script);
+    const bad_mode = try std.fs.path.join(allocator, &.{ workspace, "bad-mode" });
+    defer allocator.free(bad_mode);
+    const bad_tool = try std.fs.path.join(allocator, &.{ workspace, "bad-tool" });
+    defer allocator.free(bad_tool);
+    const bad_alias = try std.fs.path.join(allocator, &.{ workspace, "bad-alias" });
+    defer allocator.free(bad_alias);
+    const bad_prestate = try std.fs.path.join(allocator, &.{ workspace, "bad-prestate" });
+    defer allocator.free(bad_prestate);
+    const bad_cache = try std.fs.path.join(allocator, &.{ workspace, "bad-cache" });
+    defer allocator.free(bad_cache);
+
+    const script = try readRegular(allocator, bad_script, relative, 4096);
+    defer allocator.free(script);
+    const mutated_script = try std.fmt.allocPrint(allocator, "{s}\nunreviewed callback\n", .{script});
+    defer allocator.free(mutated_script);
+    try overwriteRegular(bad_script, relative, mutated_script);
+    try chmodRegular(bad_mode, relative, 0o644);
+    try overwriteRegular(bad_tool, "usr/bin/deb-systemd-helper", "foreign systemd helper\n");
+    try replaceSymlink(bad_alias, "usr/lib/aarch64-linux-gnu/libcrypt.so.1", "libcrypt.so.1.1.0", "foreign-crypt");
+    try createExclusive(bad_prestate, "usr/sbin/deb-systemd-helper", "#!/bin/sh\nexit 0\n", 0o755);
+    const cache = try readRegular(allocator, bad_cache, "etc/ld.so.cache", 1024 * 1024);
+    defer allocator.free(cache);
+    if (std.mem.indexOf(u8, cache, "/lib/aarch64-linux-gnu/libm.so.6") == null)
+        return error.MissingUtilLinuxLibmCacheProvider;
+    const mutated_cache = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        cache,
+        "/lib/aarch64-linux-gnu/libm.so.6",
+        "/bad/aarch64-linux-gnu/libm.so.6",
+    );
+    defer allocator.free(mutated_cache);
+    try overwriteRegular(bad_cache, "etc/ld.so.cache", mutated_cache);
+}
+
+pub fn writeExclusiveStdin(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    relative: []const u8,
+    mode: u16,
+    maximum_bytes: usize,
+) !void {
+    _ = try reference_paths.protected(root, true);
+    const content = try readBoundedFd(allocator, linux.STDIN_FILENO, maximum_bytes);
+    defer allocator.free(content);
+    try createExclusive(root, relative, content, mode);
+}
+
 pub fn stageDpkgReference(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -1554,6 +1645,23 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
         if (rest.len < 3 or rest.len > 4) return error.UnknownSourceSetupStage;
         const archive_rel = if (rest.len == 4) rest[3] else "var/lib/dpkg/less-probe.deb";
         try stageDpkgReference(allocator, rest[0], rest[1], rest[2], archive_rel);
+        return 0;
+    }
+    if (std.mem.eql(u8, cmd, "bash-mutate-negatives")) {
+        if (rest.len != 1) return error.UnknownSourceSetupStage;
+        try mutateBashNegativeRoots(allocator, rest[0]);
+        return 0;
+    }
+    if (std.mem.eql(u8, cmd, "util-linux-mutate-negatives")) {
+        if (rest.len != 1) return error.UnknownSourceSetupStage;
+        try mutateUtilLinuxNegativeRoots(allocator, rest[0]);
+        return 0;
+    }
+    if (std.mem.eql(u8, cmd, "create-exclusive-stdin")) {
+        if (rest.len != 4) return error.UnknownSourceSetupStage;
+        const mode = std.fmt.parseInt(u16, rest[2], 8) catch return error.UnknownSourceSetupStage;
+        const max_bytes = std.fmt.parseInt(usize, rest[3], 10) catch return error.UnknownSourceSetupStage;
+        try writeExclusiveStdin(allocator, rest[0], rest[1], mode, max_bytes);
         return 0;
     }
 

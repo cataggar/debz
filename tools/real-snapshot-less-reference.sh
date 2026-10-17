@@ -41,7 +41,7 @@ require_protected_file() {
 checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-less-reference.sh" ]]
 for file in tools/real-snapshot-less-reference.sh zig-out/bin/debz-native-dpkg-reference \
-  tools/real_snapshot_less_fixtures.py tools/real_snapshot_reference_paths.py \
+  zig-out/bin/debz-reference-stage tools/real-snapshot-stage.zig tools/real_snapshot_reference_paths.py \
   src/fixtures/ubuntu-resolute-less.preinst src/fixtures/ubuntu-resolute-less.postinst; do require_protected_file "$checkout/$file"; done
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
@@ -115,13 +115,8 @@ for path in "$script_root" "$dpkg_root" "$bad_script" "$bad_mode" \
   cp -a --reflink=auto -- "$source_root" "$path"
   require_protected_path "$path"
 done
-python3 - "$bad_script" "$bad_mode" "$bad_tool" "$bad_alias" "$bad_prestate" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, "tools")
-from real_snapshot_less_fixtures import mutate_negative_roots
-mutate_negative_roots([Path(root) for root in sys.argv[1:]])
-PY
+zig-out/bin/debz-reference-stage less-mutate-negatives \
+  "$bad_script" "$bad_mode" "$bad_tool" "$bad_alias" "$bad_prestate"
 
 check_activated_roots() {
   env DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT="$source_root" \
@@ -159,13 +154,7 @@ timeout --signal=TERM --kill-after=5s 120s \
     exec setpriv --bounding-set=-sys_admin --no-new-privs \
       /bin/sh /var/lib/debz-lifecycle-scripts/less.preinst install
   '
-python3 - "$dpkg_root" "$pinned" "$archive" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, "tools")
-from real_snapshot_less_fixtures import stage_dpkg_reference
-stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))
-PY
+zig-out/bin/debz-reference-stage less-stage-dpkg "$dpkg_root" "$pinned" "$archive"
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
@@ -200,20 +189,9 @@ for path in "$post_native" "$post_dpkg" "$post_bad_script" "$post_bad_mode" \
   cp -a --reflink=auto -- "$source_root" "$path"
   require_protected_path "$path"
 done
-python3 - "$post_bad_script" "$post_bad_mode" "$post_bad_tool" "$post_bad_alias" "$post_bad_prestate" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, "tools")
-from real_snapshot_less_fixtures import mutate_negative_roots
-mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")
-PY
-python3 - "$post_dpkg" "$pinned" "$archive" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, "tools")
-from real_snapshot_less_fixtures import stage_dpkg_reference
-stage_dpkg_reference(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
-PY
+zig-out/bin/debz-reference-stage less-mutate-negatives --kind postinst \
+  "$post_bad_script" "$post_bad_mode" "$post_bad_tool" "$post_bad_alias" "$post_bad_prestate"
+zig-out/bin/debz-reference-stage less-stage-dpkg "$post_dpkg" "$pinned" "$archive"
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \

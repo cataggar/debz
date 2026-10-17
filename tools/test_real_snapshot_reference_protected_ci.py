@@ -505,7 +505,12 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                         self.assertEqual(row[6], expected_lock)
 
     def test_less_reference_pins_use_separate_locks_and_retain_combined_lock_support(self) -> None:
-        stage = load("debz_less_source_lock_pins", "real_snapshot_less_stage.py")
+        source_artifacts = {
+            "less": ("668-1build1", 171138, "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8"),
+            "dash": ("0.5.12-12ubuntu3", 95716, "c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e"),
+            "dpkg": ("1.23.7ubuntu1", 1260980, "824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"),
+            "libc6": ("2.43-2ubuntu2.4", 1642036, "865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7"),
+        }
         source = (TOOLS / "real-snapshot-less-reference.sh").read_text()
         checks = "require_lock_artifact() {" + source.split(
             "require_lock_artifact() {", 1
@@ -515,7 +520,7 @@ debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
                    "declared_size": size, "origin": {"type": "authenticated_repository"},
                    "archive_identity": {"primary": "sha512", "digests": [
                        {"algorithm": "sha512", "digest": digest}]}}
-            for name, (version, size, digest) in stage.SOURCE_ARTIFACTS.items()
+            for name, (version, size, digest) in source_artifacts.items()
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -620,14 +625,14 @@ timeout() {
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, read, listing in (
-            ("tools/real_snapshot_less_stage.py", "        content = os.read(descriptor, 2048)\n",
+            ("tools/real-snapshot-stage.zig", '    const content = try readRegular(allocator, root, "var/lib/dpkg/info/less.list", 2048);\n',
              "var/lib/dpkg/info/less.list"),
-            ("tools/real_snapshot_python_fixtures.py", "        content = read_regular(root, relative, 2048)\n",
+            ("tools/real-snapshot-stage.zig", "        const content = try readRegular(allocator, root, pin.relative, 2048);\n",
              "var/lib/dpkg/info/python3.list"),
         ):
             for mutation in (
                 '        content = b"".join(sorted(content.splitlines(keepends=True)))\n',
-                f'        overwrite_regular(root, "{listing}", content)\n',
+                f'        try overwriteRegular(root, "{listing}", content);\n',
             ):
                 with self.subTest(path=path, mutation=mutation):
                     self.assertIn(read, texts[path])
@@ -708,8 +713,8 @@ timeout() {
             ("tools/prepare-native-dpkg.zig", "        try self.writeReceipt(prefix, raw.len);\n"),
             ("tools/real-snapshot-reference-protected-stage.sh", '  --receipt-from-archive "$workspace/build/dpkg.deb" --prefix "$dpkg_prefix"\n'),
             ("tools/real-snapshot-python3-reference.sh", 'fixture preflight "$source_root"\n'),
-            ("tools/real_snapshot_python_fixtures.py",
-             '    create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)\n'),
+            ("tools/real-snapshot-stage.zig",
+             '    try createExclusive(shadow, "usr/sbin/update-alternatives", "shadow\\n", 0o644);\n'),
             ("src/native_unpack.zig",
              "    try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);\n"),
         ):
@@ -734,7 +739,7 @@ timeout() {
             ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
             ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
             ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
-            ("tools/real_snapshot_less_stage.py", '        for package in SOURCE_ARTIFACTS:\n            archive(locks["dpkg" if package == "libc6" else package], cache, package)\n'),
+            ("tools/real-snapshot-stage.zig", '        for (source_artifacts) |pin| {\n'),
         ):
             with self.subTest(token=token):
                 self.assertIn(token, texts[path])
@@ -1162,59 +1167,6 @@ class ProtectedInputTests(unittest.TestCase):
                 toolchain(compiler)
 
 
-class SignedLessStagingTests(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="debz-less-seal-", dir=TOOLS.parent / ".zig-cache")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.info = self.root / "var/lib/dpkg/info"
-        self.info.mkdir(parents=True)
-        self.lifecycle = self.root / "var/lib/debz-lifecycle-scripts"
-        self.lifecycle.mkdir()
-        repin = load("debz_less_original_members", "real-snapshot-repin.py")
-        manifest = repin.load_json(TOOLS.parent / repin.DEFAULT_MANIFEST)
-        with zipfile.ZipFile(TOOLS.parent / manifest["prestate_evidence"]) as archive:
-            index = json.loads(archive.read("evidence.json"))
-            source = next(item for item in index["sources"]
-                          if item["architecture"] == "arm64" and item["package"] == "less")
-            original = archive.read(source["archive_file"])
-        (self.info / "less.list").write_bytes(repin.dpkg_ownership_list(original))
-        for kind in ("preinst", "postinst"):
-            script, mode = repin.tar_member(original, "control.tar", kind)
-            path = self.info / f"less.{kind}"
-            path.write_bytes(script)
-            path.chmod(mode)
-        self.stage = load("debz_less_seal", "real_snapshot_less_stage.py")
-
-    def test_seal_retains_original_controls_and_stages_both_callbacks_exclusively(self) -> None:
-        def unchanged_metadata(path: Path) -> tuple:
-            metadata = path.stat()
-            return path.read_bytes(), metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid, metadata.st_nlink
-
-        before = {path.name: unchanged_metadata(path) for path in self.info.iterdir()}
-        self.stage.seal(self.root)
-        for kind in ("preinst", "postinst"):
-            path = self.lifecycle / f"less.{kind}"
-            self.assertEqual(path.read_bytes(), before[path.name][0])
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
-        for path in self.info.iterdir():
-            self.assertEqual(unchanged_metadata(path), before[path.name])
-        with self.assertRaises(FileExistsError):
-            self.stage.seal(self.root)
-
-    def test_changed_or_symlinked_postinst_cannot_publish_callback_copies(self) -> None:
-        path = self.info / "less.postinst"
-        path.write_bytes(path.read_bytes() + b"unreviewed")
-        with self.assertRaisesRegex(ValueError, "signed less postinst changed"):
-            self.stage.seal(self.root)
-        self.assertEqual(list(self.lifecycle.iterdir()), [])
-        path.unlink()
-        path.symlink_to(self.info / "less.preinst")
-        with self.assertRaises(OSError):
-            self.stage.seal(self.root)
-        self.assertEqual(list(self.lifecycle.iterdir()), [])
-
-
 class SignedBashStagingTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="debz-bash-seal-", dir=TOOLS.parent / ".zig-cache")
@@ -1235,7 +1187,6 @@ class SignedBashStagingTests(unittest.TestCase):
         script, mode = repin.tar_member(original, "control.tar", "postinst")
         (self.info / "bash.postinst").write_bytes(script)
         (self.info / "bash.postinst").chmod(mode)
-        self.stage = load("debz_bash_seal", "real_snapshot_less_stage.py")
 
     def test_successful_stage_receipt_is_accepted_only_with_zero_exit_status(self) -> None:
         stage = (TOOLS / "real-snapshot-bash-protected-stage.sh").read_text()
@@ -1289,33 +1240,6 @@ class SignedBashStagingTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((pinned.read_bytes(), pinned.stat()), before)
 
-    def test_seal_preserves_original_controls_and_refuses_overwriting_staged_callback(self) -> None:
-        before = {path.name: (path.read_bytes(), path.stat().st_ino, path.stat().st_mode)
-                  for path in self.info.iterdir()}
-        self.stage.seal_bash(self.root)
-        staged = self.lifecycle / "bash.postinst"
-        self.assertEqual(staged.read_bytes(), before[staged.name][0])
-        self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o755)
-        for path in self.info.iterdir():
-            self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mode), before[path.name])
-        with self.assertRaises(FileExistsError):
-            self.stage.seal_bash(self.root)
-
-    def test_altered_list_or_aliased_script_refuses_before_publishing_callback(self) -> None:
-        listing = self.info / "bash.list"
-        original = listing.read_bytes()
-        listing.write_bytes(original + b"/unreviewed\n")
-        with self.assertRaisesRegex(ValueError, "signed bash ownership path set changed"):
-            self.stage.seal_bash(self.root)
-        self.assertEqual(list(self.lifecycle.iterdir()), [])
-        listing.write_bytes(original)
-        script = self.info / "bash.postinst"
-        script.unlink()
-        script.symlink_to(listing)
-        with self.assertRaises(OSError):
-            self.stage.seal_bash(self.root)
-        self.assertEqual(list(self.lifecycle.iterdir()), [])
-
 
 class SignedUtilLinuxSourceTests(unittest.TestCase):
     def test_binary_sources_preserve_text_byte_bounds_and_newline_normalization(self) -> None:
@@ -1336,52 +1260,6 @@ class SignedUtilLinuxSourceTests(unittest.TestCase):
                         source.write_bytes(data)
                         with self.assertRaises(OverflowError):
                             audit.tracked_digest_texts([source], 3)
-
-    def test_source_archive_coordinates_refuse_changes_before_reading_any_cache_bytes(self) -> None:
-        stage = load("debz_util_linux_source_lock_pins", "real_snapshot_less_stage.py")
-        version, size, digest = stage.UTIL_LINUX_ARTIFACTS["util-linux"]
-        original = {
-            "name": "util-linux", "version": version, "architecture": "arm64",
-            "declared_size": size, "origin": {"type": "authenticated_repository"},
-            "archive_identity": {"primary": "sha512", "digests": [
-                {"algorithm": "sha512", "digest": digest}]},
-        }
-        for field, changed in (
-            ("version", version + "-unreviewed"),
-            ("declared_size", size + 1),
-            ("origin", {"type": "local_artifact"}),
-            ("archive_identity", {"primary": "sha512", "digests": [
-                {"algorithm": "sha512", "digest": "0" * 128}]}),
-            ("archive_identity", {"primary": "sha256", "digests": [
-                {"algorithm": "sha256", "digest": "0" * 64}]}),
-        ):
-            with self.subTest(field=field, changed=changed):
-                with mock.patch.object(stage, "protected") as protected:
-                    with self.assertRaises(ValueError):
-                        stage.archive({"packages": [dict(original, **{field: changed})]},
-                                      Path("/unused-cache"), "util-linux")
-                    protected.assert_not_called()
-
-    def test_util_linux_runtime_archive_coordinates_bind_arch_all_and_arm64_providers(self) -> None:
-        stage = load("debz_util_linux_runtime_lock_pins", "real_snapshot_less_stage.py")
-        for package, expected_arch in (
-            ("init-system-helpers", "all"),
-            ("perl-base", "arm64"),
-            ("libcrypt1", "arm64"),
-        ):
-            version, size, digest = stage.UTIL_LINUX_ARTIFACTS[package]
-            original = {
-                "name": package, "version": version, "architecture": expected_arch,
-                "declared_size": size, "origin": {"type": "authenticated_repository"},
-                "archive_identity": {"primary": "sha512", "digests": [
-                    {"algorithm": "sha512", "digest": digest}]},
-            }
-            wrong_arch = "arm64" if expected_arch == "all" else "all"
-            with self.subTest(package=package), mock.patch.object(stage, "protected") as protected:
-                with self.assertRaises(ValueError):
-                    stage.archive({"packages": [dict(original, architecture=wrong_arch)]},
-                                  Path("/unused-cache"), package)
-                protected.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1172,6 +1172,7 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_reference_order_tests.step);
     audit_step.dependOn(&run_reference_protected_tests.step);
     audit_step.dependOn(&run_vendor_snapshot_tools_tests.step);
+    audit_step.dependOn(&run_reference_stage_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{

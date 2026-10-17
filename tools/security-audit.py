@@ -1765,19 +1765,19 @@ def audit_production_sources() -> None:
     if ("\ncheck_source_inputs\n" not in less_reference or
             less_reference.index("\ncheck_source_inputs\n") > less_reference.index("cp -a --reflink=auto")):
         fail("protected arm64 less source guard must run before fixture copies/mutations")
-    less_fixtures = (ROOT / "tools/real_snapshot_less_fixtures.py").read_text(errors="strict")
+    less_fixtures = (ROOT / "tools/real-snapshot-stage.zig").read_text(errors="strict")
     for required in (
-        "parent_fd = open_beneath(root_fd, parent, directory=True)",
-        "os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC",
-        "metadata = os.fstat(descriptor)",
-        "not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1",
-        "regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)",
-        "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC",
-        "protected(root, directory=True)",
+        "const parent_fd = try reference_paths.openBeneath(root_fd, parent, true);",
+        ".ACCMODE = .RDWR,\n        .NOFOLLOW = true,\n        .NONBLOCK = true,\n        .CLOEXEC = true,",
+        "const metadata = try rawFstat(descriptor);",
+        "(metadata.mode & linux.S.IFMT) != linux.S.IFREG or\n        metadata.nlink != 1",
+        "_ = try regularMetadata(descriptor);\n    _ = try syscall(linux.ftruncate(descriptor, 0));",
+        ".ACCMODE = .WRONLY,\n        .CREAT = true,\n        .EXCL = true,\n        .NOFOLLOW = true,\n        .CLOEXEC = true,",
+        "try reference_paths.protected(root, true)",
     ):
         if required not in less_fixtures:
             fail(f"protected arm64 less no-follow fixture mutation boundary changed: {required}")
-    if "os.O_TRUNC" in less_fixtures:
+    if ".TRUNC = true" in less_fixtures:
         fail("protected arm64 less fixture must check opened metadata before truncation")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
@@ -2850,9 +2850,6 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-less-protected-stage.sh",
     "tools/real-snapshot-bash-protected-stage.sh",
     "tools/real-snapshot-less-reference.sh",
-    "tools/real_snapshot_less_stage.py",
-    "tools/real_snapshot_less_fixtures.py",
-    "tools/real_snapshot_python_fixtures.py",
     "tools/real-snapshot-stage.zig",
     "tools/prepare-native-dpkg.zig",
 )
@@ -3347,17 +3344,18 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'toolchain(Path(sys.argv[3]))',
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-reference-protected-stage.sh --arm64-bash-source',
-        'python3 -B -I tools/real_snapshot_less_stage.py prepare-bash',
-        'python3 -B -I tools/real_snapshot_less_stage.py seal-bash',
+        'zig-out/bin/debz-reference-stage prepare-bash',
+        'zig-out/bin/debz-reference-stage seal-bash',
         '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-libtinfo6.deb /var/lib/dpkg/producer-bash.deb',
         '--force-depends --no-triggers --configure bash',
         "'5.3-2ubuntu1 arm64 install ok installed'",
         '"$zig" build test-real-snapshot-arm64-bash-source-protected',
         'grep -Fx "signed arm64 bash source guard executed without skips"',
-        'replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo")',
-        'create_exclusive(root / "bad-prestate", "usr/bin/update-menus"',
+        'zig-out/bin/debz-reference-stage bash-mutate-negatives "$workspace"',
         '/var/lib/dpkg/producer-ldconfig -i -X -C /etc/ld.so.cache -f /dev/null /usr/lib/aarch64-linux-gnu',
-        'cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6")',
+        'zig-out/bin/debz-reference-stage prepare-util-linux',
+        'zig-out/bin/debz-reference-stage seal-util-linux',
+        'zig-out/bin/debz-reference-stage util-linux-mutate-negatives "$util_workspace"',
         'bytes <= 8 * 1024 * 1024 * 1024',
     ),
     "tools/prepare-native-dpkg.zig": (
@@ -3372,65 +3370,63 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'toolchain(Path(sys.argv[3]))',
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-reference-protected-stage.sh --arm64-less-source',
-        'python3 -B -I tools/real_snapshot_less_stage.py prepare',
+        'zig-out/bin/debz-reference-stage prepare',
         '"$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json"',
-        'python3 -B -I tools/real_snapshot_less_stage.py seal',
+        'zig-out/bin/debz-reference-stage seal',
         '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb',
         'bash tools/real-snapshot-less-reference.sh',
         'bytes <= 8 * 1024 * 1024 * 1024',
-    ),
-    "tools/real_snapshot_less_stage.py": (
-        'def alias(root: Path, relative: str, target: str) -> None:\n    with parent_descriptor(root, relative) as (parent, name):',
-        'os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW',
-        'entry["origin"]["type"] != "authenticated_repository"',
-        'raise ValueError("source archive differs from exact production authority")',
-        'for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):',
-        'for package in SOURCE_ARTIFACTS:\n            archive(locks["dpkg" if package == "libc6" else package], cache, package)',
-        'f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8',
-        'c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e',
-        '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
-        '865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7',
-        'regular_descriptor(root, "var/lib/dpkg/info/less.list")',
-        'content = os.read(descriptor, 2048)',
-        'if (len(content) != 583 or hashlib.sha256(content).hexdigest() !=',
-        'raise ValueError("signed less ownership path set changed")',
-        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", preinst, 0o755)',
-        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755)',
-        'regular_descriptor(root, "var/lib/dpkg/info/less.postinst")',
-        'raise ValueError("signed less postinst changed")',
-        'if selected_package == "bash":',
-        'archive(source_lock, cache, name)',
-        'raise ValueError("signed bash ownership path set changed")',
-        'raise ValueError("signed bash postinst changed")',
-        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755)',
-        'member(archive(locks["libc-bin"], cache, "libc-bin"), "usr/sbin/ldconfig")',
-        'raise ValueError("signed ldconfig cache producer changed")',
-        'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
     ),
     "tools/real-snapshot-less-reference.sh": (
         'for file in "$pinned" "$lock" "$less_lock" "$dash_lock" "$archive" "$zig";',
         'for path in "$pinned" "$source_root" "$lock" "$less_lock" "$dash_lock" "$archive" "$script_root" "$dpkg_root";',
         'require_lock_artifact less 668-1build1 171138 "$digest" "$less_lock"',
         '\ncheck_source_inputs\n',
-        'mutate_negative_roots([Path(root) for root in sys.argv[1:]])',
-        'stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))',
-        'stage_dpkg_reference(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))',
-    ),
-    "tools/real_snapshot_less_fixtures.py": (
-        'parent_fd = open_beneath(root_fd, parent, directory=True)',
-        'regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)',
-        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC',
+        'zig-out/bin/debz-reference-stage less-mutate-negatives \\\n  "$bad_script" "$bad_mode" "$bad_tool" "$bad_alias" "$bad_prestate"',
+        'zig-out/bin/debz-reference-stage less-stage-dpkg "$dpkg_root" "$pinned" "$archive"',
+        'zig-out/bin/debz-reference-stage less-stage-dpkg "$post_dpkg" "$pinned" "$archive"',
     ),
     "tools/real-snapshot-stage.zig": (
         "pub fn openParentDescriptor(root: []const u8, relative: []const u8) !ParentDescriptor {",
+        "const parent_fd = try reference_paths.openBeneath(root_fd, parent, true);",
         "pub fn replaceContents(descriptor: i32, contents: []const u8) !void {",
+        "_ = try regularMetadata(descriptor);\n    _ = try syscall(linux.ftruncate(descriptor, 0));",
+        ".ACCMODE = .WRONLY,\n        .CREAT = true,\n        .EXCL = true,\n        .NOFOLLOW = true,\n        .CLOEXEC = true,",
         "pub fn mutateNegativeRoots(allocator: std.mem.Allocator, roots: []const []const u8, kind: []const u8) !void {",
+        'try replaceSymlink(bad_alias, "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo");',
+        'try createExclusive(bad_prestate, "usr/bin/update-menus", "#!/bin/sh\\nexit 0\\n", 0o755);',
+        '"/lib/aarch64-linux-gnu/libc.so.6",\n        "/bad/aarch64-linux-gnu/libc.so.6",',
         "pub fn preparePythonEmpty(allocator: std.mem.Allocator, root: []const u8) !void {",
+        "pub const maximum_capture_bytes: usize = 16 * 1024 * 1024;",
+        "return error.PythonReferenceCaptureExceedsByteLimit;",
+        "const content = try readRegular(allocator, root, pin.relative, 2048);",
+        "return error.SignedPythonListPathSetChanged;",
+        "(metadata.mode & linux.S.IFMT) == linux.S.IFCHR and metadata.rdev_major == 1 and metadata.rdev_minor == 3;",
+        'try createExclusive(root, "dev/null", "", 0o600);',
+        'try createExclusive(shadow, "usr/sbin/update-alternatives", "shadow\\n", 0o644);',
+        'try stageDpkgReference(allocator, paths[0], paths[1], paths[2], "var/lib/dpkg/python3-probe.deb");',
+        'const descriptor = try openRegularDescriptor(postinst, "var/lib/dpkg/info/python3-minimal.postinst");',
         "pub fn verifyLockArchive(",
+        'if (origin_type != .string or !std.mem.eql(u8, origin_type.string, "authenticated_repository"))',
+        "return error.SourceArchiveDiffersFromProductionAuthority;",
+        'for (source_artifacts) |pin| {',
+        'f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8',
+        'c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e',
+        '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
+        '865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7',
         "pub fn prepareSource(",
         "pub fn prepareUtilLinux(",
         "pub fn sealLess(allocator: std.mem.Allocator, root: []const u8) !void {",
+        'const content = try readRegular(allocator, root, "var/lib/dpkg/info/less.list", 2048);',
+        "return error.SignedLessOwnershipPathSetChanged;",
+        'try createExclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", preinst, 0o755);',
+        'try createExclusive(root, "var/lib/debz-lifecycle-scripts/less.postinst", script, 0o755);',
+        "return error.SignedLessPostinstChanged;",
         "pub fn sealBash(allocator: std.mem.Allocator, root: []const u8) !void {",
+        "return error.SignedBashOwnershipPathSetChanged;",
+        "return error.SignedBashPostinstChanged;",
+        'try createExclusive(root, "var/lib/debz-lifecycle-scripts/bash.postinst", script, 0o755);',
+        "return error.SignedLdconfigCacheProducerChanged;",
         "pub fn sealUtilLinux(allocator: std.mem.Allocator, root: []const u8) !void {",
     ),
     "tools/real-snapshot-protected-native-ci.sh": (
@@ -3506,7 +3502,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'fixture mode "$before_0644" 0644',
         'fixture capture "$workspace" "evidence/replay-$mode.txt" "evidence/replay-$mode.stderr"',
         'fixture basic "$workspace/bad-html" "$workspace/bad-link" "$workspace/bad-shadow"',
-        'create_exclusive(root, "evidence/python3-reference.args", content, 0o600)',
+        '"$checkout/zig-out/bin/debz-reference-stage" create-exclusive-stdin \\\n    "$workspace" "evidence/python3-reference.args" 0600 16384',
         'for mode in 0600 0644; do',
         'bash tools/real-snapshot-python3-reference.sh "$pinned" "$input" "$lock" "$archive"',
         '"-Dpython3-reference-root-py3compile=$after-py3compile-before"',
@@ -3535,18 +3531,6 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e',
         '[[ $(sha256sum "$py3compile_after/dev/null" | cut -d\' \' -f1) == \\\n'
         '  3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]',
-    ),
-    "tools/real_snapshot_python_fixtures.py": (
-        'maximum = 16 * 1024 * 1024',
-        'raise ValueError("Python reference capture exceeds its byte limit")',
-        'content = read_regular(root, relative, 2048)',
-        'if len(content) != size or hashlib.sha256(content).hexdigest() != digest:',
-        'raise ValueError(f"signed Python list path set changed: {name}")',
-        'not stat.S_ISCHR(metadata.st_mode) or metadata.st_rdev != os.makedev(1, 3)',
-        'create_exclusive(root, "dev/null", b"", 0o600)',
-        'create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)',
-        'stage_dpkg_reference(*roots, archive_relative="var/lib/dpkg/python3-probe.deb")',
-        'with regular_descriptor(postinst, "var/lib/dpkg/info/python3-minimal.postinst") as descriptor:',
     ),
     "tools/real-snapshot-signed-proc-prestates.sh": (
         'if [[ ${1:-} == --python3 ]]; then',
@@ -3993,10 +3977,10 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     if util_source_guard < 0 or copies < 0 or util_source_guard > copies:
         failures.append("protected ARM util-linux original source guard must execute before copies/mutations")
     for path, required in (
-        ("tools/real_snapshot_less_stage.py", (
-            '"util-linux": ("2.41.3-3ubuntu2.2", 1055344, "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad")',
-            'copy_exclusive(root, "var/lib/dpkg/producer-util-linux.deb", util_linux, 0o644)',
-            'copy_exclusive(root, "var/lib/dpkg/producer-util-linux.lock.json", util_linux_lock, 0o644)',
+        ("tools/real-snapshot-stage.zig", (
+            '.name = "util-linux",\n        .version = "2.41.3-3ubuntu2.2",\n        .declared_size = 1055344,\n        .sha512 = "adfe77778337bbf3d72b60d2c1f0089821b561876c792104bbe62a8429120d7cdbc665d537993954e2a0312a996a06d3259f7ebcb080b7ad18c64805fdbbdfad",',
+            'try copyExclusive(allocator, root, "var/lib/dpkg/producer-util-linux.deb", util_linux_deb, 0o644);',
+            'try copyExclusive(allocator, root, "var/lib/dpkg/producer-util-linux.lock.json", util_linux_lock_path, 0o644);',
         )),
         ("tools/real-snapshot-bash-protected-stage.sh", (
             '"-Darm64-util-linux-source-root=$source"',
@@ -4024,7 +4008,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             if token not in texts.get(path, ""):
                 failures.append(f"protected ARM util-linux original source binding lost {token}")
     for token in (
-        'mutate_negative_roots([Path(root) for root in sys.argv[1:]], kind="postinst")',
+        'zig-out/bin/debz-reference-stage less-mutate-negatives --kind postinst',
         '--force-depends --no-triggers --configure less',
         "'668-1build1 arm64 install ok installed'",
     ):
@@ -4093,16 +4077,16 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     if (guard not in python_reference or
             python_reference.index(guard) > python_reference.index("cp -a --reflink=auto")):
         failures.append("protected Python source guard must execute before copies/mutations")
-    fixtures = texts.get("tools/real_snapshot_less_fixtures.py", "")
-    if "os.O_TRUNC" in fixtures:
+    fixtures = texts.get("tools/real-snapshot-stage.zig", "")
+    if ".TRUNC = true" in fixtures:
         failures.append("shared reference mutations must inspect the descriptor before truncation")
     for path, name in (
-        ("tools/real_snapshot_less_stage.py", "seal"),
-        ("tools/real_snapshot_python_fixtures.py", "prepare_empty"),
+        ("tools/real-snapshot-stage.zig", "sealLess"),
+        ("tools/real-snapshot-stage.zig", "preparePythonEmpty"),
     ):
-        body = texts.get(path, "").partition(f"def {name}(")[2].partition("\ndef ")[0]
+        body = texts.get(path, "").partition(f"pub fn {name}(")[2].partition("\npub fn ")[0]
         if not body or re.search(
-            r"\b(?:sorted|overwrite_regular|replace_contents|ftruncate|write|write_bytes|write_text)\s*\(",
+            r"\b(?:sorted|sort|overwrite_regular|overwriteRegular|replace_contents|replaceContents|ftruncate|writeAllFd|write|write_bytes|write_text)\s*\(",
             body,
         ):
             failures.append(f"{path}: fixture lists must retain authenticated original bytes without rewriting")

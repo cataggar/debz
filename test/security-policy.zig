@@ -2924,14 +2924,15 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-protected-stage.sh", &.{
         "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
-        "python3 -B -I tools/real_snapshot_less_stage.py prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\" \\\n",
+        "zig-out/bin/debz-reference-stage prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\" \\\n",
         "  bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\" \\\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
-        "        for package in SOURCE_ARTIFACTS:\n            archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
-        "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
-        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.deb\", util_linux, 0o644)\n",
-        "        copy_exclusive(root, \"var/lib/dpkg/producer-util-linux.lock.json\", util_linux_lock, 0o644)\n",
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-stage.zig", &.{
+        "        for (source_artifacts) |pin| {\n",
+        "        const parent_fd = try reference_paths.openBeneath(root_fd, parent, true);\n",
+        "        try copyExclusive(allocator, root, \"var/lib/dpkg/producer-util-linux.deb\", util_linux_deb, 0o644);\n",
+        "        try copyExclusive(allocator, root, \"var/lib/dpkg/producer-util-linux.lock.json\", util_linux_lock_path, 0o644);\n",
+        "    try createExclusive(shadow, \"usr/sbin/update-alternatives\", \"shadow\\n\", 0o644);\n",
     });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
         "      run_protected_reference:\n",
@@ -2990,9 +2991,6 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "observed.entry.gid != std.os.linux.getegid()",
         "observed.entry.mode & 0o022 != 0",
         "        try cleanupStaging(parent.root, self.allocator, stage, stage_entry);\n",
-    });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_python_fixtures.py", &.{
-        "    create_exclusive(shadow, \"usr/sbin/update-alternatives\", b\"shadow\\n\", 0o644)\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-reference.sh", &.{
         "fixture preflight \"$source_root\"\n",
