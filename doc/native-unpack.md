@@ -714,9 +714,10 @@ The Python materialization acceptance and unit gates have been replaced after
 Debug and ReleaseSafe parity. The Zig unit tests include executable
 regressions for root parity and refusals, selected dpkg, pinned-executable
 tampering, version-gated fallback, archive verification before extraction,
-cache tampering, root refusal, and the package manifest. Python lifecycle,
-trigger, and recovery tests still import reusable compatibility fixtures from
-`tools/native-materialization-fixtures.py`. Offline reference-preparation
+cache tampering, root refusal, and the package manifest. All former Python
+materialization, lifecycle, trigger, and recovery fixture modules have been
+retired; the direct-dpkg config and alternatives reference oracles own their
+disposable-root helpers in `tools/dpkg-config-reference.py`. Offline reference-preparation
 regressions use `tools/prepare-native-dpkg.zig --fixture-root` with a disposable
 marker and `--fixture-archive` bytes that must still match the published pin;
 `--simulate-root` can only force refusal. These options never relax the

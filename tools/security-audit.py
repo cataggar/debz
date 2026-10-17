@@ -71,6 +71,7 @@ REMOVED_TEST_ENTRY_POINTS = {
     "tools/native-lifecycle-fixtures.py",
     "tools/native-differential.py",
     "tools/native_only_candidate.py",
+    "tools/native-materialization-fixtures.py",
 }
 
 SHA256_TOKEN = re.compile(
@@ -2112,7 +2113,7 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
@@ -2833,6 +2834,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-acceptance.sh",
     "tools/real-snapshot-reference.sh",
     "tools/real_snapshot_reference_paths.py",
+    "tools/real-snapshot-reference-paths.zig",
     "tools/real-snapshot-native-outcome.zig",
     "tools/native-phase-summary.zig",
     "tools/real-snapshot-exec-audit.zig",
@@ -3619,6 +3621,16 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "def toolchain(",
         "protected(library, directory=True)",
         "if not target.is_relative_to(library):",
+    ),
+    "tools/real-snapshot-reference-paths.zig": (
+        "pub fn openProtected(path: []const u8, directory: bool) !i32 {",
+        "pub fn verifyKeyring(path: []const u8, size: usize, expected_digest: []const u8) ![64]u8 {",
+        "pub fn toolchain(allocator: std.mem.Allocator, path: []const u8) ![]u8 {",
+        "pub fn verifyMinisign(",
+        "try ed25519Verify(key, &prehash_digest, file_sig);",
+        "try ed25519Verify(key, global_message, global_signature);",
+        "pub fn treeFailures(allocator: std.mem.Allocator, output: *std.ArrayList(u8), tree: []const u8) ![][]u8 {",
+        "pub fn packageFailures(",
     ),
     "build.zig": (
         'b.step("test-real-snapshot-python3-source-protected",',
@@ -5997,7 +6009,7 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
 
 DISPOSABLE_RUNTIME_PATHS = (
     "build.zig", "tools/disposable-root-runtime.zig", "tools/disposable_root_runtime.py",
-    "tools/native-materialization-fixtures.py",
+    "tools/dpkg-config-reference.py",
     "tools/test-integration-roots.sh",
     "tools/dpkg-alternatives-reference.py",
     ".github/workflows/ci.yml", "tools/run-dpkg-oracle-isolated.sh",
@@ -6311,27 +6323,17 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
         "tools/native-lifecycle-fixtures.py",
         "tools/native-differential.py",
         "tools/native_only_candidate.py",
+        "tools/native-materialization-fixtures.py",
     )
     for relative in retired:
         if relative in texts:
             failures.append(f"{relative}: retired Python test entry point still exists")
-    for relative in (
-        "tools/native-materialization-fixtures.py",
-    ):
-        source = texts.get(relative)
-        if source is None:
-            failures.append(f"{relative}: required import-only fixture module is missing")
-        elif (
-            source.startswith("#!")
-            or re.search(r"(?m)^import argparse\b|^from argparse\b|^def main\(|^if __name__\s*==", source)
-        ):
-            failures.append(f"{relative}: fixture module restored a Python CLI entry point")
     for consumer, fixture in (
         ("tools/dpkg-config-reference.py", "native-materialization-fixtures.py"),
         ("actions/install/__tests__/integration.test.ts", "native-materialization-fixtures.py"),
     ):
-        if fixture not in texts.get(consumer, ""):
-            failures.append(f"{consumer}: required fixture import is missing: {fixture}")
+        if fixture in texts.get(consumer, ""):
+            failures.append(f"{consumer}: retired fixture import was restored: {fixture}")
     return failures
 
 
@@ -6458,15 +6460,11 @@ def audit_ci_pins() -> None:
         for relative in fixture_paths
         if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
     }
-    for relative in fixture_paths[:12]:
+    for relative in fixture_paths[:13]:
         if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
             fixture_texts[relative] = ""
     for failure in native_lifecycle_fixture_failures(fixture_texts):
         fail(failure)
-    for relative in fixture_paths[11:12]:
-        path = ROOT / relative
-        if path.is_symlink() or (path.is_file() and path.stat().st_mode & 0o111):
-            fail(f"{relative}: import-only fixture must not be executable or a symlink")
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
         text = workflow.read_text()
