@@ -34,7 +34,6 @@ def load(name: str, path: str):
 
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
-HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
 from real_snapshot_reference_paths import toolchain, verify_keyring
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
@@ -210,75 +209,7 @@ def root_owned_lstat(path: str) -> os.stat_result:
     return os.stat_result(values)
 
 
-class ProfileStagingTests(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="debz-profile-test-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        patch = mock.patch.object(HARNESS, "protected",
-                                  side_effect=lambda path, directory=False: path.stat())
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_arm64_stages_no_amd64_profile_scripts(self) -> None:
-        self.assertEqual(HARNESS.profile_scripts(self.root, "arm64"), {})
-        (self.root / "systemd.postinst").write_text("#!/bin/sh\n")
-        with self.assertRaisesRegex(ValueError, "must not stage amd64 profile scripts"):
-            HARNESS.profile_scripts(self.root, "arm64")
-
-    def test_amd64_requires_exactly_the_bound_postinsts(self) -> None:
-        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
-            HARNESS.profile_scripts(self.root, "amd64")
-        for profile in ("systemd", "udev", "sudo"):
-            (self.root / f"{profile}.postinst").write_text(f"#!/bin/sh\n# {profile}\n")
-        self.assertEqual(sorted(HARNESS.profile_scripts(self.root, "amd64")), ["sudo", "systemd", "udev"])
-        (self.root / "extra.postinst").write_text("#!/bin/sh\n")
-        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
-            HARNESS.profile_scripts(self.root, "amd64")
-        (self.root / "extra.postinst").unlink()
-        (self.root / "udev.postinst").write_bytes(b"#" * (HARNESS.PROFILE_SCRIPT_LIMIT + 1))
-        with self.assertRaisesRegex(ValueError, "exceeds limit"):
-            HARNESS.profile_scripts(self.root, "amd64")
-
-    def test_profile_checks_are_reported_by_the_probe(self) -> None:
-        probe = (TOOLS / "real-snapshot-reference-escape-probe.zig").read_text()
-        views = {check for checks in HARNESS.PROFILE_VIEW_CHECKS.values() for check in checks}
-        for check in (*HARNESS.PROFILE_ESCAPE_CHECKS, *HARNESS.PROFILE_COMMON_CHECKS, *views):
-            self.assertIn(f'"{check}"', probe)
-        self.assertNotIn("no-proc-view", HARNESS.PROFILE_ESCAPE_CHECKS)
-        self.assertEqual(set(HARNESS.PROFILE_VIEW_CHECKS), set(HARNESS.ORDER.PROFILE_VERSIONS))
-
-
 class ProtectedCiScriptTests(unittest.TestCase):
-    def test_reference_network_controls_require_reachable_host_and_retain_refusals(self) -> None:
-        receipt = b"DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
-        for status, stdout in ((0, receipt), (1, receipt), (0, b""), (0, receipt + b"extra\n")):
-            with self.subTest(status=status, stdout=stdout), tempfile.TemporaryDirectory() as temporary:
-                workspace = Path(temporary)
-                root = workspace / "root"
-                root.mkdir()
-                result = subprocess.CompletedProcess([], status, stdout, b"original diagnostic\n")
-                with mock.patch.object(HARNESS.subprocess, "run", return_value=result) as run:
-                    if status == 0 and stdout == receipt:
-                        with HARNESS.network_control(workspace, "fixture", root, workspace / "probe") as fd:
-                            self.assertGreaterEqual(fd, 200)
-                            self.assertEqual(run.call_args.kwargs["pass_fds"], (fd,))
-                            port, name, inherited = (root / ".debz-network-control").read_text().splitlines()
-                            self.assertGreater(int(port), 0)
-                            self.assertTrue(name.startswith("debz-reference-"))
-                            self.assertEqual(inherited, str(fd))
-                    else:
-                        with self.assertRaisesRegex(AssertionError, "not genuinely reachable"):
-                            with HARNESS.network_control(workspace, "fixture", root, workspace / "probe"):
-                                self.fail("unverified host control authorized reference execution")
-                        self.assertFalse((root / ".debz-network-control").exists())
-                self.assertEqual((workspace / "fixture.network-host.stdout").read_bytes(), stdout)
-                self.assertEqual((workspace / "fixture.network-host.stderr").read_bytes(), result.stderr)
-                self.assertEqual(
-                    json.loads((workspace / "fixture.network-host.json").read_text())["exit_status"],
-                    status,
-                )
-
     def test_less_orchestration_cleans_environment_before_entering_minimal_guest(self) -> None:
         for filename, count in (("real-snapshot-less-protected-stage.sh", 1),
                                 ("real-snapshot-less-reference.sh", 3)):

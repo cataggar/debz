@@ -2821,7 +2821,6 @@ PROTECTED_REFERENCE_PATHS = (
     "build.zig",
     "tools/real-snapshot-reference-protected-ci.sh",
     "tools/real-snapshot-reference-protected-stage.sh",
-    "tools/test_real_snapshot_reference_protected.py",
     "tools/real-snapshot-reference-protected.zig",
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/real-snapshot-reference-launcher.zig",
@@ -3677,22 +3676,10 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "staging path is not root-owned and protected: $current (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
         "staging file is not root-owned and protected: $1 (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
     ),
-    "tools/test_real_snapshot_reference_protected.py": (
-        'with network_control(args.workspace, "escape", root, args.escape_probe) as inherited:',
-        'with network_control(args.workspace, name, root, args.escape_probe) as inherited:',
-        'if control.returncode != 0 or control.stdout != expected:',
-        'failed = [check for check in (*ESCAPE_CHECKS, *CONFINED_CHECKS, "private-network", "result")',
-        'parser.add_argument("--profile-scripts", type=Path, required=True)',
-        "scripts = profile_scripts(args.profile_scripts, args.architecture)",
-        "profiles = prove_profiles(args, scripts)",
-        '"systemd": ("proc-read-only", "proc-sys-masked", "proc-boot-id"),',
-        '"udev": ("proc-pid-only",),',
-        '"sudo": ("proc-pid-only",),',
-        'probe_detail(output, "proc-boot-id").get("boot_id") != host_boot_id',
-        'require(status, error, "InvalidProfile", name)',
-    ),
     "tools/real-snapshot-reference-protected.zig": (
         'pub fn openNetworkControl(',
+        'if (control.exit_code != 0 or !std.mem.eql(u8, control.stdout, expected)) {',
+        'else if (std.mem.eql(u8, flag, "--profile-scripts")) {',
         'var scripts = try profileScripts(allocator, args.profile_scripts, args.architecture);',
         'const profiles = try proveProfiles(allocator, args, &scripts);',
         '.{ .profile = "systemd", .checks = &.{ "proc-read-only", "proc-sys-masked", "proc-boot-id" } },',
@@ -4210,8 +4197,8 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         for token in tokens:
             if texts.get(path, "").count(token) != 1:
                 failures.append(f"{path}: protected reference wiring lost {token.strip()}")
-    harness = texts.get("tools/test_real_snapshot_reference_protected.py", "")
-    if "SkipTest" in harness or "skipTest" in harness:
+    harness = texts.get("tools/real-snapshot-reference-protected.zig", "")
+    if "SkipZigTest" in harness or "SkipTest" in harness or "skipTest" in harness:
         failures.append("protected reference proof must not skip")
     return failures
 
