@@ -40,6 +40,22 @@ pub const Error = error{
     CoordinationEvidenceExceedsLimit,
     UnsafeOrOversizedEvidenceMember,
     EvidenceExceedsLimit,
+    KeyringPackagePinMismatch,
+    InvalidKeyringArArchive,
+    UnsupportedKeyringArMemberName,
+    DuplicateKeyringArMember,
+    MissingKeyringArMember,
+    InvalidKeyringDebianBinary,
+    InvalidKeyringZstdArchive,
+    KeyringDataArchiveExceedsLimit,
+    UnsafeKeyringTarMemberName,
+    InvalidKeyringTarArchive,
+    DuplicateKeyringTarMember,
+    KeyringTarMemberNotRegular,
+    KeyringTarMemberSizeMismatch,
+    MissingKeyringTarMember,
+    KeyringMemberPinMismatch,
+    KeyringStagedCopyPinMismatch,
 };
 
 var test_root_override: ?[]const u8 = null;
@@ -893,6 +909,297 @@ fn writeAllFd(fd: i32, bytes: []const u8) !void {
     }
 }
 
+pub const keyring_decompressed_limit: usize = 1024 * 1024;
+
+fn unlinkIgnoreMissing(path: []const u8) void {
+    if (path.len == 0 or path.len >= maximum_path_bytes) return;
+    var buf: [maximum_path_bytes]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+    _ = linux.unlinkat(linux.AT.FDCWD, path_z, 0);
+}
+
+fn appendKeyringEvidence(
+    allocator: std.mem.Allocator,
+    evidence_path: []const u8,
+    role: []const u8,
+    path: []const u8,
+    entry: linux.Statx,
+    algorithm: []const u8,
+    digest: []const u8,
+) !void {
+    if (evidence_path.len == 0 or evidence_path.len >= maximum_path_bytes) return error.NoncanonicalReferencePath;
+    var buf: [maximum_path_bytes]u8 = undefined;
+    @memcpy(buf[0..evidence_path.len], evidence_path);
+    buf[evidence_path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&buf);
+    const flags: linux.O = .{
+        .ACCMODE = .WRONLY,
+        .APPEND = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    const fd: i32 = @intCast(try syscall(linux.openat(linux.AT.FDCWD, path_z, flags, 0)));
+    defer _ = linux.close(fd);
+    const row = try std.fmt.allocPrint(
+        allocator,
+        "{s}\t{s}\t{d}:{d}:{o:0>3}:{d}\t{s}\t{s}\n",
+        .{ path, role, entry.uid, entry.gid, entry.mode & 0o7777, entry.size, algorithm, digest },
+    );
+    defer allocator.free(row);
+    try writeAllFd(fd, row);
+}
+
+fn requireRootOwnedKeyringFile(
+    allocator: std.mem.Allocator,
+    evidence_path: []const u8,
+    role: []const u8,
+    path: []const u8,
+    entry: linux.Statx,
+    mode: u16,
+) !void {
+    if (entry.uid != 0 or
+        entry.gid != 0 or
+        (entry.mode & linux.S.IFMT) != linux.S.IFREG or
+        (entry.mode & 0o7777) != mode)
+    {
+        try appendKeyringEvidence(allocator, evidence_path, role, path, entry, "-", "-");
+        return error.UnprotectedReferencePath;
+    }
+}
+
+pub fn parseArMember(archive: []const u8, expected_name: []const u8) Error![]const u8 {
+    if (!std.mem.startsWith(u8, archive, "!<arch>\n")) return error.InvalidKeyringArArchive;
+    var offset: usize = 8;
+    var found: ?[]const u8 = null;
+    while (offset < archive.len) {
+        if (offset + 60 > archive.len) return error.InvalidKeyringArArchive;
+        const header = archive[offset .. offset + 60];
+        offset += 60;
+        if (!std.mem.eql(u8, header[58..60], "`\n")) return error.InvalidKeyringArArchive;
+        for (header[0..16]) |ch| {
+            if (ch < 0x20 or ch > 0x7e) return error.InvalidKeyringArArchive;
+        }
+        const raw_name = std.mem.trim(u8, header[0..16], " ");
+        if (std.mem.startsWith(u8, raw_name, "//") or std.mem.startsWith(u8, raw_name, "/"))
+            return error.UnsupportedKeyringArMemberName;
+        const name = std.mem.trimEnd(u8, raw_name, "/");
+        const size_text = std.mem.trim(u8, header[48..58], " ");
+        const size = std.fmt.parseInt(usize, size_text, 10) catch return error.InvalidKeyringArArchive;
+        if (offset + size > archive.len) return error.InvalidKeyringArArchive;
+        const payload = archive[offset .. offset + size];
+        offset += size + (size % 2);
+        if (std.mem.eql(u8, name, expected_name)) {
+            if (found != null) return error.DuplicateKeyringArMember;
+            found = payload;
+        }
+    }
+    return found orelse error.MissingKeyringArMember;
+}
+
+pub fn zstdDecompressBounded(allocator: std.mem.Allocator, payload: []const u8, limit: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var in: std.Io.Reader = .fixed(payload);
+    const window_buf = try allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+    defer allocator.free(window_buf);
+    var zstd_stream: std.compress.zstd.Decompress = .init(&in, window_buf, .{});
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const got = zstd_stream.reader.readSliceShort(&chunk) catch return error.InvalidKeyringZstdArchive;
+        if (got == 0) break;
+        if (out.items.len + got > limit) return error.KeyringDataArchiveExceedsLimit;
+        try out.appendSlice(allocator, chunk[0..got]);
+    }
+    if (zstd_stream.err != null or in.seek != payload.len or out.items.len == 0)
+        return error.InvalidKeyringZstdArchive;
+    return out.toOwnedSlice(allocator);
+}
+
+fn tarCString(field: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, field, 0)) |nul| return field[0..nul];
+    return field;
+}
+
+fn parseTarOctal(field: []const u8) Error!u64 {
+    const ltrimmed = std.mem.trimStart(u8, field, "0 ");
+    const rtrimmed = std.mem.trimEnd(u8, ltrimmed, " \x00");
+    if (rtrimmed.len == 0) return 0;
+    return std.fmt.parseInt(u64, rtrimmed, 8) catch return error.InvalidKeyringTarArchive;
+}
+
+pub fn extractTarMember(archive: []const u8, expected_name: []const u8, expected_size: u64) Error![]const u8 {
+    if (expected_name.len == 0 or
+        expected_name[0] == '/' or
+        std.mem.eql(u8, expected_name, "..") or
+        std.mem.startsWith(u8, expected_name, "../") or
+        std.mem.endsWith(u8, expected_name, "/..") or
+        std.mem.indexOf(u8, expected_name, "/../") != null)
+    {
+        return error.UnsafeKeyringTarMemberName;
+    }
+    if (archive.len == 0 or archive.len % 512 != 0) return error.InvalidKeyringTarArchive;
+    var offset: usize = 0;
+    var found: ?[]const u8 = null;
+    while (offset < archive.len) {
+        const block = archive[offset .. offset + 512];
+        offset += 512;
+        if (std.mem.allEqual(u8, block, 0)) continue;
+        const expected_sum = try parseTarOctal(block[148..156]);
+        var actual_sum: u64 = 0;
+        for (block, 0..) |byte, idx| {
+            actual_sum += if (idx >= 148 and idx < 156) ' ' else byte;
+        }
+        if (actual_sum != expected_sum) return error.InvalidKeyringTarArchive;
+        const member_size = try parseTarOctal(block[124..136]);
+        if (member_size > archive.len) return error.InvalidKeyringTarArchive;
+        const size_usize: usize = @intCast(member_size);
+        const padded = std.mem.alignForward(usize, size_usize, 512);
+        if (offset + padded > archive.len) return error.InvalidKeyringTarArchive;
+        const payload = archive[offset .. offset + size_usize];
+        offset += padded;
+
+        const name_part = tarCString(block[0..100]);
+        const is_ustar = std.mem.eql(u8, block[257..262], "ustar") and (block[262] == 0 or block[262] == ' ');
+        const prefix_part = if (is_ustar) tarCString(block[345..500]) else "";
+        var name_buf: [256]u8 = undefined;
+        const full_name: []const u8 = if (prefix_part.len > 0) blk: {
+            if (prefix_part.len + 1 + name_part.len > name_buf.len) return error.InvalidKeyringTarArchive;
+            @memcpy(name_buf[0..prefix_part.len], prefix_part);
+            name_buf[prefix_part.len] = '/';
+            @memcpy(name_buf[prefix_part.len + 1 ..][0..name_part.len], name_part);
+            break :blk name_buf[0 .. prefix_part.len + 1 + name_part.len];
+        } else name_part;
+
+        const typeflag = block[156];
+        if (std.mem.eql(u8, full_name, expected_name)) {
+            if (found != null) return error.DuplicateKeyringTarMember;
+            if (typeflag != '0' and typeflag != 0) return error.KeyringTarMemberNotRegular;
+            if (member_size != expected_size) return error.KeyringTarMemberSizeMismatch;
+            found = payload;
+        }
+    }
+    return found orelse error.MissingKeyringTarMember;
+}
+
+pub fn stageArchiveKeyring(
+    allocator: std.mem.Allocator,
+    deb_path: []const u8,
+    expected_deb_sha512: []const u8,
+    expected_deb_size: u64,
+    member: []const u8,
+    target: []const u8,
+    expected_keyring_sha256: []const u8,
+    expected_keyring_size: u64,
+    evidence_path: []const u8,
+) ![]u8 {
+    if (expected_deb_size == 0 or expected_deb_size > keyring_decompressed_limit)
+        return error.KeyringPackagePinMismatch;
+    if (expected_keyring_size == 0 or expected_keyring_size > keyring_decompressed_limit)
+        return error.KeyringMemberPinMismatch;
+
+    const package_stat = lstatPath(deb_path) catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    const deb_bytes = readRegularNoFollowAlloc(allocator, deb_path, keyring_decompressed_limit) catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    defer allocator.free(deb_bytes);
+
+    var deb_sha512_bytes: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(deb_bytes, &deb_sha512_bytes, .{});
+    const actual_deb_sha512 = std.fmt.bytesToHex(deb_sha512_bytes, .lower);
+    try appendKeyringEvidence(allocator, evidence_path, "downloaded-package", deb_path, package_stat, "sha512", &actual_deb_sha512);
+    if (deb_bytes.len != expected_deb_size or
+        package_stat.size != expected_deb_size or
+        !std.mem.eql(u8, &actual_deb_sha512, expected_deb_sha512))
+    {
+        unlinkIgnoreMissing(deb_path);
+        return error.KeyringPackagePinMismatch;
+    }
+    requireRootOwnedKeyringFile(allocator, evidence_path, "downloaded-package", deb_path, package_stat, 0o600) catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+
+    const debian_binary = parseArMember(deb_bytes, "debian-binary") catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    if (!std.mem.eql(u8, debian_binary, "2.0\n")) {
+        unlinkIgnoreMissing(deb_path);
+        return error.InvalidKeyringDebianBinary;
+    }
+    const data_archive = parseArMember(deb_bytes, "data.tar.zst") catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    const data_tar = zstdDecompressBounded(allocator, data_archive, keyring_decompressed_limit) catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    defer allocator.free(data_tar);
+    const keyring = extractTarMember(data_tar, member, expected_keyring_size) catch |err| {
+        unlinkIgnoreMissing(deb_path);
+        return err;
+    };
+    var keyring_sha256_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(keyring, &keyring_sha256_bytes, .{});
+    const actual_keyring_sha256 = std.fmt.bytesToHex(keyring_sha256_bytes, .lower);
+    if (keyring.len != expected_keyring_size or !std.mem.eql(u8, &actual_keyring_sha256, expected_keyring_sha256)) {
+        unlinkIgnoreMissing(deb_path);
+        return error.KeyringMemberPinMismatch;
+    }
+
+    if (target.len == 0 or target.len >= maximum_path_bytes) return error.NoncanonicalReferencePath;
+    var target_buf: [maximum_path_bytes]u8 = undefined;
+    @memcpy(target_buf[0..target.len], target);
+    target_buf[target.len] = 0;
+    const target_z: [*:0]const u8 = @ptrCast(&target_buf);
+    const create_flags: linux.O = .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    const target_fd: i32 = @intCast(try syscall(linux.openat(linux.AT.FDCWD, target_z, create_flags, 0o644)));
+    errdefer unlinkIgnoreMissing(target);
+    {
+        defer _ = linux.close(target_fd);
+        if (!builtin.is_test or linux.geteuid() == 0) {
+            _ = try syscall(linux.fchown(target_fd, 0, 0));
+        }
+        try writeAllFd(target_fd, keyring);
+        _ = try syscall(linux.fchmod(target_fd, 0o644));
+    }
+
+    const target_stat = try lstatPath(target);
+    try appendKeyringEvidence(allocator, evidence_path, "staged-keyring", target, target_stat, "sha256", &actual_keyring_sha256);
+    try requireRootOwnedKeyringFile(allocator, evidence_path, "staged-keyring", target, target_stat, 0o644);
+
+    const target_bytes = try readRegularNoFollowAlloc(allocator, target, keyring_decompressed_limit);
+    defer allocator.free(target_bytes);
+    var target_sha256_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(target_bytes, &target_sha256_bytes, .{});
+    const target_sha256 = std.fmt.bytesToHex(target_sha256_bytes, .lower);
+    if (target_bytes.len != expected_keyring_size or
+        target_stat.size != expected_keyring_size or
+        !std.mem.eql(u8, &target_sha256, expected_keyring_sha256))
+    {
+        return error.KeyringStagedCopyPinMismatch;
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "verified Ubuntu archive keyring from pinned package: {s} package_size={d} package_sha512={s} keyring_size={d} keyring_sha256={s}",
+        .{ target, deb_bytes.len, actual_deb_sha512, keyring.len, actual_keyring_sha256 },
+    );
+}
+
 pub const coordination_names = [_][]const u8{
     "root-operation-v1.json",
     "native-execution-intent-v1.json",
@@ -1359,6 +1666,30 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
         try writeAllFd(1, "\n");
         return 0;
     }
+    if (args.len == 9 and std.mem.eql(u8, args[0], "stage-keyring")) {
+        const expected_deb_size = std.fmt.parseInt(u64, args[3], 10) catch return 2;
+        const expected_keyring_size = std.fmt.parseInt(u64, args[7], 10) catch return 2;
+        const summary = stageArchiveKeyring(
+            allocator,
+            args[1],
+            args[2],
+            expected_deb_size,
+            args[4],
+            args[5],
+            args[6],
+            expected_keyring_size,
+            args[8],
+        ) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "keyring staging failed: {s}\n", .{@errorName(err)}) catch "keyring staging failed\n";
+            try writeAllFd(2, msg);
+            return 1;
+        };
+        defer allocator.free(summary);
+        try writeAllFd(1, summary);
+        try writeAllFd(1, "\n");
+        return 0;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[0], "capture-coordination")) {
         captureCoordination(allocator, args[1], args[2]) catch |err| {
             var buf: [256]u8 = undefined;
@@ -1374,7 +1705,7 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
     }
     try writeAllFd(
         2,
-        "usage: debz-reference-paths ancestry|tree TREE | packages DIR OUTPUT | verify-keyring PATH SIZE SHA256 | toolchain PATH | protected [--directory] PATH... | verify-minisign --public-key KEY --artifact PATH --signature PATH --name NAME --sha256 SHA256 --size SIZE | capture-coordination ROOT EVIDENCE | export-evidence EVIDENCE UPLOAD\n",
+        "usage: debz-reference-paths ancestry|tree TREE | packages DIR OUTPUT | verify-keyring PATH SIZE SHA256 | stage-keyring PACKAGE PACKAGE_SHA512 PACKAGE_SIZE MEMBER TARGET KEYRING_SHA256 KEYRING_SIZE EVIDENCE | toolchain PATH | protected [--directory] PATH... | verify-minisign --public-key KEY --artifact PATH --signature PATH --name NAME --sha256 SHA256 --size SIZE | capture-coordination ROOT EVIDENCE | export-evidence EVIDENCE UPLOAD\n",
     );
     return 2;
 }
@@ -1790,4 +2121,185 @@ test "captureCoordination and exportEvidence enforce bounds and refuse symlinks"
     defer allocator.free(failure_txt);
     try std.testing.expect(std.mem.indexOf(u8, failure_txt, "unsafe or oversized evidence member") != null);
 }
+
+fn buildTestTarMember(allocator: std.mem.Allocator, name: []const u8, typeflag: u8, payload: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var header: [512]u8 = @splat(0);
+    @memcpy(header[0..name.len], name);
+    _ = try std.fmt.bufPrint(header[100..108], "{o:0>7}\x00", .{@as(u32, 0o644)});
+    _ = try std.fmt.bufPrint(header[108..116], "{o:0>7}\x00", .{@as(u32, 0)});
+    _ = try std.fmt.bufPrint(header[116..124], "{o:0>7}\x00", .{@as(u32, 0)});
+    _ = try std.fmt.bufPrint(header[124..136], "{o:0>11}\x00", .{payload.len});
+    _ = try std.fmt.bufPrint(header[136..148], "{o:0>11}\x00", .{@as(u32, 0)});
+    @memset(header[148..156], ' ');
+    header[156] = typeflag;
+    @memcpy(header[257..263], "ustar\x00");
+    @memcpy(header[263..265], "00");
+    var sum: u32 = 0;
+    for (header) |byte| sum += byte;
+    _ = try std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{sum});
+    try out.appendSlice(allocator, &header);
+    try out.appendSlice(allocator, payload);
+    const pad = (512 - (payload.len % 512)) % 512;
+    try out.appendNTimes(allocator, 0, pad);
+    try out.appendNTimes(allocator, 0, 1024);
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildTestZstdRawFrame(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "\x28\xb5\x2f\xfd");
+    try out.append(allocator, 0x60);
+    var content_size_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &content_size_bytes, @intCast(payload.len - 256), .little);
+    try out.appendSlice(allocator, &content_size_bytes);
+    const block_header: u24 = (@as(u24, @intCast(payload.len)) << 3) | 1;
+    var bh_bytes: [3]u8 = undefined;
+    std.mem.writeInt(u24, &bh_bytes, block_header, .little);
+    try out.appendSlice(allocator, &bh_bytes);
+    try out.appendSlice(allocator, payload);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendTestArMember(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, payload: []const u8) !void {
+    var header: [60]u8 = @splat(' ');
+    @memcpy(header[0..name.len], name);
+    @memcpy(header[16..18], "0 ");
+    @memcpy(header[28..30], "0 ");
+    @memcpy(header[34..36], "0 ");
+    @memcpy(header[40..46], "100644");
+    const size_slice = try std.fmt.bufPrint(header[48..58], "{d}", .{payload.len});
+    header[48 + size_slice.len] = ' ';
+    header[58] = '`';
+    header[59] = '\n';
+    try out.appendSlice(allocator, &header);
+    try out.appendSlice(allocator, payload);
+    if (payload.len % 2 == 1) try out.append(allocator, '\n');
+}
+
+test "stageArchiveKeyring verifies package and tar member pins and unlinks on refusal" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try makeTempRoot(allocator, &tmp);
+    defer allocator.free(root);
+    test_root_override = root;
+    defer test_root_override = null;
+
+    const member_name = "./usr/share/keyrings/ubuntu-archive-keyring.gpg";
+    const keyring_payload = "reviewed-ubuntu-archive-keyring-bytes";
+    var keyring_sha256_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(keyring_payload, &keyring_sha256_bytes, .{});
+    const keyring_sha256 = std.fmt.bytesToHex(keyring_sha256_bytes, .lower);
+
+    const tar_bytes = try buildTestTarMember(allocator, member_name, '0', keyring_payload);
+    defer allocator.free(tar_bytes);
+    const zstd_bytes = try buildTestZstdRawFrame(allocator, tar_bytes);
+    defer allocator.free(zstd_bytes);
+
+    var deb_buf: std.ArrayList(u8) = .empty;
+    defer deb_buf.deinit(allocator);
+    try deb_buf.appendSlice(allocator, "!<arch>\n");
+    try appendTestArMember(allocator, &deb_buf, "debian-binary", "2.0\n");
+    try appendTestArMember(allocator, &deb_buf, "data.tar.zst", zstd_bytes);
+    const deb_bytes = deb_buf.items;
+
+    var deb_sha512_bytes: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(deb_bytes, &deb_sha512_bytes, .{});
+    const deb_sha512 = std.fmt.bytesToHex(deb_sha512_bytes, .lower);
+
+    const deb_path = try std.fs.path.join(allocator, &.{ root, "ubuntu-keyring.deb" });
+    defer allocator.free(deb_path);
+    const target_path = try std.fs.path.join(allocator, &.{ root, "ubuntu-archive-keyring.gpg" });
+    defer allocator.free(target_path);
+    const evidence_path = try std.fs.path.join(allocator, &.{ root, "archive-keyring-path.tsv" });
+    defer allocator.free(evidence_path);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "archive-keyring-path.tsv", .data = "path\trole\tuid:gid:mode:size\talgorithm\tdigest\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ubuntu-keyring.deb", .data = deb_bytes });
+    try chmodPath(deb_path, 0o600);
+
+    const summary = try stageArchiveKeyring(
+        allocator,
+        deb_path,
+        &deb_sha512,
+        deb_bytes.len,
+        member_name,
+        target_path,
+        &keyring_sha256,
+        keyring_payload.len,
+        evidence_path,
+    );
+    defer allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "verified Ubuntu archive keyring from pinned package:") != null);
+
+    const staged = try readRegularNoFollowAlloc(allocator, target_path, 4096);
+    defer allocator.free(staged);
+    try std.testing.expectEqualStrings(keyring_payload, staged);
+    const evidence = try readRegularNoFollowAlloc(allocator, evidence_path, 4096);
+    defer allocator.free(evidence);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\tdownloaded-package\t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\tstaged-keyring\t") != null);
+
+    // Pre-existing target is refused without overwriting it.
+    try std.testing.expectError(
+        error.PackageManifestExists,
+        stageArchiveKeyring(
+            allocator,
+            deb_path,
+            &deb_sha512,
+            deb_bytes.len,
+            member_name,
+            target_path,
+            &keyring_sha256,
+            keyring_payload.len,
+            evidence_path,
+        ),
+    );
+    try tmp.dir.deleteFile(std.testing.io, "ubuntu-archive-keyring.gpg");
+
+    // Wrong keyring SHA-256 unlinks the downloaded package.
+    const zero_sha256: [64]u8 = @splat('0');
+    try std.testing.expectError(
+        error.KeyringMemberPinMismatch,
+        stageArchiveKeyring(
+            allocator,
+            deb_path,
+            &deb_sha512,
+            deb_bytes.len,
+            member_name,
+            target_path,
+            &zero_sha256,
+            keyring_payload.len,
+            evidence_path,
+        ),
+    );
+    try std.testing.expectError(error.ReferenceSyscallRefused, lstatPath(deb_path));
+
+    // Wrong package SHA-512 unlinks the downloaded package.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ubuntu-keyring.deb", .data = deb_bytes });
+    try chmodPath(deb_path, 0o600);
+    const zero_sha512: [128]u8 = @splat('0');
+    try std.testing.expectError(
+        error.KeyringPackagePinMismatch,
+        stageArchiveKeyring(
+            allocator,
+            deb_path,
+            &zero_sha512,
+            deb_bytes.len,
+            member_name,
+            target_path,
+            &keyring_sha256,
+            keyring_payload.len,
+            evidence_path,
+        ),
+    );
+    try std.testing.expectError(error.ReferenceSyscallRefused, lstatPath(deb_path));
+
+    try std.testing.expectError(error.UnsafeKeyringTarMemberName, extractTarMember(tar_bytes, "/etc/passwd", 1));
+    try std.testing.expectError(error.UnsafeKeyringTarMemberName, extractTarMember(tar_bytes, "a/../b", 1));
+}
+
 
