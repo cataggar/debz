@@ -832,8 +832,8 @@ pinned Zig release key. It extracts it with Python's `data` filter. Zig
 0.16's `zig build --fetch` unpacks dependencies into `checkout/zig-pkg`
 with 24 world-writable (0777) shell scripts; the script records them,
 removes group/other write from `zig-pkg` and the global cache (it never
-runs them), and then requires `real-snapshot-reference-tree-check.py
-packages` to find no non-root, group/world-writable, setuid/setgid/sticky
+runs them), and then requires `debz-reference-paths packages`
+to find no non-root, group/world-writable, setuid/setgid/sticky
 or escaping-symlink entry. It records a per-file mode and SHA-256 manifest.
 The tree checker then requires root ownership, a single filesystem and no
 group/world-writable entry (except symlinks, sticky directories and

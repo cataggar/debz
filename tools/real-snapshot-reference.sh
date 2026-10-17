@@ -22,65 +22,32 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   echo "run the protected reference script from its checkout root" >&2
   exit 2
 }
-python3 -I - "$repository_root" "$workspace" "$reference_dpkg" "$lock" "$cache" "$zig" <<'PY'
-import os
-import stat
-import sys
-from pathlib import Path
-
-def protected(path, directory=False):
-    if not path.is_absolute() or any(
-        item in ("", ".", "..") for item in str(path).split("/")[1:]
-    ):
-        raise ValueError(f"noncanonical reference path: {path}")
-    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        for index, component in enumerate(path.parts[1:]):
-            last = index == len(path.parts) - 2
-            opened = os.open(
-                component, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
-                (os.O_DIRECTORY if not last or directory else 0),
-                dir_fd=fd,
-            )
-            os.close(fd)
-            fd = opened
-            info = os.fstat(fd)
-            if (info.st_uid != 0 or info.st_gid != 0 or
-                stat.S_IMODE(info.st_mode) & 0o022 or
-                ((not last or directory) and not stat.S_ISDIR(info.st_mode)) or
-                (last and not directory and not stat.S_ISREG(info.st_mode))):
-                raise ValueError(f"non-root or writable reference path: {path}")
-        return os.fstat(fd)
-    finally:
-        os.close(fd)
-
-repository, workspace, dpkg, lock, cache = map(Path, sys.argv[1:6])
-for path in (repository, repository / ".real-snapshot", workspace, cache):
-    result = protected(path, directory=True)
-    if path in (repository / ".real-snapshot", workspace) and result.st_mode & 0o7777 != 0o700:
-        raise ValueError(f"reference directory must be root-only 0700: {path}")
-for path in (repository / "tools/real-snapshot-reference.sh",
-             repository / "tools/real-snapshot-reference-launcher.zig",
-             repository / "tools/real-snapshot-reference-runtime.zig",
-             repository / "src/private_network.zig",
-             repository / "tools/real-snapshot-reference-order.zig",
-             repository / "tools/real-snapshot-reference-paths.zig",
-             repository / "tools/real_snapshot_reference_paths.py",
-             repository / "tools/prepare-native-dpkg.zig",
-             repository / "zig-out/bin/debz-native-dpkg-reference",
-             repository / "test/native_differential_cli.zig",
-             repository / "zig-out/bin/native-differential",
-             dpkg, lock, workspace / "evidence/create.json"):
-    protected(path)
-protected(workspace / "evidence", directory=True)
-protected(cache / "packages-v2/objects", directory=True)
-protected(repository / "tools/real_snapshot_reference_paths.py")
-sys.path.insert(0, str(repository / "tools"))
-from real_snapshot_reference_paths import toolchain
-if not sys.argv[6]:
-    raise ValueError("an explicit absolute protected DEBZ_ZIG compiler is required")
-toolchain(Path(sys.argv[6]))
-PY
+"$repository_root/zig-out/bin/debz-reference-paths" protected --directory \
+  "$repository_root" "$repository_root/.real-snapshot" "$workspace" \
+  "$cache" "$workspace/evidence" "$cache/packages-v2/objects"
+[[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 &&
+   $(stat -c '%u:%g:%a' "$workspace") == 0:0:700 ]] || {
+  echo "reference directory must be root-only 0700" >&2
+  exit 2
+}
+"$repository_root/zig-out/bin/debz-reference-paths" protected \
+  "$repository_root/tools/real-snapshot-reference.sh" \
+  "$repository_root/tools/real-snapshot-reference-launcher.zig" \
+  "$repository_root/tools/real-snapshot-reference-runtime.zig" \
+  "$repository_root/src/private_network.zig" \
+  "$repository_root/tools/real-snapshot-reference-order.zig" \
+  "$repository_root/tools/real-snapshot-reference-paths.zig" \
+  "$repository_root/zig-out/bin/debz-reference-paths" \
+  "$repository_root/tools/prepare-native-dpkg.zig" \
+  "$repository_root/zig-out/bin/debz-native-dpkg-reference" \
+  "$repository_root/test/native_differential_cli.zig" \
+  "$repository_root/zig-out/bin/native-differential" \
+  "$reference_dpkg" "$lock" "$workspace/evidence/create.json"
+[[ -n "$zig" ]] || {
+  echo "an explicit absolute protected DEBZ_ZIG compiler is required" >&2
+  exit 2
+}
+"$repository_root/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null
 case "$workspace" in
   "$repository_root"/.real-snapshot/*) ;;
   *) echo "unsafe reference workspace" >&2; exit 2 ;;

@@ -16,47 +16,29 @@ checkout=$tree/checkout
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-protected-native-ci.sh" ]]
 cd "$checkout"
 test "$(git rev-parse HEAD)" = "$commit"
-python3 -I tools/real-snapshot-reference-tree-check.py ancestry "$tree"
-python3 -I - "$checkout/tools" "$checkout" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-checkout = Path(sys.argv[2])
-for relative in ("tools/real-snapshot-protected-native-ci.sh",
-                 "tools/real-snapshot-acceptance.sh",
-                 "tools/real-snapshot-reference.sh",
-                 "tools/real_snapshot_reference_paths.py",
-                 "zig-out/bin/debz-vendor-snapshot-tools",
-                 "zig-out/bin/debz-native-outcome",
-                 "zig-out/bin/debz-native-phase-summary",
-                 "zig-out/bin/debz-exec-audit",
-                 "zig-out/bin/debz", "zig-out/bin/native-differential",
-                 "zig-out/bin/real-snapshot-comparator"):
-    protected(checkout / relative)
-PY
+"$checkout/zig-out/bin/debz-reference-paths" ancestry "$tree"
+"$checkout/zig-out/bin/debz-reference-paths" protected \
+  "$checkout/tools/real-snapshot-protected-native-ci.sh" \
+  "$checkout/tools/real-snapshot-acceptance.sh" \
+  "$checkout/tools/real-snapshot-reference.sh" \
+  "$checkout/tools/real-snapshot-reference-paths.zig" \
+  "$checkout/zig-out/bin/debz-reference-paths" \
+  "$checkout/zig-out/bin/debz-vendor-snapshot-tools" \
+  "$checkout/zig-out/bin/debz-native-outcome" \
+  "$checkout/zig-out/bin/debz-native-phase-summary" \
+  "$checkout/zig-out/bin/debz-exec-audit" \
+  "$checkout/zig-out/bin/debz" \
+  "$checkout/zig-out/bin/native-differential" \
+  "$checkout/zig-out/bin/real-snapshot-comparator"
 work=$checkout/.real-snapshot/$architecture
 evidence=$work/evidence
 upload=$tree/native-upload
 
 if [[ $operation != collect ]]; then
-  python3 -I - "$checkout/tools" "$tree/native-inputs.args" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-protected(Path(sys.argv[2]))
-PY
+  "$checkout/zig-out/bin/debz-reference-paths" protected "$tree/native-inputs.args"
   mapfile -t inputs <"$tree/native-inputs.args"
   [[ ${#inputs[@]} == 3 ]]
-  python3 -I - "$checkout/tools" "$tree/native-optimize.txt" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-optimize_file = Path(sys.argv[2])
-protected(optimize_file)
-PY
+  "$checkout/zig-out/bin/debz-reference-paths" protected "$tree/native-optimize.txt"
   mapfile -t optimize <"$tree/native-optimize.txt"
   [[ ${#optimize[@]} == 1 && ( ${optimize[0]} == Debug || ${optimize[0]} == ReleaseSafe ) ]]
   export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}
@@ -161,8 +143,40 @@ from pathlib import Path
 import stat
 import sys
 
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import open_absolute, open_beneath
+def open_beneath(parent_fd: int, relative: str, *, directory: bool) -> int:
+    current = parent_fd
+    owns = False
+    parts = [part for part in relative.split("/") if part]
+    for index, part in enumerate(parts):
+        if part in {".", ".."}:
+            if owns:
+                os.close(current)
+            raise SystemExit(f"non-canonical path component: {relative}")
+        last = index == len(parts) - 1
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        if not last or directory:
+            flags |= os.O_DIRECTORY
+        try:
+            next_fd = os.open(part, flags, dir_fd=current)
+        except OSError as exc:
+            if owns:
+                os.close(current)
+            raise SystemExit(f"openat failed for {relative}: {exc}") from exc
+        if owns:
+            os.close(current)
+        current = next_fd
+        owns = True
+    return current
+
+def open_absolute(path: Path, *, directory: bool) -> int:
+    raw = str(path)
+    if not raw.startswith("/"):
+        raise SystemExit(f"path must be absolute: {path}")
+    root_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        return open_beneath(root_fd, raw.lstrip("/"), directory=directory)
+    finally:
+        os.close(root_fd)
 
 root, evidence = map(Path, sys.argv[2:])
 names = (

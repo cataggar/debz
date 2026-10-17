@@ -2951,8 +2951,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "test \"$(git -C \"$checkout\" rev-parse HEAD)\" = \"$commit\"\n",
         "step zig-verify 0 \"\" python3 -I tools/verify-minisign.py --public-key \"$zig_public_key\" \\\n",
         "chmod -R go-w zig-pkg \"$tree/zig-global\"\n",
-        "step zig-pkg-verify 0 \"\" python3 -I tools/real-snapshot-reference-tree-check.py packages \\\n",
-        "step tree-staged 0 \"\" python3 -I tools/real-snapshot-reference-tree-check.py tree \"$tree\"\n",
+        "step zig-pkg-verify 0 \"\" \"$reference_paths\" packages \\\n",
+        "step tree-staged 0 \"\" \"$reference_paths\" tree \"$tree\"\n",
         "negative mutable-ancestor \"writable or non-root ancestor\" \\\n",
         "negative swapped-dpkg \"reference dpkg executable is not the pinned architecture artifact\" \\\n",
         "negative wrong-architecture \"reference dpkg executable is not the pinned architecture artifact\" \\\n",
@@ -2960,7 +2960,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    echo \"negative-$name launched before refusing\" >&2\n",
         "step proof 0 \"executed without skips\" timeout --signal=TERM --kill-after=60s 45m \\\n",
         "  mode=native-staging\n",
-        "print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))\n",
+        "    verify-keyring \"$2\" \"$archive_keyring_size\" \"$archive_keyring_sha256\"\n",
         "    --receipt-from-archive \"$tree/reference-dpkg.deb\" --prefix \"$tree/reference-dpkg\"\n",
         "    bash tools/real-snapshot-python3-protected-stage.sh \"$zig\" \"$checkout/zig-out/bin/debz\" \\\n",
         "  [[ ${#python3_arguments[@]} == 20 ]]\n",
@@ -2969,7 +2969,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    \"$python3_workspace/evidence/alternatives-proof.txt\"\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-protected-stage.sh", &.{
-        "toolchain(Path(sys.argv[3]))\n",
+        "\"$checkout/zig-out/bin/debz-reference-paths\" toolchain \"$zig\" >/dev/null\n",
         "fixture empty \"$before\"\n",
         "fixture mode \"$before_0644\" 0644\n",
         "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
@@ -3017,7 +3017,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
         "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
         "            if total > 512 * 1024 * 1024:\n",
-        "                 \"zig-out/bin/debz-native-outcome\",\n",
+        "  \"$checkout/zig-out/bin/debz-native-outcome\" \\\n",
         "PATH=/no-host-interpreters zig-out/bin/debz-native-outcome \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
         "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
         "        source_fd = open_beneath(root_fd, \"var/lib/debz\", directory=True)\n",
@@ -3027,7 +3027,7 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
         "    --check-keyring \"$keyring\" >/dev/null\n",
-        "python3 -I - \"$repository_root/tools\" \"$repository_root\" \"$debz\" <<'PY'\n",
+        "  \"$repository_root/zig-out/bin/debz-reference-paths\" \\\n",
         "  printf '%s\\n' \"$wrapper_status\" >\"$evidence/native-wrapper-exit-status.txt\"\n",
         "  printf '{\"stage\":\"%s\",\"command_exit_status\":null}\\n' \"$name\" >\"$evidence/native-stage-v1.json\"\n",
         "  printf '{\"stage\":\"%s\",\"command_exit_status\":%s}\\n' \"$name\" \"$status\" >\"$evidence/native-stage-v1.json\"\n",
@@ -3064,11 +3064,9 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    request.ifru.flags.UP = true;\n",
         "    if (applied != .SUCCESS) return applied;\n",
     });
-    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
-        "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
-        "                if not target.is_relative_to(library):\n",
-    });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-paths.zig", &.{
+        "    if (meta.size != size or observed != size or !std.mem.eql(u8, &actual_hex, expected_digest))\n",
+        "            if (!isWithinPath(target, library)) return error.ToolchainSymlinkEscapes;\n",
         "    try ed25519Verify(key, &prehash_digest, file_sig);\n",
         "    try ed25519Verify(key, global_message, global_signature);\n",
     });

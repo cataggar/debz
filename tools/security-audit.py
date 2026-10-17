@@ -2829,11 +2829,9 @@ PROTECTED_REFERENCE_PATHS = (
     "src/fixtures/script_network_probe.zig",
     "src/maintainer_script.zig",
     "tools/verify-minisign.py",
-    "tools/real-snapshot-reference-tree-check.py",
     "tools/real-snapshot-protected-native-ci.sh",
     "tools/real-snapshot-acceptance.sh",
     "tools/real-snapshot-reference.sh",
-    "tools/real_snapshot_reference_paths.py",
     "tools/real-snapshot-reference-paths.zig",
     "tools/real-snapshot-native-outcome.zig",
     "tools/native-phase-summary.zig",
@@ -3275,7 +3273,7 @@ NATIVE_DATABASE_PAIR_JOB = (
 PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "set -euo pipefail",
     'if [[ ${1:-} == --check-keyring && $# == 2 ]]; then',
-    'print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))',
+    'verify-keyring "$2" "$archive_keyring_size" "$archive_keyring_sha256"',
     'if [[ ${1:-} == --stage-native ]]; then',
     "  mode=native-staging\n",
     '[[ $mode == proof ]] || prefix=native-ci',
@@ -3288,7 +3286,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     '  [[ $native_optimize == Debug || $native_optimize == ReleaseSafe ]]',
     '"$checkout/zig-out/bin/debz-native-dpkg-reference" --architecture "$architecture" \\\n'
     '    --receipt-from-archive "$tree/reference-dpkg.deb" --prefix "$tree/reference-dpkg"',
-    'print(toolchain(Path(sys.argv[2])))',
+    'step zig-library-check 0 "" "$reference_paths" toolchain "$zig"',
     "readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb",
     "readonly archive_keyring_deb_sha512=80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
@@ -3306,7 +3304,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     '    archive.extractall(sys.argv[2], filter="data")',
     "[[ ! -e zig-pkg && ! -L zig-pkg ]]",
     'chmod -R go-w zig-pkg "$tree/zig-global"',
-    'step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \\',
+    'step zig-pkg-verify 0 "" "$reference_paths" packages \\',
     "stage_verified_archive_keyring()",
     "printf 'path\\trole\\tuid:gid:mode:size\\talgorithm\\tdigest\\n'",
     "urllib.request.urlopen(request, timeout=300)",
@@ -3321,7 +3319,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "os.unlink(target)",
     'staged_archive_keyring=\nstage_verified_archive_keyring\nreadonly staged_archive_keyring',
     'step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
-    'step tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"',
+    'step tree-final 0 "" "$reference_paths" tree "$tree"',
     "mutable=$negatives/mutable-ancestor\n[[ ! -e \"$mutable\" && ! -L \"$mutable\" ]]\ninstall -d -o root -g root -m 0777 \"$mutable\"",
     'negative mutable-ancestor "writable or non-root ancestor" \\',
     'negative swapped-dpkg "reference dpkg executable is not the pinned architecture artifact" \\',
@@ -3339,7 +3337,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-bash-protected-stage.sh": (
         '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
         '"$workspace" == "$checkout/.real-snapshot/bash-arm64"',
-        'toolchain(Path(sys.argv[3]))',
+        '"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null',
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-reference-protected-stage.sh --arm64-bash-source',
         'zig-out/bin/debz-reference-stage prepare-bash',
@@ -3365,7 +3363,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-less-protected-stage.sh": (
         '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
         '"$workspace" == "$checkout/.real-snapshot/less-arm64"',
-        'toolchain(Path(sys.argv[3]))',
+        '"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null',
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-reference-protected-stage.sh --arm64-less-source',
         'zig-out/bin/debz-reference-stage prepare',
@@ -3430,11 +3428,11 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-protected-native-ci.sh": (
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
         "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
-        "protected(Path(sys.argv[2]))",
-        "protected(optimize_file)",
+        '"$checkout/zig-out/bin/debz-reference-paths" protected "$tree/native-inputs.args"',
+        '"$checkout/zig-out/bin/debz-reference-paths" protected "$tree/native-optimize.txt"',
         'export DEBZ_NATIVE_SNAPSHOT_OPTIMIZE=${optimize[0]}',
-        '"zig-out/bin/debz-native-outcome",',
-        '"zig-out/bin/debz-exec-audit",',
+        '"$checkout/zig-out/bin/debz-native-outcome"',
+        '"$checkout/zig-out/bin/debz-exec-audit"',
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
         'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
@@ -3459,10 +3457,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
         '--check-keyring "$keyring" >/dev/null',
         'PATH=/no-host-interpreters zig-out/bin/debz-exec-audit "$@" || status=$?',
-        'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
-        'protected(repository, directory=True)',
-        'protected(repository / ".real-snapshot", directory=True)',
-        'repository / "zig-out/bin/debz-exec-audit",',
+        '"$repository_root/zig-out/bin/debz-reference-paths" protected --directory \\\n  "$repository_root" "$repository_root/.real-snapshot"',
+        '"$debz" "$repository_root/zig-out/bin/debz-exec-audit"',
+        '"$repository_root/zig-out/bin/debz-reference-paths" \\',
         'local wrapper_status=$?',
         'printf \'%s\\n\' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"',
         'printf \'{"stage":"%s","command_exit_status":null}\\n\' "$name" >"$evidence/native-stage-v1.json"',
@@ -3492,7 +3489,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-python3-protected-stage.sh": (
         '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == x86_64',
         '"$workspace" == "$checkout/.real-snapshot/python3-amd64"',
-        'toolchain(Path(sys.argv[3]))',
+        '"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null',
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-signed-proc-bindings.sh "$debz" "$workspace"',
         'bash tools/real-snapshot-signed-proc-prestates.sh --python3 "$pinned" "$workspace"',
@@ -3608,31 +3605,27 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-reference.sh": (
         "unset ZIG_LIB_DIR",
         'zig=${DEBZ_ZIG:-$(command -v zig || true)}',
-        "toolchain(Path(sys.argv[6]))",
+        '"$repository_root/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null',
         '"$zig" build-exe -O ReleaseSafe -lc --dep private_network',
         '-Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig',
         '--zig-lib-dir "$(dirname -- "$zig")/lib"',
         '"$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe',
         '"$workspace/runtime-tool/bin/debz-reference-order" \\\n  --report-only --architecture "$architecture"',
     ),
-    "tools/real_snapshot_reference_paths.py": (
-        "def open_protected(",
-        "def verify_keyring(",
-        "fd = open_protected(path)",
-        "meta.st_size != size or len(payload) != size or actual != digest",
-        "def toolchain(",
-        "protected(library, directory=True)",
-        "if not target.is_relative_to(library):",
-    ),
     "tools/real-snapshot-reference-paths.zig": (
         "pub fn openProtected(path: []const u8, directory: bool) !i32 {",
         "pub fn verifyKeyring(path: []const u8, size: usize, expected_digest: []const u8) ![64]u8 {",
+        "if (meta.size != size or observed != size or !std.mem.eql(u8, &actual_hex, expected_digest))",
         "pub fn toolchain(allocator: std.mem.Allocator, path: []const u8) ![]u8 {",
+        "if (!isWithinPath(target, library)) return error.ToolchainSymlinkEscapes;",
         "pub fn verifyMinisign(",
         "try ed25519Verify(key, &prehash_digest, file_sig);",
         "try ed25519Verify(key, global_message, global_signature);",
         "pub fn treeFailures(allocator: std.mem.Allocator, output: *std.ArrayList(u8), tree: []const u8) ![][]u8 {",
         "pub fn packageFailures(",
+        '"protected tree must be mode 0700: {s}",',
+        '"group/other-writable entry: {s}",',
+        "((entry.meta.mode & linux.S.IFMT) != linux.S.IFLNK and (entry.meta.mode & (writable_mask | special_mask)) != 0))",
     ),
     "build.zig": (
         'b.step("test-real-snapshot-python3-source-protected",',
@@ -3697,11 +3690,6 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "ed25519_verify(key, prehash.digest(), blob[10:])",
         "ed25519_verify(key, blob[10:] + trusted, global_signature)",
         'fields[1] != b"file:" + name.encode()',
-    ),
-    "tools/real-snapshot-reference-tree-check.py": (
-        "not stat.S_ISLNK(meta.st_mode) and meta.st_mode & (WRITABLE | SPECIAL)",
-        'failures.append(f"group/other-writable entry: {describe(path, meta)}")',
-        'failures.append(f"protected tree must be mode 0700: {describe(current, meta)}")',
     ),
 }
 
@@ -4183,7 +4171,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         if script.count(token) != 1:
             failures.append(f"protected reference CI script lost {token.strip()}")
     if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|SkipTest|--skip", script) or script.count(
-        'python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"'
+        '"$reference_paths" tree "$tree"'
     ) != 5:
         failures.append("protected reference CI script must not skip and must check the tree at every stage")
     for path, tokens in PROTECTED_REFERENCE_SOURCE_TOKENS.items():

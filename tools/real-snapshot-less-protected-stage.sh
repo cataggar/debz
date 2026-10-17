@@ -11,19 +11,15 @@ checkout=$(pwd -P)
 zig=$1 debz=$2 workspace=$3
 [[ "$workspace" == "$checkout/.real-snapshot/less-arm64" &&
   ! -e "$workspace" && ! -L "$workspace" && -n ${DEBZ_REAL_SNAPSHOT_KEYRING:-} ]]
-python3 -B -I - "$checkout/tools" "$checkout" "$zig" "$debz" "$DEBZ_REAL_SNAPSHOT_KEYRING" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected, toolchain
-for name in ("real-snapshot-less-protected-stage.sh", "real-snapshot-less-reference.sh",
-             "real-snapshot-stage.zig", "real-snapshot-reference-protected-stage.sh"):
-    protected(Path(sys.argv[2]) / "tools" / name)
-protected(Path(sys.argv[2]) / "zig-out/bin/debz-reference-stage")
-toolchain(Path(sys.argv[3]))
-for argument in sys.argv[4:]:
-    protected(Path(argument))
-PY
+"$checkout/zig-out/bin/debz-reference-paths" protected \
+  "$checkout/tools/real-snapshot-less-protected-stage.sh" \
+  "$checkout/tools/real-snapshot-less-reference.sh" \
+  "$checkout/tools/real-snapshot-stage.zig" \
+  "$checkout/tools/real-snapshot-reference-protected-stage.sh" \
+  "$checkout/zig-out/bin/debz-reference-paths" \
+  "$checkout/zig-out/bin/debz-reference-stage" \
+  "$debz" "$DEBZ_REAL_SNAPSHOT_KEYRING"
+"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null
 bash "$checkout/tools/real-snapshot-reference-protected-ci.sh" \
   --check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING" >/dev/null
 bash tools/real-snapshot-reference-protected-stage.sh --arm64-less-source "$zig" "$debz" "$workspace"

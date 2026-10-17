@@ -1159,6 +1159,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_snapshot_policy_tests = b.addRunArtifact(snapshot_policy_tests);
+    run_snapshot_policy_tests.step.dependOn(&install_reference_paths.step);
     const snapshot_policy_options = b.addOptions();
     snapshot_policy_options.addOptionPath("native_outcome", native_outcome.getEmittedBin());
     snapshot_policy_options.addOptionPath("exec_audit", exec_audit.getEmittedBin());
