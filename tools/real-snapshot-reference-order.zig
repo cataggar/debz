@@ -889,7 +889,7 @@ fn listDirectoryBeneath(allocator: std.mem.Allocator, root_fd: i32, relative: []
             pos += dirent.reclen;
         }
     }
-    std.mem.sort([]const u8, names.items, {}, struct {
+    std.sort.heap([]const u8, names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }
@@ -2561,7 +2561,7 @@ fn writeJsonRecords(allocator: std.mem.Allocator, writer: anytype, records: []co
         defer keys.deinit(allocator);
         var it = rec.fields.keyIterator();
         while (it.next()) |k| try keys.append(allocator, k.*);
-        std.mem.sort([]const u8, keys.items, {}, struct {
+        std.sort.heap([]const u8, keys.items, {}, struct {
             fn lessThan(_: void, a: []const u8, b: []const u8) bool {
                 return std.mem.lessThan(u8, a, b);
             }
@@ -2583,7 +2583,7 @@ fn writeJsonTriggers(allocator: std.mem.Allocator, writer: anytype, triggers: *c
     defer keys.deinit(allocator);
     var it = triggers.keyIterator();
     while (it.next()) |k| try keys.append(allocator, k.*);
-    std.mem.sort([]const u8, keys.items, {}, struct {
+    std.sort.heap([]const u8, keys.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

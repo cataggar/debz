@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import pathlib
 import codecs
+import contextlib
+import io
 import re
 import hashlib
 import json
@@ -75,7 +77,7 @@ REMOVED_TEST_ENTRY_POINTS = {
 }
 
 SHA256_TOKEN = re.compile(
-    r"(?i)(?:sha-256|sha256|[A-Za-z_][A-Za-z0-9_]*(?:sha_256|sha256)[A-Za-z0-9_]*)"
+    r"(?i)(?:sha-256|sha256|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?:sha_256|sha256)[A-Za-z0-9_]*)"
 )
 RAW_32_BYTE = re.compile(r"\[\s*32\s*\](?:const\s+)?u8")
 FIXED_64_HEX = re.compile(
@@ -276,28 +278,172 @@ def normalized_line(text: str, offset: int) -> str:
     return " ".join(text[start:end].strip().split())
 
 
+def fast_normalized_line(text: str, offset: int, cache: dict[int, str]) -> str:
+    start = text.rfind("\n", 0, offset) + 1
+    cached = cache.get(start)
+    if cached is not None:
+        return cached
+    end = text.find("\n", start)
+    if end < 0:
+        end = len(text)
+    result = " ".join(text[start:end].strip().split())
+    cache[start] = result
+    return result
+
+
+RAW_32_ANCHOR = re.compile(r"32\s*\]\s*u8")
+WORD_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
+_DIGEST_FINDINGS_FILE_CACHE: dict[tuple[str, str], list[dict[str, str]]] = {}
+_DIGEST_CANDIDATES_FILE_CACHE: dict[tuple[str, str], list[dict[str, str]]] = {}
+
+
+def windows_from_offsets(
+    text: str,
+    offsets: list[int],
+    before: int = 160,
+    after: int = 160,
+) -> list[tuple[int, int]]:
+    if not offsets:
+        return []
+    offsets.sort()
+    length = len(text)
+    merged: list[list[int]] = []
+    for pos in offsets:
+        ws = max(0, pos - before)
+        while ws > 0 and text[ws - 1] in WORD_CHARS:
+            ws -= 1
+        we = min(length, pos + after)
+        while we < length and text[we] in WORD_CHARS:
+            we += 1
+        if merged and ws <= merged[-1][1]:
+            if we > merged[-1][1]:
+                merged[-1][1] = we
+        else:
+            merged.append([ws, we])
+    return [(w[0], w[1]) for w in merged]
+
+
+def iter_sub_windows(
+    text: str,
+    lower: str | None,
+    pattern: re.Pattern[str],
+    subs: tuple[str, ...],
+    before: int = 160,
+    after: int = 160,
+):
+    if lower is None:
+        yield from pattern.finditer(text)
+        return
+    offsets: list[int] = []
+    for sub in subs:
+        pos = lower.find(sub)
+        while pos != -1:
+            offsets.append(pos)
+            pos = lower.find(sub, pos + 1)
+    for ws, we in windows_from_offsets(text, offsets, before, after):
+        yield from pattern.finditer(text, ws, we)
+
+
+def iter_cas_layout(text: str, lower: str | None):
+    yield from iter_sub_windows(
+        text,
+        lower,
+        CAS_LAYOUT,
+        (
+            "packages-v",
+            "metadata-v",
+            "objects/",
+            "staging/",
+            "locks/",
+            "cachekey",
+            "cache_key",
+            "sha256-",
+            "cas",
+        ),
+        96,
+        96,
+    )
+
+
+def iter_digest_version(text: str, lower: str | None):
+    yield from iter_sub_windows(
+        text,
+        lower,
+        DIGEST_VERSION,
+        ("digest", "identity", "checksum", "hash", "schema", "format", "namespace"),
+        96,
+        96,
+    )
+
+
+def iter_fixed_64_hex(text: str, lower: str | None):
+    yield from iter_sub_windows(text, lower, FIXED_64_HEX, ("64",), 160, 160)
+
+
+def iter_raw_32_field(text: str):
+    offsets = [m.start() for m in RAW_32_ANCHOR.finditer(text)]
+    for ws, we in windows_from_offsets(text, offsets, 128, 32):
+        yield from RAW_32_FIELD.finditer(text, ws, we)
+
+
+def iter_fixed_sha256_cas(text: str, lower: str | None):
+    yield from iter_sub_windows(
+        text,
+        lower,
+        FIXED_SHA256_CAS,
+        ("sha256", "cache_key", "packages-v1", "metadata-v1"),
+        64,
+        64,
+    )
+
+
+def iter_sha256_token(text: str, lower: str | None):
+    yield from iter_sub_windows(
+        text,
+        lower,
+        SHA256_TOKEN,
+        ("sha256", "sha-256", "sha_256"),
+        96,
+        96,
+    )
+
+
+def digest_findings_for_file(relative: str, text: str) -> list[dict[str, str]]:
+    if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
+        return []
+    key = (relative, text)
+    cached = _DIGEST_FINDINGS_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    line_cache: dict[int, str] = {}
+    lower_candidate = text.lower()
+    lower = lower_candidate if len(lower_candidate) == len(text) else None
+    file_findings: list[dict[str, str]] = []
+    for kind, matches in (
+        ("cas_layout", iter_cas_layout(text, lower)),
+        ("digest_version", iter_digest_version(text, lower)),
+        ("fixed_64_hex", iter_fixed_64_hex(text, lower)),
+        ("raw_32_byte", RAW_32_BYTE.finditer(text)),
+        ("sha256_token", iter_sha256_token(text, lower)),
+    ):
+        for match in matches:
+            file_findings.append(
+                {
+                    "context": fast_normalized_line(text, match.start(), line_cache),
+                    "kind": kind,
+                    "path": relative,
+                    "token": match.group(),
+                }
+            )
+    if len(_DIGEST_FINDINGS_FILE_CACHE) < 512:
+        _DIGEST_FINDINGS_FILE_CACHE[key] = file_findings
+    return file_findings
+
+
 def digest_findings(texts: dict[str, str]) -> list[dict[str, str]]:
-    patterns = {
-        "cas_layout": CAS_LAYOUT,
-        "digest_version": DIGEST_VERSION,
-        "fixed_64_hex": FIXED_64_HEX,
-        "raw_32_byte": RAW_32_BYTE,
-        "sha256_token": SHA256_TOKEN,
-    }
     findings: list[dict[str, str]] = []
     for relative, text in sorted(texts.items()):
-        if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
-            continue
-        for kind, pattern in patterns.items():
-            for match in pattern.finditer(text):
-                findings.append(
-                    {
-                        "context": normalized_line(text, match.start()),
-                        "kind": kind,
-                        "path": relative,
-                        "token": match.group(),
-                    }
-                )
+        findings.extend(digest_findings_for_file(relative, text))
     return sorted(
         findings,
         key=lambda item: (
@@ -350,39 +496,54 @@ def schema_sha256_candidates(relative: str, text: str) -> list[dict[str, str]]:
     return candidates
 
 
+def digest_semantic_candidates_for_file(relative: str, text: str) -> list[dict[str, str]]:
+    if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
+        return []
+    key = (relative, text)
+    cached = _DIGEST_CANDIDATES_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    line_cache: dict[int, str] = {}
+    lower_candidate = text.lower()
+    lower = lower_candidate if len(lower_candidate) == len(text) else None
+    file_candidates: list[dict[str, str]] = []
+    for match in iter_raw_32_field(text):
+        file_candidates.append(
+            {
+                "context": fast_normalized_line(text, match.start(), line_cache),
+                "kind": "raw_32_byte_field",
+                "path": relative,
+                "selector": match.group("name"),
+            }
+        )
+    file_candidates.extend(schema_sha256_candidates(relative, text))
+    for match in iter_fixed_64_hex(text, lower):
+        file_candidates.append(
+            {
+                "context": fast_normalized_line(text, match.start(), line_cache),
+                "kind": "fixed_64_hex_assumption",
+                "path": relative,
+                "selector": match.group(),
+            }
+        )
+    for match in iter_fixed_sha256_cas(text, lower):
+        file_candidates.append(
+            {
+                "context": fast_normalized_line(text, match.start(), line_cache),
+                "kind": "fixed_sha256_cas",
+                "path": relative,
+                "selector": match.group(),
+            }
+        )
+    if len(_DIGEST_CANDIDATES_FILE_CACHE) < 512:
+        _DIGEST_CANDIDATES_FILE_CACHE[key] = file_candidates
+    return file_candidates
+
+
 def digest_semantic_candidates(texts: dict[str, str]) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     for relative, text in sorted(texts.items()):
-        if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
-            continue
-        for match in RAW_32_FIELD.finditer(text):
-            candidates.append(
-                {
-                    "context": normalized_line(text, match.start()),
-                    "kind": "raw_32_byte_field",
-                    "path": relative,
-                    "selector": match.group("name"),
-                }
-            )
-        candidates.extend(schema_sha256_candidates(relative, text))
-        for match in FIXED_64_HEX.finditer(text):
-            candidates.append(
-                {
-                    "context": normalized_line(text, match.start()),
-                    "kind": "fixed_64_hex_assumption",
-                    "path": relative,
-                    "selector": match.group(),
-                }
-            )
-        for match in FIXED_SHA256_CAS.finditer(text):
-            candidates.append(
-                {
-                    "context": normalized_line(text, match.start()),
-                    "kind": "fixed_sha256_cas",
-                    "path": relative,
-                    "selector": match.group(),
-                }
-            )
+        candidates.extend(digest_semantic_candidates_for_file(relative, text))
     return sorted(
         candidates,
         key=lambda item: (
@@ -7292,6 +7453,39 @@ def main() -> int:
     return 0
 
 
+_SERVER_MODE = False
+_SERVER_FILE_CACHE: dict[str, str] = {}
+_SERVER_DIGEST_TEXTS_CACHE: dict[str, str] | None = None
+
+
+def server_read_text(relative: str) -> str:
+    if not _SERVER_MODE:
+        return (ROOT / relative).read_text()
+    cached = _SERVER_FILE_CACHE.get(relative)
+    if cached is not None:
+        return cached
+    text = (ROOT / relative).read_text()
+    _SERVER_FILE_CACHE[relative] = text
+    return text
+
+
+def server_base_digest_texts() -> dict[str, str]:
+    global _SERVER_DIGEST_TEXTS_CACHE
+    if not _SERVER_MODE:
+        files = repository_digest_files(tracked_files())
+        maximum_text_bytes = 16 * 1024 * 1024
+        if len(files) > 1024 or any(path.is_symlink() for path in files):
+            raise OverflowError("digest check input exceeds repository bounds")
+        return tracked_digest_texts(files, maximum_text_bytes)
+    if _SERVER_DIGEST_TEXTS_CACHE is None:
+        files = repository_digest_files(tracked_files())
+        maximum_text_bytes = 16 * 1024 * 1024
+        if len(files) > 1024 or any(path.is_symlink() for path in files):
+            raise OverflowError("digest check input exceeds repository bounds")
+        _SERVER_DIGEST_TEXTS_CACHE = tracked_digest_texts(files, maximum_text_bytes)
+    return dict(_SERVER_DIGEST_TEXTS_CACHE)
+
+
 def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     """Apply a production policy validator to one bounded, external input."""
     limit = 2 * 1024 * 1024 if kind in ("native-final", "native-only-candidate", "native-provenance") else 1024 * 1024
@@ -7401,7 +7595,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             print("security-audit: invalid native wiring input", file=sys.stderr)
             return 2
         texts = {
-            path: (ROOT / path).read_text()
+            path: server_read_text(path)
             for path in paths if (ROOT / path).is_file()
         }
         if fixture["text"] is None:
@@ -7471,14 +7665,9 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         if not isinstance(fixture, dict) or set(fixture) != {"path", "text"} or not isinstance(fixture["path"], str) or not isinstance(fixture["text"], str):
             print("security-audit: invalid digest semantic input", file=sys.stderr)
             return 2
-        policy = json.loads((ROOT / DIGEST_POLICY_PATH).read_text())
-        files = repository_digest_files(tracked_files())
-        maximum_text_bytes = 16 * 1024 * 1024
-        if len(files) > 1024 or any(path.is_symlink() for path in files):
-            print("security-audit: digest check input exceeds repository bounds", file=sys.stderr)
-            return 2
+        policy = json.loads(server_read_text(DIGEST_POLICY_PATH.as_posix()))
         try:
-            texts = tracked_digest_texts(files, maximum_text_bytes)
+            texts = server_base_digest_texts()
         except OverflowError:
             print("security-audit: digest check input exceeds repository bounds", file=sys.stderr)
             return 2
@@ -7487,7 +7676,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = semantic_allowlist_failures(
             candidates,
             policy,
-            (ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH).read_text(),
+            server_read_text(DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix()),
         )
     elif kind == "digest-inventory":
         fixture = json.loads(text)
@@ -7505,9 +7694,9 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         ):
             print("security-audit: invalid digest inventory input", file=sys.stderr)
             return 2
-        policy = json.loads(fixture.get("policy", (ROOT / DIGEST_POLICY_PATH).read_text()))
-        inventory_text = fixture.get("inventory", (ROOT / DIGEST_INVENTORY_PATH).read_text())
-        texts = tracked_digest_texts(tracked_files())
+        policy = json.loads(fixture.get("policy", server_read_text(DIGEST_POLICY_PATH.as_posix())))
+        inventory_text = fixture.get("inventory", server_read_text(DIGEST_INVENTORY_PATH.as_posix()))
+        texts = server_base_digest_texts()
         if fixture["path"] not in texts:
             print("security-audit: digest inventory path is not audited", file=sys.stderr)
             return 2
@@ -7546,11 +7735,11 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
     elif kind == "digest-allowlist":
         policy = json.loads(text)
-        texts = tracked_digest_texts(tracked_files())
+        texts = server_base_digest_texts()
         failures = semantic_allowlist_failures(
             digest_semantic_candidates(texts),
             policy,
-            (ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH).read_text(),
+            server_read_text(DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix()),
         )
     elif kind == "digest-untracked":
         fixture = json.loads(text)
@@ -7627,11 +7816,40 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     return int(bool(failures))
 
 
+def run_check_server() -> int:
+    global _SERVER_MODE
+    _SERVER_MODE = True
+    real_stdout = sys.stdout
+    for raw_line in sys.stdin:
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            continue
+        kind, input_path, output_path = line.split("\t")
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            code = check_policy_input(kind, pathlib.Path(input_path))
+        pathlib.Path(output_path).write_text(
+            json.dumps(
+                {
+                    "code": code,
+                    "stdout": out_buf.getvalue(),
+                    "stderr": err_buf.getvalue(),
+                }
+            )
+        )
+        real_stdout.write("ok\n")
+        real_stdout.flush()
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--write-digest-inventory":
         raise SystemExit(write_digest_inventory(check=False))
     if len(sys.argv) == 2 and sys.argv[1] == "--check-digest-inventory":
         raise SystemExit(write_digest_inventory(check=True))
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-server":
+        raise SystemExit(run_check_server())
     if len(sys.argv) == 4 and sys.argv[1] == "check":
         raise SystemExit(check_policy_input(sys.argv[2], pathlib.Path(sys.argv[3])))
     if len(sys.argv) == 2 and sys.argv[1] == "native-only-candidate":

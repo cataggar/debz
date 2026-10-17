@@ -349,8 +349,8 @@ fn checkJobInventory(
     }
     const expected_sorted = try allocator.dupe([]const u8, expected_jobs);
     defer allocator.free(expected_sorted);
-    std.mem.sort([]const u8, expected_sorted, {}, lessThanSlice);
-    std.mem.sort([]const u8, installed.items, {}, lessThanSlice);
+    std.sort.heap([]const u8, expected_sorted, {}, lessThanSlice);
+    std.sort.heap([]const u8, installed.items, {}, lessThanSlice);
     return slicesEqual(installed.items, expected_sorted);
 }
 

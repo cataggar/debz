@@ -193,7 +193,7 @@ fn inventory(fixture: *foundation.Fixture, root: []const u8, scope: []const u8, 
             .data_hex = encoded,
         });
     }
-    std.mem.sort(Entry, rows.items, {}, struct {
+    std.sort.heap(Entry, rows.items, {}, struct {
         fn lessThan(_: void, left: Entry, right: Entry) bool {
             return std.mem.lessThan(u8, left.path, right.path);
         }

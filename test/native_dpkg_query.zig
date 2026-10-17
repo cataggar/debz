@@ -288,7 +288,7 @@ fn captureAdmin(allocator: std.mem.Allocator, io: std.Io, absolute: []const u8) 
         }
         try entries.append(a, observed);
     }
-    std.mem.sort(AdminEntry, entries.items, {}, lessAdminEntry);
+    std.sort.heap(AdminEntry, entries.items, {}, lessAdminEntry);
     return std.json.Stringify.valueAlloc(allocator, entries.items, .{ .whitespace = .indent_2 });
 }
 

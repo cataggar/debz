@@ -470,8 +470,8 @@ fn verifyDatabase(f: *foundation.Fixture, c: Case, root: []const u8, version: []
             return std.mem.lessThan(u8, left, right);
         }
     }.compare;
-    std.mem.sort([]const u8, expected.items, {}, less);
-    std.mem.sort([]const u8, found.items, {}, less);
+    std.sort.heap([]const u8, expected.items, {}, less);
+    std.sort.heap([]const u8, found.items, {}, less);
     try check(found.items.len == expected.items.len, "logical installed file list count");
     for (found.items, expected.items) |left, right| try check(eq(left, right), "logical installed file list");
     for ([_][]const u8{ "preinst", "postinst", "prerm", "postrm", "md5sums", "conffiles" }) |kind| {

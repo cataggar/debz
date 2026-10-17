@@ -545,7 +545,7 @@ fn compare(allocator: std.mem.Allocator, target: []const u8, native: *const Inve
     var iterator = paths.keyIterator();
     var index: usize = 0;
     while (iterator.next()) |path| : (index += 1) sorted[index] = path.*;
-    std.mem.sort([]const u8, sorted, {}, struct {
+    std.sort.heap([]const u8, sorted, {}, struct {
         fn less(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

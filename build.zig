@@ -29,6 +29,16 @@ pub fn build(b: *std.Build) void {
         "require_privileged_orchestration_tests",
         require_privileged_orchestration_tests,
     );
+    build_options.addOption(bool, "enable_external_lifecycle_fixtures", false);
+    const external_lifecycle_build_options = b.addOptions();
+    external_lifecycle_build_options.addOption([]const u8, "version", version);
+    external_lifecycle_build_options.addOption(bool, "native_helper_debug_info", native_helper_debug_info);
+    external_lifecycle_build_options.addOption(
+        bool,
+        "require_privileged_orchestration_tests",
+        require_privileged_orchestration_tests,
+    );
+    external_lifecycle_build_options.addOption(bool, "enable_external_lifecycle_fixtures", true);
 
     const zstd_dependency = b.dependency("zstd", .{
         .target = target,
@@ -62,46 +72,21 @@ pub fn build(b: *std.Build) void {
     });
     const libsolv = libsolv_dependency.artifact("solv");
 
-    const c_headers = b.addWriteFiles();
-    const libsolv_c_header = c_headers.add("libsolv_c.h",
-        \\#define LIBSOLV_INTERNAL 1
-        \\#include "solv/evr.h"
-        \\#include "solv/pool.h"
-        \\#include "solv/poolarch.h"
-        \\#include "solv/problems.h"
-        \\#include "solv/queue.h"
-        \\#include "solv/repo.h"
-        \\#include "solv/rules.h"
-        \\#include "solv/solver.h"
-        \\#include "solv/solvable.h"
-        \\#include "solv/transaction.h"
-        \\
-    );
-    const translate_libsolv = b.addTranslateC(.{
-        .root_source_file = libsolv_c_header,
+    const libsolv_c = b.createModule(.{
+        .root_source_file = b.path("build/libsolv_c.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
         .link_libc = true,
     });
-    translate_libsolv.addIncludePath(libsolv.getEmittedIncludeTree());
-    translate_libsolv.addIncludePath(libsolv_dependency.path("src"));
-    const libsolv_c = translate_libsolv.createModule();
 
-    const compression_c_header = c_headers.add("compression_c.h",
-        \\#define LZMA_API_STATIC 1
-        \\#include "lzma.h"
-        \\#include "zstd.h"
-        \\
-    );
-    const translate_compression = b.addTranslateC(.{
-        .root_source_file = compression_c_header,
+    const compression_c = b.createModule(.{
+        .root_source_file = b.path("build/compression_c.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = !native_helper_debug_info,
         .link_libc = true,
     });
-    translate_compression.addIncludePath(xz_dependency.path("src/liblzma/api"));
-    translate_compression.addIncludePath(zstd_dependency.path("lib"));
-    const compression_c = translate_compression.createModule();
 
     const debz = b.addModule("debz", .{
         .root_source_file = b.path("src/debz.zig"),
@@ -120,6 +105,24 @@ pub fn build(b: *std.Build) void {
     debz.linkLibrary(liblzma);
     debz.linkLibrary(zstd);
     debz.link_libc = true;
+
+    const native_lifecycle_test_module = b.createModule(.{
+        .root_source_file = b.path("src/debz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = !native_helper_debug_info,
+    });
+    native_lifecycle_test_module.addOptions("debz_build_options", external_lifecycle_build_options);
+    native_lifecycle_test_module.addImport("libsolv_c", libsolv_c);
+    native_lifecycle_test_module.addImport("compression_c", compression_c);
+    native_lifecycle_test_module.addIncludePath(libsolv_dependency.path("src"));
+    native_lifecycle_test_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    native_lifecycle_test_module.addIncludePath(zstd_dependency.path("lib"));
+    native_lifecycle_test_module.addCMacro("LZMA_API_STATIC", "1");
+    native_lifecycle_test_module.linkLibrary(libsolv);
+    native_lifecycle_test_module.linkLibrary(liblzma);
+    native_lifecycle_test_module.linkLibrary(zstd);
+    native_lifecycle_test_module.link_libc = true;
 
     const cli_backend_policy = b.createModule(.{
         .root_source_file = b.path("src/cli_backend_policy.zig"),
@@ -1402,7 +1405,7 @@ pub fn build(b: *std.Build) void {
         &run_required_production_security_tests.step,
     );
     const package_family_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = production_backend_test_module,
         .filters = &.{ "package_family_backend.test.", "product_api.test." },
     });
     const run_package_family_tests = b.addRunArtifact(package_family_tests);
@@ -2121,7 +2124,7 @@ pub fn build(b: *std.Build) void {
     workload_native.dependOn(&signed_proc_compare_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = native_lifecycle_test_module,
         .filters = &.{
             "native_unpack.test.lifecycle external fixture",
             "production workflow external native fixture",
@@ -2163,6 +2166,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&native_trigger_helper.step);
     for ([_]*std.Build.Module{
         debz,
+        native_lifecycle_test_module,
         production_backend_test_module,
         apt_system_command_test_module,
         apt_system_orchestrator_test_module,
@@ -3231,7 +3235,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_provenance_tests.step);
 
     const legacy_compat_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = native_lifecycle_test_module,
         .filters = &.{
             "legacy_compat.test.",
             "system_profile.test.legacy compatibility",
@@ -3252,7 +3256,7 @@ pub fn build(b: *std.Build) void {
         "Rehearse opt-in CLI selection and pre-mutation root refusal without changing release defaults",
     );
     const rehearsal_backend_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = native_lifecycle_test_module,
         .filters = &.{
             "root_operation.test.native-only rehearsal",
             "production native-only rehearsal",
@@ -3360,16 +3364,8 @@ fn addReleaseToolModule(
     });
     // The product keeps its decoder-only library; only release tooling encodes XZ.
     const release_liblzma = liblzma_build.addStaticEncoderLibrary(b, xz_dependency, target, optimize);
-    const translate_lzma = b.addTranslateC(.{
-        .root_source_file = xz_dependency.path("src/liblzma/api/lzma.h"),
-        .target = target,
-        .optimize = release_tool_module.optimize orelse .Debug,
-        .link_libc = true,
-    });
-    translate_lzma.defineCMacro("LZMA_API_STATIC", "1");
-    translate_lzma.addIncludePath(xz_dependency.path("src/liblzma/api"));
     release_tool_module.addImport("debz", debz);
-    release_tool_module.addImport("lzma_c", translate_lzma.createModule());
+    release_tool_module.addImport("lzma_c", debz.import_table.get("compression_c").?);
     release_tool_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
     release_tool_module.addCMacro("LZMA_API_STATIC", "1");
     release_tool_module.linkLibrary(release_liblzma);
