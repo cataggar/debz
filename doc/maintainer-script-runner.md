@@ -455,7 +455,7 @@ fetch anything. It:
 - bootstraps the same unregistered tool root as
   `tools/real-snapshot-reference.sh`, then lets **pinned dpkg** install the
   closure in the reviewed order with
-  `tools/real-snapshot-reference-order.py --prestate`. Non-target packages
+  `debz-reference-order --prestate`. Non-target packages
   are configured in explicit batches, so no target is configured
   implicitly. Before systemd and udev are configured, the order tool binds
   each unchanged signed postinst `noexec`: dpkg records `half-configured`

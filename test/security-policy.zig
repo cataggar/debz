@@ -3070,6 +3070,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-order.zig", &.{
         "pub fn verifyKbdCycle(\n",
         "pub fn verifyTriggerHandlers(\n",
+        "pub fn launcherCommand(\n",
+        "fn execProcessTriggers(\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{

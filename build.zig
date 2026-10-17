@@ -1208,6 +1208,7 @@ pub fn build(b: *std.Build) void {
     audit_tests.step.dependOn(&install_native_dpkg.step);
     audit_tests.step.dependOn(&install_reference_protected.step);
     audit_step.dependOn(&audit_tests.step);
+    audit_step.dependOn(&run_reference_order_tests.step);
     audit_step.dependOn(&debian_closure_tests.step);
     audit_step.dependOn(&run_release_workflow_policy_tests.step);
     const private_network_module = b.createModule(.{

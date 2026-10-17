@@ -1138,7 +1138,7 @@ authorize arbitrary signed scripts.
 requires an explicitly selected, SHA256-checked pinned dpkg fixture and never
 runs as root.
 
-For the amd64 reference closure (#265), `tools/real-snapshot-reference-order.py`
+For the amd64 reference closure (#265), `tools/real-snapshot-reference-order.zig`
 and `tools/real-snapshot-reference-launcher.zig` process pending triggers one
 signed handler at a time (`libc-bin:amd64` for `ldconfig`, then `procps:amd64`
 for `/usr/lib/sysctl.d`). Before and inside the confined chroot, both the

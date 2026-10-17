@@ -3,7 +3,7 @@
 # sudo proc replays from the authenticated amd64 closure that
 # tools/real-snapshot-signed-proc-bindings.sh downloaded into WORKSPACE.
 # Pinned dpkg installs that exact closure in the reviewed reference order;
-# tools/real-snapshot-reference-order.py copies the root just before each
+# tools/real-snapshot-reference-order.zig copies the root just before each
 # target is configured. Systemd and udev are copied after dpkg recorded
 # half-configured and was denied execution of the unchanged signed postinst;
 # sudo is copied while it is still unpacked. The copies are disposable
@@ -93,7 +93,8 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   exit 2
 }
 require_protected_file "$script_path"
-require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
+require_protected_file "$repository_root/tools/real-snapshot-reference-order.zig"
+require_protected_file "$repository_root/tools/real-snapshot-reference-paths.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
 require_protected_file "$repository_root/src/private_network.zig"
@@ -268,9 +269,10 @@ launcher=$tools/reference-launcher
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
 require_protected_file "$launcher"
-"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+"$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
   --cache-dir "$tools/zig-cache" --global-cache-dir "$tools/zig-global-cache" \
   --prefix "$tools/runtime-tool"
+require_protected_file "$tools/runtime-tool/bin/debz-reference-order"
 runtime=$tools/reference-runtime
 "$tools/runtime-tool/bin/debz-reference-runtime" record \
   amd64 "$lock" "$cache" "$pinned" "$runtime"
@@ -292,7 +294,7 @@ require_protected_file "$tools/libcap-ng.so.0.0.0"
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 5m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$tools/runtime-tool/bin/debz-reference-order" \
     --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prove-base-cycle "$tools/setpriv"
@@ -302,7 +304,7 @@ if [[ $purpose == python3 ]]; then
   env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
     unshare --mount --propagation private -- \
     timeout --signal=TERM --kill-after=30s 20m \
-    python3 -B tools/real-snapshot-reference-order.py \
+    "$tools/runtime-tool/bin/debz-reference-order" \
       --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
       --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
       --prestate "python3:amd64=unpacked:$prestates/python3"
@@ -316,7 +318,7 @@ fi
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 20m \
-  python3 tools/real-snapshot-reference-order.py \
+  "$tools/runtime-tool/bin/debz-reference-order" \
     --launcher "$launcher" --runtime "$runtime" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prestate "systemd:amd64=half-configured:$prestates/systemd" \
