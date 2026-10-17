@@ -915,6 +915,43 @@ pub fn build(b: *std.Build) void {
     vendor_snapshot_tools_test_step.dependOn(&run_vendor_snapshot_tools_tests.step);
     workload_core.dependOn(&run_vendor_snapshot_tools_tests.step);
 
+    const reference_stage_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-stage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = !native_helper_debug_info,
+    });
+    reference_stage_module.addImport("reference_paths", reference_paths_module);
+    const reference_stage = b.addExecutable(.{
+        .name = "debz-reference-stage",
+        .root_module = reference_stage_module,
+    });
+    const install_reference_stage = b.addInstallArtifact(reference_stage, .{});
+    b.getInstallStep().dependOn(&install_reference_stage.step);
+    const reference_stage_step = b.step(
+        "build-reference-stage",
+        "Build descriptor-rooted protected snapshot staging, fixture mutation, and callback sealing tooling",
+    );
+    reference_stage_step.dependOn(&install_reference_stage.step);
+    const reference_stage_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-stage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = !native_helper_debug_info,
+    });
+    reference_stage_test_module.addImport("reference_paths", reference_paths_module);
+    const reference_stage_tests = b.addTest(.{
+        .root_module = reference_stage_test_module,
+    });
+    const run_reference_stage_tests = b.addRunArtifact(reference_stage_tests);
+    run_reference_stage_tests.step.dependOn(&install_reference_stage.step);
+    const reference_stage_test_step = b.step(
+        "test-real-snapshot-stage",
+        "Test descriptor-rooted protected snapshot staging, fixture mutations, and callback sealing",
+    );
+    reference_stage_test_step.dependOn(&run_reference_stage_tests.step);
+    workload_core.dependOn(&run_reference_stage_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
