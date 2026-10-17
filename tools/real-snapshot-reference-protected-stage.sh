@@ -86,7 +86,8 @@ for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-runtime.zig \
   tools/real-snapshot-reference-escape-probe.zig \
   src/private_network.zig src/fixtures/script_network_probe.zig \
-  tools/prepare-native-dpkg.zig tools/real_snapshot_reference_paths.py; do
+  tools/prepare-native-dpkg.zig tools/real-snapshot-reference-paths.zig \
+  zig-out/bin/debz-reference-paths; do
   require_protected_file "$repository_root/$input"
 done
 require_protected_path "$repository_root/.real-snapshot"
@@ -99,13 +100,7 @@ debz=$(realpath -- "$2")
 workspace=$(realpath -m -- "$3")
 require_protected_file "$zig"
 require_protected_path "$(dirname -- "$zig")/lib"
-python3 -I - "$repository_root/tools" "$zig" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import toolchain
-print(toolchain(Path(sys.argv[2])))
-PY
+"$repository_root/zig-out/bin/debz-reference-paths" toolchain "$zig"
 require_protected_file "$debz"
 require_protected_file "$keyring"
 [[ -x "$zig" && -x "$debz" ]]

@@ -227,20 +227,13 @@ install_ceiling_seconds=$(install_bound \
 readonly install_progress_limit_seconds install_ceiling_seconds
 [[ -x "$debz" ]]
 case "$workspace" in "$repository_root"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
-python3 -I - "$repository_root/tools" "$repository_root" "$debz" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-repository, debz = map(Path, sys.argv[2:])
-protected(repository, directory=True)
-protected(repository / ".real-snapshot", directory=True)
-for path in (debz, repository / "zig-out/bin/debz-exec-audit",
-             Path(sys.argv[1]) / "real-snapshot-acceptance.sh",
-             Path(sys.argv[1]) / "real-snapshot-reference-protected-ci.sh",
-             Path(sys.argv[1]) / "real_snapshot_reference_paths.py"):
-    protected(path)
-PY
+"$repository_root/zig-out/bin/debz-reference-paths" protected --directory \
+  "$repository_root" "$repository_root/.real-snapshot"
+"$repository_root/zig-out/bin/debz-reference-paths" protected \
+  "$debz" "$repository_root/zig-out/bin/debz-exec-audit" \
+  "$repository_root/zig-out/bin/debz-reference-paths" \
+  "$repository_root/tools/real-snapshot-acceptance.sh" \
+  "$repository_root/tools/real-snapshot-reference-protected-ci.sh"
 [[ ! -e "$5" && ! -L "$5" && ! -e "$workspace" && ! -L "$workspace" ]] || {
   echo "snapshot workspace must be new: $workspace" >&2
   exit 2

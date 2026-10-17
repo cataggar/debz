@@ -48,19 +48,13 @@ require_protected_file "$checkout/tools/real-snapshot-python3-reference.sh"
 require_protected_file "$checkout/zig-out/bin/debz-native-dpkg-reference"
 require_protected_file "$checkout/zig-out/bin/debz-reference-stage"
 require_protected_file "$checkout/tools/real-snapshot-stage.zig"
-require_protected_file "$checkout/tools/real_snapshot_reference_paths.py"
+require_protected_file "$checkout/zig-out/bin/debz-reference-paths"
 require_protected_file "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
 zig=${DEBZ_ZIG:-}
 [[ "$zig" == /* ]]
-python3 -B -I - "$checkout/tools" "$zig" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import toolchain
-toolchain(Path(sys.argv[2]))
-PY
+"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null
 fixture() {
   "$checkout/zig-out/bin/debz-reference-stage" python "$@"
 }

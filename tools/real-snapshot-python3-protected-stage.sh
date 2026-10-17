@@ -14,28 +14,19 @@ zig=$1 debz=$2 pinned=$3 workspace=$4
 [[ "$workspace" == "$checkout/.real-snapshot/python3-amd64" &&
   ! -e "$workspace" && ! -L "$workspace" ]]
 [[ -n ${DEBZ_REAL_SNAPSHOT_KEYRING:-} ]]
-python3 -B -I - "$checkout/tools" "$checkout" "$zig" "$debz" "$pinned" \
-  "$DEBZ_REAL_SNAPSHOT_KEYRING" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected, toolchain
-checkout = Path(sys.argv[2])
-for relative in ("tools/real-snapshot-python3-protected-stage.sh",
-                 "tools/real-snapshot-python3-reference.sh",
-                 "tools/real-snapshot-signed-proc-bindings.sh",
-                 "tools/real-snapshot-signed-proc-prestates.sh",
-                 "tools/real-snapshot-reference-order.zig",
-                 "tools/real-snapshot-reference-paths.zig",
-                 "tools/real-snapshot-stage.zig",
-                 "zig-out/bin/debz-reference-stage",
-                 "tools/real_snapshot_reference_paths.py"):
-    protected(checkout / relative)
-protected(checkout / ".real-snapshot", directory=True)
-toolchain(Path(sys.argv[3]))
-for argument in sys.argv[4:]:
-    protected(Path(argument))
-PY
+"$checkout/zig-out/bin/debz-reference-paths" protected --directory "$checkout/.real-snapshot"
+"$checkout/zig-out/bin/debz-reference-paths" protected \
+  "$checkout/tools/real-snapshot-python3-protected-stage.sh" \
+  "$checkout/tools/real-snapshot-python3-reference.sh" \
+  "$checkout/tools/real-snapshot-signed-proc-bindings.sh" \
+  "$checkout/tools/real-snapshot-signed-proc-prestates.sh" \
+  "$checkout/tools/real-snapshot-reference-order.zig" \
+  "$checkout/tools/real-snapshot-reference-paths.zig" \
+  "$checkout/tools/real-snapshot-stage.zig" \
+  "$checkout/zig-out/bin/debz-reference-paths" \
+  "$checkout/zig-out/bin/debz-reference-stage" \
+  "$debz" "$pinned" "$DEBZ_REAL_SNAPSHOT_KEYRING"
+"$checkout/zig-out/bin/debz-reference-paths" toolchain "$zig" >/dev/null
 bash "$checkout/tools/real-snapshot-reference-protected-ci.sh" \
   --check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING" >/dev/null
 export DEBZ_ZIG=$zig PYTHONDONTWRITEBYTECODE=1

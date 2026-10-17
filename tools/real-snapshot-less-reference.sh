@@ -41,7 +41,7 @@ require_protected_file() {
 checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-less-reference.sh" ]]
 for file in tools/real-snapshot-less-reference.sh zig-out/bin/debz-native-dpkg-reference \
-  zig-out/bin/debz-reference-stage tools/real-snapshot-stage.zig tools/real_snapshot_reference_paths.py \
+  zig-out/bin/debz-reference-stage tools/real-snapshot-stage.zig \
   src/fixtures/ubuntu-resolute-less.preinst src/fixtures/ubuntu-resolute-less.postinst; do require_protected_file "$checkout/$file"; done
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]

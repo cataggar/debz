@@ -92,15 +92,22 @@ export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR
 test "$(git -C "$checkout" rev-parse HEAD)" = "$candidate"
 test -z "$(git -C "$checkout" status --porcelain)"
-python3 -I - "$checkout/tools" "$checkout" "$candidate_bundle" "$control_bundle" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-protected(Path(sys.argv[2]), directory=True)
-for name in sys.argv[3:]:
-    protected(Path(name))
-PY
+require_protected_path() {
+  local current=$1
+  [[ $current == /* ]] || exit 2
+  while :; do
+    [[ ! -L "$current" && -e "$current" && $(stat -c '%u:%g' "$current") == 0:0 ]] || exit 2
+    local mode
+    mode=$(stat -c '%a' "$current")
+    (( (8#$mode & 0022) == 0 )) || exit 2
+    [[ $current != / ]] || break
+    current=$(dirname -- "$current")
+  done
+}
+[[ -d "$checkout" && ! -L "$checkout" ]]
+require_protected_path "$checkout"
+require_protected_path "$candidate_bundle"
+require_protected_path "$control_bundle"
 bash "$checkout/tools/real-snapshot-acceptance.sh" --validate-values "$uri" "$suite" "$architecture"
 for bundle in "$candidate_bundle" "$control_bundle"; do
   [[ $bundle == "$orchestrator/"* && -f $bundle && ! -L $bundle &&

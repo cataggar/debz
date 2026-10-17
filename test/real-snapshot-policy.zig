@@ -55,14 +55,26 @@ const Driver = struct {
             \\#!/usr/bin/env bash
             \\[[ $# == 2 && $1 == --check-keyring && -f $2 && ! -L $2 ]] || exit 2
         ++ "\n");
-        try work.write("tools/real_snapshot_reference_paths.py",
-            \\def protected(path, directory=False):
-            \\    if not path.is_absolute():
-            \\        raise ValueError(f"reference path is not absolute: {path}")
-            \\    return path.stat()
-        ++ "\n");
         try work.directory.dir.createDirPath(support.io, ".real-snapshot");
         try work.directory.dir.createDirPath(support.io, "zig-out/bin");
+        try work.write("zig-out/bin/debz-reference-paths",
+            \\#!/usr/bin/env bash
+            \\set -euo pipefail
+            \\[[ ${1:-} == protected ]] || exit 2
+            \\shift
+            \\directory=false
+            \\if [[ ${1:-} == --directory ]]; then directory=true; shift; fi
+            \\[[ $# -ge 1 ]] || exit 2
+            \\for path in "$@"; do
+            \\  [[ $path == /* && ! -L $path ]] || exit 1
+            \\  if [[ $directory == true ]]; then [[ -d $path ]] || exit 1; else [[ -f $path ]] || exit 1; fi
+            \\done
+        ++ "\n");
+        const reference_paths_bin = try work.path("zig-out/bin/debz-reference-paths");
+        defer support.allocator.free(reference_paths_bin);
+        const reference_paths_mode = try support.run(&.{ "chmod", "0700", reference_paths_bin });
+        defer reference_paths_mode.deinit();
+        try reference_paths_mode.ok();
         const exec_audit_bytes = try std.Io.Dir.cwd().readFileAlloc(
             support.io,
             @import("snapshot_policy_options").exec_audit,
@@ -272,7 +284,7 @@ test "snapshot: production acceptance refuses the unprotected offline trust fixt
         "env", key, "bash", "tools/real-snapshot-acceptance.sh", "--validate", uri, "resolute", f.arch,
     });
     defer result.deinit();
-    try result.failsWith("writable or non-root ancestor");
+    try result.failsWith("keyring verification failed: UnprotectedReferencePath");
 }
 
 test "snapshot: existing directory and dangling symlink refuse before fixture CLI or mutation" {
@@ -2332,7 +2344,7 @@ test "snapshot: reference shell and signed proc prestates build launcher and ref
         });
         defer refused.deinit();
         try testing.expect(refused.code != 0);
-        try refused.failsWith("non-root or writable reference path");
+        try refused.failsWith("protected path check failed: UnprotectedReferencePath");
     }
 }
 
@@ -2437,15 +2449,7 @@ test "snapshot: protected native CI evidence export and coordination capture enf
     const exporter_py = try work.path("exporter.py");
     defer support.allocator.free(exporter_py);
 
-    const collector_patched = try std.mem.replaceOwned(
-        u8,
-        support.allocator,
-        raw_collector,
-        "from real_snapshot_reference_paths import open_absolute, open_beneath",
-        "import real_snapshot_reference_paths as _rp\n_rp.ROOT_OVERRIDE = Path(sys.argv[2]).parent\nopen_absolute = _rp.open_absolute\nopen_beneath = _rp.open_beneath",
-    );
-    defer support.allocator.free(collector_patched);
-    try work.write("collector.py", collector_patched);
+    try work.write("collector.py", raw_collector);
     const collector_py = try work.path("collector.py");
     defer support.allocator.free(collector_py);
 

@@ -38,15 +38,8 @@ readonly archive_keyring_sha256=80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01
 readonly archive_keyring_size=3607
 
 if [[ ${1:-} == --check-keyring && $# == 2 ]]; then
-  python3 -I - "$(dirname -- "${BASH_SOURCE[0]}")" "$2" \
-    "$archive_keyring_size" "$archive_keyring_sha256" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import verify_keyring
-print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))
-PY
-  exit "$?"
+  exec "$(dirname -- "${BASH_SOURCE[0]}")/../zig-out/bin/debz-reference-paths" \
+    verify-keyring "$2" "$archive_keyring_size" "$archive_keyring_sha256"
 fi
 
 mode=proof
@@ -512,7 +505,6 @@ test -z "$(git -C "$checkout" status --porcelain --ignored)"
 staged_archive_keyring=
 stage_verified_archive_keyring
 readonly staged_archive_keyring
-step tree-initial 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 
 # Zig from the pinned release, accepted only after its pinned size, SHA256 and
 # both minisign signatures verify against the pinned key.
@@ -536,16 +528,17 @@ with tarfile.open(sys.argv[1]) as archive:
     archive.extractall(sys.argv[2], filter="data")
 ' "$downloads/$zig_name.tar.xz" "$tree/zig"
 zig=$tree/zig/$zig_name/zig
-step zig-library-check 0 "" python3 -I - "$checkout/tools" "$zig" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import toolchain
-print(toolchain(Path(sys.argv[2])))
-PY
 zenv=(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C
   "ZIG_GLOBAL_CACHE_DIR=$tree/zig-global" "ZIG_LOCAL_CACHE_DIR=$checkout/.zig-cache")
 step zig-version 0 "$zig_version" "${zenv[@]}" "$zig" version
+reference_paths=$tree/debz-reference-paths
+step reference-paths-build 0 "" "${zenv[@]}" "$zig" build-exe -O ReleaseSafe \
+  -Mroot=tools/real-snapshot-reference-paths.zig \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
+  -femit-bin="$reference_paths"
+chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$reference_paths"
+step tree-initial 0 "" "$reference_paths" tree "$tree"
+step zig-library-check 0 "" "$reference_paths" toolchain "$zig"
 
 # Zig 0.16 writes fetched package files with their archive modes, including
 # group/world-writable 0777 scripts. Tighten them, then verify and record every
@@ -556,11 +549,11 @@ step zig-fetch 0 "" "${zenv[@]}" "$zig" build --fetch
 find zig-pkg "$tree/zig-global" -xdev -perm /0022 ! -type l -printf '%M %u:%g %p\n' \
   >"$evidence/zig-pkg-writable-before.txt"
 chmod -R go-w zig-pkg "$tree/zig-global"
-step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \
+step zig-pkg-verify 0 "" "$reference_paths" packages \
   "$checkout/zig-pkg" "$evidence/zig-pkg-manifest.txt"
 step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize="$native_optimize" -j2
 chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$checkout/zig-out"
-step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+step tree-built 0 "" "$reference_paths" tree "$tree"
 
 stage_native_inputs() {
   step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize="$native_optimize" -j2
@@ -578,7 +571,7 @@ stage_native_inputs() {
   printf '%s\n' "$zig" "$tree/reference-dpkg/usr/bin/dpkg" "$staged_archive_keyring" \
     >"$tree/native-inputs.args"
   printf '%s\n' "$native_optimize" >"$tree/native-optimize.txt"
-  step native-tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+  step native-tree-staged 0 "" "$reference_paths" tree "$tree"
 }
 if [[ $mode == native-staging ]]; then
   stage_native_inputs
@@ -594,7 +587,7 @@ step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring
 arguments=$workspace/reference-protected.args
 mapfile -t proof_arguments <"$arguments"
 [[ ${#proof_arguments[@]} == 15 ]]
-step tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+step tree-staged 0 "" "$reference_paths" tree "$tree"
 
 # Preflight negatives: each must refuse before any reference launch and leave
 # its new workspace empty.
@@ -665,13 +658,7 @@ if [[ $architecture == amd64 ]]; then
     "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
     bash tools/real-snapshot-python3-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" \
     "$workspace/dpkg/usr/bin/dpkg" "$python3_workspace"
-  python3 -B -I - "$checkout/tools" "$python3_workspace/evidence/python3-reference.args" <<'PY'
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-protected(Path(sys.argv[2]))
-PY
+  "$reference_paths" protected "$python3_workspace/evidence/python3-reference.args"
   mapfile -t python3_arguments <"$python3_workspace/evidence/python3-reference.args"
   [[ ${#python3_arguments[@]} == 20 ]]
   step python3-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
@@ -781,5 +768,5 @@ if grep -F " $tree" /proc/self/mountinfo >"$evidence/mounts-after.txt"; then
   echo "mounts remain beneath the protected tree" >&2
   exit 1
 fi
-step tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+step tree-final 0 "" "$reference_paths" tree "$tree"
 echo "protected reference CI: proof and preflight refusals passed for $architecture at $commit"
