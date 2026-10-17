@@ -770,6 +770,41 @@ pub fn build(b: *std.Build) void {
     reference_paths_test_step.dependOn(&run_reference_paths_tests.step);
     workload_core.dependOn(&run_reference_paths_tests.step);
 
+    const reference_order_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_order_module.addImport("reference_paths", reference_paths_module);
+    const reference_order = b.addExecutable(.{
+        .name = "debz-reference-order",
+        .root_module = reference_order_module,
+    });
+    const install_reference_order = b.addInstallArtifact(reference_order, .{});
+    b.getInstallStep().dependOn(&install_reference_order.step);
+    const reference_order_step = b.step(
+        "build-reference-order",
+        "Build bounded reference closure ordering, cycle breaking, and trigger verification tooling",
+    );
+    reference_order_step.dependOn(&install_reference_order.step);
+    const reference_order_test_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_order_test_module.addImport("reference_paths", reference_paths_module);
+    const reference_order_tests = b.addTest(.{
+        .root_module = reference_order_test_module,
+    });
+    const run_reference_order_tests = b.addRunArtifact(reference_order_tests);
+    run_reference_order_tests.step.dependOn(&install_reference_order.step);
+    const reference_order_test_step = b.step(
+        "test-real-snapshot-reference-order",
+        "Test reference closure ordering, cycle breaking, trigger handler verification, and prestate staging",
+    );
+    reference_order_test_step.dependOn(&run_reference_order_tests.step);
+    workload_core.dependOn(&run_reference_order_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
@@ -980,6 +1015,7 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_snapshot_policy_tests.step);
     audit_step.dependOn(&reference_triggers_tests.step);
     audit_step.dependOn(&run_reference_paths_tests.step);
+    audit_step.dependOn(&run_reference_order_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{

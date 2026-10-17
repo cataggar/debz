@@ -1111,7 +1111,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 68), members);
+    try testing.expectEqual(@as(usize, 69), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -3068,6 +3068,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-paths.zig", &.{
         "    try ed25519Verify(key, &prehash_digest, file_sig);\n",
         "    try ed25519Verify(key, global_message, global_signature);\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-order.zig", &.{
+        "pub fn verifyKbdCycle(\n",
+        "pub fn verifyTriggerHandlers(\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
