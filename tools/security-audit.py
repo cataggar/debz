@@ -5902,6 +5902,7 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
             "if (!std.meta.eql(original, try parent.root.entryIfExists(output))) return error.FixtureDestinationChanged;",
             "if (point == .before_rename) try self.check();",
             'try environment.put("PATH", "/no-host-interpreters");',
+            '@import("integration-roots-check.zig").run(init.io, allocator, arguments.items[1..])',
         ),
         "actions/install/__tests__/integration.test.ts": (
             'str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository)',
@@ -5915,6 +5916,10 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
             'if [ ! -x "$repository_generator" ]; then',
             '"$repository_generator" \\',
         )
+    required["tools/test-integration-roots.sh"] += (
+        '"$repository_generator" --check-roots native-lock',
+        '"$repository_generator" --check-roots cache-result',
+    )
     for path in INTEGRATION_REPOSITORY_PATHS[5:8]:
         required[path] = (
             "std.fs.path.resolve(fixture.allocator, &.{ options.repository, options.integration_repository })",
@@ -5944,6 +5949,8 @@ def native_integration_repository_failures(texts: dict[str, str]) -> list[str]:
     for path in INTEGRATION_REPOSITORY_PATHS[3:]:
         if re.search(r"generate-integration-repository\.py|--fixture-python|DEBZ_INTEGRATION_(?:ARCHIVE|SIGNING)", texts.get(path, "")):
             failures.append(f"{path}: retired Python repository or helper adapter was restored")
+    if re.search(r"\bpython3?\b|jsonschema", texts.get("tools/test-integration-roots.sh", "")):
+        failures.append("tools/test-integration-roots.sh: retired Python integration-root check was restored")
     container = texts.get(".github/workflows/ci.yml", "").partition(
         "  download-action-container-fixture:"
     )[2].partition("\n  download-action-container:")[0]

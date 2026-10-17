@@ -2092,6 +2092,9 @@ test "security: actual integration signing binds every consumer to the native re
             "*) repository_generator=\"$PWD/$repository_generator\" ;;",
             "if [ ! -x \"$repository_generator\" ]; then",
         });
+    try nativeMutations(&f, "native-integration-signing", "tools/test-integration-roots.sh", &.{
+        "\"$repository_generator\" --check-roots native-lock",
+    });
     try nativeMutations(&f, "native-integration-signing", ".github/workflows/ci.yml", &.{
         "zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all",
         "\"$PWD/zig-out/bin/debz-integration-repository\"",

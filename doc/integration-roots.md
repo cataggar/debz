@@ -228,7 +228,9 @@ The build supplies the native repository driver, including custom install
 prefixes. Standalone generation first needs `zig build build-integration-repository`,
 then `zig-out/bin/debz-integration-repository --output /absolute/path --suite
 debian-stable --architecture arm64`. The driver directly reuses the native
-archive encoder, control-only extra-package parser and original test-key signer;
+archive encoder, control-only extra-package parser and original test-key signer,
+and `debz-integration-repository --check-roots` (`tools/integration-roots-check.zig`)
+validates the integration-root lock, package-cache, and provenance contracts;
 there is no Python producer or helper fallback.
 
 Accepted suites are `debian-stable` and `ubuntu-26.04`; architectures are

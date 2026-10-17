@@ -487,6 +487,13 @@ pub fn main(init: std.process.Init) !void {
     var iterator = init.minimal.args.iterate();
     _ = iterator.next();
     while (iterator.next()) |arg| try arguments.append(allocator, arg);
+    if (arguments.items.len > 0 and std.mem.eql(u8, arguments.items[0], "--check-roots")) {
+        @import("integration-roots-check.zig").run(init.io, allocator, arguments.items[1..]) catch |err| {
+            std.log.err("integration roots check refused: {s}", .{@errorName(err)});
+            return err;
+        };
+        return;
+    }
     const config = parse(allocator, arguments.items) catch |err| {
         std.log.err("integration repository arguments refused: {s}", .{@errorName(err)});
         return err;
@@ -626,4 +633,8 @@ test "repository CLI refuses destination and source aliases before clearing orig
     try refusal(allocator, output, &.{}, "UnsafeFixtureDestination");
     try std.testing.expectEqualStrings("original output\n", try temporary.dir.readFileAlloc(std.testing.io, "repository/sentinel", allocator, .limited(32)));
     try std.testing.expectEqualStrings("external bytes\n", try temporary.dir.readFileAlloc(std.testing.io, "outside", allocator, .limited(32)));
+}
+
+test {
+    _ = @import("integration-roots-check.zig");
 }
