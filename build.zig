@@ -1194,8 +1194,6 @@ pub fn build(b: *std.Build) void {
             "python3",
             "-m",
             "unittest",
-            "tools/test_real_snapshot_reference_launcher.py",
-            "tools/test_real_snapshot_reference_protected_ci.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
             "tools/test_real_snapshot_repin.py",
@@ -1203,10 +1201,8 @@ pub fn build(b: *std.Build) void {
     );
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
-    audit_tests.setEnvironmentVariable("DEBZ_REFERENCE_PROTECTED", getInstallPath(b, .bin, "debz-reference-protected"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
     audit_tests.step.dependOn(&install_native_dpkg.step);
-    audit_tests.step.dependOn(&install_reference_protected.step);
     audit_step.dependOn(&audit_tests.step);
     audit_step.dependOn(&run_reference_order_tests.step);
     audit_step.dependOn(&debian_closure_tests.step);

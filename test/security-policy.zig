@@ -3054,6 +3054,11 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;\n",
         "    if (network_ready != .SUCCESS) fail(status, 15, network_ready);\n",
         "        if (failure[0] == 15) return error.ReferenceNetworkSetupFailed;\n",
+        "if ((options.verb == .break_kbd_cycle) != (options.kbd_archives != null))",
+        "for (paths, kbd_cycle) |path, binding| {",
+        "if (child.options.verb == .break_kbd_cycle)\n        verifyCycle(.kbd)",
+        "if ((options.verb == .triggers_only) != (options.trigger_archive != null))",
+        "if (child.options.verb == .triggers_only)\n        verifyTriggerHandler(child.options.selector.?)",
     });
     try nativeMutations(&f, "protected-reference", "src/private_network.zig", &.{
         "    request.ifru.flags.UP = true;\n",
@@ -3068,10 +3073,12 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    try ed25519Verify(key, global_message, global_signature);\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-order.zig", &.{
-        "pub fn verifyKbdCycle(\n",
-        "pub fn verifyTriggerHandlers(\n",
-        "pub fn launcherCommand(\n",
-        "fn execProcessTriggers(\n",
+        "pub fn verifyKbdCycle(",
+        "pub fn breakKbdCycle(",
+        "pub fn verifyTriggerHandlers(",
+        "pub fn processTriggers(",
+        "fn execBreakKbdCycle(",
+        "fn execProcessTriggers(",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{

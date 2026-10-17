@@ -2106,7 +2106,7 @@ fn spawnWithRedirects(
     }
     const ustatus: u32 = @bitCast(status);
     if (linux.W.IFEXITED(ustatus)) return @intCast(linux.W.EXITSTATUS(ustatus));
-    if (linux.W.IFSIGNALED(ustatus)) return @intCast(@min(@as(u32, 255), 128 + @as(u32, @intFromEnum(linux.W.TERMSIG(ustatus)))));
+    if (linux.W.IFSIGNALED(ustatus)) return @intCast(@min(@as(u32, 255), 128 + @as(u32, @backingInt(linux.W.TERMSIG(ustatus)))));
     return 255;
 }
 
@@ -2211,7 +2211,7 @@ fn runCaptured(allocator: std.mem.Allocator, argv: []const []const u8, max_bytes
     const rc: u8 = if (linux.W.IFEXITED(ustatus))
         @intCast(linux.W.EXITSTATUS(ustatus))
     else if (linux.W.IFSIGNALED(ustatus))
-        @intCast(@min(@as(u32, 255), 128 + @as(u32, @intFromEnum(linux.W.TERMSIG(ustatus)))))
+        @intCast(@min(@as(u32, 255), 128 + @as(u32, @backingInt(linux.W.TERMSIG(ustatus)))))
     else
         255;
 
@@ -2621,8 +2621,8 @@ fn checkForbiddenInfoFiles(allocator: std.mem.Allocator, root: []const u8, names
 
 fn verifyInstalledFieldsMatchControl(installed: *const std.StringHashMap([]const u8), control: *const std.StringHashMap([]const u8), check_triggers: bool) !void {
     const compare_fields = [_][]const u8{
-        "depends", "pre-depends", "provides", "conflicts", "breaks", "replaces",
-        "multi-arch", "protected", "essential",
+        "depends",    "pre-depends", "provides",  "conflicts", "breaks", "replaces",
+        "multi-arch", "protected",   "essential",
     };
     for (compare_fields) |field| {
         if (!std.mem.eql(u8, installed.get(field) orelse "", control.get(field) orelse "")) {
@@ -4643,5 +4643,69 @@ test "reference order launcherCommand and parsePrestateSpec" {
     try std.testing.expectEqual(@as(usize, 8), conf_cmd.len);
     try std.testing.expectEqualStrings("systemd", conf_cmd[4]);
     try std.testing.expectEqualStrings("configure", conf_cmd[5]);
-}
 
+    // kbd cycle and trigger handler launcherCommand and negative refusals
+    try std.testing.expectEqual(@as(usize, 4), kbd_cycle.len);
+    try std.testing.expectEqualStrings("kbd", kbd_cycle[0].name);
+    try std.testing.expectEqualStrings("2.7.1-2ubuntu2", kbd_cycle[0].version);
+    try std.testing.expectEqualStrings("console-setup-linux", kbd_cycle[1].name);
+    try std.testing.expectEqualStrings("1.237ubuntu3.1", kbd_cycle[1].version);
+    try std.testing.expectEqualStrings("console-setup", kbd_cycle[2].name);
+    try std.testing.expectEqualStrings("1.237ubuntu3.1", kbd_cycle[2].version);
+    try std.testing.expectEqualStrings("libc6", kbd_cycle[3].name);
+    try std.testing.expectEqual(@as(usize, 2), trigger_handlers.len);
+    try std.testing.expectEqualStrings("libc-bin", trigger_handlers[0].name);
+    try std.testing.expectEqualStrings("ldconfig", trigger_handlers[0].pending);
+    try std.testing.expectEqualStrings("procps", trigger_handlers[1].name);
+    try std.testing.expectEqualStrings("/usr/lib/sysctl.d", trigger_handlers[1].pending);
+
+    var kbd_pkgs: [4]Package = undefined;
+    for (kbd_cycle, 0..) |pin, idx| {
+        kbd_pkgs[idx] = .{
+            .name = pin.name,
+            .version = pin.version,
+            .architecture = pin.architecture,
+            .digest = pin.sha512,
+            .declared_size = pin.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{pin.name}),
+        };
+    }
+    const kbd_launch = try launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", kbd_cycle_profile, "break_kbd_cycle", kbd_pkgs[0], &kbd_pkgs);
+    try std.testing.expectEqual(@as(usize, 12), kbd_launch.len);
+    try std.testing.expectEqualStrings("kbd_cycle", kbd_launch[4]);
+    try std.testing.expectEqualStrings("break_kbd_cycle", kbd_launch[5]);
+    try std.testing.expectEqualStrings("kbd:amd64", kbd_launch[6]);
+    try std.testing.expectError(error.CycleIdentityChanged, launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "arm64", kbd_cycle_profile, "break_kbd_cycle", kbd_pkgs[0], &kbd_pkgs));
+    try std.testing.expectError(error.CycleIdentityChanged, launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", "none", "break_kbd_cycle", kbd_pkgs[0], &kbd_pkgs));
+    try std.testing.expectError(error.CycleIdentityChanged, launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", kbd_cycle_profile, "break_kbd_cycle", kbd_pkgs[1], &kbd_pkgs));
+
+    for (trigger_handlers) |binding| {
+        const handler_pkg: Package = .{
+            .name = binding.name,
+            .version = binding.version,
+            .architecture = binding.architecture,
+            .digest = binding.sha512,
+            .declared_size = binding.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{binding.name}),
+        };
+        const trig_launch = try launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", binding.profile, "triggers_only", handler_pkg, &.{});
+        try std.testing.expectEqual(@as(usize, 9), trig_launch.len);
+        try std.testing.expectEqualStrings(binding.profile, trig_launch[4]);
+        try std.testing.expectEqualStrings("triggers_only", trig_launch[5]);
+        try std.testing.expectError(error.TriggerHandlerPinMismatch, launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "arm64", binding.profile, "triggers_only", handler_pkg, &.{}));
+        try std.testing.expectError(error.TriggerHandlerPinMismatch, launcherCommand(allocator, launcher, "/pinned/dpkg", "/root", "amd64", "systemd", "triggers_only", handler_pkg, &.{}));
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "evidence");
+    const tmp_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    const evidence_dir = try std.fs.path.join(allocator, &.{ tmp_root, "evidence" });
+    const probe_res = try probe(allocator, &.{ "/bin/sh", "-c", "printf 'probe-ok\\n'" }, evidence_dir);
+    try std.testing.expectEqual(@as(u8, 0), probe_res.status);
+    try std.testing.expectEqualStrings("probe-ok\n", probe_res.output);
+    const root_fd = try reference_paths.openAbsolute(tmp_root, true);
+    defer _ = linux.close(root_fd);
+    const remaining = try listDirectoryBeneath(allocator, root_fd, "evidence");
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}

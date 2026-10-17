@@ -50,7 +50,7 @@ const Driver = struct {
         defer support.allocator.free(reference_bytes);
         try work.write("tools/real-snapshot-reference.sh", reference_bytes);
         // Offline sequencing fixture only; production trust refusals and
-        // descriptor checks are exercised by the protected-CI Python tests.
+        // descriptor checks are exercised by the protected-CI Zig tests.
         try work.write("tools/real-snapshot-reference-protected-ci.sh",
             \\#!/usr/bin/env bash
             \\[[ $# == 2 && $1 == --check-keyring && -f $2 && ! -L $2 ]] || exit 2
@@ -133,7 +133,7 @@ const Driver = struct {
             const binary_arg = try std.fmt.allocPrint(support.allocator, "-femit-bin={s}", .{binary});
             defer support.allocator.free(binary_arg);
             const compiled = try support.runWithTimeout(&.{
-                "zig",                                                              "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
+                "zig",                                                            "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
                 if (@import("builtin").mode == .safe) "ReleaseSafe" else "Debug", binary_arg,
             }, .inherit, 120);
             defer compiled.deinit();
@@ -2276,4 +2276,224 @@ test "snapshot: every in-tree real-snapshot pin is a reviewed repin manifest ide
     try testing.expectEqual(@as(u8, 1), failed.code);
     try failed.failsWith("does not pin sha256:");
     try failed.failsWith("is absent from the manifest");
+}
+
+test "snapshot: reference shell and signed proc prestates build launcher and refuse unpinned dpkg" {
+    const reference = try source("tools/real-snapshot-reference.sh");
+    defer support.allocator.free(reference);
+    try testing.expect(std.mem.indexOf(u8, reference, "unshare") == null);
+    for ([_][]const u8{
+        "\"$zig\" build-exe -O ReleaseSafe -lc --dep private_network",
+        "-Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig",
+        "--zig-lib-dir \"$(dirname -- \"$zig\")/lib\"",
+        "zig-out/bin/debz-native-dpkg-reference --architecture \"$architecture\" \\\n  --verify-only \"$reference_dpkg\"",
+        "\"$workspace/runtime-tool/bin/debz-reference-order\" \\",
+        "--launcher \"$launcher\" --runtime \"$runtime\" --architecture \"$architecture\"",
+        "--dpkg \"$reference_dpkg\" --root \"$reference_root\"",
+        "--cache \"$cache\" --evidence \"$evidence\"",
+        "--report-only --architecture \"$architecture\"",
+    }) |required| try support.contains(reference, required);
+
+    const prestates = try source("tools/real-snapshot-signed-proc-prestates.sh");
+    defer support.allocator.free(prestates);
+    try testing.expect(std.mem.indexOf(u8, prestates, "chroot") == null);
+    for ([_][]const u8{
+        "zig-out/bin/debz-native-dpkg-reference --architecture amd64 --verify-only \"$pinned\"",
+        "\"$zig\" build-exe -O ReleaseSafe -lc --dep private_network",
+        "-Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig",
+        "--zig-lib-dir \"$(dirname -- \"$zig\")/lib\"",
+        "\"$tools/runtime-tool/bin/debz-reference-order\" \\",
+    }) |required| try support.contains(prestates, required);
+
+    var work = try support.Work.init();
+    defer work.deinit();
+    try work.directory.dir.createDirPath(support.io, "tools");
+    try work.write("tools/real-snapshot-reference.sh", reference);
+    const copied_script = try work.path("tools/real-snapshot-reference.sh");
+    defer support.allocator.free(copied_script);
+    const tmp_root = try work.path(".");
+    defer support.allocator.free(tmp_root);
+    const wrong_checkout = try support.run(&.{
+        "bash", copied_script, "/usr/bin/true", "/etc/passwd", tmp_root, "amd64", ".real-snapshot/unused",
+    });
+    defer wrong_checkout.deinit();
+    try testing.expectEqual(@as(u8, 2), wrong_checkout.code);
+    try wrong_checkout.failsWith("run the protected reference script from its checkout root");
+
+    if (std.os.linux.geteuid() != 0) {
+        const refused = try support.run(&.{
+            "bash",
+            "tools/real-snapshot-reference.sh",
+            "/usr/bin/true",
+            "/etc/passwd",
+            tmp_root,
+            "amd64",
+            ".real-snapshot/offline-reference-refusal-only",
+        });
+        defer refused.deinit();
+        try testing.expect(refused.code != 0);
+        try refused.failsWith("non-root or writable reference path");
+    }
+}
+
+test "snapshot: protected CI and stage scripts enforce offline refusals and pinned archive invariants" {
+    for ([_][]const []const u8{
+        &.{ "bash", "tools/real-snapshot-reference-protected-ci.sh" },
+        &.{ "bash", "tools/real-snapshot-reference-protected-ci.sh", "/srv/debz-protected/ci-1-1-amd64", "arm64", "0000000000000000000000000000000000000000" },
+        &.{ "bash", "tools/real-snapshot-reference-protected-ci.sh", "/tmp/elsewhere", "amd64", "0000000000000000000000000000000000000000" },
+        &.{ "bash", "tools/real-snapshot-reference-protected-stage.sh", "/zig", "/debz", "relative", "/workspace", "amd64" },
+        &.{ "bash", "tools/real-snapshot-reference-protected-stage.sh", "/zig", "/debz", "/key", "/workspace", "sparc64" },
+        &.{ "bash", "tools/real-snapshot-python3-protected-stage.sh", "/zig", "/debz", "relative", "/workspace", "/dpkg", "arm64" },
+        &.{ "bash", "tools/real-snapshot-python3-protected-stage.sh", "/zig", "/debz", "/key", "/workspace", "/dpkg", "amd64" },
+        &.{ "bash", "tools/real-snapshot-less-protected-stage.sh", "/zig", "/debz", "relative", "/workspace", "/dpkg", "arm64" },
+        &.{ "bash", "tools/real-snapshot-less-protected-stage.sh", "/zig", "/debz", "/key", "/workspace", "/dpkg", "amd64" },
+        &.{ "bash", "tools/real-snapshot-bash-protected-stage.sh", "/zig", "/debz", "relative", "/workspace", "/dpkg", "arm64" },
+        &.{ "bash", "tools/real-snapshot-bash-protected-stage.sh", "/zig", "/debz", "/key", "/workspace", "/dpkg", "amd64" },
+    }) |argv| {
+        const result = try support.run(argv);
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 2), result.code);
+    }
+
+    const no_keyring = try support.run(&.{
+        "env",
+        "-u",
+        "DEBZ_REAL_SNAPSHOT_KEYRING",
+        "bash",
+        "tools/real-snapshot-acceptance.sh",
+        "--validate",
+        "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z",
+        "resolute",
+        "amd64",
+    });
+    defer no_keyring.deinit();
+    try testing.expect(no_keyring.code != 0);
+    try no_keyring.failsWith("explicit regular Ubuntu archive keyring");
+
+    const stage = try source("tools/real-snapshot-reference-protected-stage.sh");
+    defer support.allocator.free(stage);
+    for ([_][]const u8{
+        "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z",
+        "--download-archive \"$workspace/build/dpkg.deb\"",
+        "--receipt-from-archive \"$workspace/build/dpkg.deb\" --prefix \"$dpkg_prefix\"",
+        "--verify-only \"$dpkg_prefix/usr/bin/dpkg\"",
+        "build-reference-runtime",
+        "-Dreference-protected-profile-scripts=",
+    }) |required| try support.contains(stage, required);
+
+    const py_stage = try source("tools/real-snapshot-python3-protected-stage.sh");
+    defer support.allocator.free(py_stage);
+    for ([_][]const u8{
+        "\"$checkout/zig-out/bin/debz-reference-stage\" python \"$@\"",
+        "bash tools/real-snapshot-signed-proc-prestates.sh --python3 \"$pinned\" \"$workspace\"",
+        "bash tools/real-snapshot-python3-reference.sh \"$pinned\" \"$input\" \"$lock\" \"$archive\"",
+        "fixture empty \"$before\"",
+        "fixture basic \"$workspace/bad-html\"",
+    }) |required| try support.contains(py_stage, required);
+
+    const less_stage = try source("tools/real-snapshot-less-protected-stage.sh");
+    defer support.allocator.free(less_stage);
+    for ([_][]const u8{
+        "zig-out/bin/debz-reference-stage prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\"",
+        "zig-out/bin/debz-reference-stage seal \"$source\"",
+        "bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\"",
+    }) |required| try support.contains(less_stage, required);
+
+    const bash_stage = try source("tools/real-snapshot-bash-protected-stage.sh");
+    defer support.allocator.free(bash_stage);
+    for ([_][]const u8{
+        "zig-out/bin/debz-reference-stage prepare-bash \"$source\" \"$lock\" \"$cache\" \"$pinned\"",
+        "zig-out/bin/debz-reference-stage seal-bash \"$source\"",
+        "zig-out/bin/debz-reference-stage bash-mutate-negatives \"$workspace\"",
+        "zig-out/bin/debz-reference-stage prepare-util-linux \"$util_source\" \"$lock\" \"$cache\" \"$pinned\"",
+        "test-real-snapshot-arm64-bash-source-protected",
+        "test-real-snapshot-arm64-util-linux-source-protected",
+    }) |required| try support.contains(bash_stage, required);
+
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const step_start = std.mem.indexOf(u8, workflow, "      - name: Execute signed binding refusal fixtures\n") orelse return error.MissingSignedBindingStep;
+    const step_end = std.mem.indexOfPos(u8, workflow, step_start + 1, "      - name:") orelse return error.MissingSignedBindingStep;
+    const step_block = workflow[step_start..step_end];
+    try support.contains(step_block, "grep -Eq '^[1-9][0-9]* passed; 3 skipped; 0 failed\\.$'");
+}
+
+test "snapshot: protected native CI evidence export and coordination capture enforce bounds and refuse aliases" {
+    const wrapper = try source("tools/real-snapshot-protected-native-ci.sh");
+    defer support.allocator.free(wrapper);
+    const exp_marker = "python3 -I - \"$evidence\" \"$upload\" <<'PY'\n";
+    const exp_start = (std.mem.indexOf(u8, wrapper, exp_marker) orelse return error.MissingExporter) + exp_marker.len;
+    const exp_end = std.mem.indexOfPos(u8, wrapper, exp_start, "\nPY\n") orelse return error.MissingExporter;
+    const exporter = wrapper[exp_start..exp_end];
+
+    const col_marker = "<<'PY' || coordination_status=$?\n";
+    const col_start = (std.mem.indexOf(u8, wrapper, col_marker) orelse return error.MissingCollector) + col_marker.len;
+    const col_end = std.mem.indexOfPos(u8, wrapper, col_start, "\nPY\n") orelse return error.MissingCollector;
+    const raw_collector = wrapper[col_start..col_end];
+
+    var work = try support.Work.init();
+    defer work.deinit();
+    try work.write("exporter.py", exporter);
+    const exporter_py = try work.path("exporter.py");
+    defer support.allocator.free(exporter_py);
+
+    const collector_patched = try std.mem.replaceOwned(
+        u8,
+        support.allocator,
+        raw_collector,
+        "from real_snapshot_reference_paths import open_absolute, open_beneath",
+        "import real_snapshot_reference_paths as _rp\n_rp.ROOT_OVERRIDE = Path(sys.argv[2]).parent\nopen_absolute = _rp.open_absolute\nopen_beneath = _rp.open_beneath",
+    );
+    defer support.allocator.free(collector_patched);
+    try work.write("collector.py", collector_patched);
+    const collector_py = try work.path("collector.py");
+    defer support.allocator.free(collector_py);
+
+    try work.directory.dir.createDirPath(support.io, "evidence/staging");
+    try work.directory.dir.createDirPath(support.io, "upload");
+    try work.directory.dir.createDirPath(support.io, "candidate/var/lib/debz");
+    try work.write("evidence/create.json", "{\"exit_status\":8,\"changed\":true}\n");
+    try work.write("evidence/create.stderr", "original native refusal\x00\xff\n");
+    try work.write("evidence/staging/compiler.txt", "original compiler provenance\n");
+    try work.write("candidate/var/lib/debz/root-operation-v1.json", "{\"phase\":\"script\",\"disposition\":\"recovery_required\"}\n");
+    try work.write("candidate/var/lib/debz/native-recovery-v1-blob-unselected", "not a coordination document");
+
+    const candidate_dir = try work.path("candidate");
+    defer support.allocator.free(candidate_dir);
+    const evidence_dir = try work.path("evidence");
+    defer support.allocator.free(evidence_dir);
+    const upload_dir = try work.path("upload");
+    defer support.allocator.free(upload_dir);
+
+    const cap_ok = try support.run(&.{ "python3", "-I", collector_py, "tools", candidate_dir, evidence_dir });
+    defer cap_ok.deinit();
+    try cap_ok.ok();
+    const inv = try work.read("evidence/native-coordination-inventory-v1.json");
+    defer support.allocator.free(inv);
+    try support.contains(inv, "\"capture_complete\": true");
+    try testing.expectError(error.FileNotFound, work.read("evidence/native-coordination/native-recovery-v1-blob-unselected"));
+
+    const exp_ok = try support.run(&.{ "python3", "-I", exporter_py, evidence_dir, upload_dir });
+    defer exp_ok.deinit();
+    try exp_ok.ok();
+    const exported_op = try work.read("upload/native-coordination/root-operation-v1.json");
+    defer support.allocator.free(exported_op);
+    try testing.expectEqualStrings("{\"phase\":\"script\",\"disposition\":\"recovery_required\"}\n", exported_op);
+    const sums = try work.read("upload/SHA256SUMS");
+    defer support.allocator.free(sums);
+    try support.contains(sums, "  create.json\n");
+    try support.contains(sums, "  native-coordination/root-operation-v1.json\n");
+
+    // Symlink in evidence is refused by exporter and indexed in export-failure.txt
+    try work.write("outside-secret", "must not be exported\n");
+    const secret_path = try work.path("outside-secret");
+    defer support.allocator.free(secret_path);
+    try work.directory.dir.symLink(support.io, secret_path, "evidence/untrusted", .{});
+    const exp_symlink = try support.run(&.{ "python3", "-I", exporter_py, evidence_dir, upload_dir });
+    defer exp_symlink.deinit();
+    try testing.expect(exp_symlink.code != 0);
+    try exp_symlink.failsWith("unsafe or oversized evidence member");
+    const failure_txt = try work.read("upload/export-failure.txt");
+    defer support.allocator.free(failure_txt);
+    try support.contains(failure_txt, "unsafe or oversized evidence member");
 }
