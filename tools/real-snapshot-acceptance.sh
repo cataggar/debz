@@ -649,14 +649,8 @@ printf 'changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n' \
   >"$evidence/update-zero-actions.txt"
 
 status_digest=$(sha256sum "$root/var/lib/dpkg/status" | cut -d' ' -f1)
-cp "$lock" "$evidence/injected-invalid.lock.json"
-python3 - "$evidence/injected-invalid.lock.json" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-value = json.loads(path.read_text())
-value["digest_sha256"] = ("0" if value["digest_sha256"][0] != "0" else "1") + value["digest_sha256"][1:]
-path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
-PY
+jq -c '.digest_sha256 = ((if .digest_sha256[0:1] != "0" then "0" else "1" end) + .digest_sha256[1:])' \
+  "$lock" >"$evidence/injected-invalid.lock.json"
 set +e
 run_candidate injected-failure "$verification_limit" "$debz" plan "${native_common[@]}" \
   --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal

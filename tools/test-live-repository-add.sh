@@ -56,29 +56,21 @@ sudo -n "$debz" repo add \
   --json >"$evidence/repo-add-result.json"
 
 # The operation state is root-only; keep a reviewer-readable copy.
-sudo -n python3 - "$evidence/repo-add-result.json" "$root" "$sha256" \
-  >"$evidence/apt-config-snapshot.json" <<'CHECK'
-import json
-import sys
-
-result = json.load(open(sys.argv[1]))
-for key, expected in (
-    ("exit_status", 0), ("installed", True), ("refreshed", True), ("refreshed_phase", "complete"),
-):
-    if result[key] != expected:
-        sys.exit(f"repo add {key}: {result[key]!r}, expected {expected!r}")
-if result["descriptor"]["sha256"] != sys.argv[3]:
-    sys.exit("repo add installed an unreviewed descriptor")
-raw = open(sys.argv[2] + result["paths"]["target_manifest"]).read()
-snapshot = json.loads(raw)
-freshness = [source["freshness"] for source in snapshot["sources"]]
-freshness += [policy["freshness"] for policy in snapshot["repository_policies"]]
-reviewed = {
-    "mode": "allow_missing_valid_until_with_max_age_seconds",
-    "maximum_release_age_seconds": 14 * 24 * 60 * 60,
-}
-if len(freshness) < 2 or any(item != reviewed for item in freshness):
-    sys.exit(f"unexpected freshness policies: {freshness}")
-sys.stdout.write(raw)
-CHECK
+jq -e --arg sha256 "$sha256" '
+  .exit_status == 0 and
+  .installed == true and
+  .refreshed == true and
+  .refreshed_phase == "complete" and
+  .descriptor.sha256 == $sha256
+' "$evidence/repo-add-result.json" >/dev/null
+target_manifest=$(jq -er '.paths.target_manifest' "$evidence/repo-add-result.json")
+sudo -n cat "$root$target_manifest" >"$evidence/apt-config-snapshot.json"
+jq -e '
+  ([.sources[].freshness, .repository_policies[].freshness]) as $freshness |
+  ($freshness | length >= 2) and
+  ($freshness | all(. == {
+    mode: "allow_missing_valid_until_with_max_age_seconds",
+    maximum_release_age_seconds: 1209600
+  }))
+' "$evidence/apt-config-snapshot.json" >/dev/null
 printf 'live repository add passed; evidence in %s\n' "$evidence"
