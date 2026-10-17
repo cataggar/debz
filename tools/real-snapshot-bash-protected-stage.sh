@@ -16,9 +16,10 @@ from pathlib import Path
 import sys
 sys.path.insert(0, sys.argv[1])
 from real_snapshot_reference_paths import protected, toolchain
-for name in ("real-snapshot-bash-protected-stage.sh", "real_snapshot_less_stage.py",
-             "real_snapshot_less_fixtures.py", "real-snapshot-reference-protected-stage.sh"):
+for name in ("real-snapshot-bash-protected-stage.sh", "real-snapshot-stage.zig",
+             "real-snapshot-reference-protected-stage.sh"):
     protected(Path(sys.argv[2]) / "tools" / name)
+protected(Path(sys.argv[2]) / "zig-out/bin/debz-reference-stage")
 toolchain(Path(sys.argv[3]))
 for argument in sys.argv[4:]:
     protected(Path(argument))
@@ -32,7 +33,7 @@ cp -a --reflink=auto --one-file-system -- "$workspace/template" "$source"
 lock=$workspace/evidence/runtime.lock.json
 cache=$workspace/snapshot/cache/packages-v2/objects
 pinned=$workspace/dpkg/usr/bin/dpkg
-python3 -B -I tools/real_snapshot_less_stage.py prepare-bash "$source" "$lock" "$cache" "$pinned" \
+zig-out/bin/debz-reference-stage prepare-bash "$source" "$lock" "$cache" "$pinned" \
   "$workspace/evidence/bash.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json" \
   "$workspace/evidence/libc-bin.lock.json"
 timeout --signal=TERM --kill-after=5s 120s \
@@ -46,7 +47,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
       --force-depends --no-triggers --unpack /var/lib/dpkg/producer-libtinfo6.deb /var/lib/dpkg/producer-bash.deb
   '
-python3 -B -I tools/real_snapshot_less_stage.py seal-bash "$source"
+zig-out/bin/debz-reference-stage seal-bash "$source"
 stage_ldconfig_cache() {
   local root=$1 prefix=$2
   [[ ! -e "$root/etc/ld.so.cache" && ! -L "$root/etc/ld.so.cache" ]]
@@ -90,27 +91,7 @@ for name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-prestat
   [[ ! -e "$destination" && ! -L "$destination" ]]
   cp -a --reflink=auto --one-file-system -- "$source" "$destination"
 done
-python3 -B -I - "$checkout/tools" "$workspace" <<'PY'
-from pathlib import Path
-import sys
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_less_fixtures import (
-    chmod_regular, create_exclusive, overwrite_regular, read_regular, replace_symlink,
-)
-root = Path(sys.argv[2])
-relative = "var/lib/dpkg/info/bash.postinst"
-script = read_regular(root / "bad-script", relative, 1024)
-overwrite_regular(root / "bad-script", relative, script + b"\nunreviewed callback\n")
-chmod_regular(root / "bad-mode", relative, 0o644)
-overwrite_regular(root / "bad-tool", "usr/bin/update-alternatives", b"foreign alternatives tool\n")
-replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libtinfo.so.6", "libtinfo.so.6.6", "foreign-tinfo")
-create_exclusive(root / "bad-prestate", "usr/bin/update-menus", b"#!/bin/sh\nexit 0\n", 0o755)
-cache = read_regular(root / "bad-cache", "etc/ld.so.cache", 1024 * 1024)
-if b"/lib/aarch64-linux-gnu/libc.so.6" not in cache:
-    raise ValueError("original ldconfig cache omitted the libc provider")
-overwrite_regular(root / "bad-cache", "etc/ld.so.cache",
-                  cache.replace(b"/lib/aarch64-linux-gnu/libc.so.6", b"/bad/aarch64-linux-gnu/libc.so.6"))
-PY
+zig-out/bin/debz-reference-stage bash-mutate-negatives "$workspace"
 {
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
@@ -133,7 +114,7 @@ util_source=$util_workspace/source
 install -d -o root -g root -m 0700 "$util_workspace"
 [[ ! -e "$util_source" && ! -L "$util_source" ]]
 cp -a --reflink=auto --one-file-system -- "$workspace/template" "$util_source"
-python3 -B -I tools/real_snapshot_less_stage.py prepare-util-linux "$util_source" "$lock" "$cache" "$pinned" \
+zig-out/bin/debz-reference-stage prepare-util-linux "$util_source" "$lock" "$cache" "$pinned" \
   "$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json" \
   "$workspace/evidence/libc-bin.lock.json" "$workspace/evidence/init-system-helpers.lock.json" \
   "$workspace/evidence/perl-base.lock.json"
@@ -157,7 +138,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       --force-depends --no-triggers --configure less
   '
 } >"$workspace/evidence/util-linux-source-producer.stdout" 2>"$workspace/evidence/util-linux-source-producer.stderr"
-python3 -B -I tools/real_snapshot_less_stage.py seal-util-linux "$util_source"
+zig-out/bin/debz-reference-stage seal-util-linux "$util_source"
 stage_ldconfig_cache "$util_source" util-linux
 [[ $(dpkg-query --admindir="$util_source/var/lib/dpkg" -W \
   -f='${Version} ${Architecture} ${Status}' util-linux) == '2.41.3-3ubuntu2.2 arm64 install ok unpacked' ]]
@@ -168,29 +149,7 @@ for util_name in native dpkg-after bad-script bad-mode bad-tool bad-alias bad-pr
   [[ ! -e "$destination" && ! -L "$destination" ]]
   cp -a --reflink=auto --one-file-system -- "$util_source" "$destination"
 done
-python3 -B -I - "$checkout/tools" "$util_workspace" <<'PY'
-from pathlib import Path
-import sys
-
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_less_fixtures import (
-    chmod_regular, create_exclusive, overwrite_regular, read_regular, replace_symlink,
-)
-
-root = Path(sys.argv[2])
-relative = "var/lib/dpkg/info/util-linux.postinst"
-script = read_regular(root / "bad-script", relative, 4096)
-overwrite_regular(root / "bad-script", relative, script + b"\nunreviewed callback\n")
-chmod_regular(root / "bad-mode", relative, 0o644)
-overwrite_regular(root / "bad-tool", "usr/bin/deb-systemd-helper", b"foreign systemd helper\n")
-replace_symlink(root / "bad-alias", "usr/lib/aarch64-linux-gnu/libcrypt.so.1", "libcrypt.so.1.1.0", "foreign-crypt")
-create_exclusive(root / "bad-prestate", "usr/sbin/deb-systemd-helper", b"#!/bin/sh\nexit 0\n", 0o755)
-cache = read_regular(root / "bad-cache", "etc/ld.so.cache", 1024 * 1024)
-if b"/lib/aarch64-linux-gnu/libm.so.6" not in cache:
-    raise ValueError("original ldconfig cache omitted the libm provider")
-overwrite_regular(root / "bad-cache", "etc/ld.so.cache",
-                  cache.replace(b"/lib/aarch64-linux-gnu/libm.so.6", b"/bad/aarch64-linux-gnu/libm.so.6"))
-PY
+zig-out/bin/debz-reference-stage util-linux-mutate-negatives "$util_workspace"
 {
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \

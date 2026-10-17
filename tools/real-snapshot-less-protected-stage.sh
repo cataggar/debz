@@ -17,9 +17,9 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from real_snapshot_reference_paths import protected, toolchain
 for name in ("real-snapshot-less-protected-stage.sh", "real-snapshot-less-reference.sh",
-             "real_snapshot_less_stage.py", "real_snapshot_less_fixtures.py",
-             "real-snapshot-reference-protected-stage.sh"):
+             "real-snapshot-stage.zig", "real-snapshot-reference-protected-stage.sh"):
     protected(Path(sys.argv[2]) / "tools" / name)
+protected(Path(sys.argv[2]) / "zig-out/bin/debz-reference-stage")
 toolchain(Path(sys.argv[3]))
 for argument in sys.argv[4:]:
     protected(Path(argument))
@@ -33,7 +33,7 @@ cp -a --reflink=auto --one-file-system -- "$workspace/template" "$source"
 lock=$workspace/evidence/runtime.lock.json
 cache=$workspace/snapshot/cache/packages-v2/objects
 pinned=$workspace/dpkg/usr/bin/dpkg
-python3 -B -I tools/real_snapshot_less_stage.py prepare "$source" "$lock" "$cache" "$pinned" \
+zig-out/bin/debz-reference-stage prepare "$source" "$lock" "$cache" "$pinned" \
   "$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json"
 # Obtain a genuine unpacked database/control state from pinned dpkg. Only the
 # unchanged signed inert less preinst runs; no configure/trigger authority.
@@ -48,7 +48,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       /var/lib/dpkg/producer-dpkg --root=/ --force-not-root --force-bad-path \
       --force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb
   '
-python3 -B -I tools/real_snapshot_less_stage.py seal "$source"
+zig-out/bin/debz-reference-stage seal "$source"
 read -r bytes _ < <(du -sb "$source")
 (( bytes <= 512 * 1024 * 1024 ))
 less_lock=$workspace/evidence/less.lock.json

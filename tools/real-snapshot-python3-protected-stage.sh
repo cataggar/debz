@@ -26,8 +26,8 @@ for relative in ("tools/real-snapshot-python3-protected-stage.sh",
                  "tools/real-snapshot-signed-proc-bindings.sh",
                  "tools/real-snapshot-signed-proc-prestates.sh",
                  "tools/real-snapshot-reference-order.py",
-                 "tools/real_snapshot_python_fixtures.py",
-                 "tools/real_snapshot_less_fixtures.py",
+                 "tools/real-snapshot-stage.zig",
+                 "zig-out/bin/debz-reference-stage",
                  "tools/real_snapshot_reference_paths.py"):
     protected(checkout / relative)
 protected(checkout / ".real-snapshot", directory=True)
@@ -39,12 +39,7 @@ bash "$checkout/tools/real-snapshot-reference-protected-ci.sh" \
   --check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING" >/dev/null
 export DEBZ_ZIG=$zig PYTHONDONTWRITEBYTECODE=1
 fixture() {
-  python3 -B -I - "$checkout/tools" "$@" <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_python_fixtures import dispatch
-dispatch(sys.argv[2:])
-PY
+  "$checkout/zig-out/bin/debz-reference-stage" python "$@"
 }
 
 # Reuse the authenticated full closure and its existing pinned-dpkg scheduler;
@@ -111,19 +106,8 @@ printf '%s\n' \
   "-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler" \
   "-Dpython3-reference-inputs-proof=$evidence/inputs-proof.txt" \
   "-Dpython3-reference-alternatives-proof=$evidence/alternatives-proof.txt" \
-  | python3 -B -I -c '
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import protected
-from real_snapshot_less_fixtures import create_exclusive
-root = Path(sys.argv[2])
-protected(root, directory=True)
-content = sys.stdin.buffer.read(16385)
-if len(content) > 16384:
-    raise ValueError("Python arguments exceed bound")
-create_exclusive(root, "evidence/python3-reference.args", content, 0o600)
-' "$checkout/tools" "$workspace"
+  | "$checkout/zig-out/bin/debz-reference-stage" create-exclusive-stdin \
+    "$workspace" "evidence/python3-reference.args" 0600 16384
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 16 * 1024 * 1024 * 1024 ))
 echo "Python source and all 18 root coordinates staged; Zig verification has not executed"

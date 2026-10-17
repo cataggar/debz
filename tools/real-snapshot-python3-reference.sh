@@ -46,8 +46,8 @@ checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-python3-reference.sh" ]]
 require_protected_file "$checkout/tools/real-snapshot-python3-reference.sh"
 require_protected_file "$checkout/zig-out/bin/debz-native-dpkg-reference"
-require_protected_file "$checkout/tools/real_snapshot_python_fixtures.py"
-require_protected_file "$checkout/tools/real_snapshot_less_fixtures.py"
+require_protected_file "$checkout/zig-out/bin/debz-reference-stage"
+require_protected_file "$checkout/tools/real-snapshot-stage.zig"
 require_protected_file "$checkout/tools/real_snapshot_reference_paths.py"
 require_protected_file "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 require_protected_path "$checkout/.real-snapshot"
@@ -62,12 +62,7 @@ from real_snapshot_reference_paths import toolchain
 toolchain(Path(sys.argv[2]))
 PY
 fixture() {
-  python3 -B -I - "$checkout/tools" "$@" <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_python_fixtures import dispatch
-dispatch(sys.argv[2:])
-PY
+  "$checkout/zig-out/bin/debz-reference-stage" python "$@"
 }
 
 pinned=$(realpath -- "$1")
