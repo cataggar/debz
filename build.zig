@@ -63,8 +63,7 @@ pub fn build(b: *std.Build) void {
     const libsolv = libsolv_dependency.artifact("solv");
 
     const c_headers = b.addWriteFiles();
-    const libsolv_c_header = c_headers.add(
-        "libsolv_c.h",
+    const libsolv_c_header = c_headers.add("libsolv_c.h",
         \\#define LIBSOLV_INTERNAL 1
         \\#include "solv/evr.h"
         \\#include "solv/pool.h"
@@ -88,8 +87,7 @@ pub fn build(b: *std.Build) void {
     translate_libsolv.addIncludePath(libsolv_dependency.path("src"));
     const libsolv_c = translate_libsolv.createModule();
 
-    const compression_c_header = c_headers.add(
-        "compression_c.h",
+    const compression_c_header = c_headers.add("compression_c.h",
         \\#define LZMA_API_STATIC 1
         \\#include "lzma.h"
         \\#include "zstd.h"
@@ -740,6 +738,38 @@ pub fn build(b: *std.Build) void {
     reference_runtime_test_step.dependOn(&run_reference_runtime_tests.step);
     workload_core.dependOn(&run_reference_runtime_tests.step);
 
+    const reference_paths_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-paths.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reference_paths = b.addExecutable(.{
+        .name = "debz-reference-paths",
+        .root_module = reference_paths_module,
+    });
+    const install_reference_paths = b.addInstallArtifact(reference_paths, .{});
+    b.getInstallStep().dependOn(&install_reference_paths.step);
+    const reference_paths_step = b.step(
+        "build-reference-paths",
+        "Build descriptor-rooted protected reference path and signature verification tooling",
+    );
+    reference_paths_step.dependOn(&install_reference_paths.step);
+    const reference_paths_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/real-snapshot-reference-paths.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_reference_paths_tests = b.addRunArtifact(reference_paths_tests);
+    run_reference_paths_tests.step.dependOn(&install_reference_paths.step);
+    const reference_paths_test_step = b.step(
+        "test-real-snapshot-reference-paths",
+        "Test descriptor-rooted protected reference paths, tree checks, and minisign verification",
+    );
+    reference_paths_test_step.dependOn(&run_reference_paths_tests.step);
+    workload_core.dependOn(&run_reference_paths_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
@@ -949,6 +979,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_snapshot_policy_tests.step);
     audit_step.dependOn(&run_snapshot_policy_tests.step);
     audit_step.dependOn(&reference_triggers_tests.step);
+    audit_step.dependOn(&run_reference_paths_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{
@@ -1806,9 +1837,9 @@ pub fn build(b: *std.Build) void {
     native_conffile_step.dependOn(&run_native_conffile_zig.step);
 
     const dpkg_config_reference = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
+        "sudo",                                          "-n",                                                      "env",                                                                                       "PYTHONDONTWRITEBYTECODE=1",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
-        "python3",                                      "tools/dpkg-config-reference.py",
+        "python3",                                       "tools/dpkg-config-reference.py",
     });
     dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
     dpkg_config_reference.step.dependOn(&install_native_dpkg.step);
@@ -1823,9 +1854,9 @@ pub fn build(b: *std.Build) void {
         .dependOn(&dpkg_config_reference.step);
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",                                                                                      "PYTHONDONTWRITEBYTECODE=1",
+        "sudo",                                          "-n",                                                      "env",                                                                                       "PYTHONDONTWRITEBYTECODE=1",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
-        "python3",                                      "tools/dpkg-alternatives-reference.py",
+        "python3",                                       "tools/dpkg-alternatives-reference.py",
     });
     dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);
     dpkg_alternatives_reference.step.dependOn(&install_native_dpkg.step);
@@ -2004,7 +2035,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lifecycle_zig_module,
     });
     const lifecycle_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     lifecycle_zig.addArtifactArg(lifecycle_zig_executable);
@@ -2041,7 +2072,7 @@ pub fn build(b: *std.Build) void {
     root_import_unit_step.dependOn(&run_root_import_capture_tests.step);
     root_import_unit_step.dependOn(&root_import_executable.step);
     const root_import = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     root_import.addArtifactArg(root_import_executable);
@@ -2051,7 +2082,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-root-import", "Compare healthy pinned-dpkg root import and copied-root refusals")
         .dependOn(&root_import.step);
     const lifecycle_oracle_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     lifecycle_oracle_zig.addArtifactArg(lifecycle_zig_executable);
@@ -2077,7 +2108,7 @@ pub fn build(b: *std.Build) void {
         .root_module = trigger_zig_module,
     });
     const trigger_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     trigger_zig.addArtifactArg(trigger_zig_executable);
@@ -2089,7 +2120,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-triggers-zig", "Run Zig-owned trigger and helper acceptance against dpkg")
         .dependOn(&trigger_zig.step);
     const trigger_oracle_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     trigger_oracle_zig.addArtifactArg(trigger_zig_executable);
@@ -2106,7 +2137,7 @@ pub fn build(b: *std.Build) void {
         trigger_oracle_zig.addArg("--multi-handler-only");
     }
     const settlement_oracle_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     settlement_oracle_zig.addArtifactArg(trigger_zig_executable);
@@ -2142,7 +2173,7 @@ pub fn build(b: *std.Build) void {
         .root_module = settlement_module,
     });
     const settlement = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     settlement.addArtifactArg(settlement_executable);
@@ -2248,7 +2279,7 @@ pub fn build(b: *std.Build) void {
         .root_module = recovery_zig_module,
     });
     const recovery_zig = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_zig.addArtifactArg(recovery_zig_executable);
@@ -2276,7 +2307,7 @@ pub fn build(b: *std.Build) void {
         .root_module = recovery_family_module,
     });
     const recovery_family = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_family.addArtifactArg(recovery_family_executable);
@@ -2306,7 +2337,7 @@ pub fn build(b: *std.Build) void {
         .root_module = recovery_parity_module,
     });
     const recovery_parity = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_parity.addArtifactArg(recovery_parity_executable);
@@ -2336,7 +2367,7 @@ pub fn build(b: *std.Build) void {
     order_fixture_build.dependOn(&trigger_zig_executable.step);
     order_fixture_build.dependOn(&recovery_helper_executable.step);
     const recovery_helper = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_helper.addArtifactArg(recovery_helper_executable);
@@ -2359,7 +2390,7 @@ pub fn build(b: *std.Build) void {
         .root_module = final_gaps_module,
     });
     const final_gaps = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     final_gaps.addArtifactArg(final_gaps_executable);
@@ -2379,7 +2410,7 @@ pub fn build(b: *std.Build) void {
         .root_module = recovery_bootstrap_module,
     });
     const recovery_bootstrap = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_bootstrap.addArtifactArg(recovery_bootstrap_executable);
@@ -2412,7 +2443,7 @@ pub fn build(b: *std.Build) void {
     }) |consumer| integration_archive_consumers.dependOn(&consumer.step);
     http_fixture_step.dependOn(&repository_recovery_executable.step);
     const repository_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     repository_recovery.addArtifactArg(repository_recovery_executable);
@@ -2451,7 +2482,7 @@ pub fn build(b: *std.Build) void {
         .root_module = rollback_clock_module,
     });
     const rollback_clock = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     rollback_clock.addArtifactArg(rollback_clock_executable);
@@ -2471,7 +2502,7 @@ pub fn build(b: *std.Build) void {
         .root_module = scriptless_recovery_module,
     });
     const scriptless_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     scriptless_recovery.addArtifactArg(scriptless_recovery_executable);
@@ -2491,7 +2522,7 @@ pub fn build(b: *std.Build) void {
         .root_module = statoverride_recovery_module,
     });
     const statoverride_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
@@ -2511,7 +2542,7 @@ pub fn build(b: *std.Build) void {
         .root_module = literal_recovery_module,
     });
     const literal_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     literal_recovery.addArtifactArg(literal_recovery_executable);
@@ -2531,7 +2562,7 @@ pub fn build(b: *std.Build) void {
         .root_module = metadata_recovery_module,
     });
     const metadata_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     metadata_recovery.addArtifactArg(metadata_recovery_executable);
@@ -2551,7 +2582,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mutation_boundaries_module,
     });
     const mutation_boundaries = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     mutation_boundaries.addArtifactArg(mutation_boundaries_executable);
@@ -2574,7 +2605,7 @@ pub fn build(b: *std.Build) void {
         .root_module = publication_recovery_module,
     });
     const publication_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     publication_recovery.addArtifactArg(publication_recovery_executable);
@@ -2594,7 +2625,7 @@ pub fn build(b: *std.Build) void {
         .root_module = conffile_recovery_module,
     });
     const conffile_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     conffile_recovery.addArtifactArg(conffile_recovery_executable);
@@ -2614,7 +2645,7 @@ pub fn build(b: *std.Build) void {
         .root_module = recovery_diversions_module,
     });
     const recovery_diversions = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     recovery_diversions.addArtifactArg(recovery_diversions_executable);
@@ -2864,7 +2895,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-maintainer-script", "Run audited maintainer-script runner tests")
         .dependOn(&run_maintainer_script_tests.step);
     const native_helper_namespace_tests = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env", "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
+        "sudo",                                          "-n",                                                      "env", "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),
     });
     native_helper_namespace_tests.addPrefixedFileArg(

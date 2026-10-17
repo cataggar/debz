@@ -1111,7 +1111,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 67), members);
+    try testing.expectEqual(@as(usize, 68), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1842,7 +1842,7 @@ test "security: disposable runtime consumers require native copying without a Py
         "try context.input.check(context.root);",
         "try context.input.checkParent(context.root, context.directory.?);",
     });
-    try nativeMutations(&f, "native-disposable-runtime", "tools/native-materialization-fixtures.py", &.{
+    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-config-reference.py", &.{
         "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
         "stdin=subprocess.DEVNULL, timeout=120, check=True,",
     });
@@ -2869,44 +2869,27 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
     var f = try Fixture.init();
     defer f.deinit();
     for ([_][]const u8{
-        "tools/test-native-lifecycle.py",               "tools/test_native_lifecycle.py",
-        "tools/test-native-triggers.py",                "tools/test_native_triggers.py",
-        "tools/test-native-recovery.py",                "tools/test_native_recovery.py",
-        "tools/native-trigger-fixtures.py",             "tools/native_diversion_settlement_oracle.py",
+        "tools/test-native-lifecycle.py",                 "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",                  "tools/test_native_triggers.py",
+        "tools/test-native-recovery.py",                  "tools/test_native_recovery.py",
+        "tools/native-trigger-fixtures.py",               "tools/native_diversion_settlement_oracle.py",
         "tools/test_real_snapshot_reference_triggers.py", "tools/native-lifecycle-fixtures.py",
-        "tools/native-differential.py",                 "tools/native_only_candidate.py",
+        "tools/native-differential.py",                   "tools/native_only_candidate.py",
+        "tools/native-materialization-fixtures.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();
         try restored.failsWith("retired Python test entry point still exists");
-    }
-    for ([_][]const u8{"tools/native-materialization-fixtures.py"}) |path| {
-        const source = try f.source(path);
-        const valid = try nativeCheck(&f, "native-fixtures", path, source);
-        defer valid.deinit();
-        try valid.ok();
-        const missing = try nativeCheck(&f, "native-fixtures", path, null);
-        defer missing.deinit();
-        try missing.failsWith("required import-only fixture module is missing");
-        for ([_][]const u8{
-            "#!/usr/bin/env python3\n",         "\nimport argparse\n", "\ndef main() -> int:\n",
-            "\nif __name__ == \"__main__\":\n",
-        }) |marker| {
-            const altered = try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ marker, source });
-            const refused = try nativeCheck(&f, "native-fixtures", path, altered);
-            defer refused.deinit();
-            try refused.failsWith("fixture module restored a Python CLI entry point");
-        }
     }
     for ([_][]const u8{
         "tools/dpkg-config-reference.py",
         "actions/install/__tests__/integration.test.ts",
     }) |path| {
         const source = try f.source(path);
-        const altered = try f.replace(source, "native-materialization-fixtures.py", "missing.py");
+        const altered = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n# native-materialization-fixtures.py\n", .{source});
         const refused = try nativeCheck(&f, "native-fixtures", path, altered);
         defer refused.deinit();
-        try refused.failsWith("required fixture import is missing");
+        try refused.failsWith("retired fixture import was restored");
     }
 }
 
@@ -3081,6 +3064,10 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
         "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
         "                if not target.is_relative_to(library):\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-paths.zig", &.{
+        "    try ed25519Verify(key, &prehash_digest, file_sig);\n",
+        "    try ed25519Verify(key, global_message, global_signature);\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{

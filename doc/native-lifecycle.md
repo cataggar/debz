@@ -420,10 +420,10 @@ or references; it does not purport to implement the entire Draft 2020-12
 vocabulary. The `test-native-lifecycle` build target now runs this Zig
 acceptance, not Python; its Python unit gate has been removed. CI requires
 native and both-reference selectors on amd64 and arm64 in Debug and
-ReleaseSafe. All four former Python lifecycle/trigger test entry points are
-absent. `tools/native-materialization-fixtures.py` is an import-only module for
-the separate dpkg-config reference and action integration
-fixtures; it has no lifecycle acceptance CLI.
+ReleaseSafe. All former Python lifecycle, trigger, and materialization fixture
+modules have been retired; the direct-dpkg config and alternatives reference
+oracles own their disposable-root helpers directly in
+`tools/dpkg-config-reference.py`.
 Trigger acceptance has a separate reference-only
 unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
 

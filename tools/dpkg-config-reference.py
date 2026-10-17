@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import copy
 from contextlib import nullcontext
+from functools import lru_cache
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -109,12 +110,229 @@ def limit_contract() -> dict[str, int]:
     }
 
 
-MATERIALIZATION_SPEC = importlib.util.spec_from_file_location(
-    "debz_config_materialization", ROOT / "tools/native-materialization-fixtures.py",
-)
-assert MATERIALIZATION_SPEC and MATERIALIZATION_SPEC.loader
-m = importlib.util.module_from_spec(MATERIALIZATION_SPEC)
-MATERIALIZATION_SPEC.loader.exec_module(m)
+REPOSITORY = ROOT
+DISPOSABLE_RUNTIME = Path(os.environ.get(
+    "DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",
+))
+NATIVE_REFERENCE = Path(os.environ.get(
+    "DEBZ_NATIVE_DPKG_REFERENCE", REPOSITORY / "zig-out/bin/debz-native-dpkg-reference",
+))
+
+
+class Materialization:
+    REPOSITORY = REPOSITORY
+    GUARD = ".debz-native-disposable"
+    GUARD_CONTENT = "debz native materialization fixture v1\n"
+    EPOCH = 1_700_000_000
+    PACKAGE = "debz-native-demo"
+    PAYLOAD = Path("usr/share") / PACKAGE
+    REFERENCE_DPKG = "dpkg"
+    DISPOSABLE_RUNTIME = DISPOSABLE_RUNTIME
+    NATIVE_REFERENCE = NATIVE_REFERENCE
+
+    @staticmethod
+    def native_reference(*arguments: str) -> str:
+        NATIVE_REFERENCE = Materialization.NATIVE_REFERENCE
+        if not NATIVE_REFERENCE.is_absolute():
+            raise ValueError(f"native reference helper requires an absolute path: {NATIVE_REFERENCE}")
+        return subprocess.run(
+            [str(NATIVE_REFERENCE), *arguments], cwd=REPOSITORY,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "LC_ALL": "C"}, timeout=120, check=True,
+        ).stdout
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def reference_description() -> dict:
+        return json.loads(Materialization.native_reference("--describe"))
+
+    @staticmethod
+    def verify_reference(path: Path, architecture: str, tool: str = "dpkg") -> None:
+        Materialization.native_reference(
+            "--architecture", architecture, "--verify-binding", str(path), "--tool", tool,
+        )
+
+    @staticmethod
+    def select_reference(
+        executable: Path | None, architecture: str, *, root_accounts: bool = False,
+    ) -> str:
+        arguments = ["--architecture", architecture]
+        arguments.extend(("--select", str(executable)) if executable is not None else ("--check-host",))
+        if root_accounts:
+            arguments.append("--root-accounts")
+        return Materialization.native_reference(*arguments).strip()
+
+    @staticmethod
+    def run(argv: list[str], environment: dict[str, str], log: Path) -> None:
+        with log.open("wb") as output:
+            result = subprocess.run(
+                argv,
+                cwd=REPOSITORY,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+        if result.returncode:
+            with log.open("rb") as output:
+                detail = output.read(12_000).decode(errors="replace")
+            raise RuntimeError(f"{argv[0]} exited {result.returncode}; {log}\n{detail}")
+
+    @staticmethod
+    def write(path: Path, data: bytes, mode: int = 0o644) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+
+    @staticmethod
+    def copy_program(
+        root: Path, source: Path, destination: str, *, max_file_bytes: int | None = None,
+    ) -> None:
+        DISPOSABLE_RUNTIME = Materialization.DISPOSABLE_RUNTIME
+        command = [str(DISPOSABLE_RUNTIME), str(root), str(source), destination]
+        if max_file_bytes is not None:
+            command.extend(("--max-file-bytes", str(max_file_bytes)))
+        subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL, timeout=120, check=True,
+        )
+
+    @staticmethod
+    def make_package(
+        workspace: Path,
+        environment: dict[str, str],
+        architecture: str,
+        version: str,
+        feature: str = "data",
+        *,
+        package: str = PACKAGE,
+        conffile_content: bytes = b"package configuration\n",
+        extra_files: dict[str, bytes] | None = None,
+        scripts: dict[str, bytes] | None = None,
+        control_fields: dict[str, str] | None = None,
+        prepare_payload: Callable[[Path], None] | None = None,
+        compression: str = "gzip",
+        triggers: bytes | None = None,
+        archive_builder: Callable[[Path, Path], None] | None = None,
+    ) -> Path:
+        if compression not in ("gzip", "none"):
+            raise ValueError(f"unsupported fixture compression: {compression}")
+        stem = f"{package}_{version}_{feature}"
+        source = workspace / (stem + ".source")
+        payload = Path("usr/share") / package
+        control = (
+            f"Package: {package}\nVersion: {version}\nArchitecture: {architecture}\n"
+            "Maintainer: debz fixture <fixture@example.invalid>\n"
+            "Description: native data-only materialization fixture\n"
+        )
+        for name, value in (control_fields or {}).items():
+            control += f"{name}: {value}\n"
+        Materialization.write(source / "DEBIAN/control", control.encode())
+        Materialization.write(source / payload / "data", f"data version {version}\n".encode())
+        os.link(source / payload / "data", source / payload / "data.link")
+        (source / payload / "current").symlink_to("data")
+        Materialization.write(
+            source / payload / "mode",
+            b"permission-sensitive payload\n",
+            0o600 if version == "1" else 0o640,
+        )
+        Materialization.write(
+            source / payload / ("obsolete" if version == "1" else "introduced"),
+            f"only in {version}\n".encode(),
+        )
+        (source / payload / "empty").mkdir(mode=0o750)
+        if feature == "conffile":
+            Materialization.write(source / "etc/debz-native.conf", conffile_content)
+            Materialization.write(source / "DEBIAN/conffiles", b"/etc/debz-native.conf\n")
+        elif feature in ("obsolete-conffile", "remove-on-upgrade"):
+            (source / "etc").mkdir(mode=0o755)
+            if feature == "remove-on-upgrade":
+                Materialization.write(
+                    source / "DEBIAN/conffiles",
+                    b"remove-on-upgrade /etc/debz-native.conf\n",
+                )
+        elif feature == "script":
+            Materialization.write(source / "DEBIAN/preinst", b"#!/bin/sh\nexit 99\n", 0o755)
+        elif feature not in ("data", "zero-time"):
+            raise ValueError(f"unknown fixture feature: {feature}")
+        for path, content in (extra_files or {}).items():
+            Materialization.write(source / path, content)
+        for name, content in (scripts or {}).items():
+            if name not in ("preinst", "postinst", "prerm", "postrm"):
+                raise ValueError(f"unsupported maintainer-script fixture: {name}")
+            Materialization.write(source / "DEBIAN" / name, content, 0o755)
+        if triggers is not None:
+            Materialization.write(source / "DEBIAN/triggers", triggers)
+        if prepare_payload is not None:
+            prepare_payload(source)
+
+        checksums = []
+        for path in sorted(source.rglob("*")):
+            relative = path.relative_to(source)
+            if relative.parts[0] == "DEBIAN" or path.is_symlink() or not path.is_file():
+                continue
+            checksums.append(f"{hashlib.md5(path.read_bytes()).hexdigest()}  {relative.as_posix()}\n")
+        Materialization.write(source / "DEBIAN/md5sums", "".join(checksums).encode())
+        for path in [*source.rglob("*"), source]:
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o750 if path == source / payload / "empty" else 0o755)
+            os.utime(path, (Materialization.EPOCH, Materialization.EPOCH), follow_symlinks=False)
+        if feature == "zero-time":
+            os.utime(source / payload / "empty", (0, 0))
+        destination = workspace / (stem + ".deb")
+        if archive_builder is None:
+            Materialization.run(
+                ["dpkg-deb", "--build", "--uniform-compression", f"-Z{compression}",
+                 *(["-z1"] if compression == "gzip" else []),
+                 str(source), str(destination)],
+                environment,
+                workspace / (stem + ".build.log"),
+            )
+        else:
+            archive_builder(source, destination)
+        return destination
+
+    @staticmethod
+    def make_root(path: Path, architecture: str) -> None:
+        for directory in ("info", "updates", "triggers"):
+            (path / "var/lib/dpkg" / directory).mkdir(parents=True, exist_ok=True)
+        Materialization.write(path / Materialization.GUARD, Materialization.GUARD_CONTENT.encode(), 0o600)
+        Materialization.write(path / "var/lib/dpkg/status", b"")
+        Materialization.write(path / "var/lib/dpkg/info/format", b"1\n")
+        Materialization.write(path / "var/lib/dpkg/arch", (architecture + "\n").encode())
+
+    @classmethod
+    def reference_command(cls, root: Path) -> list[str]:
+        if (
+            not root.is_absolute()
+            or root == Path("/")
+            or root.resolve(strict=True) != root
+            or (root / cls.GUARD).is_symlink()
+            or (root / cls.GUARD).read_text() != cls.GUARD_CONTENT
+        ):
+            raise RuntimeError("reference execution requires a disposable fixture root")
+        return [
+            cls.REFERENCE_DPKG, "--force-not-root", "--force-bad-path", "--no-triggers",
+            f"--root={root}",
+        ]
+
+    @staticmethod
+    def fixture_environment(workspace: Path) -> dict[str, str]:
+        (workspace / "home").mkdir()
+        (workspace / "tmp").mkdir()
+        return {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "HOME": str(workspace / "home"),
+            "TMPDIR": str(workspace / "tmp"),
+            "SOURCE_DATE_EPOCH": str(Materialization.EPOCH),
+        }
+
+
+m = Materialization
 
 
 def canonical_json(document: Any) -> str:

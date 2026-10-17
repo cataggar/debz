@@ -177,16 +177,15 @@ test('native installs bind real receipts across cold, warm, offline, same-root, 
   const temporary = path.resolve(actionPath, '../../.tmp');
   await mkdir(temporary, { recursive: true });
   const bootstrap = `
-import importlib.util, os, shutil, subprocess, sys
+import os, shutil, subprocess, sys
 from pathlib import Path
 repo, workspace, runner = map(Path, sys.argv[1:4])
 cli, arch, uid, gid = sys.argv[4:]
-def load(name, filename):
-    spec = importlib.util.spec_from_file_location(name, repo / "tools" / filename)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-m = load("install_materialization", "native-materialization-fixtures.py")
+runtime = Path(os.environ.get("DEBZ_DISPOSABLE_RUNTIME", repo / "zig-out/bin/debz-disposable-runtime"))
+def write(path, data, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(mode)
 repository = workspace / "repository"
 subprocess.run([
     str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository),
@@ -199,13 +198,23 @@ source.write_text(f"Types: deb\\nURIs: file://{repository}\\nSuites: debian-stab
 for name in ("plan", "cold", "warm-fresh", "offline", "failure", "receiptless", "cross-backend"):
     root = runner / f"root-{name}"
     root.mkdir()
-    m.make_root(root, arch)
-    m.copy_program(root, Path("/bin/sh"), "/bin/sh")
+    for directory in ("info", "updates", "triggers"):
+        (root / "var/lib/dpkg" / directory).mkdir(parents=True, exist_ok=True)
+    write(root / ".debz-native-disposable", b"debz native materialization fixture v1\\n", 0o600)
+    write(root / "var/lib/dpkg/status", b"")
+    write(root / "var/lib/dpkg/info/format", b"1\\n")
+    write(root / "var/lib/dpkg/arch", (arch + "\\n").encode())
+    subprocess.run([str(runtime), str(root), "/bin/sh", "/bin/sh"], stdin=subprocess.DEVNULL, timeout=120, check=True)
     seeds = ["native-helper-target", "essential-core"]
     if name == "receiptless":
         seeds += ["base-dep", "scenario-main"]
-    archives = [repository / f"pool/main/{package}_1.0-1_{arch}.deb" for package in seeds]
-    assert m.reference_phase(root, archives, "install", dict(os.environ), root, packages=[]) == 0
+    archives = [str(repository / f"pool/main/{package}_1.0-1_{arch}.deb") for package in seeds]
+    with (root / "reference.log").open("wb") as output:
+        result = subprocess.run([
+            "dpkg", "--force-not-root", "--force-bad-path", "--no-triggers",
+            f"--root={root}", "--force-confold", "--install", *archives,
+        ], env=dict(os.environ), stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=120, check=False)
+    assert result.returncode == 0
 for selector, filename, backend in (
     ("scenario-main", "lock.json", "native"), ("fail-script", "fail.lock.json", "native"),
     ("scenario-main", "legacy.lock.json", "legacy_dpkg"),
