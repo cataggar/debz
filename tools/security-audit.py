@@ -2113,7 +2113,7 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests", "run_reference_protected_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests", "run_reference_protected_tests", "run_vendor_snapshot_tools_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
