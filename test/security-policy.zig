@@ -1111,7 +1111,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 69), members);
+    try testing.expectEqual(@as(usize, 70), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -3082,6 +3082,11 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
         "    \"udev\": (\"proc-pid-only\",),\n",
         "            if control.returncode != 0 or control.stdout != expected:\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected.zig", &.{
+        "    const profiles = try proveProfiles(allocator, args, &scripts);\n",
+        "    .{ .profile = \"systemd\", .checks = &.{ \"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\" } },\n",
+        "    .{ .profile = \"udev\", .checks = &.{\"proc-pid-only\"} },\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
         "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",

@@ -2113,7 +2113,7 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests", "run_reference_protected_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
@@ -2822,6 +2822,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference-protected-ci.sh",
     "tools/real-snapshot-reference-protected-stage.sh",
     "tools/test_real_snapshot_reference_protected.py",
+    "tools/real-snapshot-reference-protected.zig",
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/real-snapshot-reference-launcher.zig",
     "tools/real-snapshot-reference-order.py",
@@ -3692,6 +3693,16 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         '"sudo": ("proc-pid-only",),',
         'probe_detail(output, "proc-boot-id").get("boot_id") != host_boot_id',
         'require(status, error, "InvalidProfile", name)',
+    ),
+    "tools/real-snapshot-reference-protected.zig": (
+        'pub fn openNetworkControl(',
+        'var scripts = try profileScripts(allocator, args.profile_scripts, args.architecture);',
+        'const profiles = try proveProfiles(allocator, args, &scripts);',
+        '.{ .profile = "systemd", .checks = &.{ "proc-read-only", "proc-sys-masked", "proc-boot-id" } },',
+        '.{ .profile = "udev", .checks = &.{"proc-pid-only"} },',
+        '.{ .profile = "sudo", .checks = &.{"proc-pid-only"} },',
+        'if (!std.mem.eql(u8, boot_detail.get("boot_id") orelse "", host_boot_id)) {',
+        'try requireRefusal(res.status, res.stderr, neg.expected);',
     ),
     "tools/real-snapshot-reference-escape-probe.zig": (
         "try network_probe.observe(",
