@@ -2113,7 +2113,7 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "native_action_empty_lock_tests", "baseline_fixture_tests", "disposable_runtime_tests", "integration_archive_tests", "integration_signing_tests", "integration_repository_tests", "openpgp_fixture_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests", "run_reference_protected_tests", "run_vendor_snapshot_tools_tests",
+        "run_real_snapshot_comparator_tests", "run_reference_runtime_tests", "run_reference_paths_tests", "run_reference_order_tests", "run_reference_protected_tests", "run_vendor_snapshot_tools_tests", "run_reference_stage_tests",
         "run_script_network_probe_tests",
         "run_http_fixture_tests",
         "run_debian_closure_inventory_tests", "debian_readiness_tests", "debian_closure_tests",
@@ -2853,6 +2853,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real_snapshot_less_stage.py",
     "tools/real_snapshot_less_fixtures.py",
     "tools/real_snapshot_python_fixtures.py",
+    "tools/real-snapshot-stage.zig",
     "tools/prepare-native-dpkg.zig",
 )
 PROTECTED_REFERENCE_INPUT = (
@@ -3419,6 +3420,18 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'parent_fd = open_beneath(root_fd, parent, directory=True)',
         'regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)',
         'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC',
+    ),
+    "tools/real-snapshot-stage.zig": (
+        "pub fn openParentDescriptor(root: []const u8, relative: []const u8) !ParentDescriptor {",
+        "pub fn replaceContents(descriptor: i32, contents: []const u8) !void {",
+        "pub fn mutateNegativeRoots(allocator: std.mem.Allocator, roots: []const []const u8, kind: []const u8) !void {",
+        "pub fn preparePythonEmpty(allocator: std.mem.Allocator, root: []const u8) !void {",
+        "pub fn verifyLockArchive(",
+        "pub fn prepareSource(",
+        "pub fn prepareUtilLinux(",
+        "pub fn sealLess(allocator: std.mem.Allocator, root: []const u8) !void {",
+        "pub fn sealBash(allocator: std.mem.Allocator, root: []const u8) !void {",
+        "pub fn sealUtilLinux(allocator: std.mem.Allocator, root: []const u8) !void {",
     ),
     "tools/real-snapshot-protected-native-ci.sh": (
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
