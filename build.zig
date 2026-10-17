@@ -842,6 +842,39 @@ pub fn build(b: *std.Build) void {
     reference_protected_test_step.dependOn(&run_reference_protected_tests.step);
     workload_core.dependOn(&run_reference_protected_tests.step);
 
+    const vendor_snapshot_tools_module = b.createModule(.{
+        .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const vendor_snapshot_tools = b.addExecutable(.{
+        .name = "debz-vendor-snapshot-tools",
+        .root_module = vendor_snapshot_tools_module,
+    });
+    const install_vendor_snapshot_tools = b.addInstallArtifact(vendor_snapshot_tools, .{});
+    b.getInstallStep().dependOn(&install_vendor_snapshot_tools.step);
+    const vendor_snapshot_tools_step = b.step(
+        "build-vendor-snapshot-tools",
+        "Build bounded vendor-state capture and reference derivation tooling",
+    );
+    vendor_snapshot_tools_step.dependOn(&install_vendor_snapshot_tools.step);
+    const vendor_snapshot_tools_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_vendor_snapshot_tools_tests = b.addRunArtifact(vendor_snapshot_tools_tests);
+    run_vendor_snapshot_tools_tests.setCwd(b.path("."));
+    run_vendor_snapshot_tools_tests.step.dependOn(&install_vendor_snapshot_tools.step);
+    const vendor_snapshot_tools_test_step = b.step(
+        "test-vendor-snapshot-tools",
+        "Test bounded vendor-state capture, reference derivation, and fail-closed refusals",
+    );
+    vendor_snapshot_tools_test_step.dependOn(&run_vendor_snapshot_tools_tests.step);
+    workload_core.dependOn(&run_vendor_snapshot_tools_tests.step);
+
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
@@ -1054,6 +1087,7 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_reference_paths_tests.step);
     audit_step.dependOn(&run_reference_order_tests.step);
     audit_step.dependOn(&run_reference_protected_tests.step);
+    audit_step.dependOn(&run_vendor_snapshot_tools_tests.step);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{
