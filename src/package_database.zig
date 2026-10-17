@@ -2031,7 +2031,7 @@ const Importer = struct {
                 .sha256 = digestOf(entry.bytes),
             };
         }
-        std.mem.sort(PendingUpdate, fragments, {}, lessPendingUpdate);
+        std.sort.heap(PendingUpdate, fragments, {}, lessPendingUpdate);
         for (fragments, 0..) |fragment, index| {
             if (index != 0 and fragments[index - 1].sequence == fragment.sequence) {
                 return self.fail(.updates, .invalid_update_name, fragment.name, null);
@@ -2563,7 +2563,7 @@ pub fn generation(
             .sha256 = digestOf(entry.bytes),
         });
     }
-    std.mem.sort(GenerationEntry, entries.items, {}, lessGenerationEntry);
+    std.sort.heap(GenerationEntry, entries.items, {}, lessGenerationEntry);
 
     var buffer: [512]u8 = undefined;
     const hash_span = phase_telemetry.start(.hash);
@@ -3151,7 +3151,7 @@ pub fn writeStatusDocument(
     const ordered = try allocator.alloc(*const PackageRecord, packages.len);
     defer allocator.free(ordered);
     for (packages, 0..) |*record, index| ordered[index] = record;
-    std.mem.sort(*const PackageRecord, ordered, native_architecture, statusRecordLessThan);
+    std.sort.heap(*const PackageRecord, ordered, native_architecture, statusRecordLessThan);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     for (ordered) |record| {

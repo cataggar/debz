@@ -7911,7 +7911,7 @@ fn captureDatabase(
         });
     }
     _ = allocator;
-    std.mem.sort(package_database.InfoEntry, entries.items, {}, struct {
+    std.sort.heap(package_database.InfoEntry, entries.items, {}, struct {
         fn less(_: void, left: package_database.InfoEntry, right: package_database.InfoEntry) bool {
             return std.mem.order(u8, left.name, right.name) == .lt;
         }

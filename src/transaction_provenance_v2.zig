@@ -401,7 +401,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
             [20]u8,
             repository.signer_fingerprints,
         );
-        std.mem.sort(
+        std.sort.heap(
             [20]u8,
             @constCast(repositories[index].signer_fingerprints),
             {},
@@ -415,7 +415,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
             )) return error.DuplicateSigner;
         }
     }
-    std.mem.sort(RepositoryEvidence, repositories, {}, lessRepository);
+    std.sort.heap(RepositoryEvidence, repositories, {}, lessRepository);
     for (repositories, 0..) |repository, index| {
         if (index != 0 and std.mem.eql(
             u8,
@@ -467,7 +467,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
             },
         }
     }
-    std.mem.sort(PackageEvidence, packages, {}, lessPackage);
+    std.sort.heap(PackageEvidence, packages, {}, lessPackage);
     for (packages, 0..) |package, index| {
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;
@@ -490,7 +490,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
                     try v1.redactAlloc(owned, entry.value),
             };
         }
-        std.mem.sort(EnvironmentEntry, environment, {}, lessEnvironment);
+        std.sort.heap(EnvironmentEntry, environment, {}, lessEnvironment);
         for (environment, 0..) |entry, environment_index| {
             if (environment_index != 0 and
                 std.mem.eql(u8, entry.key, environment[environment_index - 1].key))
@@ -562,7 +562,7 @@ pub fn verifyLockEvidence(
 
     const sorted_repositories = try allocator.dupe(RepositoryEvidence, repositories);
     defer allocator.free(sorted_repositories);
-    std.mem.sort(RepositoryEvidence, sorted_repositories, {}, lessRepository);
+    std.sort.heap(RepositoryEvidence, sorted_repositories, {}, lessRepository);
     for (sorted_repositories, 0..) |repository, index| {
         if (index != 0 and std.mem.eql(
             u8,
@@ -596,7 +596,7 @@ pub fn verifyLockEvidence(
     if (lock.packages.len != packages.len) return error.MissingPackageEvidence;
     const sorted_packages = try allocator.dupe(PackageEvidence, packages);
     defer allocator.free(sorted_packages);
-    std.mem.sort(PackageEvidence, sorted_packages, {}, lessPackage);
+    std.sort.heap(PackageEvidence, sorted_packages, {}, lessPackage);
     for (lock.packages, sorted_packages) |locked, package| {
         if (!std.mem.eql(u8, locked.name, package.name) or
             !std.mem.eql(u8, locked.version, package.version) or
@@ -1004,8 +1004,8 @@ fn sameFingerprints(
     defer allocator.free(sorted_left);
     const sorted_right = try allocator.dupe([20]u8, right);
     defer allocator.free(sorted_right);
-    std.mem.sort([20]u8, sorted_left, {}, lessFingerprint);
-    std.mem.sort([20]u8, sorted_right, {}, lessFingerprint);
+    std.sort.heap([20]u8, sorted_left, {}, lessFingerprint);
+    std.sort.heap([20]u8, sorted_right, {}, lessFingerprint);
     return std.mem.eql([20]u8, sorted_left, sorted_right);
 }
 

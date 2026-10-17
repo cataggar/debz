@@ -572,7 +572,7 @@ fn installRecord(
             .link = try owned.dupe(u8, incoming.link),
         });
     }
-    std.mem.sort(Slave, slave_list.items, {}, slaveNameLess);
+    std.sort.heap(Slave, slave_list.items, {}, slaveNameLess);
 
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(owned);
@@ -614,7 +614,7 @@ fn installRecord(
         .priority = registration.priority,
         .targets = incoming_targets,
     });
-    std.mem.sort(Candidate, candidates.items, {}, candidateLess);
+    std.sort.heap(Candidate, candidates.items, {}, candidateLess);
 
     // A slave definition disappears only when no remaining provider supplies
     // it. Re-registering one provider without a prior slave therefore removes
@@ -1830,11 +1830,11 @@ pub fn discoverScriptAuthority(
         return error.AlternativesLimit;
     if (commands.items.len > limits.max_script_commands)
         return error.AlternativesLimit;
-    std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+    std.sort.heap([]const u8, paths.items, {}, bytewisePathLess);
     var unique: std.ArrayList([]const u8) = .empty;
     defer unique.deinit(owned);
     for (paths.items) |path| try appendUniquePath(owned, &unique, path);
-    std.mem.sort(
+    std.sort.heap(
         []const u8,
         immutable_targets.items,
         {},
@@ -1985,7 +1985,7 @@ pub fn listGroups(
             return error.UnsupportedAlternativesEntry;
         name.* = try owned.dupe(u8, member.name);
     }
-    std.mem.sort([]const u8, names, {}, bytewisePathLess);
+    std.sort.heap([]const u8, names, {}, bytewisePathLess);
     return .{
         .names = names,
         .arena = storage.arena,
@@ -2426,7 +2426,7 @@ pub fn captureScriptInputs(
         tool.link_count != 1)
         return error.InvalidAlternativesTool;
     try appendFact(owned, &facts, tool);
-    std.mem.sort(EntryFact, facts.items, {}, entryFactLess);
+    std.sort.heap(EntryFact, facts.items, {}, entryFactLess);
     const result = try owned.dupe(EntryFact, facts.items);
     return .{
         .facts = result,
@@ -3022,8 +3022,8 @@ pub fn capture(
         error.FileNotFound => {
             if (groups.items.len != 0)
                 return error.AlternativesSelectorsMissing;
-            std.mem.sort(GroupState, groups.items, {}, bytewiseGroupLess);
-            std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+            std.sort.heap(GroupState, groups.items, {}, bytewiseGroupLess);
+            std.sort.heap([]const u8, paths.items, {}, bytewisePathLess);
             return .{
                 .groups = try owned.dupe(GroupState, groups.items),
                 .paths = try owned.dupe([]const u8, paths.items),
@@ -3099,8 +3099,8 @@ pub fn capture(
         if (!expected) return error.UnsupportedAlternativesSelector;
     }
 
-    std.mem.sort(GroupState, groups.items, {}, bytewiseGroupLess);
-    std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+    std.sort.heap(GroupState, groups.items, {}, bytewiseGroupLess);
+    std.sort.heap([]const u8, paths.items, {}, bytewisePathLess);
     var relationship_count: usize = 0;
     for (groups.items) |group| {
         relationship_count = std.math.add(

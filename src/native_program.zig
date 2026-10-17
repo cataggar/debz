@@ -1803,7 +1803,7 @@ fn buildInstalled(self: *Compiler) CompileError!void {
                 package.triggers_pending.len + package.triggers_awaited.len,
         );
     }
-    std.mem.sort(InstalledPackage, packages, {}, lessInstalled);
+    std.sort.heap(InstalledPackage, packages, {}, lessInstalled);
     try self.installed_index.ensureTotalCapacity(self.arena, @intCast(packages.len));
     for (packages, 0..) |package, index| {
         const key: PackageRef = .{ .name = package.name, .architecture = package.architecture };
@@ -1830,7 +1830,7 @@ fn prepareScripts(self: *Compiler, package: InstalledPackage) CompileError![]con
             .package = package.name,
         });
     const scripts = try self.arena.dupe(InstalledScript, package.scripts);
-    std.mem.sort(InstalledScript, scripts, {}, struct {
+    std.sort.heap(InstalledScript, scripts, {}, struct {
         fn less(_: void, left: InstalledScript, right: InstalledScript) bool {
             return @intFromEnum(left.kind) < @intFromEnum(right.kind);
         }
@@ -1868,7 +1868,7 @@ fn prepareInstalledConffiles(
                 .path = conffile.path,
             });
     }
-    std.mem.sort(InstalledConffile, conffiles, {}, lessInstalledConffile);
+    std.sort.heap(InstalledConffile, conffiles, {}, lessInstalledConffile);
     for (conffiles, 0..) |conffile, index| {
         if (index != 0 and std.mem.eql(u8, conffile.path, conffiles[index - 1].path))
             return self.reject(.{
@@ -1894,7 +1894,7 @@ fn prepareDeclarations(
                 .path = declaration.name,
             });
     }
-    std.mem.sort(TriggerDeclaration, owned, {}, lessTrigger);
+    std.sort.heap(TriggerDeclaration, owned, {}, lessTrigger);
     for (owned, 0..) |declaration, index| {
         if (index == 0) continue;
         const previous = owned[index - 1];
@@ -1925,7 +1925,7 @@ fn prepareArchiveScripts(
             .package = archive.package,
         });
     const scripts = try self.arena.dupe(ArchiveScript, archive.scripts);
-    std.mem.sort(ArchiveScript, scripts, {}, struct {
+    std.sort.heap(ArchiveScript, scripts, {}, struct {
         fn less(_: void, left: ArchiveScript, right: ArchiveScript) bool {
             return @intFromEnum(left.kind) < @intFromEnum(right.kind);
         }
@@ -1969,7 +1969,7 @@ fn prepareArchiveConffiles(
                 .path = conffile.path,
             });
     }
-    std.mem.sort(ArchiveConffile, conffiles, {}, lessConffile);
+    std.sort.heap(ArchiveConffile, conffiles, {}, lessConffile);
     for (conffiles, 0..) |conffile, index| {
         if (index != 0 and std.mem.eql(u8, conffile.path, conffiles[index - 1].path))
             return self.reject(.{
@@ -1998,7 +1998,7 @@ fn prepareReplaces(self: *Compiler, archive: Archive) CompileError![]const []con
             });
         replaces[index] = name;
     }
-    std.mem.sort([]const u8, replaces, {}, lessString);
+    std.sort.heap([]const u8, replaces, {}, lessString);
     return replaces;
 }
 
@@ -2291,7 +2291,7 @@ fn buildModeled(self: *Compiler) CompileError!void {
         });
     }
     const modeled = try entries.toOwnedSlice(self.arena);
-    std.mem.sort(Modeled, modeled, {}, struct {
+    std.sort.heap(Modeled, modeled, {}, struct {
         fn less(_: void, left: Modeled, right: Modeled) bool {
             return lessRef({}, left.ref(), right.ref());
         }
@@ -2748,7 +2748,7 @@ fn emitOwnership(self: *Compiler) CompileError!void {
             !validIdentity(conflict.claimant.architecture))
             return self.reject(.{ .code = .invalid_ownership_conflict, .detail = "identity" });
     }
-    std.mem.sort(OwnershipConflict, conflicts, {}, lessConflict);
+    std.sort.heap(OwnershipConflict, conflicts, {}, lessConflict);
     for (conflicts, 0..) |conflict, index| {
         try self.charge(1);
         if (index != 0 and
@@ -3819,7 +3819,7 @@ fn emitTriggerWork(self: *Compiler) CompileError!void {
     for (self.modeled, 0..) |*entry, index| {
         try self.charge(1);
         if (entry.pending_triggers.items.len == 0) continue;
-        std.mem.sort([]const u8, entry.pending_triggers.items, {}, lessString);
+        std.sort.heap([]const u8, entry.pending_triggers.items, {}, lessString);
         try indices.append(self.arena, @intCast(index));
         try pending.append(self.arena, .{
             .package = try self.ref(entry.ref()),

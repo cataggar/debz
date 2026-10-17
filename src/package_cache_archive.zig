@@ -341,7 +341,7 @@ fn exportVersion(
     const order = try allocator.alloc(usize, lock.packages.len);
     defer allocator.free(order);
     for (order, 0..) |*value, index| value.* = index;
-    std.mem.sort(usize, order, lock, struct {
+    std.sort.heap(usize, order, lock, struct {
         fn less(context: @TypeOf(lock), left: usize, right: usize) bool {
             return std.mem.order(u8, &context.packages[left].sha256, &context.packages[right].sha256) == .lt;
         }
@@ -695,7 +695,7 @@ fn exportTaggedBinding(
         }
         order[index] = index;
     }
-    std.mem.sort(usize, order, lock, struct {
+    std.sort.heap(usize, order, lock, struct {
         fn less(context: exact_lock_v3.Lock, left: usize, right: usize) bool {
             return content_digest.Identity.order(
                 context.packages[left].archive_identity,
@@ -1677,7 +1677,7 @@ test "package_cache_archive.test.native invalid closures publish no objects" {
             .extra => 3,
             else => 2,
         };
-        std.mem.sort(TestArchiveEntry, entries[0..length], {}, struct {
+        std.sort.heap(TestArchiveEntry, entries[0..length], {}, struct {
             fn less(_: void, left: TestArchiveEntry, right: TestArchiveEntry) bool {
                 return std.mem.order(u8, &left.digest, &right.digest) == .lt;
             }

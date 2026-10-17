@@ -217,7 +217,7 @@ pub fn captureFromDatabase(
             const path = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}", .{member.name});
             try controls.append(allocator, try reader.file(path));
         }
-        std.mem.sort(File, controls.items, {}, lessFile);
+        std.sort.heap(File, controls.items, {}, lessFile);
         var payload: std.ArrayList(File) = .empty;
         for (paths) |listed| {
             const logical = database.logicalListPath(listed);
@@ -226,7 +226,7 @@ pub fn captureFromDatabase(
                 return error.InvalidInstalledBaselineComponent;
             try payload.append(allocator, try reader.file(logical[1..]));
         }
-        std.mem.sort(File, payload.items, {}, lessFile);
+        std.sort.heap(File, payload.items, {}, lessFile);
         components[index] = .{
             .package = .{
                 .name = try allocator.dupe(u8, package.name),

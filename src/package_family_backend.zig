@@ -518,7 +518,7 @@ pub const NativeBackend = struct {
             .architecture = try allocator.dupe(u8, package.architecture.value),
             .status = package.status,
         };
-        std.mem.sort(InspectedPackage, packages, {}, lessInspectedPackage);
+        std.sort.heap(InspectedPackage, packages, {}, lessInspectedPackage);
 
         const store = root_operation.Store.init(root.root);
         var operation = try store.read(allocator);

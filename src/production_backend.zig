@@ -327,7 +327,7 @@ pub const Backend = struct {
 
         const canonical_selectors = try allocator.dupe(solver.PackageSelector, workflow.selectors);
         defer allocator.free(canonical_selectors);
-        std.mem.sort(
+        std.sort.heap(
             solver.PackageSelector,
             canonical_selectors,
             {},
@@ -5220,7 +5220,7 @@ fn semanticRequestDigest(
     };
     const canonical = try allocator.dupe(solver.PackageSelector, selectors);
     defer allocator.free(canonical);
-    std.mem.sort(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
+    std.sort.heap(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
 
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("debz-semantic-transaction-request-v1\x00");
@@ -5260,7 +5260,7 @@ pub fn workflowProductRequestDigest(
 ) ![32]u8 {
     const canonical = try allocator.dupe(solver.PackageSelector, selectors);
     defer allocator.free(canonical);
-    std.mem.sort(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
+    std.sort.heap(solver.PackageSelector, canonical, {}, lessWorkflowSelector);
     const packages = try allocator.alloc([]const u8, canonical.len);
     defer allocator.free(packages);
     var formatted: usize = 0;
@@ -6436,7 +6436,7 @@ fn refreshRepositoryEvidence(
         signers[signer_count] = fingerprint;
         signer_count += 1;
     };
-    std.mem.sort([20]u8, signers[0..signer_count], {}, struct {
+    std.sort.heap([20]u8, signers[0..signer_count], {}, struct {
         fn lessThan(_: void, a: [20]u8, b: [20]u8) bool {
             return std.mem.order(u8, &a, &b) == .lt;
         }
@@ -6714,7 +6714,7 @@ fn success(operation: api.Operation, changed: bool, summary: []const u8, items: 
 }
 
 fn sortItems(items: []api.Item) void {
-    std.mem.sort(api.Item, items, {}, struct {
+    std.sort.heap(api.Item, items, {}, struct {
         fn lessThan(_: void, left: api.Item, right: api.Item) bool {
             const package_order = std.mem.order(u8, left.package, right.package);
             if (package_order != .eq) return package_order == .lt;

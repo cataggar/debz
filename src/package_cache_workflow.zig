@@ -898,7 +898,7 @@ fn prepareAfterCleanupVersion(
     defer allocator.free(retained);
     for (request.lock.packages, 0..) |package, index|
         retained[index] = packageIdentity(version, package);
-    std.mem.sort(package_acquisition.Digest, retained, {}, lessDigest);
+    std.sort.heap(package_acquisition.Digest, retained, {}, lessDigest);
 
     var downloaded_count: usize = 0;
     var reused_count: usize = 0;
@@ -1178,7 +1178,7 @@ fn validateLock(
         const digests = try allocator.alloc([32]u8, lock.packages.len);
         defer allocator.free(digests);
         for (lock.packages, 0..) |package, index| digests[index] = package.sha256;
-        std.mem.sort([32]u8, digests, {}, lessBytes32);
+        std.sort.heap([32]u8, digests, {}, lessBytes32);
         if (digests.len > 1) for (digests[1..], digests[0 .. digests.len - 1]) |current, prior|
             if (std.mem.eql(u8, &current, &prior)) return error.DuplicatePackageDigest;
     }
@@ -1361,7 +1361,7 @@ fn acceptancePolicyDigest(
 ) ![32]u8 {
     const foreign = try allocator.dupe([]const u8, policy.foreign_architectures);
     defer allocator.free(foreign);
-    std.mem.sort([]const u8, foreign, {}, lessString);
+    std.sort.heap([]const u8, foreign, {}, lessString);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hashField(&hash, fingerprintDomain(version));
     hashField(&hash, lockSchema(version));

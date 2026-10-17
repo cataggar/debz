@@ -12,7 +12,7 @@ rm -rf "$root"
 mkdir -p "$root"
 
 "$zig" build \
-  --cache-dir "$root/gnu-cache" \
+  --cache-dir "$root/cache" \
   -Dtarget=x86_64-linux-gnu \
   -Doptimize=ReleaseSafe \
   -Dversion="$version" \
@@ -33,7 +33,7 @@ cmp "$gnu_prefix/share/debz/digest-semantic-allowlist-v1.tsv" \
 cmp "$gnu_prefix/share/debz/legacy-cutover-policy.json" \
   "$gnu_prefix/share/doc/debz/legacy-cutover-policy.json"
 if "$zig" build \
-  --cache-dir "$root/gnu-cache" \
+  --cache-dir "$root/cache" \
   -Dtarget=x86_64-linux-gnu \
   -Doptimize=ReleaseSafe \
   -Dversion="$version" \
@@ -44,7 +44,7 @@ then
 fi
 
 "$zig" build \
-  --cache-dir "$root/release-cache" \
+  --cache-dir "$root/cache" \
   -Dtarget=x86_64-linux-musl \
   -Doptimize=ReleaseSafe \
   -Dversion="$version" \

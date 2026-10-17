@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/consumer.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
         }),
     });
     tests.root_module.addImport("debz", debz.module("debz"));

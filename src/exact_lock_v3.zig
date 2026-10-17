@@ -359,7 +359,7 @@ pub fn create(
         try validateDigestIdentity(repository.index_identity);
         if (repository.signer_fingerprints.len == 0) return error.MissingSigner;
         const fingerprints = try owned.dupe([20]u8, repository.signer_fingerprints);
-        std.mem.sort([20]u8, fingerprints, {}, lessBytes20);
+        std.sort.heap([20]u8, fingerprints, {}, lessBytes20);
         for (fingerprints, 0..) |fingerprint, signer_index| {
             if (signer_index != 0 and
                 std.mem.eql(u8, &fingerprint, &fingerprints[signer_index - 1]))
@@ -368,7 +368,7 @@ pub fn create(
         repositories[index] = repository;
         repositories[index].signer_fingerprints = fingerprints;
     }
-    std.mem.sort(Repository, repositories, {}, lessRepository);
+    std.sort.heap(Repository, repositories, {}, lessRepository);
     for (repositories, 0..) |repository, index| {
         if (index != 0 and std.mem.eql(u8, &repository.id, &repositories[index - 1].id))
             return error.DuplicateRepository;
@@ -386,7 +386,7 @@ pub fn create(
             return error.DuplicateArtifact;
         local_artifacts[index] = try dupeLocalArtifact(owned, artifact);
     }
-    std.mem.sort(
+    std.sort.heap(
         package_origin.LocalArtifactEvidenceV2,
         local_artifacts,
         {},
@@ -464,7 +464,7 @@ pub fn create(
             if (entry.found_existing) return error.DuplicateArtifact;
         }
     }
-    std.mem.sort(Package, packages, {}, lessPackage);
+    std.sort.heap(Package, packages, {}, lessPackage);
     for (packages, 0..) |package, index| {
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;

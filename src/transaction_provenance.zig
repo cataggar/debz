@@ -451,7 +451,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
         if (!repository.signature_verified) return error.UnauthenticatedRepository;
         repositories[index] = repository;
         repositories[index].signer_fingerprints = try owned.dupe([20]u8, repository.signer_fingerprints);
-        std.mem.sort([20]u8, @constCast(repositories[index].signer_fingerprints), {}, lessFingerprint);
+        std.sort.heap([20]u8, @constCast(repositories[index].signer_fingerprints), {}, lessFingerprint);
         for (repositories[index].signer_fingerprints, 0..) |fingerprint, signer_index| {
             if (signer_index != 0 and std.mem.eql(
                 u8,
@@ -460,7 +460,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
             )) return error.DuplicateSigner;
         }
     }
-    std.mem.sort(RepositoryEvidence, repositories, {}, lessRepository);
+    std.sort.heap(RepositoryEvidence, repositories, {}, lessRepository);
     for (repositories, 0..) |repository, index| {
         if (index != 0 and std.mem.eql(
             u8,
@@ -485,7 +485,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
         packages[index].version = try owned.dupe(u8, package.version);
         packages[index].architecture = try owned.dupe(u8, package.architecture);
     }
-    std.mem.sort(PackageEvidence, packages, {}, lessPackage);
+    std.sort.heap(PackageEvidence, packages, {}, lessPackage);
     for (packages, 0..) |package, index| {
         if (index != 0 and samePackageIdentity(package, packages[index - 1]))
             return error.DuplicatePackage;
@@ -503,7 +503,7 @@ pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
                 .value = if (secretName(entry.key)) try owned.dupe(u8, "<redacted>") else try redactAlloc(owned, entry.value),
             };
         }
-        std.mem.sort(EnvironmentEntry, environment, {}, lessEnvironment);
+        std.sort.heap(EnvironmentEntry, environment, {}, lessEnvironment);
         for (environment, 0..) |entry, environment_index| {
             if (environment_index != 0 and std.mem.eql(u8, entry.key, environment[environment_index - 1].key))
                 return error.DuplicateEnvironmentKey;

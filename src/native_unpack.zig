@@ -858,7 +858,7 @@ fn routeSettlementBlueprintFromPlan(
     }
     if (routes.items.len == 0)
         return error.InvalidUnpackRouteSettlement;
-    std.mem.sort(
+    std.sort.heap(
         RouteSettlementBlueprintRoute,
         routes.items,
         {},
@@ -992,7 +992,7 @@ fn routeSettlementBlueprintFromModel(
     }
     if (routes.items.len == 0)
         return error.InvalidUnpackRouteSettlement;
-    std.mem.sort(
+    std.sort.heap(
         RouteSettlementBlueprintRoute,
         routes.items,
         {},
@@ -2476,7 +2476,7 @@ fn indexOwnershipWithDiversions(
     }
     const items = try entries.toOwnedSlice(allocator);
     errdefer allocator.free(items);
-    std.mem.sort(OwnedEntry, items, {}, lessOwnedEntry);
+    std.sort.heap(OwnedEntry, items, {}, lessOwnedEntry);
 
     // One counting pass plus one placement pass groups every entry under its
     // owner, so answering "what does this package publish" never scans the
@@ -3559,7 +3559,7 @@ fn buildHandoff(
     const owned = arena.allocator();
     const ordered = try allocator.dupe(DeferredItem, items);
     defer allocator.free(ordered);
-    std.mem.sort(DeferredItem, ordered, {}, lessDeferredItem);
+    std.sort.heap(DeferredItem, ordered, {}, lessDeferredItem);
     const copied = try owned.alloc(DeferredItem, ordered.len);
     var hash = Sha256.init(.{});
     hash.update(digest_domain);
@@ -3640,7 +3640,7 @@ fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
     try collectSteps(builder);
     if (builder.deferred.items.len != 0) return error.Deferred;
 
-    std.mem.sort(PackageWork, builder.work.items, {}, lessPackageWork);
+    std.sort.heap(PackageWork, builder.work.items, {}, lessPackageWork);
     for (builder.work.items, 0..) |item, index| {
         if (item.owner_index) |owner|
             try builder.owner_work.put(
@@ -4431,7 +4431,7 @@ fn inspectTouchedConffiles(builder: *Builder) PlanError!void {
     defer paths.deinit(builder.allocator);
     var keys = builder.installed_conffiles.keyIterator();
     while (keys.next()) |path| try paths.append(builder.allocator, path.*);
-    std.mem.sort([]const u8, paths.items, {}, lessPath);
+    std.sort.heap([]const u8, paths.items, {}, lessPath);
     for (paths.items) |path| {
         const owners = builder.installed_conffiles.get(path).?;
         var claimed = builder.transaction_claims.contains(path) or
@@ -5817,7 +5817,7 @@ fn rootDirectoryObservation(
     };
     try builder.chargeWork(observed.members.len, diagnostic);
     try chargeComparedBytes(builder, name_bytes, diagnostic);
-    std.mem.sort(
+    std.sort.heap(
         root_fs.DirectoryMember,
         observed.members,
         {},
@@ -6809,7 +6809,7 @@ fn revalidateDirectoryObservations(builder: *Builder) PlanError!void {
     defer paths.deinit(builder.allocator);
     var keys = builder.directory_observations.keyIterator();
     while (keys.next()) |path| try paths.append(builder.allocator, path.*);
-    std.mem.sort([]const u8, paths.items, {}, lessPath);
+    std.sort.heap([]const u8, paths.items, {}, lessPath);
     for (paths.items) |path| {
         const resolved = root_fs.Path.initPackage(path) catch
             return builder.fail(.{
@@ -7438,7 +7438,7 @@ fn synthesizeAncestors(builder: *Builder, item: *PackageWork, package: u32) Plan
         }
     }
     if (missing.items.len == 0) return;
-    std.mem.sort([]const u8, missing.items, {}, lessPath);
+    std.sort.heap([]const u8, missing.items, {}, lessPath);
     for (missing.items) |path| {
         const owned = try builder.arena.dupe(u8, path);
         try builder.published.put(builder.allocator, owned, .directory);
@@ -7526,7 +7526,7 @@ fn planFinalRemovals(builder: *Builder) PlanError!void {
             });
         index = last;
     }
-    std.mem.sort(FinalRemoval, candidates.items, {}, struct {
+    std.sort.heap(FinalRemoval, candidates.items, {}, struct {
         fn greater(_: void, left: FinalRemoval, right: FinalRemoval) bool {
             return switch (std.mem.order(u8, left.path, right.path)) {
                 .gt => true,
@@ -7657,7 +7657,7 @@ fn observeFinalDirectoryPrefixes(builder: *Builder) PlanError!void {
     defer paths.deinit(builder.allocator);
     var keys = builder.final_claim_ancestors.keyIterator();
     while (keys.next()) |path| try paths.append(builder.allocator, path.*);
-    std.mem.sort([]const u8, paths.items, {}, lessPath);
+    std.sort.heap([]const u8, paths.items, {}, lessPath);
     for (paths.items) |path| {
         if (builder.final_claim_ancestors.get(path).?.kind != .directory)
             return builder.fail(.{
@@ -7699,7 +7699,7 @@ fn observeFinalDirectoryPrefixes(builder: *Builder) PlanError!void {
 }
 
 fn sortRetainedDirectories(builder: *Builder) void {
-    std.mem.sort(
+    std.sort.heap(
         RetainedDirectory,
         builder.retained_directories.items,
         {},
@@ -7771,7 +7771,7 @@ fn indexCaseGraph(builder: *Builder) PlanError!void {
     var conffiles = builder.installed_conffiles.keyIterator();
     while (conffiles.next()) |path|
         try conffile_paths.append(builder.allocator, path.*);
-    std.mem.sort([]const u8, conffile_paths.items, {}, lessPath);
+    std.sort.heap([]const u8, conffile_paths.items, {}, lessPath);
     for (conffile_paths.items) |path|
         try recordPathPrefixes(builder, path, null, null);
     for (builder.work.items, 0..) |item, index| {
@@ -8162,7 +8162,7 @@ fn inspectPublicationTriggers(builder: *Builder) PlanError!void {
         for (item.removals.items) |removal|
             try affected_paths.append(builder.allocator, removal.path);
     }
-    std.mem.sort([]const u8, affected_paths.items, {}, lessPath);
+    std.sort.heap([]const u8, affected_paths.items, {}, lessPath);
     for (affected_paths.items) |path| {
         var cursor: ?root_fs.Path = root_fs.Path.initPackage(path) catch
             return builder.fail(.{
@@ -8346,7 +8346,7 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
         );
     }
     if (!shipped_md5sums)
-        std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
+        std.sort.heap(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
 }
 
 fn lessMd5sum(
@@ -8729,8 +8729,8 @@ fn lower(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
             });
         }
     }
-    std.mem.sort(OrderedPath, directories.items, builder.work.items, lessOrderedDirectory);
-    std.mem.sort(OrderedRemoval, removals.items, builder.work.items, greaterOrderedRemoval);
+    std.sort.heap(OrderedPath, directories.items, builder.work.items, lessOrderedDirectory);
+    std.sort.heap(OrderedRemoval, removals.items, builder.work.items, greaterOrderedRemoval);
 
     var changes: std.ArrayList(FilesystemChange) = .empty;
     defer changes.deinit(builder.allocator);
@@ -8998,7 +8998,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
     var displaced = builder.displaced.keyIterator();
     while (displaced.next()) |slot|
         try displaced_owners.append(builder.allocator, slot.*);
-    std.mem.sort(u32, displaced_owners.items, builder.ownership, struct {
+    std.sort.heap(u32, displaced_owners.items, builder.ownership, struct {
         fn less(ownership: Ownership, left: u32, right: u32) bool {
             const first = ownership.owners[left].identity;
             const second = ownership.owners[right].identity;
@@ -9803,7 +9803,7 @@ fn captureDatabaseSnapshotInto(
             .mode = file.mode,
         });
     }
-    std.mem.sort(
+    std.sort.heap(
         package_database.NamedTriggerEntry,
         named_triggers.items,
         {},
@@ -9849,7 +9849,7 @@ fn captureDatabaseSnapshotInto(
             .gid = captured.gid,
         });
     }
-    std.mem.sort(package_database.InfoEntry, info.items, {}, struct {
+    std.sort.heap(package_database.InfoEntry, info.items, {}, struct {
         fn less(
             _: void,
             left: package_database.InfoEntry,
@@ -9885,7 +9885,7 @@ fn captureDatabaseSnapshotInto(
             .mode = file.mode,
         });
     }
-    std.mem.sort(package_database.UpdateEntry, updates.items, {}, struct {
+    std.sort.heap(package_database.UpdateEntry, updates.items, {}, struct {
         fn less(
             _: void,
             left: package_database.UpdateEntry,
@@ -11084,7 +11084,7 @@ fn unpackBackups(
             try backups.append(allocator, backup);
         }
     }
-    std.mem.sort(native_unpack_diversion.Backup, backups.items, {}, struct {
+    std.sort.heap(native_unpack_diversion.Backup, backups.items, {}, struct {
         fn less(_: void, left: native_unpack_diversion.Backup, right: native_unpack_diversion.Backup) bool {
             return std.mem.lessThan(u8, left.path, right.path);
         }
@@ -14137,12 +14137,12 @@ fn materializeRemoval(
             });
     }
 
-    std.mem.sort([]const u8, files.items, {}, lessPath);
+    std.sort.heap([]const u8, files.items, {}, lessPath);
     for (files.items) |path| try intents.append(allocator, .{ .remove = .{
         .path = path,
         .removal = .allow_absent,
     } });
-    std.mem.sort([]const u8, directories.items, {}, greaterPath);
+    std.sort.heap([]const u8, directories.items, {}, greaterPath);
     for (directories.items) |path| {
         if (removing.contains(path)) continue;
         if (!try removableDirectory(request.root, path, &removing))
@@ -14193,7 +14193,7 @@ fn materializeRemoval(
         }
         if (paths.items.len == 0 and filter.fallback_root)
             try paths.append(allocator, package_database.root_list_path);
-        std.mem.sort([]const u8, paths.items, {}, lessPath);
+        std.sort.heap([]const u8, paths.items, {}, lessPath);
         staged.paths = try owned.dupe([]const u8, paths.items);
     }
     if (request.planning.trigger_execution) {
@@ -15815,7 +15815,7 @@ fn lifecycleDeclarationsDigest(
         declarations,
     );
     defer allocator.free(sorted);
-    std.mem.sort(
+    std.sort.heap(
         native_program.TriggerDeclaration,
         sorted,
         {},
@@ -31904,7 +31904,7 @@ const BaselineOwnershipIndex = struct {
             entries[offset] = .{ .file = file };
             offset += 1;
         };
-        std.mem.sort(RetainedEntry, entries, {}, struct {
+        std.sort.heap(RetainedEntry, entries, {}, struct {
             fn less(_: void, left: RetainedEntry, right: RetainedEntry) bool {
                 return std.mem.lessThan(u8, left.file.path, right.file.path);
             }
