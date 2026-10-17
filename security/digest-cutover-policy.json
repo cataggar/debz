@@ -395,9 +395,7 @@
         "src/transaction_provenance_v2.zig",
         "src/transaction_provenance_v3.zig",
         "src/transaction_recovery.zig",
-        "test/apt-system-schema-validator.zig",
-        "tools/derive-vendor-state-reference.py",
-        "tools/test_vendor_state_capture.py"
+        "test/apt-system-schema-validator.zig"
       ]
     },
     {

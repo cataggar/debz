@@ -26,8 +26,8 @@ checkout = Path(sys.argv[2])
 for relative in ("tools/real-snapshot-protected-native-ci.sh",
                  "tools/real-snapshot-acceptance.sh",
                  "tools/real-snapshot-reference.sh",
-                 "tools/capture-vendor-state.py",
                  "tools/real_snapshot_reference_paths.py",
+                 "zig-out/bin/debz-vendor-snapshot-tools",
                  "zig-out/bin/debz-native-outcome",
                  "zig-out/bin/debz-native-phase-summary",
                  "zig-out/bin/debz-exec-audit",
@@ -85,7 +85,7 @@ esac
 install -d -o root -g root -m 0700 "$evidence" "$upload"
 capture_status=0 differential_status=0 forbidden_exec_status=0 outcome_status=0 copy_status=0 coordination_status=0
 if [[ -d "$work/root/var/lib/dpkg/info" ]]; then
-  timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py \
+  timeout --signal=TERM --kill-after=30s 5m zig-out/bin/debz-vendor-snapshot-tools capture \
     --reference-root "$work/root" --architecture "$architecture" \
     --output "$evidence/vendor-state-inventory-v1.json" || capture_status=$?
 else
