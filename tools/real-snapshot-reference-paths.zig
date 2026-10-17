@@ -40,6 +40,10 @@ pub const Error = error{
 var test_root_override: ?[]const u8 = null;
 var test_force_root_owned_lstat: bool = false;
 
+pub fn setTestRootOverride(prefix: ?[]const u8) void {
+    if (builtin.is_test) test_root_override = prefix;
+}
+
 fn syscall(result: usize) !usize {
     return switch (linux.errno(result)) {
         .SUCCESS => result,
