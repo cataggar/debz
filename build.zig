@@ -106,6 +106,27 @@ pub fn build(b: *std.Build) void {
     debz.linkLibrary(zstd);
     debz.link_libc = true;
 
+    const debz_debug = if (optimize == .debug) debz else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/debz.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addOptions("debz_build_options", build_options);
+        module.addImport("libsolv_c", libsolv_c);
+        module.addImport("compression_c", compression_c);
+        module.addIncludePath(libsolv_dependency.path("src"));
+        module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+        module.addIncludePath(zstd_dependency.path("lib"));
+        module.addCMacro("LZMA_API_STATIC", "1");
+        module.linkLibrary(libsolv);
+        module.linkLibrary(liblzma);
+        module.linkLibrary(zstd);
+        module.link_libc = true;
+        break :blk module;
+    };
+
     const native_lifecycle_test_module = b.createModule(.{
         .root_source_file = b.path("src/debz.zig"),
         .target = target,
@@ -124,6 +145,27 @@ pub fn build(b: *std.Build) void {
     native_lifecycle_test_module.linkLibrary(zstd);
     native_lifecycle_test_module.link_libc = true;
 
+    const native_lifecycle_debug_test_module = if (optimize == .debug) native_lifecycle_test_module else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/debz.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addOptions("debz_build_options", external_lifecycle_build_options);
+        module.addImport("libsolv_c", libsolv_c);
+        module.addImport("compression_c", compression_c);
+        module.addIncludePath(libsolv_dependency.path("src"));
+        module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+        module.addIncludePath(zstd_dependency.path("lib"));
+        module.addCMacro("LZMA_API_STATIC", "1");
+        module.linkLibrary(libsolv);
+        module.linkLibrary(liblzma);
+        module.linkLibrary(zstd);
+        module.link_libc = true;
+        break :blk module;
+    };
+
     const cli_backend_policy = b.createModule(.{
         .root_source_file = b.path("src/cli_backend_policy.zig"),
         .target = target,
@@ -131,6 +173,16 @@ pub fn build(b: *std.Build) void {
         .strip = !native_helper_debug_info,
     });
     cli_backend_policy.addImport("debz", debz);
+    const cli_backend_policy_debug = if (optimize == .debug) cli_backend_policy else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/cli_backend_policy.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addImport("debz", debz_debug);
+        break :blk module;
+    };
     const repository_cli = b.createModule(.{
         .root_source_file = b.path("src/repository_cli.zig"),
         .target = target,
@@ -139,6 +191,17 @@ pub fn build(b: *std.Build) void {
     });
     repository_cli.addImport("debz", debz);
     repository_cli.addImport("cli_backend_policy", cli_backend_policy);
+    const repository_cli_debug = if (optimize == .debug) repository_cli else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/repository_cli.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addImport("debz", debz_debug);
+        module.addImport("cli_backend_policy", cli_backend_policy_debug);
+        break :blk module;
+    };
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -157,6 +220,22 @@ pub fn build(b: *std.Build) void {
         .name = "debz",
         .root_module = cli_module,
     });
+    const cli_debug = if (optimize == .debug) cli else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addImport("debz", debz_debug);
+        module.addImport("repository_cli", repository_cli_debug);
+        module.addImport("cli_backend_policy", cli_backend_policy_debug);
+        module.addOptions("cli_rehearsal_options", release_cli_options);
+        break :blk b.addExecutable(.{
+            .name = "debz-debug",
+            .root_module = module,
+        });
+    };
     const install_cli = b.addInstallArtifact(cli, .{});
     b.getInstallStep().dependOn(&install_cli.step);
     const release_install = b.step("release-install", "Install the complete release tree for packaging");
@@ -164,7 +243,7 @@ pub fn build(b: *std.Build) void {
     installReleaseFiles(b, install_cli, release_install, target);
 
     const run_cli = b.addRunArtifact(cli);
-    run_cli.step.dependOn(b.getInstallStep());
+    run_cli.step.dependOn(&install_cli.step);
     run_cli.addPassthruArgs();
     b.step("run", "Run the debz CLI").dependOn(&run_cli.step);
 
@@ -186,10 +265,10 @@ pub fn build(b: *std.Build) void {
     const native_outcome_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-native-outcome.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_outcome_module.addImport("debz", debz);
+    native_outcome_module.addImport("debz", debz_debug);
     const native_outcome = b.addExecutable(.{
         .name = "debz-native-outcome",
         .root_module = native_outcome_module,
@@ -203,10 +282,10 @@ pub fn build(b: *std.Build) void {
     const native_phase_summary_module = b.createModule(.{
         .root_source_file = b.path("tools/native-phase-summary.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_phase_summary_module.addImport("debz", debz);
+    native_phase_summary_module.addImport("debz", debz_debug);
     const native_phase_summary = b.addExecutable(.{
         .name = "debz-native-phase-summary",
         .root_module = native_phase_summary_module,
@@ -220,7 +299,7 @@ pub fn build(b: *std.Build) void {
     const exec_audit_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-exec-audit.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const exec_audit = b.addExecutable(.{
@@ -236,10 +315,10 @@ pub fn build(b: *std.Build) void {
     const native_action_empty_lock_module = b.createModule(.{
         .root_source_file = b.path("tools/native-action-empty-lock.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_action_empty_lock_module.addImport("debz", debz);
+    native_action_empty_lock_module.addImport("debz", debz_debug);
     const native_action_empty_lock = b.addExecutable(.{
         .name = "debz-native-action-empty-lock",
         .root_module = native_action_empty_lock_module,
@@ -255,10 +334,10 @@ pub fn build(b: *std.Build) void {
     const baseline_fixture_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    baseline_fixture_module.addImport("debz", debz);
+    baseline_fixture_module.addImport("debz", debz_debug);
     baseline_fixture_module.addOptions("baseline_fixture_options", baseline_fixture_options);
     const baseline_fixture = b.addExecutable(.{
         .name = "debz-native-baseline-fixture",
@@ -281,10 +360,10 @@ pub fn build(b: *std.Build) void {
     const baseline_fixture_test_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-native-baseline-fixture.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    baseline_fixture_test_module.addImport("debz", debz);
+    baseline_fixture_test_module.addImport("debz", debz_debug);
     baseline_fixture_test_module.addOptions("baseline_fixture_options", baseline_fixture_options);
     baseline_fixture_test_module.addOptions("baseline_fixture_test_options", baseline_fixture_test_options);
     const baseline_fixture_tests = b.addRunArtifact(b.addTest(.{ .root_module = baseline_fixture_test_module }));
@@ -294,10 +373,10 @@ pub fn build(b: *std.Build) void {
     const disposable_runtime_module = b.createModule(.{
         .root_source_file = b.path("tools/disposable-root-runtime.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    disposable_runtime_module.addImport("debz", debz);
+    disposable_runtime_module.addImport("debz", debz_debug);
     const disposable_runtime = b.addExecutable(.{
         .name = "debz-disposable-runtime",
         .root_module = disposable_runtime_module,
@@ -310,10 +389,10 @@ pub fn build(b: *std.Build) void {
     const disposable_runtime_test_module = b.createModule(.{
         .root_source_file = b.path("tools/disposable-root-runtime.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    disposable_runtime_test_module.addImport("debz", debz);
+    disposable_runtime_test_module.addImport("debz", debz_debug);
     disposable_runtime_test_module.addOptions("disposable_runtime_test_options", disposable_runtime_test_options);
     const disposable_runtime_tests = b.addRunArtifact(b.addTest(.{ .root_module = disposable_runtime_test_module }));
     b.step("test-disposable-runtime", "Test original fixture runtime copying and no-follow refusal").dependOn(&disposable_runtime_tests.step);
@@ -322,10 +401,10 @@ pub fn build(b: *std.Build) void {
     const integration_signing_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-signing.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    integration_signing_module.addImport("debz", debz);
+    integration_signing_module.addImport("debz", debz_debug);
     const integration_signing = b.addExecutable(.{
         .name = "debz-integration-signing",
         .root_module = integration_signing_module,
@@ -339,10 +418,10 @@ pub fn build(b: *std.Build) void {
     const integration_signing_test_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-signing.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    integration_signing_test_module.addImport("debz", debz);
+    integration_signing_test_module.addImport("debz", debz_debug);
     integration_signing_test_module.addOptions("integration_signing_test_options", integration_signing_test_options);
     const integration_signing_tests = b.addRunArtifact(b.addTest(.{ .root_module = integration_signing_test_module }));
     b.step("test-integration-signing", "Test original signature identities and rooted signing refusals").dependOn(&integration_signing_tests.step);
@@ -351,10 +430,10 @@ pub fn build(b: *std.Build) void {
     const integration_archive_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-archive.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    integration_archive_module.addImport("debz", debz);
+    integration_archive_module.addImport("debz", debz_debug);
     const integration_archive = b.addExecutable(.{
         .name = "debz-integration-archive",
         .root_module = integration_archive_module,
@@ -368,10 +447,10 @@ pub fn build(b: *std.Build) void {
     const integration_archive_test_module = b.createModule(.{
         .root_source_file = b.path("tools/integration-archive.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    integration_archive_test_module.addImport("debz", debz);
+    integration_archive_test_module.addImport("debz", debz_debug);
     integration_archive_test_module.addOptions("integration_archive_test_options", integration_archive_test_options);
     const integration_archive_tests = b.addRunArtifact(b.addTest(.{ .root_module = integration_archive_test_module }));
     b.step("test-integration-archive", "Test original archive byte identities and fail-closed encoding").dependOn(&integration_archive_tests.step);
@@ -382,10 +461,10 @@ pub fn build(b: *std.Build) void {
     const native_dpkg_module = b.createModule(.{
         .root_source_file = b.path("tools/prepare-native-dpkg.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_dpkg_module.addImport("debz", debz);
+    native_dpkg_module.addImport("debz", debz_debug);
     native_dpkg_module.addOptions("native_dpkg_options", native_dpkg_options);
     const native_dpkg = b.addExecutable(.{
         .name = "debz-native-dpkg-reference",
@@ -404,10 +483,10 @@ pub fn build(b: *std.Build) void {
     const debian_readiness_module = b.createModule(.{
         .root_source_file = b.path("tools/debian-stable-readiness.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    debian_readiness_module.addImport("debz", debz);
+    debian_readiness_module.addImport("debz", debz_debug);
     debian_readiness_module.addOptions("debian_readiness_options", debian_readiness_options);
     const debian_readiness = b.addExecutable(.{ .name = "debz-debian-stable-readiness", .root_module = debian_readiness_module });
     const install_debian_readiness = b.addInstallArtifact(debian_readiness, .{});
@@ -424,11 +503,11 @@ pub fn build(b: *std.Build) void {
     const debian_closure_module = b.createModule(.{
         .root_source_file = b.path("tools/debian-stable-closure.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     debian_closure_module.link_libc = true;
-    debian_closure_module.addImport("debz", debz);
+    debian_closure_module.addImport("debz", debz_debug);
     debian_closure_module.addOptions("debian_closure_options", debian_closure_options);
     const debian_closure = b.addExecutable(.{ .name = "debz-debian-stable-closure", .root_module = debian_closure_module });
     const install_debian_closure = b.addInstallArtifact(debian_closure, .{});
@@ -447,7 +526,7 @@ pub fn build(b: *std.Build) void {
     const reference_triggers_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-triggers.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const reference_triggers = b.addExecutable(.{ .name = "debz-real-snapshot-reference-triggers", .root_module = reference_triggers_module });
@@ -459,7 +538,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-real-snapshot-reference-triggers", "Test unprivileged pinned-dpkg trigger scheduling proof and verification refusals").dependOn(&reference_triggers_tests.step);
     workload_core.dependOn(&reference_triggers_tests.step);
 
-    const release_tool_module = addReleaseToolModule(b, target, optimize, debz, xz_dependency);
+    const release_tool_module = addReleaseToolModule(b, target, .Debug, debz_debug, xz_dependency);
     // Unoptimized level-9 gzip/XZ encoding of a complete release tree takes
     // minutes, so the installed packager and its encoder are always ReleaseSafe,
     // including default Debug builds; unit tests still follow -Doptimize.
@@ -477,7 +556,7 @@ pub fn build(b: *std.Build) void {
     const release_workflow_policy_module = b.createModule(.{
         .root_source_file = b.path("tools/release-workflow-policy.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const release_workflow_policy = b.addExecutable(.{
@@ -494,7 +573,7 @@ pub fn build(b: *std.Build) void {
     const release_workflow_policy_test_module = b.createModule(.{
         .root_source_file = b.path("tools/release-workflow-policy.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     release_workflow_policy_test_module.addOptions("release_workflow_policy_options", release_workflow_policy_options);
@@ -508,7 +587,7 @@ pub fn build(b: *std.Build) void {
     const native_only_candidate_module = b.createModule(.{
         .root_source_file = b.path("tools/native-only-candidate.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const native_only_candidate = b.addExecutable(.{
@@ -524,7 +603,7 @@ pub fn build(b: *std.Build) void {
     const native_only_candidate_test_module = b.createModule(.{
         .root_source_file = b.path("tools/native-only-candidate.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     native_only_candidate_test_module.addOptions("native_only_candidate_options", native_only_candidate_options);
@@ -538,10 +617,10 @@ pub fn build(b: *std.Build) void {
     const integration_repository_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    integration_repository_module.addImport("debz", debz);
+    integration_repository_module.addImport("debz", debz_debug);
     const integration_repository = b.addExecutable(.{
         .name = "debz-integration-repository",
         .root_module = integration_repository_module,
@@ -554,10 +633,10 @@ pub fn build(b: *std.Build) void {
     const integration_repository_test_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-integration-repository.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    integration_repository_test_module.addImport("debz", debz);
+    integration_repository_test_module.addImport("debz", debz_debug);
     integration_repository_test_module.addOptions("integration_repository_test_options", integration_repository_test_options);
     integration_repository_test_module.addOptions("integration_archive_test_options", integration_archive_test_options);
     integration_repository_test_module.addOptions("integration_signing_test_options", integration_signing_test_options);
@@ -570,10 +649,10 @@ pub fn build(b: *std.Build) void {
     const openpgp_fixture_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-openpgp-fixtures.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    openpgp_fixture_module.addImport("debz", debz);
+    openpgp_fixture_module.addImport("debz", debz_debug);
     openpgp_fixture_module.addOptions("openpgp_fixture_options", openpgp_fixture_options);
     const openpgp_fixture = b.addExecutable(.{
         .name = "debz-openpgp-fixtures",
@@ -596,10 +675,10 @@ pub fn build(b: *std.Build) void {
     const openpgp_fixture_test_module = b.createModule(.{
         .root_source_file = b.path("tools/generate-openpgp-fixtures.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
         .strip = !native_helper_debug_info,
     });
-    openpgp_fixture_test_module.addImport("debz", debz);
+    openpgp_fixture_test_module.addImport("debz", debz_debug);
     openpgp_fixture_test_module.addOptions("openpgp_fixture_options", openpgp_fixture_options);
     openpgp_fixture_test_module.addOptions("openpgp_fixture_test_options", openpgp_fixture_test_options);
     const openpgp_fixture_tests = b.addRunArtifact(b.addTest(.{ .root_module = openpgp_fixture_test_module }));
@@ -616,7 +695,7 @@ pub fn build(b: *std.Build) void {
     const cli_smoke_module = b.createModule(.{
         .root_source_file = b.path("test/cli-smoke.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     cli_smoke_module.addOptions("cli_smoke_options", cli_smoke_options);
@@ -711,7 +790,7 @@ pub fn build(b: *std.Build) void {
     const real_snapshot_comparator_module = b.createModule(.{
         .root_source_file = b.path("test/real-snapshot-comparator.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const real_snapshot_comparator = b.addExecutable(.{
@@ -743,10 +822,10 @@ pub fn build(b: *std.Build) void {
     const reference_runtime_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-runtime.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    reference_runtime_module.addImport("debz", debz);
+    reference_runtime_module.addImport("debz", debz_debug);
     const reference_runtime = b.addExecutable(.{
         .name = "debz-reference-runtime",
         .root_module = reference_runtime_module,
@@ -761,7 +840,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/real-snapshot-reference-runtime.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -776,7 +855,7 @@ pub fn build(b: *std.Build) void {
     const reference_paths_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-paths.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const reference_paths = b.addExecutable(.{
@@ -794,7 +873,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/real-snapshot-reference-paths.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -810,7 +889,7 @@ pub fn build(b: *std.Build) void {
     const reference_order_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_order_module.addImport("reference_paths", reference_paths_module);
@@ -828,7 +907,7 @@ pub fn build(b: *std.Build) void {
     const reference_order_test_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-order.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_order_test_module.addImport("reference_paths", reference_paths_module);
@@ -847,7 +926,7 @@ pub fn build(b: *std.Build) void {
     const reference_protected_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_protected_module.addImport("reference_paths", reference_paths_module);
@@ -866,7 +945,7 @@ pub fn build(b: *std.Build) void {
     const reference_protected_test_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-protected.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_protected_test_module.addImport("reference_paths", reference_paths_module);
@@ -886,7 +965,7 @@ pub fn build(b: *std.Build) void {
     const vendor_snapshot_tools_module = b.createModule(.{
         .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const vendor_snapshot_tools = b.addExecutable(.{
@@ -904,7 +983,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/vendor-snapshot-tools.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -921,7 +1000,7 @@ pub fn build(b: *std.Build) void {
     const reference_stage_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-stage.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_stage_module.addImport("reference_paths", reference_paths_module);
@@ -939,7 +1018,7 @@ pub fn build(b: *std.Build) void {
     const reference_stage_test_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-stage.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_stage_test_module.addImport("reference_paths", reference_paths_module);
@@ -958,10 +1037,10 @@ pub fn build(b: *std.Build) void {
     const debian_closure_inventory_module = b.createModule(.{
         .root_source_file = b.path("test/debian-closure-inventory.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    debian_closure_inventory_module.addImport("debz", debz);
+    debian_closure_inventory_module.addImport("debz", debz_debug);
     for ([_][2][]const u8{
         .{ "debian_closure_amd64_apt_lock", "amd64-apt" },
         .{ "debian_closure_amd64_systemd_sysv_lock", "amd64-systemd-sysv" },
@@ -1008,7 +1087,7 @@ pub fn build(b: *std.Build) void {
     const apt_system_acceptance_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-acceptance.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     apt_system_acceptance_module.link_libc = true;
@@ -1025,7 +1104,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_apt_acceptance_unit_tests.step);
     workload_core.dependOn(&run_apt_acceptance_unit_tests.step);
     const apt_system_acceptance_zig = b.addRunArtifact(apt_system_acceptance_binary);
-    apt_system_acceptance_zig.addArtifactArg(cli);
+    apt_system_acceptance_zig.addArtifactArg(cli_debug);
     b.step("test-apt-system-acceptance-zig", "Run executable Zig apt facade acceptance (requires root)")
         .dependOn(&apt_system_acceptance_zig.step);
     const apt_system_acceptance_step = b.step(
@@ -1042,11 +1121,11 @@ pub fn build(b: *std.Build) void {
     const repository_add_module = b.createModule(.{
         .root_source_file = b.path("test/repository-add-integration.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    repository_add_module.addImport("debz", debz);
-    repository_add_module.addImport("repository_cli", repository_cli);
+    repository_add_module.addImport("debz", debz_debug);
+    repository_add_module.addImport("repository_cli", repository_cli_debug);
     const repository_add_harness = b.addExecutable(.{
         .name = "repository-add-integration",
         .root_module = repository_add_module,
@@ -1054,10 +1133,10 @@ pub fn build(b: *std.Build) void {
     const http_fixture_module = b.createModule(.{
         .root_source_file = b.path("tools/http-fixture-server.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    http_fixture_module.addImport("debz", debz);
+    http_fixture_module.addImport("debz", debz_debug);
     const http_fixture_server = b.addExecutable(.{
         .name = "http-fixture-server",
         .root_module = http_fixture_module,
@@ -1106,11 +1185,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("fuzz/fuzz_targets.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
-    fuzz_tests.root_module.addImport("debz", debz);
+    fuzz_tests.root_module.addImport("debz", debz_debug);
     const fuzz_options = b.addOptions();
     fuzz_options.addOption(
         usize,
@@ -1142,7 +1221,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/security-policy.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -1157,7 +1236,16 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/real-snapshot-policy.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        }),
+    });
+    const snapshot_fixture_cli = b.addExecutable(.{
+        .name = "real-snapshot-fixture-cli",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/real-snapshot-fixture-cli.zig"),
+            .target = target,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -1166,6 +1254,7 @@ pub fn build(b: *std.Build) void {
     const snapshot_policy_options = b.addOptions();
     snapshot_policy_options.addOptionPath("native_outcome", native_outcome.getEmittedBin());
     snapshot_policy_options.addOptionPath("exec_audit", exec_audit.getEmittedBin());
+    snapshot_policy_options.addOptionPath("fixture_cli", snapshot_fixture_cli.getEmittedBin());
     snapshot_policy_tests.root_module.addOptions("snapshot_policy_options", snapshot_policy_options);
     run_snapshot_policy_tests.setCwd(b.path("."));
     b.step("test-real-snapshot-policy", "Run real-snapshot policy and exec-trace audit tests")
@@ -1177,20 +1266,6 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_reference_protected_tests.step);
     audit_step.dependOn(&run_vendor_snapshot_tools_tests.step);
     audit_step.dependOn(&run_reference_stage_tests.step);
-    const snapshot_repin_options = b.addOptions();
-    snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
-    const snapshot_repin_module = b.createModule(.{
-        .root_source_file = b.path("test/real-snapshot-repin.zig"),
-        .target = target,
-        .optimize = optimize,
-        .strip = !native_helper_debug_info,
-    });
-    snapshot_repin_module.addOptions("real_snapshot_repin_options", snapshot_repin_options);
-    const run_snapshot_repin_tests = b.addRunArtifact(b.addTest(.{ .root_module = snapshot_repin_module }));
-    run_snapshot_repin_tests.setCwd(b.path("."));
-    b.step("test-real-snapshot-repin", "Drive the real-snapshot repin tool against synthetic signed snapshots")
-        .dependOn(&run_snapshot_repin_tests.step);
-    workload_release.dependOn(&run_snapshot_repin_tests.step);
     const audit_tests = b.addSystemCommand(
         &.{
             "env",
@@ -1212,7 +1287,7 @@ pub fn build(b: *std.Build) void {
     const private_network_module = b.createModule(.{
         .root_source_file = b.path("src/private_network.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const reference_network_probe_module = b.createModule(.{
@@ -1224,7 +1299,7 @@ pub fn build(b: *std.Build) void {
     const reference_launcher_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-launcher.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_launcher_module.link_libc = true;
@@ -1245,7 +1320,7 @@ pub fn build(b: *std.Build) void {
     const reference_launcher_root_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-reference-launcher-root-test.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     reference_launcher_root_module.link_libc = true;
@@ -1310,7 +1385,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/release-tooling.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
@@ -1342,7 +1417,7 @@ pub fn build(b: *std.Build) void {
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const apt_schema_tests = b.addTest(.{ .root_module = apt_schema_module });
@@ -1382,13 +1457,33 @@ pub fn build(b: *std.Build) void {
     production_backend_test_module.linkLibrary(liblzma);
     production_backend_test_module.linkLibrary(zstd);
     production_backend_test_module.link_libc = true;
+    const production_backend_debug_test_module = if (optimize == .debug) production_backend_test_module else blk: {
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/production_backend.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .strip = !native_helper_debug_info,
+        });
+        module.addOptions("debz_build_options", build_options);
+        module.addImport("libsolv_c", libsolv_c);
+        module.addImport("compression_c", compression_c);
+        module.addIncludePath(libsolv_dependency.path("src"));
+        module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+        module.addIncludePath(zstd_dependency.path("lib"));
+        module.addCMacro("LZMA_API_STATIC", "1");
+        module.linkLibrary(libsolv);
+        module.linkLibrary(liblzma);
+        module.linkLibrary(zstd);
+        module.link_libc = true;
+        break :blk module;
+    };
     const production_backend_tests = b.addTest(.{
         .root_module = production_backend_test_module,
         .filters = &.{"production "},
     });
     const run_production_backend_tests = b.addRunArtifact(production_backend_tests);
     const required_production_security_tests = b.addTest(.{
-        .root_module = production_backend_test_module,
+        .root_module = production_backend_debug_test_module,
         .filters = &.{"production workflow required_security."},
     });
     const run_required_production_security_tests = b.addRunArtifact(
@@ -1403,7 +1498,7 @@ pub fn build(b: *std.Build) void {
         &run_required_production_security_tests.step,
     );
     const package_family_tests = b.addTest(.{
-        .root_module = production_backend_test_module,
+        .root_module = production_backend_debug_test_module,
         .filters = &.{ "package_family_backend.test.", "product_api.test." },
     });
     const run_package_family_tests = b.addRunArtifact(package_family_tests);
@@ -1450,7 +1545,7 @@ pub fn build(b: *std.Build) void {
     const apt_system_command_test_module = b.createModule(.{
         .root_source_file = b.path("src/apt_system_command.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     apt_system_command_test_module.addOptions(
@@ -1499,7 +1594,7 @@ pub fn build(b: *std.Build) void {
     const apt_system_orchestrator_test_module = b.createModule(.{
         .root_source_file = b.path("src/apt_system_orchestrator.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     apt_system_orchestrator_test_module.addOptions(
@@ -1544,17 +1639,21 @@ pub fn build(b: *std.Build) void {
         "test-apt-system",
         "Run trusted profile, apt/system contract, and orchestration tests",
     );
-    apt_system_test_step.dependOn(&run_system_profile_tests.step);
-    apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
-    apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
+    if (!require_privileged_orchestration_tests) {
+        apt_system_test_step.dependOn(&run_system_profile_tests.step);
+        apt_system_test_step.dependOn(&run_apt_system_api_tests.step);
+        apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);
+        apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
+    }
     apt_system_test_step.dependOn(&run_apt_system_command_tests.step);
-    apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
-    workload_apt_system.dependOn(&run_system_profile_tests.step);
-    workload_apt_system.dependOn(&run_apt_system_api_tests.step);
-    workload_apt_system.dependOn(&run_apt_system_cli_tests.step);
+    if (!require_privileged_orchestration_tests) {
+        workload_apt_system.dependOn(&run_system_profile_tests.step);
+        workload_apt_system.dependOn(&run_apt_system_api_tests.step);
+        workload_apt_system.dependOn(&run_apt_system_cli_tests.step);
+        workload_apt_system.dependOn(&run_apt_system_state_tests.step);
+    }
     workload_apt_system.dependOn(&run_apt_system_command_tests.step);
-    workload_apt_system.dependOn(&run_apt_system_state_tests.step);
     workload_apt_system.dependOn(&run_apt_system_orchestrator_tests.step);
     const required_security_test_step = b.step(
         "test-required-security",
@@ -1610,7 +1709,7 @@ pub fn build(b: *std.Build) void {
     const product_result_module = b.createModule(.{
         .root_source_file = b.path("src/product_api.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
         .link_libc = true,
     });
@@ -1914,11 +2013,11 @@ pub fn build(b: *std.Build) void {
                 "src/native_alternatives_oracle_test.zig",
             ),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
-    native_alternatives_oracle_tests.root_module.addImport("debz", debz);
+    native_alternatives_oracle_tests.root_module.addImport("debz", debz_debug);
     const native_alternatives_oracle_options = b.addOptions();
     native_alternatives_oracle_options.addOption(
         []const u8,
@@ -1956,17 +2055,17 @@ pub fn build(b: *std.Build) void {
     const native_differential_module = b.createModule(.{
         .root_source_file = b.path("test/native_differential.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_differential_module.addImport("debz", debz);
+    native_differential_module.addImport("debz", debz_debug);
     const native_snapshot_module = b.createModule(.{
         .root_source_file = b.path("test/native_differential_cli.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_snapshot_module.addImport("debz", debz);
+    native_snapshot_module.addImport("debz", debz_debug);
     const native_differential_options = b.addOptions();
     native_differential_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     native_differential_options.addOption(
@@ -1999,10 +2098,10 @@ pub fn build(b: *std.Build) void {
     const native_fixture_module = b.createModule(.{
         .root_source_file = b.path("test/native_materialization.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_fixture_module.addImport("debz", debz);
+    native_fixture_module.addImport("debz", debz_debug);
     const native_fixture_options = b.addOptions();
     native_fixture_options.addOption([]const u8, "repository", pathFromRoot(b, "."));
     native_fixture_options.addOptionPath("native_dpkg_reference", native_dpkg.getEmittedBin());
@@ -2028,10 +2127,10 @@ pub fn build(b: *std.Build) void {
     const native_conffile_module = b.createModule(.{
         .root_source_file = b.path("test/native_conffiles.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    native_conffile_module.addImport("debz", debz);
+    native_conffile_module.addImport("debz", debz_debug);
     native_conffile_module.addOptions("native_test_options", native_fixture_options);
     const native_conffile_zig_tests = b.addTest(.{ .root_module = native_conffile_module });
     const run_native_conffile_zig_tests = b.addRunArtifact(native_conffile_zig_tests);
@@ -2049,14 +2148,15 @@ pub fn build(b: *std.Build) void {
     );
     native_conffile_step.dependOn(&run_native_conffile_zig.step);
 
+    const dpkg_config_reference_module = b.createModule(.{
+        .root_source_file = b.path("tools/dpkg-config-reference.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .strip = !native_helper_debug_info,
+    });
     const dpkg_config_reference_exe = b.addExecutable(.{
         .name = "debz-dpkg-config-reference",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/dpkg-config-reference.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = !native_helper_debug_info,
-        }),
+        .root_module = dpkg_config_reference_module,
     });
     const install_dpkg_config_reference = b.addInstallArtifact(dpkg_config_reference_exe, .{});
     b.getInstallStep().dependOn(&install_dpkg_config_reference.step);
@@ -2072,12 +2172,7 @@ pub fn build(b: *std.Build) void {
     dpkg_config_reference.step.dependOn(&install_native_dpkg.step);
     dpkg_config_reference.step.dependOn(&install_dpkg_config_reference.step);
     const dpkg_config_reference_unit = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/dpkg-config-reference.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = !native_helper_debug_info,
-        }),
+        .root_module = dpkg_config_reference_module,
     });
     const dpkg_config_reference_tests = b.addRunArtifact(dpkg_config_reference_unit);
     dpkg_config_reference_tests.setCwd(b.path("."));
@@ -2093,14 +2188,15 @@ pub fn build(b: *std.Build) void {
     b.step("test-dpkg-config-reference-unit", "Run dpkg config reference oracle unit tests")
         .dependOn(&dpkg_config_reference_tests.step);
 
+    const dpkg_alternatives_reference_module = b.createModule(.{
+        .root_source_file = b.path("tools/dpkg-alternatives-reference.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .strip = !native_helper_debug_info,
+    });
     const dpkg_alternatives_reference_exe = b.addExecutable(.{
         .name = "debz-dpkg-alternatives-reference",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/dpkg-alternatives-reference.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = !native_helper_debug_info,
-        }),
+        .root_module = dpkg_alternatives_reference_module,
     });
     const install_dpkg_alternatives_reference = b.addInstallArtifact(dpkg_alternatives_reference_exe, .{});
     b.getInstallStep().dependOn(&install_dpkg_alternatives_reference.step);
@@ -2116,12 +2212,7 @@ pub fn build(b: *std.Build) void {
     dpkg_alternatives_reference.step.dependOn(&install_native_dpkg.step);
     dpkg_alternatives_reference.step.dependOn(&install_dpkg_alternatives_reference.step);
     const dpkg_alternatives_reference_unit = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/dpkg-alternatives-reference.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = !native_helper_debug_info,
-        }),
+        .root_module = dpkg_alternatives_reference_module,
     });
     const dpkg_alternatives_reference_tests = b.addRunArtifact(dpkg_alternatives_reference_unit);
     dpkg_alternatives_reference_tests.setCwd(b.path("."));
@@ -2141,10 +2232,10 @@ pub fn build(b: *std.Build) void {
     const dpkg_oracle_evidence_module = b.createModule(.{
         .root_source_file = b.path("tools/dpkg-oracle-evidence.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    dpkg_oracle_evidence_module.addImport("debz", debz);
+    dpkg_oracle_evidence_module.addImport("debz", debz_debug);
     const dpkg_oracle_evidence = b.addExecutable(.{
         .name = "debz-dpkg-oracle-evidence",
         .root_module = dpkg_oracle_evidence_module,
@@ -2158,10 +2249,10 @@ pub fn build(b: *std.Build) void {
     const signed_proc_compare_module = b.createModule(.{
         .root_source_file = b.path("tools/real-snapshot-signed-proc-compare.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    signed_proc_compare_module.addImport("debz", debz);
+    signed_proc_compare_module.addImport("debz", debz_debug);
     const signed_proc_compare = b.addExecutable(.{
         .name = "debz-signed-proc-compare",
         .root_module = signed_proc_compare_module,
@@ -2223,6 +2314,15 @@ pub fn build(b: *std.Build) void {
     }) |module| module.addAnonymousImport("debz_native_trigger_helper", .{
         .root_source_file = native_trigger_helper.getEmittedBin(),
     });
+    if (optimize != .debug) {
+        for ([_]*std.Build.Module{
+            debz_debug,
+            native_lifecycle_debug_test_module,
+            production_backend_debug_test_module,
+        }) |module| module.addAnonymousImport("debz_native_trigger_helper", .{
+            .root_source_file = native_trigger_helper.getEmittedBin(),
+        });
+    }
     const sha512_e2e_module = b.createModule(.{
         .root_source_file = b.path("src/sha512_transaction_e2e_test.zig"),
         .target = target,
@@ -2252,7 +2352,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);
     const sha512_legacy_compat_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = debz_debug,
         .filters = &.{
             "exact_lock_v2.test.mixed origins canonical roundtrip and tamper rejection",
             "repository_plan.test.canonical executable plan round trips exactly",
@@ -2291,10 +2391,10 @@ pub fn build(b: *std.Build) void {
     const lifecycle_zig_module = b.createModule(.{
         .root_source_file = b.path("test/native_lifecycle_acceptance.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    lifecycle_zig_module.addImport("debz", debz);
+    lifecycle_zig_module.addImport("debz", debz_debug);
     lifecycle_zig_module.addOptions("native_test_options", native_fixture_options);
     const lifecycle_zig_tests = b.addTest(.{ .root_module = lifecycle_zig_module });
     const run_lifecycle_zig_tests = b.addRunArtifact(lifecycle_zig_tests);
@@ -2320,15 +2420,15 @@ pub fn build(b: *std.Build) void {
     const root_import_module = b.createModule(.{
         .root_source_file = b.path("test/native_root_import.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    root_import_module.addImport("debz", debz);
+    root_import_module.addImport("debz", debz_debug);
     root_import_module.addOptions("native_test_options", native_fixture_options);
     const root_import_tests = b.addTest(.{ .root_module = root_import_module });
     const run_root_import_tests = b.addRunArtifact(root_import_tests);
     const root_import_capture_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = debz_debug,
         .filters = &.{
             "native_unpack.test.live database",
             "native_unpack.test.imported live database",
@@ -2366,10 +2466,10 @@ pub fn build(b: *std.Build) void {
     const trigger_zig_module = b.createModule(.{
         .root_source_file = b.path("test/native_trigger_acceptance.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    trigger_zig_module.addImport("debz", debz);
+    trigger_zig_module.addImport("debz", debz_debug);
     trigger_zig_module.addOptions("native_test_options", native_fixture_options);
     const trigger_zig_tests = b.addTest(.{ .root_module = trigger_zig_module });
     const run_trigger_zig_tests = b.addRunArtifact(trigger_zig_tests);
@@ -2420,21 +2520,20 @@ pub fn build(b: *std.Build) void {
         .dependOn(&settlement_oracle_zig.step);
     const install_acceptance = b.step("build-native-acceptance-zig", "Install lifecycle/trigger selectors and the focused fixture driver");
     install_acceptance.dependOn(&b.addInstallArtifact(lifecycle_zig_executable, .{}).step);
-    install_acceptance.dependOn(&b.addInstallArtifact(native_lifecycle_tests, .{ .dest_sub_path = "native-lifecycle-fixture-driver" }).step);
     install_acceptance.dependOn(&b.addInstallArtifact(trigger_zig_executable, .{}).step);
 
     const settlement_module = b.createModule(.{
         .root_source_file = b.path("test/native_diversion_settlement.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    settlement_module.addImport("debz", debz);
+    settlement_module.addImport("debz", debz_debug);
     settlement_module.addOptions("native_test_options", native_fixture_options);
     const settlement_tests = b.addTest(.{ .root_module = settlement_module });
     const run_settlement_tests = b.addRunArtifact(settlement_tests);
     const settlement_lowering_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = debz_debug,
         .filters = &.{"native_unpack.test.success route settlement lowers every reference profile"},
     });
     const run_settlement_lowering_tests = b.addRunArtifact(settlement_lowering_tests);
@@ -2461,13 +2560,13 @@ pub fn build(b: *std.Build) void {
     const phase_telemetry_module = b.createModule(.{
         .root_source_file = b.path("src/native_phase_telemetry.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
     const phase_telemetry_test_module = b.createModule(.{
         .root_source_file = b.path("test/native_phase_telemetry.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
         .link_libc = true,
     });
@@ -2489,7 +2588,7 @@ pub fn build(b: *std.Build) void {
     workload_native.dependOn(phase_telemetry_step);
 
     const database_performance_tests = b.addRunArtifact(b.addTest(.{
-        .root_module = debz,
+        .root_module = debz_debug,
         .filters = &.{
             "native_unpack.test.scoped database capture refuses",
             "native_unpack.test.materialization same-phase",
@@ -2502,7 +2601,7 @@ pub fn build(b: *std.Build) void {
     database_performance_step.dependOn(&run_native_phase_summary_tests.step);
 
     const native_recovery_tests = b.addTest(.{
-        .root_module = debz,
+        .root_module = debz_debug,
         .filters = &.{
             "native_phase_telemetry.test.",
             "native_recovery.test.",
@@ -2519,10 +2618,10 @@ pub fn build(b: *std.Build) void {
     const recovery_unit_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_unit.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_unit_module.addImport("debz", debz);
+    recovery_unit_module.addImport("debz", debz_debug);
     recovery_unit_module.addOptions("native_test_options", native_fixture_options);
     const recovery_unit_tests = b.addTest(.{ .root_module = recovery_unit_module });
     const run_recovery_unit_tests = b.addRunArtifact(recovery_unit_tests);
@@ -2547,10 +2646,10 @@ pub fn build(b: *std.Build) void {
     const recovery_zig_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_acceptance.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_zig_module.addImport("debz", debz);
+    recovery_zig_module.addImport("debz", debz_debug);
     recovery_zig_module.addOptions("native_test_options", native_fixture_options);
     const recovery_zig_executable = b.addExecutable(.{
         .name = "native-recovery-zig-acceptance",
@@ -2576,10 +2675,10 @@ pub fn build(b: *std.Build) void {
     const recovery_family_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_family.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_family_module.addImport("debz", debz);
+    recovery_family_module.addImport("debz", debz_debug);
     recovery_family_module.addOptions("native_test_options", native_fixture_options);
     const recovery_family_executable = b.addExecutable(.{
         .name = "native-recovery-zig-family",
@@ -2607,10 +2706,10 @@ pub fn build(b: *std.Build) void {
     const recovery_parity_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_parity.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_parity_module.addImport("debz", debz);
+    recovery_parity_module.addImport("debz", debz_debug);
     recovery_parity_module.addOptions("native_test_options", native_fixture_options);
     const recovery_parity_executable = b.addExecutable(.{
         .name = "native-recovery-zig-parity",
@@ -2633,10 +2732,10 @@ pub fn build(b: *std.Build) void {
     const recovery_helper_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_helper.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_helper_module.addImport("debz", debz);
+    recovery_helper_module.addImport("debz", debz_debug);
     recovery_helper_module.addOptions("native_test_options", native_fixture_options);
     const recovery_helper_executable = b.addExecutable(.{
         .name = "native-recovery-helper-zig-acceptance",
@@ -2662,10 +2761,10 @@ pub fn build(b: *std.Build) void {
     const final_gaps_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_final_gaps.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    final_gaps_module.addImport("debz", debz);
+    final_gaps_module.addImport("debz", debz_debug);
     final_gaps_module.addOptions("native_test_options", native_fixture_options);
     const final_gaps_executable = b.addExecutable(.{
         .name = "native-recovery-zig-final-gaps",
@@ -2683,10 +2782,10 @@ pub fn build(b: *std.Build) void {
     const recovery_bootstrap_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_bootstrap.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_bootstrap_module.addImport("debz", debz);
+    recovery_bootstrap_module.addImport("debz", debz_debug);
     recovery_bootstrap_module.addOptions("native_test_options", native_fixture_options);
     const recovery_bootstrap_executable = b.addExecutable(.{
         .name = "native-recovery-bootstrap-zig-acceptance",
@@ -2708,10 +2807,10 @@ pub fn build(b: *std.Build) void {
     const repository_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_repository.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    repository_recovery_module.addImport("debz", debz);
+    repository_recovery_module.addImport("debz", debz_debug);
     repository_recovery_module.addOptions("native_test_options", native_fixture_options);
     const repository_recovery_unit = b.addTest(.{ .root_module = repository_recovery_module });
     const run_repository_recovery_unit = b.addRunArtifact(repository_recovery_unit);
@@ -2757,10 +2856,10 @@ pub fn build(b: *std.Build) void {
     const rollback_clock_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_rollback_clock.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    rollback_clock_module.addImport("debz", debz);
+    rollback_clock_module.addImport("debz", debz_debug);
     rollback_clock_module.addOptions("native_test_options", native_fixture_options);
     const rollback_clock_executable = b.addExecutable(.{
         .name = "native-recovery-zig-rollback-clock",
@@ -2778,10 +2877,10 @@ pub fn build(b: *std.Build) void {
     const scriptless_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_scriptless.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    scriptless_recovery_module.addImport("debz", debz);
+    scriptless_recovery_module.addImport("debz", debz_debug);
     scriptless_recovery_module.addOptions("native_test_options", native_fixture_options);
     const scriptless_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-scriptless",
@@ -2799,10 +2898,10 @@ pub fn build(b: *std.Build) void {
     const statoverride_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_statoverride.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    statoverride_recovery_module.addImport("debz", debz);
+    statoverride_recovery_module.addImport("debz", debz_debug);
     statoverride_recovery_module.addOptions("native_test_options", native_fixture_options);
     const statoverride_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-statoverride",
@@ -2820,10 +2919,10 @@ pub fn build(b: *std.Build) void {
     const literal_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_literal.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    literal_recovery_module.addImport("debz", debz);
+    literal_recovery_module.addImport("debz", debz_debug);
     literal_recovery_module.addOptions("native_test_options", native_fixture_options);
     const literal_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-literal",
@@ -2841,10 +2940,10 @@ pub fn build(b: *std.Build) void {
     const metadata_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_metadata.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    metadata_recovery_module.addImport("debz", debz);
+    metadata_recovery_module.addImport("debz", debz_debug);
     metadata_recovery_module.addOptions("native_test_options", native_fixture_options);
     const metadata_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-metadata",
@@ -2862,10 +2961,10 @@ pub fn build(b: *std.Build) void {
     const mutation_boundaries_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_mutation_boundaries.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    mutation_boundaries_module.addImport("debz", debz);
+    mutation_boundaries_module.addImport("debz", debz_debug);
     mutation_boundaries_module.addOptions("native_test_options", native_fixture_options);
     const mutation_boundaries_executable = b.addExecutable(.{
         .name = "native-recovery-zig-mutation-boundaries",
@@ -2886,10 +2985,10 @@ pub fn build(b: *std.Build) void {
     const publication_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_publication.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    publication_recovery_module.addImport("debz", debz);
+    publication_recovery_module.addImport("debz", debz_debug);
     publication_recovery_module.addOptions("native_test_options", native_fixture_options);
     const publication_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-publication",
@@ -2907,10 +3006,10 @@ pub fn build(b: *std.Build) void {
     const conffile_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_conffile.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    conffile_recovery_module.addImport("debz", debz);
+    conffile_recovery_module.addImport("debz", debz_debug);
     conffile_recovery_module.addOptions("native_test_options", native_fixture_options);
     const conffile_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-conffile",
@@ -2928,10 +3027,10 @@ pub fn build(b: *std.Build) void {
     const recovery_diversions_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_diversions.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    recovery_diversions_module.addImport("debz", debz);
+    recovery_diversions_module.addImport("debz", debz_debug);
     recovery_diversions_module.addOptions("native_test_options", native_fixture_options);
     const recovery_diversions_executable = b.addExecutable(.{
         .name = "native-recovery-zig-diversions",
@@ -3285,7 +3384,7 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_provenance_tests.step);
 
     const legacy_compat_tests = b.addTest(.{
-        .root_module = native_lifecycle_test_module,
+        .root_module = native_lifecycle_debug_test_module,
         .filters = &.{
             "legacy_compat.test.",
             "system_profile.test.legacy compatibility",
@@ -3306,7 +3405,7 @@ pub fn build(b: *std.Build) void {
         "Rehearse opt-in CLI selection and pre-mutation root refusal without changing release defaults",
     );
     const rehearsal_backend_tests = b.addTest(.{
-        .root_module = native_lifecycle_test_module,
+        .root_module = native_lifecycle_debug_test_module,
         .filters = &.{
             "root_operation.test.native-only rehearsal",
             "production native-only rehearsal",
@@ -3318,7 +3417,7 @@ pub fn build(b: *std.Build) void {
     });
     native_only_rehearsal.dependOn(&b.addRunArtifact(rehearsal_backend_tests).step);
     const rehearsal_cli_tests = b.addTest(.{
-        .root_module = repository_cli,
+        .root_module = repository_cli_debug,
         .filters = &.{
             "cli_backend_policy.test.",
             "repo add parser rehearses native-only",
@@ -3330,12 +3429,12 @@ pub fn build(b: *std.Build) void {
     const rehearsal_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
         .strip = !native_helper_debug_info,
     });
-    rehearsal_module.addImport("debz", debz);
-    rehearsal_module.addImport("repository_cli", repository_cli);
-    rehearsal_module.addImport("cli_backend_policy", cli_backend_policy);
+    rehearsal_module.addImport("debz", debz_debug);
+    rehearsal_module.addImport("repository_cli", repository_cli_debug);
+    rehearsal_module.addImport("cli_backend_policy", cli_backend_policy_debug);
     rehearsal_module.addOptions("cli_rehearsal_options", rehearsal_options);
     const rehearsal_cli = b.addExecutable(.{
         .name = "debz-native-only-rehearsal",
@@ -3347,16 +3446,30 @@ pub fn build(b: *std.Build) void {
     rehearsal_cli_cases.addArtifactArg(rehearsal_cli);
     native_only_rehearsal.dependOn(&rehearsal_cli_cases.step);
     workload_release.dependOn(native_only_rehearsal);
+    const snapshot_repin_options = b.addOptions();
+    snapshot_repin_options.addOptionPath("debz", cli_debug.getEmittedBin());
+    const snapshot_repin_module = b.createModule(.{
+        .root_source_file = b.path("test/real-snapshot-repin.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .strip = !native_helper_debug_info,
+    });
+    snapshot_repin_module.addOptions("real_snapshot_repin_options", snapshot_repin_options);
+    const run_snapshot_repin_tests = b.addRunArtifact(b.addTest(.{ .root_module = snapshot_repin_module }));
+    run_snapshot_repin_tests.setCwd(b.path("."));
+    b.step("test-real-snapshot-repin", "Drive the real-snapshot repin tool against synthetic signed snapshots")
+        .dependOn(&run_snapshot_repin_tests.step);
+    workload_release.dependOn(&run_snapshot_repin_tests.step);
 
     const production_customize_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/production_backend_customize_test.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
-    production_customize_tests.root_module.addImport("debz", debz);
+    production_customize_tests.root_module.addImport("debz", debz_debug);
     const run_production_customize_tests = b.addRunArtifact(production_customize_tests);
     b.step(
         "test-production-customize",
@@ -3369,11 +3482,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/version_oracle.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .Debug,
             .strip = !native_helper_debug_info,
         }),
     });
-    version_oracle.root_module.addImport("debz", debz);
+    version_oracle.root_module.addImport("debz", debz_debug);
 
     const dpkg_oracle = b.addSystemCommand(&.{ "sh", "tools/test-version-dpkg.sh" });
     dpkg_oracle.addArtifactArg(version_oracle);
