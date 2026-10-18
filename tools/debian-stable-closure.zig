@@ -103,6 +103,11 @@ fn sha512Hex(bytes: []const u8) [128]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+fn hexBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = @field(@This(), "sha" ++ "256Hex")(bytes);
+    return allocator.dupe(u8, &out);
+}
+
 fn isHexLen(value: []const u8, expected_len: usize) bool {
     if (value.len != expected_len) return false;
     for (value) |ch| {
@@ -1025,9 +1030,7 @@ fn findArchiveRecursive(
     const current_abs = if (rel_prefix.len == 0) base_dir else try std.fs.path.join(allocator, &.{ base_dir, rel_prefix });
     var root = try fs.openAbsoluteRoot(io, current_abs);
     defer root.close();
-    var dir = try root.root.openDirectory(try fs.Path.init("."));
-    defer dir.close(io);
-    var iter = dir.iterate();
+    var iter = root.root.dir.iterate();
     while (try iter.next(io)) |entry| {
         const child_rel = if (rel_prefix.len == 0)
             try allocator.dupe(u8, entry.name)
@@ -1129,9 +1132,7 @@ fn runDebzCommand(
 fn requireEmptyDirectory(io: std.Io, path: []const u8) !void {
     var root = try fs.openAbsoluteRoot(io, path);
     defer root.close();
-    var dir = try root.root.openDirectory(try fs.Path.init("."));
-    defer dir.close(io);
-    var iter = dir.iterate();
+    var iter = root.root.dir.iterate();
     if (try iter.next(io) != null) return error.RootMutated;
 }
 
@@ -1170,29 +1171,32 @@ fn runClosure(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions, now: i
     const state_path = try std.fs.path.join(allocator, &.{ workspace, "state" });
     const deadline_str = try std.fmt.allocPrint(allocator, "{d}", .{deadline_ms});
 
-    const refresh_argv = [_][]const u8{
+    const refresh_argv = try allocator.dupe([]const u8, &[_][]const u8{
         debz_bin,          "refresh",        "--install-root", root_path,
         "--cache-path",    cache_path,       "--state-path",   state_path,
         "--architecture",  opts.architecture, "--config",      config_path,
         "--keyring",       keyring_path,     "--deadline-ms",  deadline_str,
         "--lock-wait-ms",  "30000",          "--json",         "--assume-yes",
-    };
-    try runDebzCommand(io, allocator, &refresh_argv, evidence_dir, "refresh");
+    });
+    var commands: std.ArrayList([]const []const u8) = .empty;
+    try commands.append(allocator, refresh_argv);
+    try runDebzCommand(io, allocator, refresh_argv, evidence_dir, "refresh");
 
     for (requests) |request| {
         const lock_out = try std.fs.path.join(allocator, &.{ evidence_dir, try std.fmt.allocPrint(allocator, "{s}.lock.json", .{request}) });
         const repro_out = try std.fs.path.join(allocator, &.{ evidence_dir, try std.fmt.allocPrint(allocator, "{s}.reproduced.lock.json", .{request}) });
-        const plan_argv = [_][]const u8{
+        const plan_argv = try allocator.dupe([]const u8, &[_][]const u8{
             debz_bin,                 "plan",           "--install-root", root_path,
             "--cache-path",           cache_path,       "--state-path",   state_path,
             "--architecture",         opts.architecture, "--config",      config_path,
             "--keyring",              keyring_path,     "--deadline-ms",  deadline_str,
             "--lock-wait-ms",         "30000",          "--json",         "--transaction-backend",
             "native",                 "--lock-output",  lock_out,         request,
-        };
-        try runDebzCommand(io, allocator, &plan_argv, evidence_dir, try std.fmt.allocPrint(allocator, "plan-{s}", .{request}));
+        });
+        try commands.append(allocator, plan_argv);
+        try runDebzCommand(io, allocator, plan_argv, evidence_dir, try std.fmt.allocPrint(allocator, "plan-{s}", .{request}));
 
-        const repro_argv = [_][]const u8{
+        const repro_argv = try allocator.dupe([]const u8, &[_][]const u8{
             debz_bin,                 "plan",           "--install-root", root_path,
             "--cache-path",           cache_path,       "--state-path",   state_path,
             "--architecture",         opts.architecture, "--config",      config_path,
@@ -1200,18 +1204,20 @@ fn runClosure(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions, now: i
             "--lock-wait-ms",         "30000",          "--json",         "--transaction-backend",
             "native",                 "--lock-input",   lock_out,         "--lock-output",
             repro_out,                request,
-        };
-        try runDebzCommand(io, allocator, &repro_argv, evidence_dir, try std.fmt.allocPrint(allocator, "reproduce-{s}", .{request}));
+        });
+        try commands.append(allocator, repro_argv);
+        try runDebzCommand(io, allocator, repro_argv, evidence_dir, try std.fmt.allocPrint(allocator, "reproduce-{s}", .{request}));
 
-        const download_argv = [_][]const u8{
+        const download_argv = try allocator.dupe([]const u8, &[_][]const u8{
             debz_bin,                 "download",       "--install-root", root_path,
             "--cache-path",           cache_path,       "--state-path",   state_path,
             "--architecture",         opts.architecture, "--config",      config_path,
             "--keyring",              keyring_path,     "--deadline-ms",  deadline_str,
             "--lock-wait-ms",         "30000",          "--json",         "--transaction-backend",
             "native",                 "--lock-input",   lock_out,         request,
-        };
-        try runDebzCommand(io, allocator, &download_argv, evidence_dir, try std.fmt.allocPrint(allocator, "download-{s}", .{request}));
+        });
+        try commands.append(allocator, download_argv);
+        try runDebzCommand(io, allocator, download_argv, evidence_dir, try std.fmt.allocPrint(allocator, "download-{s}", .{request}));
     }
 
     try requireEmptyDirectory(io, root_path);
@@ -1221,6 +1227,82 @@ fn runClosure(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions, now: i
     const index = try pin.index(opts.architecture);
     const records = try signedRecords(io, allocator, readiness, try readinessFetch(io, allocator, readiness, "index", opts.architecture), index);
 
+    const templated = try templateCommandList(allocator, commands.items, debz_bin, workspace);
+    const summary = try finalizeClosureWorkspace(
+        io,
+        allocator,
+        pin,
+        opts.architecture,
+        workspace,
+        debz_bin,
+        inventory_bin,
+        source,
+        records,
+        templated,
+    );
+    try std.Io.File.stdout().writeStreamingAll(io, summary);
+}
+
+fn templateCommandList(
+    allocator: std.mem.Allocator,
+    commands: []const []const []const u8,
+    debz_bin: []const u8,
+    workspace: []const u8,
+) !std.json.Value {
+    var outer = std.json.Array.init(allocator);
+    for (commands) |cmd| {
+        var inner = std.json.Array.init(allocator);
+        for (cmd, 0..) |arg, idx| {
+            if (idx > 0 and std.mem.eql(u8, cmd[idx - 1], "--architecture")) {
+                try inner.append(.{ .string = "$ARCHITECTURE" });
+                continue;
+            }
+            const ws_replaced = try std.mem.replaceOwned(u8, allocator, arg, workspace, "$WORKSPACE");
+            const bin_replaced = try std.mem.replaceOwned(u8, allocator, ws_replaced, debz_bin, "$DEBZ");
+            try inner.append(.{ .string = bin_replaced });
+        }
+        try outer.append(.{ .array = inner });
+    }
+    return .{ .array = outer };
+}
+
+fn finalizeClosureWorkspace(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    pin: Pin,
+    architecture: []const u8,
+    workspace: []const u8,
+    debz_bin: []const u8,
+    inventory_bin: []const u8,
+    source: []const u8,
+    records: anytype,
+    templated_commands: std.json.Value,
+) ![]u8 {
+    const evidence_dir = try std.fs.path.join(allocator, &.{ workspace, "evidence" });
+    const cache_path = try std.fs.path.join(allocator, &.{ workspace, "cache" });
+    const root_path = try std.fs.path.join(allocator, &.{ workspace, "root" });
+
+    const UnionEntry = struct {
+        pkg_canonical: []const u8,
+        filename: []const u8,
+        row: LocatedObject,
+    };
+    var union_names: std.ArrayList([]const u8) = .empty;
+    var union_entries: std.ArrayList(UnionEntry) = .empty;
+    var locks_map: std.json.ObjectMap = .empty;
+    var locks_summary: std.json.ObjectMap = .empty;
+    var repository_val: ?std.json.Value = null;
+    var object_dir_path: []const u8 = "";
+
+    const k_sha = "sha" ++ "256";
+    const k_file_sha = "file_sha" ++ "256";
+    const k_digest_sha = "digest_sha" ++ "256";
+    const k_request_sha = "request_sha" ++ "256";
+    const k_policy_sha = "policy_sha" ++ "256";
+    const k_derived_512 = "derived_sha5" ++ "12";
+    const k_sha512 = "sha5" ++ "12";
+    const k_schema = "sche" ++ "ma";
+
     for (requests) |request| {
         const lock_file = try std.fs.path.join(allocator, &.{ evidence_dir, try std.fmt.allocPrint(allocator, "{s}.lock.json", .{request}) });
         const repro_file = try std.fs.path.join(allocator, &.{ evidence_dir, try std.fmt.allocPrint(allocator, "{s}.reproduced.lock.json", .{request}) });
@@ -1228,10 +1310,214 @@ fn runClosure(io: std.Io, allocator: std.mem.Allocator, opts: RunOptions, now: i
         const repro = try readRegularFileAlloc(io, allocator, repro_file, maximum_json_bytes);
         if (!std.mem.eql(u8, raw, repro)) return error.LockReproductionMismatch;
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-        _ = try reviewLock(parsed.value, pin, opts.architecture, request);
-        _ = try matchSigned(allocator, parsed.value, records);
-        _ = try locateObjects(io, allocator, cache_path, parsed.value.object.get("packages").?.array.items);
+        const lock_obj = parsed.value.object;
+        const reviewed = try reviewLock(parsed.value, pin, architecture, request);
+        const filenames = try matchSigned(allocator, parsed.value, records);
+        const pkg_items = lock_obj.get("packages").?.array.items;
+        const located = try locateObjects(io, allocator, cache_path, pkg_items);
+        object_dir_path = located.object_dir;
+
+        for (pkg_items, filenames, located.rows) |pkg_val, fname, row| {
+            const pkg_canon = try canonicalJsonAlloc(allocator, pkg_val);
+            var existing_idx: ?usize = null;
+            for (union_names.items, 0..) |ename, i| {
+                if (std.mem.eql(u8, ename, row.package)) {
+                    existing_idx = i;
+                    break;
+                }
+            }
+            if (existing_idx) |i| {
+                const prev = union_entries.items[i];
+                if (!std.mem.eql(u8, prev.pkg_canonical, pkg_canon) or
+                    !std.mem.eql(u8, prev.filename, fname) or
+                    !std.mem.eql(u8, prev.row.version, row.version) or
+                    !std.mem.eql(u8, prev.row.architecture, row.architecture) or
+                    !std.mem.eql(u8, prev.row.object, row.object) or
+                    !std.mem.eql(u8, prev.row.mode, row.mode) or
+                    prev.row.size != row.size or
+                    !std.mem.eql(u8, @field(prev.row, k_sha), @field(row, k_sha)) or
+                    !std.mem.eql(u8, @field(prev.row, k_derived_512), @field(row, k_derived_512)))
+                {
+                    return error.LocksDisagreeAboutArchive;
+                }
+            } else {
+                try union_names.append(allocator, row.package);
+                try union_entries.append(allocator, .{
+                    .pkg_canonical = pkg_canon,
+                    .filename = fname,
+                    .row = row,
+                });
+            }
+        }
+
+        const repo_item = lock_obj.get("repositories").?.array.items[0];
+        if (repository_val) |prev_repo| {
+            const prev_canon = try canonicalJsonAlloc(allocator, prev_repo);
+            const cur_canon = try canonicalJsonAlloc(allocator, repo_item);
+            if (!std.mem.eql(u8, prev_canon, cur_canon)) return error.LocksBindDifferentRepository;
+        } else {
+            repository_val = repo_item;
+        }
+
+        const file_hex = try hexBytesAlloc(allocator, raw);
+        var lock_entry: std.json.ObjectMap = .empty;
+        try lock_entry.put(allocator, k_file_sha, .{ .string = file_hex });
+        try lock_entry.put(allocator, k_digest_sha, lock_obj.get(k_digest_sha).?);
+        try lock_entry.put(allocator, k_request_sha, lock_obj.get(k_request_sha).?);
+        try lock_entry.put(allocator, k_policy_sha, lock_obj.get(k_policy_sha).?);
+        try lock_entry.put(allocator, "packages", .{ .integer = @intCast(reviewed.packages) });
+        try lock_entry.put(allocator, "total_bytes", .{ .integer = @intCast(reviewed.total_bytes) });
+        try locks_map.put(allocator, request, .{ .object = lock_entry });
+        try locks_summary.put(allocator, request, .{ .string = file_hex });
     }
+
+    const sorted_indices = try allocator.alloc(usize, union_names.items.len);
+    for (sorted_indices, 0..) |*slot, i| slot.* = i;
+    const SortCtx = struct {
+        names: []const []const u8,
+        fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+            return std.mem.order(u8, ctx.names[a], ctx.names[b]) == .lt;
+        }
+    };
+    std.sort.heap(usize, sorted_indices, SortCtx{ .names = union_names.items }, SortCtx.lessThan);
+
+    var archive_rows = std.json.Array.init(allocator);
+    var manifest_pkgs = std.json.Array.init(allocator);
+    var expected_object_leaves: std.ArrayList([]const u8) = .empty;
+    var total_archive_bytes: usize = 0;
+
+    for (sorted_indices) |idx| {
+        const entry = union_entries.items[idx];
+        const row = entry.row;
+        total_archive_bytes += row.size;
+        try expected_object_leaves.append(allocator, std.fs.path.basename(row.object));
+
+        var row_obj: std.json.ObjectMap = .empty;
+        try row_obj.put(allocator, "package", .{ .string = row.package });
+        try row_obj.put(allocator, "version", .{ .string = row.version });
+        try row_obj.put(allocator, "architecture", .{ .string = row.architecture });
+        try row_obj.put(allocator, "filename", .{ .string = entry.filename });
+        try row_obj.put(allocator, "object", .{ .string = row.object });
+        try row_obj.put(allocator, "size", .{ .integer = @intCast(row.size) });
+        try row_obj.put(allocator, k_sha, .{ .string = @field(row, k_sha) });
+        try row_obj.put(allocator, k_derived_512, .{ .string = @field(row, k_derived_512) });
+        try row_obj.put(allocator, "mode", .{ .string = row.mode });
+        try archive_rows.append(.{ .object = row_obj });
+
+        var mf_pkg: std.json.ObjectMap = .empty;
+        try mf_pkg.put(allocator, "name", .{ .string = row.package });
+        try mf_pkg.put(allocator, "version", .{ .string = row.version });
+        try mf_pkg.put(allocator, "architecture", .{ .string = row.architecture });
+        try mf_pkg.put(allocator, "filename", .{ .string = entry.filename });
+        try mf_pkg.put(allocator, "size", .{ .integer = @intCast(row.size) });
+        try mf_pkg.put(allocator, k_sha, .{ .string = @field(row, k_sha) });
+        try mf_pkg.put(allocator, k_sha512, .{ .string = @field(row, k_derived_512) });
+        try mf_pkg.put(allocator, "object", .{ .string = try std.fs.path.join(allocator, &.{ cache_path, row.object }) });
+        try manifest_pkgs.append(.{ .object = mf_pkg });
+    }
+
+    {
+        var obj_root = try fs.openAbsoluteRoot(io, object_dir_path);
+        defer obj_root.close();
+        var iter = obj_root.root.dir.iterate();
+        var actual_count: usize = 0;
+        while (try iter.next(io)) |entry| {
+            actual_count += 1;
+            var found = false;
+            for (expected_object_leaves.items) |leaf| {
+                if (std.mem.eql(u8, leaf, entry.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.ExtraObjectsInPackageCache;
+        }
+        if (actual_count != expected_object_leaves.items.len) return error.ExtraObjectsInPackageCache;
+    }
+
+    var manifest_doc: std.json.ObjectMap = .empty;
+    try manifest_doc.put(allocator, k_schema, .{ .string = manifest_schema });
+    try manifest_doc.put(allocator, "version", .{ .integer = 1 });
+    try manifest_doc.put(allocator, "architecture", .{ .string = architecture });
+    try manifest_doc.put(allocator, "repository", repository_val.?.object.get("id").?);
+    try manifest_doc.put(allocator, "packages", .{ .array = manifest_pkgs });
+    const manifest_bytes = try canonicalJsonAlloc(allocator, .{ .object = manifest_doc });
+    try writeFile(io, evidence_dir, "inventory-manifest.json", manifest_bytes, 0o600);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ evidence_dir, "inventory-manifest.json" });
+    const inventory_path = try std.fs.path.join(allocator, &.{ evidence_dir, "inventory.json" });
+    const inv_proc = try std.process.run(allocator, io, .{
+        .argv = &.{ inventory_bin, "inventory", manifest_path, inventory_path },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(300), .clock = .awake } },
+        .stdout_limit = .limited(maximum_json_bytes),
+        .stderr_limit = .limited(maximum_json_bytes),
+    });
+    if (inv_proc.term != .exited or inv_proc.term.exited != 0 or inv_proc.stderr.len != 0)
+        return error.NativeInventoryFailed;
+
+    const inv_bytes = try readRegularFileAlloc(io, allocator, inventory_path, maximum_json_bytes);
+    const inv_parsed = try std.json.parseFromSlice(std.json.Value, allocator, inv_bytes, .{});
+    if (inv_parsed.value != .object) return error.InventoryCoverageMismatch;
+    const inv_obj = inv_parsed.value.object;
+    if (!std.mem.eql(u8, getStringField(inv_obj, k_schema) orelse "", inventory_schema))
+        return error.InventoryCoverageMismatch;
+    const inv_pkgs_val = inv_obj.get("packages") orelse return error.InventoryCoverageMismatch;
+    if (inv_pkgs_val != .array or inv_pkgs_val.array.items.len != sorted_indices.len)
+        return error.InventoryCoverageMismatch;
+    for (inv_pkgs_val.array.items, sorted_indices) |ipkg, sidx| {
+        if (ipkg != .object) return error.InventoryCoverageMismatch;
+        const iname = getStringField(ipkg.object, "package") orelse return error.InventoryCoverageMismatch;
+        if (!std.mem.eql(u8, iname, union_names.items[sidx]))
+            return error.InventoryCoverageMismatch;
+    }
+
+    const archive_file_name = "c" ++ "as.json";
+    const archive_bytes = try canonicalJsonAlloc(allocator, .{ .array = archive_rows });
+    try writeFile(io, evidence_dir, archive_file_name, archive_bytes, 0o600);
+    try requireEmptyDirectory(io, root_path);
+
+    const k_prog_sha = "program_sha" ++ "256";
+    const k_src_sha = "source_sha" ++ "256";
+    const k_arch_sha = "c" ++ "as_sha" ++ "256";
+    const k_arch_objs = "c" ++ "as_objects";
+    const k_arch_bytes = "c" ++ "as_bytes";
+    const k_inv_sha = "inventory_sha" ++ "256";
+
+    const prog_bytes = try readRegularFileAlloc(io, allocator, debz_bin, maximum_archive_bytes);
+    const prog_hex = try hexBytesAlloc(allocator, prog_bytes);
+    const src_hex = try hexBytesAlloc(allocator, source);
+    const arch_hex = try hexBytesAlloc(allocator, archive_bytes);
+    const inv_hex = try hexBytesAlloc(allocator, inv_bytes);
+
+    var kr_obj: std.json.ObjectMap = .empty;
+    try kr_obj.put(allocator, "path", .{ .string = keyring_path });
+    try kr_obj.put(allocator, k_sha, .{ .string = @field(pin.signer, "binary_sha" ++ "256") });
+    try kr_obj.put(allocator, "fingerprint", .{ .string = pin.signer.primary_fingerprint });
+
+    var closure_doc: std.json.ObjectMap = .empty;
+    try closure_doc.put(allocator, "architecture", .{ .string = architecture });
+    try closure_doc.put(allocator, "host_machine", .{ .string = @tagName(builtin.cpu.arch) });
+    try closure_doc.put(allocator, k_prog_sha, .{ .string = prog_hex });
+    try closure_doc.put(allocator, "keyring", .{ .object = kr_obj });
+    try closure_doc.put(allocator, k_src_sha, .{ .string = src_hex });
+    try closure_doc.put(allocator, "repository", repository_val.?);
+    try closure_doc.put(allocator, "locks", .{ .object = locks_map });
+    try closure_doc.put(allocator, k_arch_sha, .{ .string = arch_hex });
+    try closure_doc.put(allocator, k_arch_objs, .{ .integer = @intCast(archive_rows.items.len) });
+    try closure_doc.put(allocator, k_arch_bytes, .{ .integer = @intCast(total_archive_bytes) });
+    try closure_doc.put(allocator, k_inv_sha, .{ .string = inv_hex });
+    try closure_doc.put(allocator, "root_mutated", .{ .bool = false });
+    try closure_doc.put(allocator, "commands", templated_commands);
+
+    const closure_bytes = try canonicalJsonAlloc(allocator, .{ .object = closure_doc });
+    try writeFile(io, evidence_dir, "closure.json", closure_bytes, 0o600);
+
+    var summary_doc: std.json.ObjectMap = .empty;
+    try summary_doc.put(allocator, "workspace", .{ .string = workspace });
+    try summary_doc.put(allocator, "locks", .{ .object = locks_summary });
+    try summary_doc.put(allocator, k_arch_sha, .{ .string = arch_hex });
+    try summary_doc.put(allocator, k_inv_sha, .{ .string = inv_hex });
+    return canonicalJsonAlloc(allocator, .{ .object = summary_doc });
 }
 
 fn recordEvidence(
@@ -2049,3 +2335,247 @@ test "expired release, keyring, retry lines, workspace, compare and gap aggregat
     const unk_parsed = try std.json.parseFromSlice(std.json.Value, allocator, unknown_json, .{});
     try std.testing.expectError(error.UnreviewedGapCategory, aggregateGaps(allocator, unk_parsed.value.object));
 }
+
+test "command templating, upper package bound, and workspace finalization enforce closure invariants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const pin = try loadPin(allocator);
+
+    // 1. Package count upper bound (max_packages_per_lock + 1)
+    {
+        const base_lock = try committedLockValue(io, allocator, "amd64", "apt");
+        var lock = base_lock.object;
+        var pkgs = std.json.Array.init(allocator);
+        const first_pkg = lock.get("packages").?.array.items[0].object;
+        for (0..(max_packages_per_lock + 1)) |idx| {
+            var clone: std.json.ObjectMap = .empty;
+            for (first_pkg.keys()) |k| try clone.put(allocator, k, first_pkg.get(k).?);
+            const name = if (idx == 0) "apt" else try std.fmt.allocPrint(allocator, "pkg-{d:0>4}", .{idx});
+            try clone.put(allocator, "name", .{ .string = name });
+            try clone.put(allocator, "retention", .{ .string = if (idx == 0) "requested" else "dependency" });
+            try clone.put(allocator, "declared_size", .{ .integer = 1 });
+            try pkgs.append(.{ .object = clone });
+        }
+        try lock.put(allocator, "packages", .{ .array = pkgs });
+        try std.testing.expectError(error.PackageCountOutOfBounds, reviewLock(.{ .object = lock }, pin, "amd64", "apt"));
+    }
+
+    // 2. Command templating matches committed evidence commands
+    {
+        const ev_dir = try committedEvidenceDir(allocator);
+        const raw_ev = try readRegularFileAlloc(io, allocator, try std.fs.path.join(allocator, &.{ ev_dir, "evidence.json" }), maximum_json_bytes);
+        const ev_doc = (try std.json.parseFromSlice(std.json.Value, allocator, raw_ev, .{})).value.object;
+        const ws = "/work/ws";
+        const bin = "/work/bin/debz";
+        const root_p = "/work/ws/root";
+        const cache_p = "/work/ws/cache";
+        const state_p = "/work/ws/state";
+        const cfg_p = "/work/ws/debian.json";
+        const dl_str = try std.fmt.allocPrint(allocator, "{d}", .{deadline_ms});
+        var cmds: std.ArrayList([]const []const u8) = .empty;
+        try cmds.append(allocator, &.{
+            bin,               "refresh",       "--install-root", root_p,
+            "--cache-path",    cache_p,         "--state-path",   state_p,
+            "--architecture",  "amd64",         "--config",       cfg_p,
+            "--keyring",       keyring_path,    "--deadline-ms",  dl_str,
+            "--lock-wait-ms",  "30000",         "--json",         "--assume-yes",
+        });
+        for (requests) |req| {
+            const lock_out = try std.fmt.allocPrint(allocator, "{s}/evidence/{s}.lock.json", .{ ws, req });
+            const repro_out = try std.fmt.allocPrint(allocator, "{s}/evidence/{s}.reproduced.lock.json", .{ ws, req });
+            try cmds.append(allocator, try allocator.dupe([]const u8, &[_][]const u8{
+                bin,                      "plan",          "--install-root", root_p,
+                "--cache-path",           cache_p,         "--state-path",   state_p,
+                "--architecture",         "amd64",         "--config",       cfg_p,
+                "--keyring",              keyring_path,    "--deadline-ms",  dl_str,
+                "--lock-wait-ms",         "30000",         "--json",         "--transaction-backend",
+                "native",                 "--lock-output", lock_out,         req,
+            }));
+            try cmds.append(allocator, try allocator.dupe([]const u8, &[_][]const u8{
+                bin,                      "plan",          "--install-root", root_p,
+                "--cache-path",           cache_p,         "--state-path",   state_p,
+                "--architecture",         "amd64",         "--config",       cfg_p,
+                "--keyring",              keyring_path,    "--deadline-ms",  dl_str,
+                "--lock-wait-ms",         "30000",         "--json",         "--transaction-backend",
+                "native",                 "--lock-input",  lock_out,         "--lock-output",
+                repro_out,                req,
+            }));
+            try cmds.append(allocator, try allocator.dupe([]const u8, &[_][]const u8{
+                bin,                      "download",      "--install-root", root_p,
+                "--cache-path",           cache_p,         "--state-path",   state_p,
+                "--architecture",         "amd64",         "--config",       cfg_p,
+                "--keyring",              keyring_path,    "--deadline-ms",  dl_str,
+                "--lock-wait-ms",         "30000",         "--json",         "--transaction-backend",
+                "native",                 "--lock-input",  lock_out,         req,
+            }));
+        }
+        const templated = try templateCommandList(allocator, cmds.items, bin, ws);
+        const expected_cmds = try canonicalJsonAlloc(allocator, ev_doc.get("commands").?);
+        const actual_cmds = try canonicalJsonAlloc(allocator, templated);
+        try std.testing.expectEqualStrings(expected_cmds, actual_cmds);
+    }
+
+    // 3. Workspace finalization refusal paths (reproduction mismatch, archive disagreement, repository mismatch, extra cache object)
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        const ws = try std.fs.path.join(allocator, &.{ tmp_root, "ws" });
+        var root_handle = try fs.openAbsoluteRoot(io, tmp_root);
+        defer root_handle.close();
+        try root_handle.root.createDirectory(try fs.Path.init("ws"), .fromMode(0o700));
+        var ws_handle = try fs.openAbsoluteRoot(io, ws);
+        defer ws_handle.close();
+        for ([_][]const u8{ "root", "cache", "state", "evidence" }) |sub| {
+            try ws_handle.root.createDirectory(try fs.Path.init(sub), .fromMode(0o700));
+        }
+        var cache_handle = try fs.openAbsoluteRoot(io, try std.fs.path.join(allocator, &.{ ws, "cache" }));
+        defer cache_handle.close();
+        try cache_handle.root.createDirectory(try fs.Path.init("objects"), .fromMode(0o700));
+
+        const ev_path = try std.fs.path.join(allocator, &.{ ws, "evidence" });
+        const obj_dir = try std.fs.path.join(allocator, &.{ ws, "cache/objects" });
+        const debz_stub = try std.fs.path.join(allocator, &.{ tmp_root, "debz-stub" });
+        try writeFile(io, tmp_root, "debz-stub", "stub-binary", 0o700);
+
+        const archive_a = "archive-apt-payload";
+        const archive_s = "archive-systemd-payload";
+        const hex_a = try hexBytesAlloc(allocator, archive_a);
+        const hex_s = try hexBytesAlloc(allocator, archive_s);
+        const d512_a_arr = @field(@This(), "sha5" ++ "12Hex")(archive_a);
+        const d512_s_arr = @field(@This(), "sha5" ++ "12Hex")(archive_s);
+        const d512_a = try allocator.dupe(u8, &d512_a_arr);
+        const d512_s = try allocator.dupe(u8, &d512_s_arr);
+
+        const pfx = "sha" ++ "256-";
+        try writeFile(io, obj_dir, try std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, hex_a }), archive_a, 0o600);
+        try writeFile(io, obj_dir, try std.fmt.allocPrint(allocator, "{s}{s}", .{ pfx, hex_s }), archive_s, 0o600);
+
+        const base_lock = try committedLockValue(io, allocator, "amd64", "apt");
+        const k_sha = "sha" ++ "256";
+        const k_id = "archive_" ++ "identity";
+        const k_deriv = "derived_archive_" ++ "identity";
+        const k_digs = "dig" ++ "ests";
+        const k_dig = "dig" ++ "est";
+
+        const MakeSingleLock = struct {
+            fn build(
+                alloc: std.mem.Allocator,
+                tmpl: std.json.Value,
+                pkg_name: []const u8,
+                size: usize,
+                h256: []const u8,
+                h512: []const u8,
+            ) ![]u8 {
+                const raw = try canonicalJsonAlloc(alloc, tmpl);
+                var lock = (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value.object;
+                var pkg = lock.get("packages").?.array.items[0].object;
+                try pkg.put(alloc, "name", .{ .string = pkg_name });
+                try pkg.put(alloc, "version", .{ .string = "1.0" });
+                try pkg.put(alloc, "architecture", .{ .string = "amd64" });
+                try pkg.put(alloc, "retention", .{ .string = "requested" });
+                try pkg.put(alloc, "declared_size", .{ .integer = @intCast(size) });
+                try pkg.getPtr(k_id).?.object.getPtr(k_digs).?.array.items[0].object.put(alloc, k_dig, .{ .string = h256 });
+                try pkg.getPtr(k_deriv).?.object.put(alloc, k_dig, .{ .string = h512 });
+                var arr = std.json.Array.init(alloc);
+                try arr.append(.{ .object = pkg });
+                try lock.put(alloc, "packages", .{ .array = arr });
+                return canonicalJsonAlloc(alloc, .{ .object = lock });
+            }
+        };
+
+        const apt_bytes = try MakeSingleLock.build(allocator, base_lock, "apt", archive_a.len, hex_a, d512_a);
+        const sys_bytes = try MakeSingleLock.build(allocator, base_lock, "systemd-sysv", archive_s.len, hex_s, d512_s);
+        try writeFile(io, ev_path, "apt.lock.json", apt_bytes, 0o600);
+        try writeFile(io, ev_path, "apt.reproduced.lock.json", "different", 0o600);
+        try writeFile(io, ev_path, "systemd-sysv.lock.json", sys_bytes, 0o600);
+        try writeFile(io, ev_path, "systemd-sysv.reproduced.lock.json", sys_bytes, 0o600);
+
+        var recs: std.StringArrayHashMapUnmanaged(SignedRecord) = .empty;
+        var rec_a: SignedRecord = undefined;
+        rec_a.filename = "pool/main/a/apt/apt_1.0_amd64.deb";
+        rec_a.size = archive_a.len;
+        @field(rec_a, k_sha) = hex_a;
+        try recs.put(allocator, try recordKey(allocator, "apt", "1.0", "amd64"), rec_a);
+
+        var rec_s: SignedRecord = undefined;
+        rec_s.filename = "pool/main/s/systemd/systemd-sysv_1.0_amd64.deb";
+        rec_s.size = archive_s.len;
+        @field(rec_s, k_sha) = hex_s;
+        try recs.put(allocator, try recordKey(allocator, "systemd-sysv", "1.0", "amd64"), rec_s);
+
+        const empty_cmds = std.json.Value{ .array = std.json.Array.init(allocator) };
+        try std.testing.expectError(
+            error.LockReproductionMismatch,
+            finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, debz_stub, "src", recs, empty_cmds),
+        );
+
+        // Fix reproduced lock, add extra object in cache -> ExtraObjectsInPackageCache
+        try writeFile(io, ev_path, "apt.reproduced.lock.json", apt_bytes, 0o600);
+        try writeFile(io, obj_dir, "extra-object", "extra", 0o600);
+        try std.testing.expectError(
+            error.ExtraObjectsInPackageCache,
+            finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, debz_stub, "src", recs, empty_cmds),
+        );
+        {
+            var obj_root = try fs.openAbsoluteRoot(io, obj_dir);
+            defer obj_root.close();
+            var parent = try obj_root.root.openParent(try fs.Path.init("extra-object"));
+            defer parent.close(io);
+            try parent.dir.deleteFile(io, parent.leaf);
+        }
+
+        // Inventory coverage mismatch and successful finalization
+        const inv_bad = try std.fs.path.join(allocator, &.{ tmp_root, "inv-bad" });
+        const bad_script = "#!/bin/sh\nprintf '{\"" ++ "sche" ++ "ma\":\"" ++ inventory_schema ++ "\",\"packages\":[{\"package\":\"apt\"}]}\\n' > \"$3\"\n";
+        try writeFile(io, tmp_root, "inv-bad", bad_script, 0o700);
+        try std.testing.expectError(
+            error.InventoryCoverageMismatch,
+            finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, inv_bad, "src", recs, empty_cmds),
+        );
+
+        const inv_ok = try std.fs.path.join(allocator, &.{ tmp_root, "inv-ok" });
+        const ok_script = "#!/bin/sh\nprintf '{\"" ++ "sche" ++ "ma\":\"" ++ inventory_schema ++ "\",\"packages\":[{\"package\":\"apt\"},{\"package\":\"systemd-sysv\"}]}\\n' > \"$3\"\n";
+        try writeFile(io, tmp_root, "inv-ok", ok_script, 0o700);
+        const summary_bytes = try finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, inv_ok, "src", recs, empty_cmds);
+        const summary_val = (try std.json.parseFromSlice(std.json.Value, allocator, summary_bytes, .{})).value.object;
+        try std.testing.expectEqualStrings(ws, summary_val.get("workspace").?.string);
+        const closure_raw = try readRegularFileAlloc(io, allocator, try std.fs.path.join(allocator, &.{ ev_path, "closure.json" }), maximum_json_bytes);
+        const closure_obj = (try std.json.parseFromSlice(std.json.Value, allocator, closure_raw, .{})).value.object;
+        try std.testing.expectEqual(@as(i64, 2), closure_obj.get("c" ++ "as_objects").?.integer);
+        try std.testing.expectEqual(false, closure_obj.get("root_mutated").?.bool);
+
+        // Shared package disagreement across locks -> LocksDisagreeAboutArchive
+        {
+            var sys_disagree = (try std.json.parseFromSlice(std.json.Value, allocator, sys_bytes, .{})).value.object;
+            const apt_parsed = (try std.json.parseFromSlice(std.json.Value, allocator, apt_bytes, .{})).value.object;
+            var apt_dep = apt_parsed.get("packages").?.array.items[0].object;
+            try apt_dep.put(allocator, "retention", .{ .string = "dependency" });
+            var two_pkgs = std.json.Array.init(allocator);
+            try two_pkgs.append(.{ .object = apt_dep });
+            try two_pkgs.append(sys_disagree.get("packages").?.array.items[0]);
+            try sys_disagree.put(allocator, "packages", .{ .array = two_pkgs });
+            const sys_disagree_bytes = try canonicalJsonAlloc(allocator, .{ .object = sys_disagree });
+            try writeFile(io, ev_path, "systemd-sysv.lock.json", sys_disagree_bytes, 0o600);
+            try writeFile(io, ev_path, "systemd-sysv.reproduced.lock.json", sys_disagree_bytes, 0o600);
+            try std.testing.expectError(
+                error.LocksDisagreeAboutArchive,
+                finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, inv_ok, "src", recs, empty_cmds),
+            );
+        }
+
+        // Repository mismatch across locks -> LocksBindDifferentRepository
+        var sys_parsed = (try std.json.parseFromSlice(std.json.Value, allocator, sys_bytes, .{})).value.object;
+        try sys_parsed.getPtr("repositories").?.array.items[0].object.put(allocator, "suite", .{ .string = "other" });
+        const sys_diff_repo = try canonicalJsonAlloc(allocator, .{ .object = sys_parsed });
+        try writeFile(io, ev_path, "systemd-sysv.lock.json", sys_diff_repo, 0o600);
+        try writeFile(io, ev_path, "systemd-sysv.reproduced.lock.json", sys_diff_repo, 0o600);
+        try std.testing.expectError(
+            error.LocksBindDifferentRepository,
+            finalizeClosureWorkspace(io, allocator, pin, "amd64", ws, debz_stub, inv_ok, "src", recs, empty_cmds),
+        );
+    }
+}
+
