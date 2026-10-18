@@ -2102,6 +2102,7 @@ jobs:
         run: |
           zig build build-dpkg-oracle-evidence test-dpkg-oracle-evidence -Doptimize=ReleaseSafe -j2 --summary all
           zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all
+          zig build build-dpkg-config-reference -Doptimize=ReleaseSafe -j2 --summary all
       - name: Prepare digest-verified private ARM64 tools
         run: |
           zig build build-native-dpkg-reference -j2
@@ -2115,19 +2116,8 @@ jobs:
           output="$PWD/.tmp/arm64-dpkg-oracles"
           reference="$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin"
           mkdir -p "$output/host-config/dpkg.cfg.d"
-          python3 - <<'PY'
-          import importlib.util
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location(
-              "debz_config_reference",
-              Path("tools/dpkg-config-reference.py"),
-          )
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          Path(".tmp/arm64-dpkg-oracles/host-config/dpkg.cfg").write_bytes(
-              module.PINNED_DPKG_CONFIG
-          )
-          PY
+          zig-out/bin/debz-dpkg-config-reference \
+            --write-host-config .tmp/arm64-dpkg-oracles/host-config/dpkg.cfg
           if ! sudo -n /usr/bin/unshare --mount --propagation private \
             /usr/bin/env -i \
             PATH=/usr/bin:/bin \
@@ -2194,8 +2184,8 @@ jobs:
           PATH=/no-host-interpreters zig-out/bin/debz-dpkg-oracle-evidence verify \
             --evidence "$output/dpkg-oracle-execution-evidence-arm64-v1.json" \
             --artifact-root "$output"
+          zig build test-dpkg-config-reference-unit -Doptimize=ReleaseSafe -j2 --summary all
           python3 -m unittest \
-            tools/test_dpkg_config_reference.py \
             tools/test_dpkg_alternatives_reference.py
       - name: Upload canonical ARM64 oracle evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -423,7 +423,7 @@ native and both-reference selectors on amd64 and arm64 in Debug and
 ReleaseSafe. All former Python lifecycle, trigger, and materialization fixture
 modules have been retired; the direct-dpkg config and alternatives reference
 oracles own their disposable-root helpers directly in
-`tools/dpkg-config-reference.py`.
+`tools/dpkg-config-reference.zig` and `tools/dpkg-alternatives-reference.py`.
 Trigger acceptance has a separate reference-only
 unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
 

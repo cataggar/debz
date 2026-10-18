@@ -1875,9 +1875,9 @@ test "security: disposable runtime consumers require native copying without a Py
         "try context.input.check(context.root);",
         "try context.input.checkParent(context.root, context.directory.?);",
     });
-    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-config-reference.py", &.{
-        "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
-        "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-config-reference.zig", &.{
+        "\"DEBZ_DISPOSABLE_RUNTIME\"",
+        "try argv.appendSlice(self.allocator, &.{ self.disposable_runtime, root, source, destination });",
     });
     try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-alternatives-reference.py", &.{
         "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
@@ -2911,14 +2911,15 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         "tools/native-trigger-fixtures.py",               "tools/native_diversion_settlement_oracle.py",
         "tools/test_real_snapshot_reference_triggers.py", "tools/native-lifecycle-fixtures.py",
         "tools/native-differential.py",                   "tools/native_only_candidate.py",
-        "tools/native-materialization-fixtures.py",
+        "tools/native-materialization-fixtures.py",       "tools/dpkg-config-reference.py",
+        "tools/test_dpkg_config_reference.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();
         try restored.failsWith("retired Python test entry point still exists");
     }
     for ([_][]const u8{
-        "tools/dpkg-config-reference.py",
+        "tools/dpkg-config-reference.zig",
         "actions/install/__tests__/integration.test.ts",
     }) |path| {
         const source = try f.source(path);
