@@ -1198,7 +1198,6 @@ pub fn build(b: *std.Build) void {
             "python3",
             "-m",
             "unittest",
-            "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
             "tools/test_real_snapshot_repin.py",
         },
@@ -2051,22 +2050,49 @@ pub fn build(b: *std.Build) void {
     );
     native_conffile_step.dependOn(&run_native_conffile_zig.step);
 
+    const dpkg_config_reference_exe = b.addExecutable(.{
+        .name = "debz-dpkg-config-reference",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/dpkg-config-reference.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = !native_helper_debug_info,
+        }),
+    });
+    const install_dpkg_config_reference = b.addInstallArtifact(dpkg_config_reference_exe, .{});
+    b.getInstallStep().dependOn(&install_dpkg_config_reference.step);
+    b.step("build-dpkg-config-reference", "Build the native dpkg config reference oracle")
+        .dependOn(&install_dpkg_config_reference.step);
+
     const dpkg_config_reference = b.addSystemCommand(&.{
-        "sudo",                                          "-n",                                                      "env",                                                                                       "PYTHONDONTWRITEBYTECODE=1",
+        "sudo",                                          "-n",                                                      "env",
         b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
-        "python3",                                       "tools/dpkg-config-reference.py",
+        getInstallPath(b, .bin, "debz-dpkg-config-reference"),
     });
     dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
     dpkg_config_reference.step.dependOn(&install_native_dpkg.step);
-    const dpkg_config_reference_tests = b.addSystemCommand(
-        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
-    );
+    dpkg_config_reference.step.dependOn(&install_dpkg_config_reference.step);
+    const dpkg_config_reference_unit = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/dpkg-config-reference.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = !native_helper_debug_info,
+        }),
+    });
+    const dpkg_config_reference_tests = b.addRunArtifact(dpkg_config_reference_unit);
+    dpkg_config_reference_tests.setCwd(b.path("."));
+    dpkg_config_reference_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     dpkg_config_reference_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
+    dpkg_config_reference_tests.step.dependOn(&install_disposable_runtime.step);
     dpkg_config_reference_tests.step.dependOn(&install_native_dpkg.step);
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     workload_native.dependOn(&dpkg_config_reference_tests.step);
+    audit_step.dependOn(&dpkg_config_reference_tests.step);
     b.step("test-dpkg-config-reference", "Verify pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
+    b.step("test-dpkg-config-reference-unit", "Run dpkg config reference oracle unit tests")
+        .dependOn(&dpkg_config_reference_tests.step);
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
         "sudo",                                          "-n",                                                      "env",                                                                                       "PYTHONDONTWRITEBYTECODE=1",

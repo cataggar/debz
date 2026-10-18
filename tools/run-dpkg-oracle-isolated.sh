@@ -60,7 +60,12 @@ test "$(/usr/bin/sha256sum "$host_config")" = \
 cd "$repository"
 
 if [ "$kind" = config ]; then
-    exec /usr/bin/python3 tools/dpkg-config-reference.py \
+    DEBZ_DPKG_CONFIG_REFERENCE="$repository/zig-out/bin/debz-dpkg-config-reference"
+    if [ ! -x "$DEBZ_DPKG_CONFIG_REFERENCE" ]; then
+        echo "isolated dpkg config oracle requires debz-dpkg-config-reference" >&2
+        exit 2
+    fi
+    exec "$DEBZ_DPKG_CONFIG_REFERENCE" \
         --architecture "$architecture" \
         --reference-dpkg "$dpkg" \
         --capture-observed "$output"

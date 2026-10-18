@@ -2982,8 +2982,8 @@ architecture-qualified package/status/info bytes. Commands, exits, traces,
 maintainer-script environments, config non-execution, package states, journal
 semantics, and frontend exclusion are otherwise identical.
 
-The elevated `tools/dpkg-config-reference.py` runner invokes only the pinned
-dpkg binary against guarded disposable roots. Its deterministic Python
+The elevated `tools/dpkg-config-reference.zig` runner (`debz-dpkg-config-reference`) invokes only the pinned
+dpkg binary against guarded disposable roots. Its deterministic
 archive builder does not invoke host `dpkg-deb`; generated package archives,
 control members, and installed info members are digest-, size-, mode-, uid-,
 and gid-bound in the observation. The runner requires the exact benign

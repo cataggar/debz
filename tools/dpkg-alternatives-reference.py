@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import Callable
 from contextlib import nullcontext
+import copy
+from functools import lru_cache
 import hashlib
-import importlib.util
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -17,6 +20,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 from typing import Any
@@ -47,15 +51,33 @@ LOG_CLOCK_PATTERN = re.compile(
 DPKG_LOG_CLOCK_PATTERN = re.compile(
     rb"(?m)^(?P<clock>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}) "
 )
-
-
-CONFIG_SPEC = importlib.util.spec_from_file_location(
-    "debz_alternatives_config", ROOT / "tools/dpkg-config-reference.py",
+UPDATE_PATTERN = re.compile(r"^[0-9]{4}$")
+FORBIDDEN_FRONTEND_ENV = (
+    "DEBCONF_DB_FALLBACK",
+    "DEBCONF_DB_OVERRIDE",
+    "DEBCONF_DEBUG",
+    "DEBIAN_FRONTEND",
 )
-assert CONFIG_SPEC and CONFIG_SPEC.loader
-config = importlib.util.module_from_spec(CONFIG_SPEC)
-CONFIG_SPEC.loader.exec_module(config)
-m = config.m
+FORBIDDEN_FRONTEND_PATHS = (
+    "usr/bin/apt",
+    "usr/bin/apt-get",
+    "usr/sbin/dpkg-preconfigure",
+    "usr/bin/debconf",
+)
+PINNED_DPKG_CONFIG = b"""# dpkg configuration file
+#
+# This file can contain default options for dpkg.  All command-line
+# options are allowed.  Values can be specified by putting them after
+# the option, separated by whitespace and/or an `=' sign.
+#
+
+# Do not enable debsig-verify by default; since the distribution is not using
+# embedded signatures, debsig-verify would reject all packages.
+no-debsig
+
+# Log status changes and actions to a file.
+log /var/log/dpkg.log
+"""
 
 
 class OracleError(RuntimeError):
@@ -126,6 +148,575 @@ def optional_regular(path: Path, maximum: int) -> bytes | None:
     except FileNotFoundError:
         return None
     return read_regular(path, maximum)
+
+
+REPOSITORY = ROOT
+DISPOSABLE_RUNTIME = Path(os.environ.get(
+    "DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",
+))
+NATIVE_REFERENCE = Path(os.environ.get(
+    "DEBZ_NATIVE_DPKG_REFERENCE", REPOSITORY / "zig-out/bin/debz-native-dpkg-reference",
+))
+
+
+class Materialization:
+    REPOSITORY = REPOSITORY
+    GUARD = ".debz-native-disposable"
+    GUARD_CONTENT = "debz native materialization fixture v1\n"
+    EPOCH = 1_700_000_000
+    PACKAGE = "debz-native-demo"
+    PAYLOAD = Path("usr/share") / PACKAGE
+    REFERENCE_DPKG = "dpkg"
+    DISPOSABLE_RUNTIME = DISPOSABLE_RUNTIME
+    NATIVE_REFERENCE = NATIVE_REFERENCE
+
+    @staticmethod
+    def native_reference(*arguments: str) -> str:
+        NATIVE_REFERENCE = Materialization.NATIVE_REFERENCE
+        if not NATIVE_REFERENCE.is_absolute():
+            raise ValueError(f"native reference helper requires an absolute path: {NATIVE_REFERENCE}")
+        return subprocess.run(
+            [str(NATIVE_REFERENCE), *arguments], cwd=REPOSITORY,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "LC_ALL": "C"}, timeout=120, check=True,
+        ).stdout
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def reference_description() -> dict:
+        return json.loads(Materialization.native_reference("--describe"))
+
+    @staticmethod
+    def verify_reference(path: Path, architecture: str, tool: str = "dpkg") -> None:
+        Materialization.native_reference(
+            "--architecture", architecture, "--verify-binding", str(path), "--tool", tool,
+        )
+
+    @staticmethod
+    def select_reference(
+        executable: Path | None, architecture: str, *, root_accounts: bool = False,
+    ) -> str:
+        arguments = ["--architecture", architecture]
+        arguments.extend(("--select", str(executable)) if executable is not None else ("--check-host",))
+        if root_accounts:
+            arguments.append("--root-accounts")
+        return Materialization.native_reference(*arguments).strip()
+
+    @staticmethod
+    def run(argv: list[str], environment: dict[str, str], log: Path) -> None:
+        with log.open("wb") as output:
+            result = subprocess.run(
+                argv,
+                cwd=REPOSITORY,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                check=False,
+            )
+        if result.returncode:
+            with log.open("rb") as output:
+                detail = output.read(12_000).decode(errors="replace")
+            raise RuntimeError(f"{argv[0]} exited {result.returncode}; {log}\n{detail}")
+
+    @staticmethod
+    def write(path: Path, data: bytes, mode: int = 0o644) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+
+    @staticmethod
+    def copy_program(
+        root: Path, source: Path, destination: str, *, max_file_bytes: int | None = None,
+    ) -> None:
+        DISPOSABLE_RUNTIME = Materialization.DISPOSABLE_RUNTIME
+        command = [str(DISPOSABLE_RUNTIME), str(root), str(source), destination]
+        if max_file_bytes is not None:
+            command.extend(("--max-file-bytes", str(max_file_bytes)))
+        subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL, timeout=120, check=True,
+        )
+
+    @staticmethod
+    def make_package(
+        workspace: Path,
+        environment: dict[str, str],
+        architecture: str,
+        version: str,
+        feature: str = "data",
+        *,
+        package: str = PACKAGE,
+        conffile_content: bytes = b"package configuration\n",
+        extra_files: dict[str, bytes] | None = None,
+        scripts: dict[str, bytes] | None = None,
+        control_fields: dict[str, str] | None = None,
+        prepare_payload: Callable[[Path], None] | None = None,
+        compression: str = "gzip",
+        triggers: bytes | None = None,
+        archive_builder: Callable[[Path, Path], None] | None = None,
+    ) -> Path:
+        if compression not in ("gzip", "none"):
+            raise ValueError(f"unsupported fixture compression: {compression}")
+        stem = f"{package}_{version}_{feature}"
+        source = workspace / (stem + ".source")
+        payload = Path("usr/share") / package
+        control = (
+            f"Package: {package}\nVersion: {version}\nArchitecture: {architecture}\n"
+            "Maintainer: debz fixture <fixture@example.invalid>\n"
+            "Description: native data-only materialization fixture\n"
+        )
+        for name, value in (control_fields or {}).items():
+            control += f"{name}: {value}\n"
+        Materialization.write(source / "DEBIAN/control", control.encode())
+        Materialization.write(source / payload / "data", f"data version {version}\n".encode())
+        os.link(source / payload / "data", source / payload / "data.link")
+        (source / payload / "current").symlink_to("data")
+        Materialization.write(
+            source / payload / "mode",
+            b"permission-sensitive payload\n",
+            0o600 if version == "1" else 0o640,
+        )
+        Materialization.write(
+            source / payload / ("obsolete" if version == "1" else "introduced"),
+            f"only in {version}\n".encode(),
+        )
+        (source / payload / "empty").mkdir(mode=0o750)
+        if feature == "conffile":
+            Materialization.write(source / "etc/debz-native.conf", conffile_content)
+            Materialization.write(source / "DEBIAN/conffiles", b"/etc/debz-native.conf\n")
+        elif feature in ("obsolete-conffile", "remove-on-upgrade"):
+            (source / "etc").mkdir(mode=0o755)
+            if feature == "remove-on-upgrade":
+                Materialization.write(
+                    source / "DEBIAN/conffiles",
+                    b"remove-on-upgrade /etc/debz-native.conf\n",
+                )
+        elif feature == "script":
+            Materialization.write(source / "DEBIAN/preinst", b"#!/bin/sh\nexit 99\n", 0o755)
+        elif feature not in ("data", "zero-time"):
+            raise ValueError(f"unknown fixture feature: {feature}")
+        for path, content in (extra_files or {}).items():
+            Materialization.write(source / path, content)
+        for name, content in (scripts or {}).items():
+            if name not in ("preinst", "postinst", "prerm", "postrm"):
+                raise ValueError(f"unsupported maintainer-script fixture: {name}")
+            Materialization.write(source / "DEBIAN" / name, content, 0o755)
+        if triggers is not None:
+            Materialization.write(source / "DEBIAN/triggers", triggers)
+        if prepare_payload is not None:
+            prepare_payload(source)
+
+        checksums = []
+        for path in sorted(source.rglob("*")):
+            relative = path.relative_to(source)
+            if relative.parts[0] == "DEBIAN" or path.is_symlink() or not path.is_file():
+                continue
+            checksums.append(f"{hashlib.md5(path.read_bytes()).hexdigest()}  {relative.as_posix()}\n")
+        Materialization.write(source / "DEBIAN/md5sums", "".join(checksums).encode())
+        for path in [*source.rglob("*"), source]:
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o750 if path == source / payload / "empty" else 0o755)
+            os.utime(path, (Materialization.EPOCH, Materialization.EPOCH), follow_symlinks=False)
+        if feature == "zero-time":
+            os.utime(source / payload / "empty", (0, 0))
+        destination = workspace / (stem + ".deb")
+        if archive_builder is None:
+            Materialization.run(
+                ["dpkg-deb", "--build", "--uniform-compression", f"-Z{compression}",
+                 *(["-z1"] if compression == "gzip" else []),
+                 str(source), str(destination)],
+                environment,
+                workspace / (stem + ".build.log"),
+            )
+        else:
+            archive_builder(source, destination)
+        return destination
+
+    @staticmethod
+    def make_root(path: Path, architecture: str) -> None:
+        for directory in ("info", "updates", "triggers"):
+            (path / "var/lib/dpkg" / directory).mkdir(parents=True, exist_ok=True)
+        Materialization.write(path / Materialization.GUARD, Materialization.GUARD_CONTENT.encode(), 0o600)
+        Materialization.write(path / "var/lib/dpkg/status", b"")
+        Materialization.write(path / "var/lib/dpkg/info/format", b"1\n")
+        Materialization.write(path / "var/lib/dpkg/arch", (architecture + "\n").encode())
+
+    @classmethod
+    def reference_command(cls, root: Path) -> list[str]:
+        if (
+            not root.is_absolute()
+            or root == Path("/")
+            or root.resolve(strict=True) != root
+            or (root / cls.GUARD).is_symlink()
+            or (root / cls.GUARD).read_text() != cls.GUARD_CONTENT
+        ):
+            raise RuntimeError("reference execution requires a disposable fixture root")
+        return [
+            cls.REFERENCE_DPKG, "--force-not-root", "--force-bad-path", "--no-triggers",
+            f"--root={root}",
+        ]
+
+    @staticmethod
+    def fixture_environment(workspace: Path) -> dict[str, str]:
+        (workspace / "home").mkdir()
+        (workspace / "tmp").mkdir()
+        return {
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "HOME": str(workspace / "home"),
+            "TMPDIR": str(workspace / "tmp"),
+            "SOURCE_DATE_EPOCH": str(Materialization.EPOCH),
+        }
+
+
+m = Materialization
+
+
+class _ConfigLimits:
+    maximum_archive_bytes = Limits.maximum_archive_bytes
+    maximum_status_bytes = 256 * 1024
+    maximum_updates = 32
+
+
+def _decode_json_pointer(pointer: str) -> list[str]:
+    if not pointer.startswith("/") or len(pointer) == 1:
+        raise OracleError(f"architecture difference path is not a JSON pointer: {pointer!r}")
+    return [part.replace("~1", "/").replace("~0", "~") for part in pointer[1:].split("/")]
+
+
+def _replace_json_pointer(document: Any, pointer: str, value: Any) -> None:
+    parts = _decode_json_pointer(pointer)
+    selected = document
+    for part in parts[:-1]:
+        if isinstance(selected, list):
+            try:
+                index = int(part)
+            except ValueError:
+                raise OracleError(f"architecture difference list index is invalid: {pointer}") from None
+            if index < 0 or index >= len(selected):
+                raise OracleError(f"architecture difference list path is out of range: {pointer}")
+            selected = selected[index]
+        elif isinstance(selected, dict):
+            if part not in selected:
+                raise OracleError(f"architecture difference path is missing: {pointer}")
+            selected = selected[part]
+        else:
+            raise OracleError(f"architecture difference path is not container-backed: {pointer}")
+    final = parts[-1]
+    if isinstance(selected, list):
+        try:
+            index = int(final)
+        except ValueError:
+            raise OracleError(f"architecture difference list index is invalid: {pointer}") from None
+        if index < 0 or index >= len(selected):
+            raise OracleError(f"architecture difference list path is out of range: {pointer}")
+        selected[index] = copy.deepcopy(value)
+    elif isinstance(selected, dict) and final in selected:
+        selected[final] = copy.deepcopy(value)
+    else:
+        raise OracleError(f"architecture difference path is missing: {pointer}")
+
+
+def _validate_observation_architecture(reference: dict[str, Any], architecture: str) -> None:
+    boundary = reference["boundary"]
+    observed_architectures = boundary.get("observed_architectures")
+    if observed_architectures is None:
+        observed_architectures = [boundary["observed_architecture"]]
+    if architecture not in observed_architectures:
+        raise OracleError(
+            "published direct-dpkg observation is architecture-specific: "
+            f"requested={architecture}, published={observed_architectures}"
+        )
+
+
+def _verify_architecture_evidence(reference: dict[str, Any]) -> dict[str, Any]:
+    evidence = reference["architecture_evidence"]
+    baseline = evidence["baseline"]
+    observed = reference["observed_behavior"]
+    observed_raw = canonical_json(observed).encode("utf-8")
+    if (
+        baseline["architecture"] != "amd64"
+        or baseline["observation_sha256"] != sha256_bytes(observed_raw)
+        or baseline["observation_size"] != len(observed_raw)
+    ):
+        raise OracleError("amd64 architecture evidence baseline changed")
+    arm64 = evidence["arm64"]
+    differences = arm64["differences_from_baseline"]
+    if arm64["difference_count"] != len(differences):
+        raise OracleError("arm64 architecture difference count changed")
+    paths = [entry["path"] for entry in differences]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise OracleError("arm64 architecture differences are not canonical")
+    reconstructed = copy.deepcopy(observed)
+    for difference in differences:
+        _replace_json_pointer(reconstructed, difference["path"], difference["value"])
+    reconstructed_raw = canonical_json(reconstructed).encode("utf-8")
+    artifact = arm64["observation"]
+    if (
+        artifact["sha256"] != sha256_bytes(reconstructed_raw)
+        or artifact["size"] != len(reconstructed_raw)
+    ):
+        raise OracleError("arm64 architecture observation binding changed")
+    if reference["boundary"].get("observed_architectures") != ["amd64", "arm64"]:
+        raise OracleError("published architecture evidence coverage changed")
+    return reconstructed
+
+
+def _published_observation(reference: dict[str, Any], architecture: str) -> dict[str, Any]:
+    _validate_observation_architecture(reference, architecture)
+    if architecture == reference["architecture_evidence"]["baseline"]["architecture"]:
+        return reference["observed_behavior"]
+    if architecture == "arm64":
+        return _verify_architecture_evidence(reference)
+    raise OracleError(f"missing published observation for architecture: {architecture}")
+
+
+def _tar_tree_paths(source: Path, *, control: bool) -> list[tuple[Path, str]]:
+    root = source / "DEBIAN" if control else source
+    entries: list[tuple[Path, str]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if not control and (relative == "DEBIAN" or relative.startswith("DEBIAN/")):
+            continue
+        entries.append((path, f"./{relative}"))
+    return entries
+
+
+def _build_tar(source: Path, *, control: bool) -> bytes:
+    buffer = io.BytesIO()
+    hardlinks: dict[tuple[int, int], str] = {}
+    with tarfile.open(fileobj=buffer, mode="w:", format=tarfile.GNU_FORMAT) as archive:
+        for path, name in _tar_tree_paths(source, control=control):
+            metadata = path.lstat()
+            info = tarfile.TarInfo(
+                name + ("/" if stat.S_ISDIR(metadata.st_mode) else "")
+            )
+            info.mode = stat.S_IMODE(metadata.st_mode)
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+            info.mtime = int(metadata.st_mtime)
+            if stat.S_ISDIR(metadata.st_mode):
+                info.type = tarfile.DIRTYPE
+                info.size = 0
+                archive.addfile(info)
+            elif stat.S_ISLNK(metadata.st_mode):
+                info.type = tarfile.SYMTYPE
+                info.size = 0
+                info.linkname = os.readlink(path)
+                archive.addfile(info)
+            elif stat.S_ISREG(metadata.st_mode):
+                key = (metadata.st_dev, metadata.st_ino)
+                if metadata.st_nlink > 1 and key in hardlinks:
+                    info.type = tarfile.LNKTYPE
+                    info.size = 0
+                    info.linkname = hardlinks[key]
+                    archive.addfile(info)
+                else:
+                    if metadata.st_nlink > 1:
+                        hardlinks[key] = name
+                    data = read_regular(path, _ConfigLimits.maximum_archive_bytes)
+                    info.type = tarfile.REGTYPE
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+            else:
+                raise OracleError(f"unsupported package input type: {path}")
+    raw = buffer.getvalue()
+    if len(raw) > _ConfigLimits.maximum_archive_bytes:
+        raise OracleError("uncompressed package tar exceeds its byte limit")
+    return raw
+
+
+def _ar_member(name: str, data: bytes) -> bytes:
+    if len(name) > 15 or "/" in name:
+        raise OracleError(f"invalid package archive member name: {name!r}")
+    header = (
+        f"{name + '/':<16}{m.EPOCH:<12}{0:<6}{0:<6}{0o100644:<8}{len(data):<10}`\n"
+    ).encode("ascii")
+    if len(header) != 60:
+        raise OracleError(f"invalid package archive header for {name}")
+    padding = b"\n" if len(data) % 2 == 1 else b""
+    return header + data + padding
+
+
+def _build_package_archive(source: Path, destination: Path) -> None:
+    control_tar = _build_tar(source, control=True)
+    data_tar = _build_tar(source, control=False)
+    archive = (
+        b"!<arch>\n"
+        + _ar_member("debian-binary", b"2.0\n")
+        + _ar_member("control.tar", control_tar)
+        + _ar_member("data.tar", data_tar)
+    )
+    if len(archive) > _ConfigLimits.maximum_archive_bytes:
+        raise OracleError(f"package archive exceeds its byte limit: {destination}")
+    m.write(destination, archive, 0o644)
+    os.utime(destination, (m.EPOCH, m.EPOCH), follow_symlinks=False)
+
+
+def _parse_deb822(data: bytes, label: str) -> list[dict[str, str]]:
+    if len(data) > _ConfigLimits.maximum_status_bytes:
+        raise OracleError(f"database text exceeds limit: {label}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OracleError(f"database text is not UTF-8: {label}") from None
+    records: list[dict[str, str]] = []
+    for paragraph in text.split("\n\n"):
+        if not paragraph:
+            continue
+        record: dict[str, str] = {}
+        current: str | None = None
+        for line in paragraph.splitlines():
+            if not line:
+                continue
+            if line[0] in (" ", "\t"):
+                if current is None:
+                    raise OracleError(f"orphan continuation in {label}")
+                record[current] += "\n" + line
+                continue
+            if ":" not in line:
+                raise OracleError(f"malformed database field in {label}: {line!r}")
+            name, value = line.split(":", 1)
+            if not name or name in record:
+                raise OracleError(f"malformed database field in {label}: {line!r}")
+            current = name
+            record[name] = value.lstrip(" ")
+        if record:
+            records.append(record)
+    return records
+
+
+def _package_record(data: bytes, package: str, label: str) -> dict[str, str] | None:
+    matches = [
+        record
+        for record in _parse_deb822(data, label)
+        if record.get("Package") == package
+    ]
+    if len(matches) > 1:
+        raise OracleError(f"duplicate package record in {label}")
+    return matches[0] if matches else None
+
+
+def _summarize_record(record: dict[str, str] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    summary: dict[str, Any] = {
+        "architecture": record["Architecture"],
+        "description": record["Description"],
+        "maintainer": record["Maintainer"],
+        "status": record["Status"],
+        "version": record["Version"],
+    }
+    if "Config-Version" in record:
+        summary["config_version"] = record["Config-Version"]
+    return summary
+
+
+def _database_state(root: Path, package: str) -> dict[str, Any]:
+    status_path = root / "var/lib/dpkg/status"
+    committed = _package_record(
+        read_regular(status_path, _ConfigLimits.maximum_status_bytes),
+        package,
+        "status",
+    )
+    updates_dir = root / "var/lib/dpkg/updates"
+    entries = sorted(updates_dir.iterdir(), key=lambda item: item.name)
+    if len(entries) > _ConfigLimits.maximum_updates:
+        raise OracleError("dpkg update journal exceeds its entry limit")
+    numeric: list[dict[str, str]] = []
+    temporary = False
+    for entry in entries:
+        metadata = entry.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or entry.is_symlink():
+            raise OracleError(f"dpkg update entry is not regular: {entry.name}")
+        if entry.name == "tmp.i":
+            read_regular(entry, _ConfigLimits.maximum_status_bytes)
+            temporary = True
+        elif UPDATE_PATTERN.fullmatch(entry.name):
+            record = _package_record(
+                read_regular(entry, _ConfigLimits.maximum_status_bytes),
+                package,
+                f"updates/{entry.name}",
+            )
+            if record is not None:
+                numeric.append(record)
+        else:
+            raise OracleError(f"unexpected dpkg update entry: {entry.name}")
+    return {
+        "committed": _summarize_record(committed),
+        "journal_latest": _summarize_record(numeric[-1]) if numeric else None,
+        "journal_nonempty": bool(numeric),
+        "temporary_update": temporary,
+    }
+
+
+def _direct_dpkg_command(executable: str, root: Path, arguments: list[str]) -> list[str]:
+    m.REFERENCE_DPKG = executable
+    command = [
+        *m.reference_command(root),
+        f"--log={root / DPKG_LOG}",
+        *arguments,
+    ]
+    if command[0] != executable:
+        raise OracleError("reference command did not select the pinned dpkg executable")
+    if any(
+        Path(argument).name in ("apt", "apt-get", "debconf", "dpkg-preconfigure")
+        for argument in command
+    ):
+        raise OracleError("frontend executable entered the direct-dpkg command")
+    return command
+
+
+def _validate_config_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+        raise OracleError(f"ambient dpkg config directory is not a real directory: {path}")
+    entries = sorted(entry.name for entry in path.iterdir())
+    if entries:
+        raise OracleError(f"ambient dpkg config fragments are forbidden: {path}: {entries}")
+
+
+def _validate_host_configuration(
+    home: Path,
+    *,
+    config_root: Path = Path("/etc/dpkg"),
+) -> None:
+    config_path = config_root / "dpkg.cfg"
+    if read_regular(config_path, 4096) != PINNED_DPKG_CONFIG:
+        raise OracleError("ambient dpkg.cfg differs from the pinned benign config")
+    _validate_config_directory(config_root / "dpkg.cfg.d")
+    user_config = home / ".dpkg.cfg"
+    try:
+        user_config.lstat()
+    except FileNotFoundError:
+        return
+    raise OracleError(f"ambient dpkg config file is forbidden: {user_config}")
+
+
+class _ConfigSupport:
+    m = Materialization
+    Limits = _ConfigLimits
+    PINNED_DPKG_CONFIG = PINNED_DPKG_CONFIG
+    FORBIDDEN_FRONTEND_ENV = FORBIDDEN_FRONTEND_ENV
+    FORBIDDEN_FRONTEND_PATHS = FORBIDDEN_FRONTEND_PATHS
+    verify_architecture_evidence = staticmethod(_verify_architecture_evidence)
+    published_observation = staticmethod(_published_observation)
+    build_package_archive = staticmethod(_build_package_archive)
+    database_state = staticmethod(_database_state)
+    package_record = staticmethod(_package_record)
+    direct_dpkg_command = staticmethod(_direct_dpkg_command)
+    validate_host_configuration = staticmethod(_validate_host_configuration)
+
+
+config = _ConfigSupport
 
 
 def bounded_scandir(path: Path, maximum: int) -> list[os.DirEntry[str]]:

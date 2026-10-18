@@ -6167,7 +6167,7 @@ def native_integration_archive_failures(texts: dict[str, str]) -> list[str]:
 
 DISPOSABLE_RUNTIME_PATHS = (
     "build.zig", "tools/disposable-root-runtime.zig", "tools/disposable_root_runtime.py",
-    "tools/dpkg-config-reference.py",
+    "tools/dpkg-config-reference.zig",
     "tools/test-integration-roots.sh",
     "tools/dpkg-alternatives-reference.py",
     ".github/workflows/ci.yml", "tools/run-dpkg-oracle-isolated.sh",
@@ -6199,9 +6199,9 @@ def native_disposable_runtime_failures(texts: dict[str, str]) -> list[str]:
             "if (entry.link_count != 1) return error.HardLinkedFixtureDestination;",
         ),
         DISPOSABLE_RUNTIME_PATHS[3]: (
-            '"DEBZ_DISPOSABLE_RUNTIME", REPOSITORY / "zig-out/bin/debz-disposable-runtime",',
-            "[str(DISPOSABLE_RUNTIME), str(root), str(source), destination]",
-            "stdin=subprocess.DEVNULL, timeout=120, check=True,",
+            '"DEBZ_DISPOSABLE_RUNTIME"',
+            '"zig-out/bin/debz-disposable-runtime"',
+            "try argv.appendSlice(self.allocator, &.{ self.disposable_runtime, root, source, destination });",
         ),
         DISPOSABLE_RUNTIME_PATHS[5]: (
             "validate_absolute_path(destination)",
@@ -6482,12 +6482,14 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
         "tools/native-differential.py",
         "tools/native_only_candidate.py",
         "tools/native-materialization-fixtures.py",
+        "tools/dpkg-config-reference.py",
+        "tools/test_dpkg_config_reference.py",
     )
     for relative in retired:
         if relative in texts:
             failures.append(f"{relative}: retired Python test entry point still exists")
     for consumer, fixture in (
-        ("tools/dpkg-config-reference.py", "native-materialization-fixtures.py"),
+        ("tools/dpkg-config-reference.zig", "native-materialization-fixtures.py"),
         ("actions/install/__tests__/integration.test.ts", "native-materialization-fixtures.py"),
     ):
         if fixture in texts.get(consumer, ""):
@@ -6611,6 +6613,8 @@ def audit_ci_pins() -> None:
         "tools/native_only_candidate.py",
         "tools/native-materialization-fixtures.py",
         "tools/dpkg-config-reference.py",
+        "tools/test_dpkg_config_reference.py",
+        "tools/dpkg-config-reference.zig",
         "actions/install/__tests__/integration.test.ts",
     )
     fixture_texts = {
@@ -6618,7 +6622,7 @@ def audit_ci_pins() -> None:
         for relative in fixture_paths
         if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
     }
-    for relative in fixture_paths[:13]:
+    for relative in fixture_paths[:15]:
         if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
             fixture_texts[relative] = ""
     for failure in native_lifecycle_fixture_failures(fixture_texts):
@@ -7579,6 +7583,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
                 "tools/native-differential.py",
                 "tools/native_only_candidate.py",
                 "tools/dpkg-config-reference.py",
+                "tools/test_dpkg_config_reference.py",
+                "tools/dpkg-config-reference.zig",
                 "actions/install/__tests__/integration.test.ts",
                 "tools/test-native-lifecycle.py", "tools/test_native_lifecycle.py",
                 "tools/test-native-triggers.py", "tools/test_native_triggers.py",
