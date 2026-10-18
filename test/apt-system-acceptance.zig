@@ -857,7 +857,7 @@ test "apt acceptance captures schema-sized stdout but kills oversized subprocess
         .io = std.testing.io,
         .cwd = ".",
     };
-    const captured = try runner.run(&.{ "python3", "-c", "import sys; sys.stdout.buffer.write(b'A' * (1024 * 1024 + 1))" }, 10, null);
+    const captured = try runner.run(&.{ "head", "-c", "1048577", "/dev/zero" }, 10, null);
     defer std.testing.allocator.free(captured.stdout);
     defer std.testing.allocator.free(captured.stderr);
     try std.testing.expectEqual(@as(usize, 1024 * 1024 + 1), captured.stdout.len);

@@ -549,7 +549,6 @@ const workload_jobs = [_]WorkloadJob{
             "              -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
             "              -Drequire-privileged-orchestration-tests=true \\\n",
             "            TMPDIR=\"$PWD/.zig-cache\" \\\n",
-            "            PYTHONPYCACHEPREFIX=\"$PWD/.zig-cache/pycache\" \\\n",
             "            ZIG_GLOBAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-global\" \\\n",
             "            ZIG_LOCAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-local\" \\\n",
             "          sudo rm -rf /run/debz\n",
@@ -903,7 +902,7 @@ test "security: every split build workload job, mode and step fails closed under
             try rejected.failsWith(limit);
         }
         const setup = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must retain pinned Zig and metadata dependencies", .{workload_job.name});
-        for ([_][]const u8{ "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U", "liblzma-dev libzstd-dev python3-jsonschema", "          persist-credentials: false\n" }) |token| {
+        for ([_][]const u8{ "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U", "liblzma-dev libzstd-dev", "          persist-credentials: false\n" }) |token| {
             const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
             const rejected = try f.check("ci-recovery", changed);
             defer rejected.deinit();
@@ -1256,7 +1255,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             timeout,                               "      fail-fast: false",
             "          - os: ubuntu-24.04",        "          - os: ubuntu-24.04-arm",
             "      - name: Install Zig via ghr\n", "      - name: Install metadata decompression and signed fixture dependencies\n",
-            "libzstd-dev python3-jsonschema",      "reference_dpkg=\"$(zig-out/bin/debz-native-dpkg-reference)\"",
+            "libzstd-dev",                         "reference_dpkg=\"$(zig-out/bin/debz-native-dpkg-reference)\"",
         }) |token| {
             const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
             const rejected = try f.check("ci-recovery", changed);
@@ -2067,9 +2066,11 @@ test "security: actual integration archive encoding and every fixture consumer r
         "\"$PWD/zig-out/bin/debz-integration-repository\"",
     });
     try nativeMutations(&f, "native-integration-archive", "actions/install/__tests__/integration.test.ts", &.{
-        "str(Path(cli).parent / \"debz-integration-repository\"), \"--output\", str(repository)",
-        "\"--suite\", \"debian-stable\", \"--architecture\", arch",
-        "check=True, timeout=60, env={\"PATH\": \"/no-host-interpreters\"}",
+        "const repositoryGenerator = path.join(path.dirname(sourceCli), 'debz-integration-repository');",
+        "['--output', repository, '--suite', 'debian-stable', '--architecture', architecture]",
+        "{ env: { PATH: '/no-host-interpreters' }, timeout: 60_000, maxBuffer: 1024 * 1024 }",
+        "repositoryGenerator, '--check-roots', 'bootstrap-install-action'",
+        "['--check-roots', 'check-install-action-results', path.resolve(actionPath, '../..'), observations]",
     });
     const restored = try nativeCheck(&f, "native-integration-archive", "tools/generate-integration-repository.py", "def tar_gz(entries):\n    return b''\n");
     defer restored.deinit();

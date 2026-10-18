@@ -176,63 +176,18 @@ test('native installs bind real receipts across cold, warm, offline, same-root, 
   environment.DEBZ_INSTALL_CLI_CACHE = 'false';
   const temporary = path.resolve(actionPath, '../../.tmp');
   await mkdir(temporary, { recursive: true });
-  const bootstrap = `
-import os, shutil, subprocess, sys
-from pathlib import Path
-repo, workspace, runner = map(Path, sys.argv[1:4])
-cli, arch, uid, gid = sys.argv[4:]
-runtime = Path(os.environ.get("DEBZ_DISPOSABLE_RUNTIME", repo / "zig-out/bin/debz-disposable-runtime"))
-def write(path, data, mode=0o644):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
-    path.chmod(mode)
-repository = workspace / "repository"
-subprocess.run([
-    str(Path(cli).parent / "debz-integration-repository"), "--output", str(repository),
-    "--suite", "debian-stable", "--architecture", arch,
-], check=True, timeout=60, env={"PATH": "/no-host-interpreters"})
-keyring = workspace / "keyring.gpg"
-shutil.copyfile(repository / "fixture-keyring.gpg", keyring)
-source = workspace / "repo.sources"
-source.write_text(f"Types: deb\\nURIs: file://{repository}\\nSuites: debian-stable\\nComponents: main\\nArchitectures: {arch}\\nSigned-By: {keyring}\\n")
-for name in ("plan", "cold", "warm-fresh", "offline", "failure", "receiptless", "cross-backend"):
-    root = runner / f"root-{name}"
-    root.mkdir()
-    for directory in ("info", "updates", "triggers"):
-        (root / "var/lib/dpkg" / directory).mkdir(parents=True, exist_ok=True)
-    write(root / ".debz-native-disposable", b"debz native materialization fixture v1\\n", 0o600)
-    write(root / "var/lib/dpkg/status", b"")
-    write(root / "var/lib/dpkg/info/format", b"1\\n")
-    write(root / "var/lib/dpkg/arch", (arch + "\\n").encode())
-    subprocess.run([str(runtime), str(root), "/bin/sh", "/bin/sh"], stdin=subprocess.DEVNULL, timeout=120, check=True)
-    seeds = ["native-helper-target", "essential-core"]
-    if name == "receiptless":
-        seeds += ["base-dep", "scenario-main"]
-    archives = [str(repository / f"pool/main/{package}_1.0-1_{arch}.deb") for package in seeds]
-    with (root / "reference.log").open("wb") as output:
-        result = subprocess.run([
-            "dpkg", "--force-not-root", "--force-bad-path", "--no-triggers",
-            f"--root={root}", "--force-confold", "--install", *archives,
-        ], env=dict(os.environ), stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=120, check=False)
-    assert result.returncode == 0
-for selector, filename, backend in (
-    ("scenario-main", "lock.json", "native"), ("fail-script", "fail.lock.json", "native"),
-    ("scenario-main", "legacy.lock.json", "legacy_dpkg"),
-):
-    result = subprocess.run([cli, "plan", "--transaction-backend", backend,
-        "--install-root", str(runner / "root-plan"), "--cache-path", str(workspace / "plan-cache"),
-        "--state-path", str(workspace / "plan-state"), "--architecture", arch,
-        "--source", str(source), "--keyring", str(keyring),
-        "--lock-output", str(workspace / filename), "--json", selector],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    assert result.returncode == 0, (result.stdout[-8192:], result.stderr[-8192:])
-    os.chown(workspace / filename, int(uid), int(gid))
-`;
+  const repositoryGenerator = path.join(path.dirname(sourceCli), 'debz-integration-repository');
+  const repository = path.join(workspace, 'repository');
+  await promisify(execFile)(
+    repositoryGenerator,
+    ['--output', repository, '--suite', 'debian-stable', '--architecture', architecture],
+    { env: { PATH: '/no-host-interpreters' }, timeout: 60_000, maxBuffer: 1024 * 1024 },
+  );
   const bootstrapArgs = [
-    '/usr/bin/env', 'PYTHONDONTWRITEBYTECODE=1', `TMPDIR=${temporary}`,
+    '/usr/bin/env', `TMPDIR=${temporary}`,
     `XDG_CACHE_HOME=${path.resolve(actionPath, '../../.cache')}`,
-    '/usr/bin/python3', '-c', bootstrap, path.resolve(actionPath, '../..'),
-    workspace, runner, sourceCli, architecture,
+    repositoryGenerator, '--check-roots', 'bootstrap-install-action',
+    path.resolve(actionPath, '../..'), workspace, runner, sourceCli, architecture,
     String(process.getuid?.() ?? 0), String(process.getgid?.() ?? 0),
   ];
   const elevated = environment.DEBZ_INSTALL_USE_SUDO === 'true';
@@ -240,7 +195,7 @@ for selector, filename, backend in (
     elevated ? '/usr/bin/sudo' : bootstrapArgs[0],
     elevated ? ['-n', '--', ...bootstrapArgs] : bootstrapArgs.slice(1),
     {
-      env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', TMPDIR: temporary },
+      env: { ...process.env, TMPDIR: temporary },
       timeout: 180_000, maxBuffer: 1024 * 1024,
     },
   );
@@ -316,17 +271,11 @@ for selector, filename, backend in (
   assert.equal(new Set(receipts).size, receipts.length);
   const observations = path.join(workspace, 'observed-native-results.json');
   await writeFile(observations, JSON.stringify(documents));
-  await promisify(execFile)('/usr/bin/python3', ['-c', `
-import json, pathlib, sys
-import jsonschema
-schemas = pathlib.Path(sys.argv[1]) / "schema"
-for document in json.loads(pathlib.Path(sys.argv[2]).read_text()):
-    name = "native-install-result-v1.json" if "evidence" in document else "native-install-capability-v1.json"
-    jsonschema.Draft202012Validator(json.loads((schemas / name).read_text())).validate(document)
-`, path.resolve(actionPath, '../..'), observations], {
-    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', TMPDIR: temporary },
-    timeout: 30_000, maxBuffer: 1024 * 1024,
-  });
+  await promisify(execFile)(
+    repositoryGenerator,
+    ['--check-roots', 'check-install-action-results', path.resolve(actionPath, '../..'), observations],
+    { env: { PATH: '/no-host-interpreters', TMPDIR: temporary }, timeout: 30_000, maxBuffer: 1024 * 1024 },
+  );
 });
 
 async function inputsFor(

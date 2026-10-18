@@ -288,3 +288,16 @@ retiring `tools/test_real_snapshot_reference_triggers.py`, `tools/native-trigger
 `tools/native_diversion_settlement_oracle.py`, `tools/native-differential.py`, and
 `tools/native-lifecycle-fixtures.py`.
 
+`zig build build-real-snapshot-repin test-real-snapshot-repin` builds and tests
+`debz-real-snapshot-repin` (`tools/real-snapshot-repin.zig`), retiring
+`tools/real-snapshot-repin.py` and `tools/test_real_snapshot_repin.py`.
+`actions/install/__tests__/integration.test.ts` bootstraps disposable roots and
+validates install-result and capability schemas via
+`debz-integration-repository --check-roots` (`bootstrap-install-action` and
+`check-install-action-results`), `src/maintainer_script.zig` proves private
+loopback and sealed inherited socket behavior via
+`debz-script-network-probe --mode launcher`, and the rootless container CI
+bootstrap (`ubuntu:24.04`) omits `python3` and `python3-jsonschema` and asserts
+`! command -v python3` and `! command -v python` on both `amd64` and `arm64`.
+
+

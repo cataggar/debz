@@ -3516,13 +3516,6 @@ fn skipUnlessPosixShell() !void {
     shell.close(testing.io);
 }
 
-fn skipUnlessPython3() !void {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var python = std.Io.Dir.openFileAbsolute(testing.io, "/usr/bin/python3", .{ .mode = .read_only }) catch
-        return error.SkipZigTest;
-    python.close(testing.io);
-}
-
 fn skipUnlessHostFile(path: []const u8) !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var file = std.Io.Dir.openFileAbsolute(testing.io, path, .{ .mode = .read_only }) catch
@@ -3793,110 +3786,26 @@ test "maintainer_script.test.system launcher forces dpkg's umask over the caller
 
 test "maintainer_script.test.system launcher uses private loopback and seals inherited sockets" {
     try skipUnlessPosixShell();
-    try skipUnlessPython3();
+    _ = try signedProcFixture(
+        std.c.getenv("DEBZ_SCRIPT_NETWORK_PROBE"),
+        std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null,
+    );
     var directory = testing.tmpDir(.{});
     defer directory.cleanup();
-    const listener = try openLoopbackListener();
-    defer _ = linux.close(listener.fd);
-    const abstract_name = try std.fmt.allocPrint(
+    const network = try SignedNetworkProof.init(testing.allocator, "launcher");
+    defer network.deinit();
+    var script = try HostScript.init(
         testing.allocator,
-        "debz278-{d}-{d}",
-        .{ linux.getpid(), monotonicMs() },
-    );
-    defer testing.allocator.free(abstract_name);
-    const unix_listener = try openAbstractUnixListener(abstract_name);
-    defer _ = linux.close(unix_listener);
-    var leaked: [2]i32 = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&leaked, .{})));
-    defer closePipe(&leaked);
-
-    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
-        \\#!/bin/sh
-        \\exec python3 - "$@" <<'PY'
-        \\import errno, os, socket, sys
-        \\port = int(sys.argv[1])
-        \\abstract_name = sys.argv[2]
-        \\leaked_fd = int(sys.argv[3])
-        \\
-        \\def emit(key, value):
-        \\    print(f"{key}={value}")
-        \\
-        \\emit("proc_net", "present" if os.path.isdir("/proc/net") else "absent")
-        \\interfaces = []
-        \\try:
-        \\    with open("/proc/net/dev", "r", encoding="utf-8") as handle:
-        \\        for line in handle.readlines()[2:]:
-        \\            if ":" in line:
-        \\                interfaces.append(line.split(":", 1)[0].strip())
-        \\except OSError as exc:
-        \\    emit("interfaces_error", str(exc.errno))
-        \\emit("interfaces", ",".join(sorted(interfaces)))
-        \\default_route = "false"
-        \\try:
-        \\    with open("/proc/net/route", "r", encoding="utf-8") as handle:
-        \\        for line in handle.readlines()[1:]:
-        \\            fields = line.split()
-        \\            if len(fields) >= 2 and fields[1] == "00000000":
-        \\                default_route = "true"
-        \\except OSError:
-        \\    pass
-        \\emit("default_route", default_route)
-        \\
-        \\try:
-        \\    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
-        \\    emit("socket_tcp", "ok")
-        \\except OSError as exc:
-        \\    emit("socket_tcp", f"errno:{exc.errno}")
-        \\
-        \\try:
-        \\    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        \\    probe.settimeout(0.2)
-        \\    probe.connect(("127.0.0.1", port))
-        \\    emit("host_tcp_connect", "ok")
-        \\    probe.close()
-        \\except OSError as exc:
-        \\    emit("host_tcp_connect", f"denied:{exc.errno}")
-        \\
-        \\try:
-        \\    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        \\    server.bind(("127.0.0.1", 0))
-        \\    server.listen(1)
-        \\    client = socket.create_connection(("127.0.0.1", server.getsockname()[1]), timeout=0.2)
-        \\    accepted, _ = server.accept()
-        \\    accepted.close()
-        \\    client.close()
-        \\    server.close()
-        \\    emit("bind_loopback", "ok")
-        \\except OSError as exc:
-        \\    emit("bind_loopback", f"errno:{exc.errno}")
-        \\
-        \\try:
-        \\    unix_probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        \\    unix_probe.settimeout(0.2)
-        \\    unix_probe.connect("\\0" + abstract_name)
-        \\    emit("abstract_unix_connect", "ok")
-        \\    unix_probe.close()
-        \\except OSError as exc:
-        \\    emit("abstract_unix_connect", f"denied:{exc.errno}")
-        \\
-        \\try:
-        \\    os.write(leaked_fd, b"x")
-        \\    emit("inherited_fd", "ok")
-        \\except OSError as exc:
-        \\    emit("inherited_fd", f"sealed:{exc.errno}")
-        \\PY
-        \\
+        &directory,
+        "demo.postinst",
+        "#!/bin/sh\nprintf 'script=ok\\n'\n",
     );
     defer script.deinit(testing.allocator);
-    const port = try std.fmt.allocPrint(testing.allocator, "{d}", .{listener.port});
-    defer testing.allocator.free(port);
-    const fd = try std.fmt.allocPrint(testing.allocator, "{d}", .{leaked[1]});
-    defer testing.allocator.free(fd);
 
-    var launcher: SystemLauncher = .{};
+    var launcher: SystemLauncher = .{ .boundary_probe = network.boundary() };
     var report = try run(
         testing.allocator,
-        script.request(&.{ port, abstract_name, fd }),
+        script.request(&.{}),
         .{ .launcher = launcher.interface() },
     );
     defer report.deinit();
@@ -3904,14 +3813,10 @@ test "maintainer_script.test.system launcher uses private loopback and seals inh
 
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
     try testing.expectEqualStrings("", report.stderr);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "proc_net=present\n") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "interfaces=lo\n") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "default_route=false\n") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "socket_tcp=ok\n") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "host_tcp_connect=denied:") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "bind_loopback=ok\n") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "abstract_unix_connect=denied:") != null);
-    try testing.expect(std.mem.indexOf(u8, report.stdout, "inherited_fd=sealed:9\n") != null);
+    try testing.expectEqualStrings(
+        "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\nscript=ok\n",
+        report.stdout,
+    );
 }
 
 test "maintainer_script.test.debconf confmodule reexec works with sealed descriptors" {

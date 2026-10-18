@@ -83,10 +83,22 @@ fn matchesSchemaPattern(pattern: []const u8, text: []const u8) !bool {
         return matchesCasKeyPattern(text, "debz-package-cas-v4-", false);
     } else if (std.mem.eql(u8, pattern, "^/")) {
         return std.mem.startsWith(u8, text, "/");
+    } else if (std.mem.eql(u8, pattern, "^/[^\\u0000\\r\\n]+$")) {
+        return text.len >= 2 and text[0] == '/' and std.mem.indexOfAny(u8, text, "\x00\r\n") == null;
     } else if (std.mem.eql(u8, pattern, "/packages-v2/objects$")) {
         return std.mem.endsWith(u8, text, "/packages-v2/objects");
     }
     return error.UnsupportedSchemaPattern;
+}
+
+fn matchesSchemaType(type_name: []const u8, instance: std.json.Value) !bool {
+    if (std.mem.eql(u8, type_name, "object")) return instance == .object;
+    if (std.mem.eql(u8, type_name, "array")) return instance == .array;
+    if (std.mem.eql(u8, type_name, "string")) return instance == .string;
+    if (std.mem.eql(u8, type_name, "integer")) return instance == .integer;
+    if (std.mem.eql(u8, type_name, "boolean")) return instance == .bool;
+    if (std.mem.eql(u8, type_name, "null")) return instance == .null;
+    return error.UnsupportedSchemaType;
 }
 
 fn schemaAllows(root: std.json.Value, schema: std.json.Value, instance: std.json.Value, depth: usize) anyerror!bool {
@@ -97,9 +109,10 @@ fn schemaAllows(root: std.json.Value, schema: std.json.Value, instance: std.json
         const key = field.key_ptr.*;
         const supported = [_][]const u8{
             "$schema",    "$id",                  "title",     "$defs",     "$ref",    "type",
-            "const",      "enum",                 "oneOf",     "pattern",   "minimum", "maximum",
-            "minItems",   "maxItems",             "minLength", "maxLength", "items",   "required",
-            "properties", "additionalProperties",
+            "const",      "enum",                 "oneOf",     "allOf",     "if",      "then",
+            "else",       "pattern",              "minimum",   "maximum",   "minItems", "maxItems",
+            "minLength",  "maxLength",            "items",     "required",  "properties",
+            "additionalProperties",
         };
         var found = false;
         for (supported) |name| found = found or std.mem.eql(u8, name, key);
@@ -118,21 +131,19 @@ fn schemaAllows(root: std.json.Value, schema: std.json.Value, instance: std.json
         if (!try schemaAllows(root, target, instance, depth + 1)) return false;
     }
     if (schema.object.get("type")) |kind| {
-        if (kind != .string) return error.InvalidSchema;
-        const matches = if (std.mem.eql(u8, kind.string, "object"))
-            instance == .object
-        else if (std.mem.eql(u8, kind.string, "array"))
-            instance == .array
-        else if (std.mem.eql(u8, kind.string, "string"))
-            instance == .string
-        else if (std.mem.eql(u8, kind.string, "integer"))
-            instance == .integer
-        else if (std.mem.eql(u8, kind.string, "boolean"))
-            instance == .bool
-        else if (std.mem.eql(u8, kind.string, "null"))
-            instance == .null
-        else
-            return error.UnsupportedSchemaType;
+        const matches = switch (kind) {
+            .string => |s| try matchesSchemaType(s, instance),
+            .array => |arr| blk: {
+                if (arr.items.len == 0) return error.InvalidSchema;
+                var any = false;
+                for (arr.items) |item| {
+                    if (item != .string) return error.InvalidSchema;
+                    if (try matchesSchemaType(item.string, instance)) any = true;
+                }
+                break :blk any;
+            },
+            else => return error.InvalidSchema,
+        };
         if (!matches) return false;
     }
     if (schema.object.get("const")) |expected| if (!equalValue(expected, instance)) return false;
@@ -147,6 +158,23 @@ fn schemaAllows(root: std.json.Value, schema: std.json.Value, instance: std.json
         var matches: usize = 0;
         for (choices.array.items) |choice| matches += @intFromBool(try schemaAllows(root, choice, instance, depth + 1));
         if (matches != 1) return false;
+    }
+    if (schema.object.get("allOf")) |subschemas| {
+        if (subschemas != .array) return error.InvalidSchema;
+        for (subschemas.array.items) |sub| {
+            if (!try schemaAllows(root, sub, instance, depth + 1)) return false;
+        }
+    }
+    if (schema.object.get("if")) |cond| {
+        if (try schemaAllows(root, cond, instance, depth + 1)) {
+            if (schema.object.get("then")) |then_schema| {
+                if (!try schemaAllows(root, then_schema, instance, depth + 1)) return false;
+            }
+        } else {
+            if (schema.object.get("else")) |else_schema| {
+                if (!try schemaAllows(root, else_schema, instance, depth + 1)) return false;
+            }
+        }
     }
     if (schema.object.get("pattern")) |pattern| {
         if (pattern != .string) return error.InvalidSchema;
@@ -832,6 +860,178 @@ fn checkCacheResult(allocator: std.mem.Allocator, args: []const []const u8) !voi
     } else return error.UnknownCacheResultMode;
 }
 
+fn writeFileMode(io: std.Io, path: []const u8, bytes: []const u8, mode: u32) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
+    try writeFileAll(io, path, bytes);
+    const path_z = try std.posix.toPosixPath(path);
+    if (std.os.linux.errno(std.os.linux.fchmodat(std.os.linux.AT.FDCWD, &path_z, mode)) != .SUCCESS) {
+        return error.ChmodFailed;
+    }
+}
+
+fn chownFile(path: []const u8, uid: u32, gid: u32) !void {
+    const path_z = try std.posix.toPosixPath(path);
+    if (std.os.linux.errno(std.os.linux.fchownat(std.os.linux.AT.FDCWD, &path_z, uid, gid, 0)) != .SUCCESS) {
+        return error.ChownFailed;
+    }
+}
+
+fn bootstrapInstallAction(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 7) return error.InvalidCheckArguments;
+    const repo = args[0];
+    const workspace = args[1];
+    const runner = args[2];
+    const cli = args[3];
+    const arch = args[4];
+    const uid = try std.fmt.parseInt(u32, args[5], 10);
+    const gid = try std.fmt.parseInt(u32, args[6], 10);
+
+    const runtime = if (std.c.getenv("DEBZ_DISPOSABLE_RUNTIME")) |val| blk: {
+        const s = std.mem.span(val);
+        break :blk if (s.len > 0) s else try std.fmt.allocPrint(allocator, "{s}/zig-out/bin/debz-disposable-runtime", .{repo});
+    } else try std.fmt.allocPrint(allocator, "{s}/zig-out/bin/debz-disposable-runtime", .{repo});
+
+    const repository = try std.fmt.allocPrint(allocator, "{s}/repository", .{workspace});
+    const keyring = try std.fmt.allocPrint(allocator, "{s}/keyring.gpg", .{workspace});
+    const fixture_keyring_path = try std.fmt.allocPrint(allocator, "{s}/fixture-keyring.gpg", .{repository});
+    const keyring_bytes = try readFileAlloc(io, allocator, fixture_keyring_path);
+    try writeFileMode(io, keyring, keyring_bytes, 0o644);
+
+    const source = try std.fmt.allocPrint(allocator, "{s}/repo.sources", .{workspace});
+    const source_text = try std.fmt.allocPrint(
+        allocator,
+        "Types: deb\nURIs: file://{s}\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: {s}\n",
+        .{ repository, arch, keyring },
+    );
+    try writeFileMode(io, source, source_text, 0o644);
+
+    for ([_][]const u8{ "plan", "cold", "warm-fresh", "offline", "failure", "receiptless", "cross-backend" }) |name| {
+        const root = try std.fmt.allocPrint(allocator, "{s}/root-{s}", .{ runner, name });
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        for ([_][]const u8{ "info", "updates", "triggers" }) |directory| {
+            try std.Io.Dir.cwd().createDirPath(
+                io,
+                try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/{s}", .{ root, directory }),
+            );
+        }
+        try writeFileMode(
+            io,
+            try std.fmt.allocPrint(allocator, "{s}/.debz-native-disposable", .{root}),
+            "debz native materialization fixture v1\n",
+            0o600,
+        );
+        try writeFileMode(io, try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/status", .{root}), "", 0o644);
+        try writeFileMode(io, try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/format", .{root}), "1\n", 0o644);
+        try writeFileMode(
+            io,
+            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/arch", .{root}),
+            try std.fmt.allocPrint(allocator, "{s}\n", .{arch}),
+            0o644,
+        );
+        const rt_res = try std.process.run(allocator, io, .{
+            .argv = &.{ runtime, root, "/bin/sh", "/bin/sh" },
+            .stdout_limit = .limited(maximum_json_bytes),
+            .stderr_limit = .limited(maximum_json_bytes),
+        });
+        if (rt_res.term != .exited or rt_res.term.exited != 0) return error.DisposableRuntimeFailed;
+
+        var dpkg_argv: std.ArrayList([]const u8) = .empty;
+        try dpkg_argv.appendSlice(allocator, &.{
+            "dpkg",
+            "--force-not-root",
+            "--force-bad-path",
+            "--no-triggers",
+            try std.fmt.allocPrint(allocator, "--root={s}", .{root}),
+            "--force-confold",
+            "--install",
+            try std.fmt.allocPrint(allocator, "{s}/pool/main/native-helper-target_1.0-1_{s}.deb", .{ repository, arch }),
+            try std.fmt.allocPrint(allocator, "{s}/pool/main/essential-core_1.0-1_{s}.deb", .{ repository, arch }),
+        });
+        if (std.mem.eql(u8, name, "receiptless")) {
+            try dpkg_argv.appendSlice(allocator, &.{
+                try std.fmt.allocPrint(allocator, "{s}/pool/main/base-dep_1.0-1_{s}.deb", .{ repository, arch }),
+                try std.fmt.allocPrint(allocator, "{s}/pool/main/scenario-main_1.0-1_{s}.deb", .{ repository, arch }),
+            });
+        }
+        const dpkg_res = try std.process.run(allocator, io, .{
+            .argv = dpkg_argv.items,
+            .stdout_limit = .limited(maximum_json_bytes),
+            .stderr_limit = .limited(maximum_json_bytes),
+        });
+        const ref_log = try std.fmt.allocPrint(allocator, "{s}{s}", .{ dpkg_res.stdout, dpkg_res.stderr });
+        try writeFileMode(io, try std.fmt.allocPrint(allocator, "{s}/reference.log", .{root}), ref_log, 0o644);
+        if (dpkg_res.term != .exited or dpkg_res.term.exited != 0) return error.ReferenceDpkgSeedFailed;
+    }
+
+    const PlanSpec = struct {
+        selector: []const u8,
+        filename: []const u8,
+        backend: []const u8,
+    };
+    for ([_]PlanSpec{
+        .{ .selector = "scenario-main", .filename = "lock.json", .backend = "native" },
+        .{ .selector = "fail-script", .filename = "fail.lock.json", .backend = "native" },
+        .{ .selector = "scenario-main", .filename = "legacy.lock.json", .backend = "legacy_dpkg" },
+    }) |spec| {
+        const lock_out = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace, spec.filename });
+        const plan_res = try std.process.run(allocator, io, .{
+            .argv = &.{
+                cli,
+                "plan",
+                "--transaction-backend",
+                spec.backend,
+                "--install-root",
+                try std.fmt.allocPrint(allocator, "{s}/root-plan", .{runner}),
+                "--cache-path",
+                try std.fmt.allocPrint(allocator, "{s}/plan-cache", .{workspace}),
+                "--state-path",
+                try std.fmt.allocPrint(allocator, "{s}/plan-state", .{workspace}),
+                "--architecture",
+                arch,
+                "--source",
+                source,
+                "--keyring",
+                keyring,
+                "--lock-output",
+                lock_out,
+                "--json",
+                spec.selector,
+            },
+            .stdout_limit = .limited(maximum_json_bytes),
+            .stderr_limit = .limited(maximum_json_bytes),
+        });
+        if (plan_res.term != .exited or plan_res.term.exited != 0) return error.LockPlanFailed;
+        try chownFile(lock_out, uid, gid);
+    }
+}
+
+fn checkInstallActionResults(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len != 2) return error.InvalidCheckArguments;
+    const repo = args[0];
+    const observations = args[1];
+    const documents = try parseJsonFile(io, allocator, observations);
+    if (documents != .array or documents.array.items.len == 0) return error.InvalidInstallObservations;
+
+    const result_schema = try parseJsonFile(
+        io,
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s}/schema/native-install-result-v1.json", .{repo}),
+    );
+    const capability_schema = try parseJsonFile(
+        io,
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s}/schema/native-install-capability-v1.json", .{repo}),
+    );
+
+    for (documents.array.items) |document| {
+        if (document != .object) return error.InvalidInstallObservation;
+        const schema = if (document.object.contains("evidence")) result_schema else capability_schema;
+        if (!try schemaAllows(schema, schema, document, 0)) return error.InstallObservationSchemaMismatch;
+    }
+}
+
 pub fn run(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) return error.MissingCheckSubcommand;
     const subcommand = args[0];
@@ -860,6 +1060,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !
         try writeAbandonedStaging(io, allocator, rest);
     } else if (std.mem.eql(u8, subcommand, "cache-result")) {
         try checkCacheResult(allocator, rest);
+    } else if (std.mem.eql(u8, subcommand, "bootstrap-install-action")) {
+        try bootstrapInstallAction(io, allocator, rest);
+    } else if (std.mem.eql(u8, subcommand, "check-install-action-results")) {
+        try checkInstallActionResults(io, allocator, rest);
     } else return error.UnknownCheckSubcommand;
 }
 

@@ -299,8 +299,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -350,8 +352,6 @@ jobs:
           node-version: 24.20.0
       - name: Build CLI and action test runtime
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends python3-jsonschema
           zig build -Doptimize=ReleaseSafe
           npm --prefix actions/install ci
           npm --prefix actions/install run build
@@ -887,15 +887,14 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Build and test workload core
         run: |
@@ -995,8 +994,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1043,15 +1044,14 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Build and test workload production
         run: |
@@ -1101,8 +1101,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1149,15 +1151,14 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Build and test workload apt system
         run: |
@@ -1167,7 +1168,6 @@ jobs:
           sudo env \
             PATH="$PATH" \
             TMPDIR="$PWD/.zig-cache" \
-            PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \
             ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" \
             ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" \
             "$(command -v zig)" build test-apt-system-acceptance \
@@ -1232,8 +1232,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1280,15 +1282,14 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Build and test workload native
         run: |
@@ -1343,8 +1344,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1391,15 +1394,14 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Build and test workload release
         run: |
@@ -1471,8 +1473,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1519,15 +1523,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise Zig recovery units in both modes
         run: |
@@ -1579,8 +1582,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1627,15 +1632,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise Zig repository recovery
         run: |
@@ -1675,8 +1679,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1723,15 +1729,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise Zig helper, bootstrap, parity and rollback recovery
         run: |
@@ -1777,8 +1782,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1825,15 +1832,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise Zig signed FAMILY recovery
         run: |
@@ -1873,8 +1879,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -1921,15 +1929,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise Zig recovery scenario and mutation matrices
         run: |
@@ -2002,8 +2009,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -2050,15 +2059,14 @@ jobs:
       - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! /usr/bin/python3 -c 'import jsonschema' >/dev/null 2>&1; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
           fi
       - name: Exercise counted Zig diversion recovery shard
         run: |
@@ -2630,8 +2638,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
@@ -2678,8 +2688,7 @@ jobs:
       - name: Install audited system dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd ||
-             ! python3 -c 'import jsonschema' 2>/dev/null; then
+             ! pkg-config --exists liblzma libzstd; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
@@ -2687,7 +2696,7 @@ jobs:
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
             sudo apt-get install --yes --no-install-recommends \
-              liblzma-dev libzstd-dev pkg-config python3-jsonschema
+              liblzma-dev libzstd-dev pkg-config
           fi
       - name: Test real acceptance input validation
         run: |
@@ -2924,8 +2933,10 @@ jobs:
           rm -f /etc/dpkg/dpkg.cfg.d/excludes
           apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
           apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
-            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \
-            python3-jsonschema sudo unzip xz-utils zstd
+            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \
+            sudo unzip xz-utils zstd
+          ! command -v python3
+          ! command -v python
           # Steps run as the hosted image's unprivileged user with passwordless
           # sudo, because some tools refuse to run as root.
           useradd --create-home --uid 1001 --shell /bin/bash runner
