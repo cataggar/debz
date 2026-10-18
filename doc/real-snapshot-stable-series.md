@@ -57,7 +57,7 @@ This document answers the five design questions on #330 with measured data:
   maintainer scripts byte-identical, or changed only debhelper version
   comments. Stonking changed 18, 33 (+1/−2) and 36 versions, and 5, 6 and 5
   reviewed identities, including upstream jumps and semantic script changes.
-- **Tooling:** `tools/real-snapshot-repin.py` and a reviewed pin manifest. All
+- **Tooling:** `tools/real-snapshot-repin.zig` (`debz-real-snapshot-repin`) and a reviewed pin manifest. All
   authentication goes through `debz` itself. Admissions bind exact bytes, so
   a repin that leaves those bytes unchanged needs no re-review.
 - **Order:**
@@ -573,7 +573,7 @@ These differences are reviewed once, in the migration PR.
 
 ### Tool
 
-`tools/real-snapshot-repin.py` uses only the Python standard library, like
+`tools/real-snapshot-repin.zig` (`debz-real-snapshot-repin`) is a self-contained Zig tool, like
 `tools/prepare-native-dpkg.zig` and #289's `tools/debian-stable-closure.zig`.
 Its subcommands (`probe`, `diff`, `record`, `check`) follow the latter's
 `run`/`compare`/`record`/`check` pattern, so the Debian lane can adopt it
@@ -699,7 +699,7 @@ The implemented commands and current manifest are documented in the
 [repin runbook](real-snapshot-repin.md#runbook).
 
 1. Build ReleaseSafe `debz` at the current `main`.
-2. Run `tools/real-snapshot-repin.py probe` and read the report. Note the new
+2. Run `zig-out/bin/debz-real-snapshot-repin probe` and read the report. Note the new
    admission deadline.
 3. Run `diff --pr <open real-snapshot PRs>`.
 4. For each `changed` identity:
