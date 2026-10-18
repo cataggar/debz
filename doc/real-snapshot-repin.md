@@ -416,7 +416,7 @@ its `./usr/share/keyrings/ubuntu-archive-keyring.gpg` member is 3,607 bytes.
 The authoritative URL, archive SHA-512/size and member SHA-256/size constants
 live in `tools/real-snapshot-reference-protected-ci.sh`. Their anti-drift
 tokens are in `PROTECTED_REFERENCE_SCRIPT_TOKENS` in
-`tools/security-audit.py`. Read those current values when renewing; do not
+`tools/security-audit.zig`. Read those current values when renewing; do not
 reuse the older stonking values from the original issue.
 
 Review renewal when Ubuntu announces an archive signing-key addition,

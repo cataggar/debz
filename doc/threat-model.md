@@ -47,7 +47,7 @@ transaction engine adds the audited maintainer-script runner
 ([Audited maintainer-script runner](maintainer-script-runner.md),
 `src/maintainer_script.zig`, the only production source permitted to call
 `execve` or `chroot`; it and the live-root supervisor are the two reviewed
-`fork` owners pinned by `tools/security-audit.py`), which
+`fork` owners pinned by `tools/security-audit.zig`), which
 executes exactly one validated maintainer script per request: unsafe roots,
 script paths, names, identities, arguments, variables and limits are rejected
 before any process exists; the child enters the selected root with a

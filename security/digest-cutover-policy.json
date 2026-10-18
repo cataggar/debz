@@ -25,7 +25,7 @@
       "security/digest-cutover-policy.json",
       "security/digest-inventory-v1.tsv",
       "security/digest-semantic-allowlist-v1.tsv",
-      "tools/security-audit.py"
+      "tools/security-audit.zig"
     ],
     "exclusion_rationale": "The repository manifest includes tracked and non-ignored untracked files so pre-commit audit results remain stable after commit. The policy, per-file inventory, semantic allowlist inventory, and audit/canary implementation are excluded from token findings to avoid recursive self-classification; they do not define repository digest authority."
   },

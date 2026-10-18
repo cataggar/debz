@@ -2705,7 +2705,7 @@ the same `InvalidRecoveryProgress` that `verifyNativePackageState` reports.
 
 **Wiring.** FS, FSS and FF run in the required `native-recovery-zig-family` job.
 HCC and HCR run in the required `native-recovery-zig-helper` job.
-`tools/security-audit.py` refuses loss of the hermetic filter and import
+`tools/security-audit.zig` refuses loss of the hermetic filter and import
 (`native_provenance_binding_wiring_failures`), the `ownedComponents`
 matrix and its three call sites, the `callerScriptComponents` matrix and its
 two call sites, and the terminal-record and script-outcome bindings in

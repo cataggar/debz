@@ -1766,7 +1766,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/security-audit.py"
+          "path": "tools/security-audit.zig"
         }
       ],
       "digest": "sha256:d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528",
@@ -3017,7 +3017,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/security-audit.py"
+          "path": "tools/security-audit.zig"
         }
       ],
       "derived_from": [
@@ -3161,7 +3161,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/security-audit.py"
+          "path": "tools/security-audit.zig"
         },
         {
           "form": "fixture",
@@ -3203,7 +3203,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/security-audit.py"
+          "path": "tools/security-audit.zig"
         }
       ],
       "digest": "sha256:a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",
@@ -3237,7 +3237,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/security-audit.py"
+          "path": "tools/security-audit.zig"
         }
       ],
       "derived_from": [
