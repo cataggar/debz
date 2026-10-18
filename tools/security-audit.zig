@@ -4607,7 +4607,7 @@ pub const WORKLOAD_SETUP_LINES = [_][]const u8{
     "            cataggar/zig@v0.17.0",
     "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "        run: test \"$(zig version)\" = 0.17.0",
-    "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
+    "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev",
 };
 
 pub const WORKLOAD_RUNS_ON = "    runs-on: ${{ matrix.os }}";
@@ -4657,8 +4657,10 @@ pub const ROOTLESS_ROOT_BOOTSTRAP =
     "          rm -f /etc/dpkg/dpkg.cfg.d/excludes\n" ++
     "          apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update\n" ++
     "          apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \\\n" ++
-    "            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config python3 \\\n" ++
-    "            python3-jsonschema sudo unzip xz-utils zstd\n" ++
+    "            binutils bzip2 ca-certificates curl file git gnupg jq pkg-config \\\n" ++
+    "            sudo unzip xz-utils zstd\n" ++
+    "          ! command -v python3\n" ++
+    "          ! command -v python\n" ++
     "          # Steps run as the hosted image's unprivileged user with passwordless\n" ++
     "          # sudo, because some tools refuse to run as root.\n" ++
     "          useradd --create-home --uid 1001 --shell /bin/bash runner\n" ++
@@ -5054,7 +5056,6 @@ pub const WORKLOAD_JOBS = [_]WorkloadJobExpectation{
                 .condition = null,
                 .commands = &.{
                     "sudo env PATH=\"$PATH\" TMPDIR=\"$PWD/.zig-cache\" " ++
-                        "PYTHONPYCACHEPREFIX=\"$PWD/.zig-cache/pycache\" " ++
                         "ZIG_GLOBAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-global\" " ++
                         "ZIG_LOCAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-local\" " ++
                         "\"$(command -v zig)\" build test-apt-system-acceptance " ++ WORKLOAD_MODE,
@@ -7737,7 +7738,8 @@ pub fn nativeRecoveryCiFailures(allocator: std.mem.Allocator, text_raw: []const 
             std.mem.indexOf(u8, setup, "      - name: Install Zig via ghr\n") == null or
             std.mem.indexOf(u8, setup, "      - name: Validate Zig version\n") == null or
             std.mem.indexOf(u8, setup, "      - name: Install metadata decompression and signed fixture dependencies\n") == null or
-            std.mem.indexOf(u8, setup, "liblzma-dev libzstd-dev python3-jsonschema") == null or
+            std.mem.indexOf(u8, setup, "liblzma-dev libzstd-dev") == null or
+            std.mem.indexOf(u8, setup, "python3") != null or
             setup_has_if)
         {
             try failures.append(allocator, try std.fmt.allocPrint(allocator, "ci.yml: {s} must retain pinned Zig and signed fixture dependencies", .{sh.name}));
@@ -10205,9 +10207,11 @@ pub fn nativeIntegrationRepositoryFailures(
         .{
             .path = "actions/install/__tests__/integration.test.ts",
             .tokens = &.{
-                "str(Path(cli).parent / \"debz-integration-repository\"), \"--output\", str(repository)",
-                "\"--suite\", \"debian-stable\", \"--architecture\", arch",
-                "check=True, timeout=60, env={\"PATH\": \"/no-host-interpreters\"}",
+                "const repositoryGenerator = path.join(path.dirname(sourceCli), 'debz-integration-repository');",
+                "['--output', repository, '--suite', 'debian-stable', '--architecture', architecture]",
+                "{ env: { PATH: '/no-host-interpreters' }, timeout: 60_000, maxBuffer: 1024 * 1024 }",
+                "repositoryGenerator, '--check-roots', 'bootstrap-install-action'",
+                "['--check-roots', 'check-install-action-results', path.resolve(actionPath, '../..'), observations]",
             },
         },
         .{
@@ -10308,6 +10312,14 @@ pub fn nativeIntegrationRepositoryFailures(
         std.mem.indexOf(u8, roots_sh, "jsonschema") != null)
     {
         try failures.append(allocator, try allocator.dupe(u8, "tools/test-integration-roots.sh: retired Python integration-root check was restored"));
+    }
+    const install_test = texts.get("actions/install/__tests__/integration.test.ts") orelse "";
+    if (countWordOccurrences(install_test, "python") > 0 or
+        countWordOccurrences(install_test, "python3") > 0 or
+        std.mem.indexOf(u8, install_test, "PYTHONDONTWRITEBYTECODE") != null or
+        std.mem.indexOf(u8, install_test, "jsonschema") != null)
+    {
+        try failures.append(allocator, try allocator.dupe(u8, "actions/install/__tests__/integration.test.ts: retired Python install-action bootstrap or validator was restored"));
     }
 
     const ci = texts.get(".github/workflows/ci.yml") orelse "";

@@ -288,7 +288,7 @@ fn privateProcNetwork(devices: []const u8, routes: []const u8) !void {
     }
 }
 
-pub const Mode = enum { host, reference, systemd, udev, sudo };
+pub const Mode = enum { host, launcher, reference, systemd, udev, sudo };
 
 pub fn observe(mode: Mode, port: u16, unix_name: []const u8, inherited: i32) !void {
     if (port == 0 or inherited < 200)
@@ -300,9 +300,10 @@ pub fn observe(mode: Mode, port: u16, unix_name: []const u8, inherited: i32) !vo
     if (inherited_result != (if (host) linux.E.SUCCESS else linux.E.BADF))
         return error.InheritedDescriptorBoundaryFailed;
     const systemd = mode == .systemd;
-    if (try present("/proc/net") != (host or systemd)) return error.ProcNetworkBoundaryFailed;
+    const launcher = mode == .launcher;
+    if (try present("/proc/net") != (host or systemd or launcher)) return error.ProcNetworkBoundaryFailed;
     if (!host) {
-        if (systemd) {
+        if (systemd or launcher) {
             // The existing full proc profile exposes this private network namespace.
             var devices: [16384]u8 = undefined;
             var routes: [16384]u8 = undefined;
@@ -310,8 +311,8 @@ pub fn observe(mode: Mode, port: u16, unix_name: []const u8, inherited: i32) !vo
                 try readProcNetwork("/proc/net/dev", &devices),
                 try readProcNetwork("/proc/net/route", &routes),
             );
-            if (!try present("/proc/sys/kernel/random/boot_id") or
-                try present("/proc/sys/kernel/random/uuid"))
+            if (systemd and (!try present("/proc/sys/kernel/random/boot_id") or
+                try present("/proc/sys/kernel/random/uuid")))
                 return error.SignedProcBoundaryFailed;
         } else {
             if (try present("/proc/net/dev") or try present("/proc/net/route"))
@@ -338,7 +339,7 @@ pub fn observe(mode: Mode, port: u16, unix_name: []const u8, inherited: i32) !vo
         "DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
     else if (mode == .reference or mode == .sudo)
         "DEBZ_REFERENCE_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
-    else if (systemd)
+    else if (systemd or launcher)
         "DEBZ_SIGNED_NETWORK_PROOF proc_net=private interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n"
     else
         "DEBZ_SIGNED_NETWORK_PROOF proc_net=absent interfaces=lo default_route=false host_tcp=denied abstract_unix=denied inherited_fd=sealed loopback=ok\n";
