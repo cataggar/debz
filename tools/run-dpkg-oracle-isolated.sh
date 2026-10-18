@@ -70,7 +70,12 @@ if [ "$kind" = config ]; then
         --reference-dpkg "$dpkg" \
         --capture-observed "$output"
 fi
-exec /usr/bin/python3 tools/dpkg-alternatives-reference.py \
+DEBZ_DPKG_ALTERNATIVES_REFERENCE="$repository/zig-out/bin/debz-dpkg-alternatives-reference"
+if [ ! -x "$DEBZ_DPKG_ALTERNATIVES_REFERENCE" ]; then
+    echo "isolated dpkg alternatives oracle requires debz-dpkg-alternatives-reference" >&2
+    exit 2
+fi
+exec "$DEBZ_DPKG_ALTERNATIVES_REFERENCE" \
     --architecture "$architecture" \
     --reference-dpkg "$dpkg" \
     --reference-update-alternatives "$update_alternatives" \

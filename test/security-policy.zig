@@ -1879,8 +1879,9 @@ test "security: disposable runtime consumers require native copying without a Py
         "\"DEBZ_DISPOSABLE_RUNTIME\"",
         "try argv.appendSlice(self.allocator, &.{ self.disposable_runtime, root, source, destination });",
     });
-    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-alternatives-reference.py", &.{
-        "root, source, destination, max_file_bytes=Limits.maximum_archive_bytes,",
+    try nativeMutations(&f, "native-disposable-runtime", "tools/dpkg-alternatives-reference.zig", &.{
+        "_ = try validateAbsolutePath(destination);",
+        "const limit_str = try std.fmt.allocPrint(self.allocator, \"{d}\", .{Limits.maximum_archive_bytes});",
     });
     try nativeMutations(&f, "native-disposable-runtime", ".github/workflows/ci.yml", &.{
         "          zig build build-disposable-runtime test-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all",
@@ -2912,7 +2913,8 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         "tools/test_real_snapshot_reference_triggers.py", "tools/native-lifecycle-fixtures.py",
         "tools/native-differential.py",                   "tools/native_only_candidate.py",
         "tools/native-materialization-fixtures.py",       "tools/dpkg-config-reference.py",
-        "tools/test_dpkg_config_reference.py",
+        "tools/test_dpkg_config_reference.py",            "tools/dpkg-alternatives-reference.py",
+        "tools/test_dpkg_alternatives_reference.py",
     }) |path| {
         const restored = try nativeCheck(&f, "native-fixtures", path, "");
         defer restored.deinit();

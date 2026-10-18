@@ -717,7 +717,7 @@ tampering, version-gated fallback, archive verification before extraction,
 cache tampering, root refusal, and the package manifest. All former Python
 materialization, lifecycle, trigger, and recovery fixture modules have been
 retired; the direct-dpkg config and alternatives reference oracles own their
-disposable-root helpers in `tools/dpkg-config-reference.zig` and `tools/dpkg-alternatives-reference.py`. Offline reference-preparation
+disposable-root helpers in `tools/dpkg-config-reference.zig` and `tools/dpkg-alternatives-reference.zig`. Offline reference-preparation
 regressions use `tools/prepare-native-dpkg.zig --fixture-root` with a disposable
 marker and `--fixture-archive` bytes that must still match the published pin;
 `--simulate-root` can only force refusal. These options never relax the

@@ -1,6 +1,6 @@
 # Pinned dpkg/update-alternatives reference
 
-`tools/dpkg-alternatives-reference.py` is an executable reference for dpkg
+`tools/dpkg-alternatives-reference.zig` is an executable reference for dpkg
 1.22.22 and its `update-alternatives` 1.22.22 binary. Its reviewed boundary is
 now admitted by the native alternatives implementation. Admission remains
 limited to the pinned architectures, tool digests, bounded literal script
