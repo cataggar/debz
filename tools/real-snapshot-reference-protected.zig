@@ -948,7 +948,7 @@ pub fn operation(
     )));
     defer _ = linux.close(stderr_fd);
 
-    const status = try execForkedCommand(allocator, argv.items, stdin_fd, stdout_fd, stderr_fd, null);
+    const status = try execForkedCommand(allocator, argv.items, stdin_fd, stdout_fd, stderr_fd, options.inherited_fd);
     const teardown = try assertTeardown(allocator, root);
     const err_bytes = try readHostFile(allocator, stderr_path, 4 * 1024 * 1024);
     errdefer allocator.free(err_bytes);
@@ -2080,6 +2080,59 @@ pub fn runMain(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     writeAllFd(1, summary);
 }
 
+pub fn failureDiagnostic(err: anyerror) []const u8 {
+    return switch (err) {
+        error.PermissionError => "protected reference proof requires UID/GID 0",
+        error.InvalidArguments => "invalid protected reference proof arguments",
+        error.NonAbsoluteProofInput => "protected proof inputs must be absolute paths",
+        error.NoncanonicalReferencePath => "noncanonical protected path",
+        error.UnprotectedReferenceRoot => "reference root directory is unprotected",
+        error.UnprotectedReferencePath => "reference path has writable or non-root ancestor",
+        error.WrongReferenceFileType => "reference path has the wrong file type",
+        error.UnprotectedProofDirectory => "protected proof directory must be root-only 0700",
+        error.NonEmptyProofWorkspace => "protected proof workspace must be new and empty",
+        error.UnsupportedArchitecture, error.UnpinnedReferenceDpkg => "reference dpkg executable is not the pinned architecture artifact",
+        error.UnexpectedArchitectureProfileScripts => "non-amd64 architecture must not stage amd64 profile scripts",
+        error.InvalidProfileScripts => "amd64 profile scripts must be exactly sudo.postinst, systemd.postinst, and udev.postinst",
+        error.ProfileScriptExceedsLimit => "profile script exceeds limit",
+        error.InvalidProofTemplateMountpoints => "protected proof template has invalid proc/archive mountpoints",
+        error.InvalidArchiveSha512 => "archive SHA512 must come from the authenticated lock",
+        error.InvalidArchiveSize => "invalid authenticated archive size",
+        error.ArchiveSizeMismatch => "authenticated archive size differs",
+        error.ArchiveSha512Mismatch => "authenticated archive SHA512 differs",
+        error.NonEmptyProofTemplateDatabase => "proof template is not an empty dpkg root",
+        error.NonEmptyProofTemplateProc => "proof template proc mountpoint is not empty",
+        error.UnsupportedProtectedTemplateMember => "unsupported protected template member",
+        error.ProcessesRetainReferenceRoot => "processes retain reference root",
+        error.ReferenceMountSurvived => "reference mount survived under root",
+        error.ReferenceMountpointChanged => "reference archive or proc mountpoint changed",
+        error.TemporaryReferenceRuntimeSurvived => "temporary reference runtime survived",
+        error.ExpectedRefusalNotObserved => "expected nonzero exit with refusal",
+        error.DpkgStartedDespiteRuntimeRefusal => "dpkg started despite runtime refusal",
+        error.PostBindingDriftProofFailed => "post-binding drift proof failed",
+        error.PostBindingMutatedDatabase => "post-binding proof mutated the package database",
+        error.DpkgStartedWithUnboundPreload => "dpkg started with an unbound preload",
+        error.UnreachableHostNetworkControl => "host network controls were not genuinely reachable",
+        error.RefusedProfileChangedPackageState => "refused profile changed the package state",
+        error.ProbeRanDespiteRefusal => "the probe ran despite the refusal",
+        error.ProfileProcViewCheckFailed => "proc view checks failed",
+        error.ProfileProbeWrongMode => "the probe did not run as the profile postinst",
+        error.ProfileBootIdMismatch => "the masked boot ID is not the host boot ID",
+        error.DetachedDescendantNeverStarted => "detached descendant never started",
+        error.PinnedDpkgDidNotConfigureBoundPackage => "pinned dpkg did not configure the bound package",
+        error.InRootBindingDidNotRefuseAtStage10 => "the in-root binding did not refuse at stage 10",
+        error.PinnedDpkgRefusedValidOperation => "pinned dpkg refused valid operation",
+        error.ProbeChangedDirectoryTimestamps => "read-only probe changed directory timestamps through temporary runtime mounts",
+        error.UnpackProducedEmptyDatabase => "pinned dpkg reported success without an installed database entry",
+        error.RootDatabaseChangedAfterRefusal => "root database changed after refusal",
+        error.UnconfinedControlMissedAuthority => "unconfined root control failed",
+        error.EscapeConfinementCheckFailed => "confined escape checks failed",
+        error.BoundArchiveSizeMismatch => "bound archive size differs from the authenticated escape archive",
+        error.PinnedDpkgDidNotRecordProbePackage => "pinned dpkg did not record the probe package",
+        else => "protected reference proof failed",
+    };
+}
+
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -2094,8 +2147,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
 
     runMain(allocator, args_list.items) catch |err| {
-        var msg_buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "{s}: protected reference proof failed\n", .{@errorName(err)}) catch "protected reference proof failed\n";
+        var msg_buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s}\n", .{ @errorName(err), failureDiagnostic(err) }) catch "protected reference proof failed\n";
         writeAllFd(2, msg);
         return 1;
     };
@@ -2507,4 +2560,42 @@ test "runtime mutation negatives reach checks using workspace-rooted writes" {
     }) |key| {
         try std.testing.expect(std.mem.indexOf(u8, report_bytes, key) != null);
     }
+}
+
+test "failure diagnostics emit protected reference CI refusal strings" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.UnprotectedReferencePath),
+        "writable or non-root ancestor",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.UnpinnedReferenceDpkg),
+        "reference dpkg executable is not the pinned architecture artifact",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.UnsupportedArchitecture),
+        "reference dpkg executable is not the pinned architecture artifact",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.ArchiveSha512Mismatch),
+        "authenticated archive SHA512 differs",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.InvalidProfileScripts),
+        "profile scripts",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.UnexpectedArchitectureProfileScripts),
+        "profile scripts",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        failureDiagnostic(error.NonEmptyProofWorkspace),
+        "must be new and empty",
+    ) != null);
 }
