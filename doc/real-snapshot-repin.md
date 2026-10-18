@@ -1,10 +1,9 @@
 # Real-snapshot repin tool and runbook
 
-`tools/real-snapshot-repin.py` moves the reviewed real-snapshot pins from one
+`tools/real-snapshot-repin.zig` (`debz-real-snapshot-repin`) moves the reviewed real-snapshot pins from one
 snapshot.ubuntu.com timestamp to a newer one. Unchanged bytes move
 automatically, and every reviewed identity whose bytes changed has to be
-reviewed again. The tool implements the repin design from #330. It uses only
-the Python standard library.
+reviewed again. The tool implements the repin design from #330 as a compiled Zig executable.
 
 ## Trust boundary
 
@@ -89,7 +88,7 @@ two fetches of each InRelease before recording the result.
 ### `probe`
 
 ```sh
-python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute \
+zig-out/bin/debz-real-snapshot-repin probe --series ubuntu-resolute \
     [--timestamp 20261015T000000Z] --debz zig-out/bin/debz \
     [--manifest PATH] [--workspace DIR] [--accept-frozen-release]
 ```
@@ -166,7 +165,7 @@ Each pocket's `binding`, per architecture, is one of:
 ### `diff`
 
 ```sh
-python3 tools/real-snapshot-repin.py diff --report DIR/report.json \
+zig-out/bin/debz-real-snapshot-repin diff --report DIR/report.json \
     [--pr N ...] [--pr-diff-file PATH ...]
 ```
 
@@ -195,7 +194,7 @@ identity or archive digest) and marks the pins this repin makes stale.
 ### `bind-architecture`
 
 ```sh
-python3 tools/real-snapshot-repin.py bind-architecture \
+zig-out/bin/debz-real-snapshot-repin bind-architecture \
     --identity script:less/postinst --architecture arm64 --reviewed '#393'
 ```
 
@@ -214,7 +213,7 @@ those remain independent native guards and protected replay requirements.
 ### `bind-member`
 
 ```sh
-python3 tools/real-snapshot-repin.py bind-member \
+zig-out/bin/debz-real-snapshot-repin bind-member \
     --archive-identity archive:less@arm64 --member usr/bin/less \
     --consumer src/native_unpack.zig --reviewed '#393'
 ```
@@ -231,7 +230,7 @@ updates freshness nor substitutes for protected execution evidence.
 ### `record`
 
 ```sh
-python3 tools/real-snapshot-repin.py record --report DIR/report.json \
+zig-out/bin/debz-real-snapshot-repin record --report DIR/report.json \
     [--reviewed ID=#PR ...] [--accept-frozen-release #PR]
 ```
 
@@ -263,7 +262,7 @@ then runs `check`.
 ### `check`
 
 ```sh
-python3 tools/real-snapshot-repin.py check
+zig-out/bin/debz-real-snapshot-repin check
 ```
 
 `check` is offline. It exits 1 and lists every failure when:
@@ -385,7 +384,7 @@ and also verifies that it refuses a manifest with a mutated identity.
 1. Build ReleaseSafe `debz` at the current `main`:
    `zig build -Doptimize=ReleaseSafe -j4`.
 2. Probe the newest settled day:
-   `python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute --debz zig-out/bin/debz`.
+   `zig-out/bin/debz-real-snapshot-repin probe --series ubuntu-resolute --debz zig-out/bin/debz`.
    Read `summary.md` and note the new admission deadline.
 3. Run `diff --report .tmp/real-snapshot-repin/<T>/report.json --pr N` for
    every open real-snapshot pull request.
@@ -505,8 +504,9 @@ or extend the current witness deadline to conceal a renewal failure.
     contributes nothing, without any extra `debz` plan, and `record` keeps
     that binding. Contributing Release/snapshot identities match exact locks;
     frozen witnesses include an empty security pocket on both architectures.
-- `tools/test_real_snapshot_repin.py` unit-tests the tool's pure logic in
-  `zig build security-audit`: timestamps, Release parsing, date and deadline
+- `zig build test-real-snapshot-repin-unit` (`tools/real-snapshot-repin.zig`, in
+  `zig build security-audit`) unit-tests the tool's pure logic:
+  timestamps, Release parsing, date and deadline
   rules, manifest and binding validation, statuses, `record` refusals and
   renames, pocket binding, and package member extraction.
 

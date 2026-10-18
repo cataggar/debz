@@ -2262,8 +2262,7 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
 }
 
 test "snapshot: every in-tree real-snapshot pin is a reviewed repin manifest identity" {
-    const tool = "tools/real-snapshot-repin.py";
-    const passed = try support.runWithTimeout(&.{ "python3", tool, "check" }, .inherit, 120);
+    const passed = try support.runWithTimeout(&.{ @import("snapshot_policy_options").real_snapshot_repin, "check" }, .inherit, 120);
     defer passed.deinit();
     try passed.ok();
     try support.contains(passed.stdout, "check passed: ");
@@ -2279,7 +2278,7 @@ test "snapshot: every in-tree real-snapshot pin is a reviewed repin manifest ide
     try work.write("pin.json", manifest);
     const path = try work.path("pin.json");
     defer support.allocator.free(path);
-    const failed = try support.runWithTimeout(&.{ "python3", tool, "check", "--manifest", path }, .inherit, 120);
+    const failed = try support.runWithTimeout(&.{ @import("snapshot_policy_options").real_snapshot_repin, "check", "--manifest", path }, .inherit, 120);
     defer failed.deinit();
     try testing.expectEqual(@as(u8, 1), failed.code);
     try failed.failsWith("does not pin sha256:");

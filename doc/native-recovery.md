@@ -1996,9 +1996,9 @@ There were 56 Python methods: all have Zig assertions for the portable behavior,
 `tools/test_native_recovery.py`. The signed Zig FAMILY, parity and repository
 targets instead invoke the emitted `debz-integration-repository`, which
 directly reuses the native archive/parser and original test-key signer, not Python cryptography,
-the recovery acceptance module or `jsonschema`. Remaining required Python schema checks
-(`test_real_snapshot_repin.py`) call `jsonschema.Draft202012Validator`
-directly on self-contained schemas; none imports the recovery fallback or
+the recovery acceptance module or `jsonschema`. The real-snapshot repin unit target
+(`zig build test-real-snapshot-repin-unit`, `tools/real-snapshot-repin.zig`) validates the
+command schemas in Zig without `jsonschema`; none imports the recovery fallback or
 resolves an external `$ref`. With both Python
 recovery entry points retired on this branch, no remaining Python consumer needs this
 fallback. Replacing a removed Python interpreter import branch with Zig would

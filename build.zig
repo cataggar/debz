@@ -1232,6 +1232,20 @@ pub fn build(b: *std.Build) void {
     run_security_policy_tests.setCwd(b.path("."));
     audit_step.dependOn(&run_security_policy_tests.step);
     audit_step.dependOn(&run_native_only_candidate_tests.step);
+    const real_snapshot_repin_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-repin.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .strip = !native_helper_debug_info,
+    });
+    real_snapshot_repin_module.addImport("debz", debz_debug);
+    const real_snapshot_repin = b.addExecutable(.{
+        .name = "debz-real-snapshot-repin",
+        .root_module = real_snapshot_repin_module,
+    });
+    const install_real_snapshot_repin = b.addInstallArtifact(real_snapshot_repin, .{});
+    b.step("build-real-snapshot-repin", "Install the real-snapshot repin tool")
+        .dependOn(&install_real_snapshot_repin.step);
     const snapshot_policy_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/real-snapshot-policy.zig"),
@@ -1255,6 +1269,7 @@ pub fn build(b: *std.Build) void {
     snapshot_policy_options.addOptionPath("native_outcome", native_outcome.getEmittedBin());
     snapshot_policy_options.addOptionPath("exec_audit", exec_audit.getEmittedBin());
     snapshot_policy_options.addOptionPath("fixture_cli", snapshot_fixture_cli.getEmittedBin());
+    snapshot_policy_options.addOptionPath("real_snapshot_repin", real_snapshot_repin.getEmittedBin());
     snapshot_policy_tests.root_module.addOptions("snapshot_policy_options", snapshot_policy_options);
     run_snapshot_policy_tests.setCwd(b.path("."));
     b.step("test-real-snapshot-policy", "Run real-snapshot policy and exec-trace audit tests")
@@ -1266,16 +1281,10 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&run_reference_protected_tests.step);
     audit_step.dependOn(&run_vendor_snapshot_tools_tests.step);
     audit_step.dependOn(&run_reference_stage_tests.step);
-    const audit_tests = b.addSystemCommand(
-        &.{
-            "env",
-            "PYTHONDONTWRITEBYTECODE=1",
-            "python3",
-            "-m",
-            "unittest",
-            "tools/test_real_snapshot_repin.py",
-        },
-    );
+    const audit_tests = b.addRunArtifact(b.addTest(.{ .root_module = real_snapshot_repin_module }));
+    audit_tests.setCwd(b.path("."));
+    b.step("test-real-snapshot-repin-unit", "Run unit tests for the real-snapshot repin tool")
+        .dependOn(&audit_tests.step);
     audit_tests.setEnvironmentVariable("DEBZ_DISPOSABLE_RUNTIME", getInstallPath(b, .bin, "debz-disposable-runtime"));
     audit_tests.setEnvironmentVariable("DEBZ_NATIVE_DPKG_REFERENCE", getInstallPath(b, .bin, "debz-native-dpkg-reference"));
     audit_tests.step.dependOn(&install_disposable_runtime.step);
@@ -2164,9 +2173,9 @@ pub fn build(b: *std.Build) void {
         .dependOn(&install_dpkg_config_reference.step);
 
     const dpkg_config_reference = b.addSystemCommand(&.{
-        "sudo",                                          "-n",                                                      "env",
-        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
-        getInstallPath(b, .bin, "debz-dpkg-config-reference"),
+        "sudo",                                                                                            "-n",                                                      "env",
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}),                                                   b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}),
+        b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}), getInstallPath(b, .bin, "debz-dpkg-config-reference"),
     });
     dpkg_config_reference.step.dependOn(&install_disposable_runtime.step);
     dpkg_config_reference.step.dependOn(&install_native_dpkg.step);
@@ -2204,9 +2213,9 @@ pub fn build(b: *std.Build) void {
         .dependOn(&install_dpkg_alternatives_reference.step);
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
-        "sudo",                                          "-n",                                                      "env",
-        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}), b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}), b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}),
-        getInstallPath(b, .bin, "debz-dpkg-alternatives-reference"),
+        "sudo",                                                                                            "-n",                                                        "env",
+        b.fmt("TMPDIR={s}", .{pathFromRoot(b, ".tmp")}),                                                   b.fmt("XDG_CACHE_HOME={s}", .{pathFromRoot(b, ".cache")}),   b.fmt("DEBZ_DISPOSABLE_RUNTIME={s}", .{getInstallPath(b, .bin, "debz-disposable-runtime")}),
+        b.fmt("DEBZ_NATIVE_DPKG_REFERENCE={s}", .{getInstallPath(b, .bin, "debz-native-dpkg-reference")}), getInstallPath(b, .bin, "debz-dpkg-alternatives-reference"),
     });
     dpkg_alternatives_reference.step.dependOn(&install_disposable_runtime.step);
     dpkg_alternatives_reference.step.dependOn(&install_native_dpkg.step);
@@ -3448,6 +3457,7 @@ pub fn build(b: *std.Build) void {
     workload_release.dependOn(native_only_rehearsal);
     const snapshot_repin_options = b.addOptions();
     snapshot_repin_options.addOptionPath("debz", cli_debug.getEmittedBin());
+    snapshot_repin_options.addOptionPath("real_snapshot_repin", real_snapshot_repin.getEmittedBin());
     const snapshot_repin_module = b.createModule(.{
         .root_source_file = b.path("test/real-snapshot-repin.zig"),
         .target = target,
@@ -3457,8 +3467,9 @@ pub fn build(b: *std.Build) void {
     snapshot_repin_module.addOptions("real_snapshot_repin_options", snapshot_repin_options);
     const run_snapshot_repin_tests = b.addRunArtifact(b.addTest(.{ .root_module = snapshot_repin_module }));
     run_snapshot_repin_tests.setCwd(b.path("."));
-    b.step("test-real-snapshot-repin", "Drive the real-snapshot repin tool against synthetic signed snapshots")
-        .dependOn(&run_snapshot_repin_tests.step);
+    const test_real_snapshot_repin_step = b.step("test-real-snapshot-repin", "Drive the real-snapshot repin tool against synthetic signed snapshots");
+    test_real_snapshot_repin_step.dependOn(&run_snapshot_repin_tests.step);
+    test_real_snapshot_repin_step.dependOn(&audit_tests.step);
     workload_release.dependOn(&run_snapshot_repin_tests.step);
 
     const production_customize_tests = b.addTest(.{

@@ -414,7 +414,7 @@
       "rationale": "These exact command schema and repin checks validate opaque 64-character source repository ids used to join every public refresh pocket and frozen witness. Release and snapshot content digests remain algorithm-tagged; this does not introduce raw-width package content authority.",
       "paths": [
         "schema/command-result-v1.json",
-        "tools/real-snapshot-repin.py"
+        "tools/real-snapshot-repin.zig"
       ]
     },
     {

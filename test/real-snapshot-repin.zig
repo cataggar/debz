@@ -1,4 +1,4 @@
-//! Drives tools/real-snapshot-repin.py against synthetic signed snapshots.
+//! Drives tools/real-snapshot-repin.zig against synthetic signed snapshots.
 //!
 //! Each Release is signed here with a throwaway Ed25519 key, served through
 //! file:// URIs and authenticated by the real debz CLI, so the tool's bindings
@@ -18,7 +18,6 @@ const day: i64 = 24 * 60 * 60;
 const key_created: u32 = 1_600_000_000;
 const archive_mtime: u64 = 1_700_000_000;
 const armor_columns = 64;
-const tool = "tools/real-snapshot-repin.py";
 const reviewed = "#330";
 const weekdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
 const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
@@ -246,7 +245,7 @@ const Harness = struct {
 
     fn repin(self: *Harness, arguments: []const []const u8, expected: u8) !Result {
         var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(self.arena(), &.{ "python3", tool });
+        try argv.append(self.arena(), options.real_snapshot_repin);
         try argv.appendSlice(self.arena(), arguments);
         return self.run(argv.items, expected);
     }
@@ -806,12 +805,15 @@ test "repin: offline source evidence defeats matching stale prestate code and ma
     _ = try h.repin(&check, 0);
     try std.testing.expect(h.exists("tree/tools/fixtures/real-snapshot/prestate-sources-v1.zip"));
     const stale = try sha256Hex(h.arena(), "stale historical list\n");
-    _ = try h.run(&.{
-        "python3", "-c",
-        "import json,sys; p=sys.argv[1]; m=json.load(open(p)); m['identities'][0]['digest']='sha256:'+sys.argv[2]; " ++
-            "open(p,'w').write(json.dumps(m))",
-        manifest,  stale,
-    }, 0);
+    const manifest_bytes = try h.read("synthetic-prestate.pin.json");
+    const mutated_manifest = try std.mem.replaceOwned(
+        u8,
+        h.arena(),
+        manifest_bytes,
+        try h.print("\"sha256:{s}\"", .{digest}),
+        try h.print("\"sha256:{s}\"", .{stale}),
+    );
+    try h.work.write("synthetic-prestate.pin.json", mutated_manifest);
     try h.work.write("tree/src/native_unpack.zig", try h.print(
         "const inputs = .{{.{{ .path = \"var/lib/dpkg/info/alpha.list\", .size = {d}, .mode = 0o644, .sha256 = \"{s}\" }}}};\n",
         .{ ownership.len, stale },
