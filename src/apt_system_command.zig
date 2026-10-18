@@ -2224,6 +2224,7 @@ test "apt_system_command.test.recovery execution errors retain recovery-required
 }
 
 test "apt_system_command.test.required_privileged.production adapter binds concrete composition" {
+    if (!@import("debz_build_options").require_privileged_orchestration_tests) return;
     var backend: @import("production_backend.zig").Backend = .{
         .io = std.testing.io,
     };

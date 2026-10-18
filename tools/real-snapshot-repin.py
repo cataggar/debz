@@ -18,6 +18,7 @@ import difflib
 import email.utils
 import email.parser
 import email.policy
+import functools
 import gzip
 import hashlib
 import io
@@ -458,7 +459,10 @@ def validated_tar_members(archive: tarfile.TarFile):
         fail(f"malformed tar archive: {error}")
 
 
-def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
+@functools.lru_cache(maxsize=64)
+def _tar_member_cached(
+    deb: bytes, prefix: str, path: str, max_tar_bytes: int, max_member_bytes: int,
+) -> tuple[bytes, int]:
     wanted = {path, "./" + path}
     result = None
     with package_tar(deb, prefix) as archive:
@@ -472,8 +476,8 @@ def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
             stream = archive.extractfile(member)
             if stream is None:
                 fail(f"cannot read {prefix} member {path}")
-            data = stream.read(MAXIMUM_MEMBER_BYTES + 1)
-            if len(data) > MAXIMUM_MEMBER_BYTES:
+            data = stream.read(max_member_bytes + 1)
+            if len(data) > max_member_bytes:
                 fail(f"{prefix} member {path} is too large")
             if member.isreg() and len(data) != member.size:
                 fail(f"{prefix} member {path} is truncated")
@@ -482,6 +486,10 @@ def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
         return result
     fail(f"{prefix} has no member {path}")
     raise AssertionError
+
+
+def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
+    return _tar_member_cached(deb, prefix, path, MAXIMUM_TAR_BYTES, MAXIMUM_MEMBER_BYTES)
 
 
 def tar_member_dpkg_list_path(name: str) -> str:
@@ -494,12 +502,17 @@ def tar_member_dpkg_list_path(name: str) -> str:
     return name.rstrip("/") or "/."
 
 
-def dpkg_ownership_list(deb: bytes) -> bytes:
+@functools.lru_cache(maxsize=64)
+def _dpkg_ownership_list_cached(deb: bytes, max_tar_bytes: int, max_member_bytes: int) -> bytes:
     lines = []
     with package_tar(deb, "data.tar") as archive:
         for member in validated_tar_members(archive):
             lines.append(tar_member_dpkg_list_path(member.name))
     return ("\n".join(lines) + "\n").encode()
+
+
+def dpkg_ownership_list(deb: bytes) -> bytes:
+    return _dpkg_ownership_list_cached(deb, MAXIMUM_TAR_BYTES, MAXIMUM_MEMBER_BYTES)
 
 
 def prestate_derivation(identity: dict, arch: str) -> str | None:
@@ -1080,24 +1093,32 @@ def release_index_entries(data: bytes, algorithm: str) -> dict[str, tuple[str, i
     return entries
 
 
-def source_index_package(index: bytes, index_path: str, entry: dict) -> dict[str, str]:
+@functools.lru_cache(maxsize=16)
+def _parsed_source_index(
+    index_path: str, index: bytes, max_tar_bytes: int,
+) -> dict[tuple[str | None, str | None, str | None], list[dict[str, str]]]:
     if index_path.endswith((".xz", ".gz", ".zst")):
         data = decompress("source.tar" + Path(index_path).suffix, index)
     else:
-        if len(index) > MAXIMUM_TAR_BYTES:
+        if len(index) > max_tar_bytes:
             fail("source Packages index is too large")
         data = index
-    matches = []
+    by_coordinates: dict[tuple[str | None, str | None, str | None], list[dict[str, str]]] = {}
     for paragraph in data.replace(b"\r\n", b"\n").split(b"\n\n"):
         if not paragraph.strip():
             continue
         fields = deb822_fields(paragraph)
-        if (fields.get("package"), fields.get("version"), fields.get("architecture")) == (
-                entry["name"], entry["version"], entry["architecture"]):
-            matches.append(fields)
+        key = fields.get("package"), fields.get("version"), fields.get("architecture")
+        by_coordinates.setdefault(key, []).append(fields)
+    return by_coordinates
+
+
+def source_index_package(index: bytes, index_path: str, entry: dict) -> dict[str, str]:
+    by_coordinates = _parsed_source_index(index_path, index, MAXIMUM_TAR_BYTES)
+    matches = by_coordinates.get((entry["name"], entry["version"], entry["architecture"]), [])
     if len(matches) != 1:
         fail(f"source Packages index must name {entry['name']} exactly once")
-    fields = matches[0]
+    fields = dict(matches[0])
     if fields.get("sha512") != source_archive_digest(entry).split(":", 1)[1] or fields.get("size") != str(entry["declared_size"]):
         fail(f"source Packages index for {entry['name']} differs from its authenticated archive lock")
     validate_relative_path(fields.get("filename"), "source package Filename")

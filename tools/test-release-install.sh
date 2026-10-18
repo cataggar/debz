@@ -5,16 +5,16 @@ zig=$1
 version=$2
 release_tool=$3
 root=$PWD/.zig-cache/test-release-install
+cache_dir=$PWD/.zig-cache/test-release-install-cache
 gnu_prefix=$root/gnu
 release_prefix=$root/release
 
 rm -rf "$root"
-mkdir -p "$root"
+mkdir -p "$root" "$cache_dir"
 
 "$zig" build \
-  --cache-dir "$root/cache" \
+  --cache-dir "$cache_dir" \
   -Dtarget=x86_64-linux-gnu \
-  -Doptimize=ReleaseSafe \
   -Dversion="$version" \
   install --prefix "$gnu_prefix"
 
@@ -33,9 +33,8 @@ cmp "$gnu_prefix/share/debz/digest-semantic-allowlist-v1.tsv" \
 cmp "$gnu_prefix/share/debz/legacy-cutover-policy.json" \
   "$gnu_prefix/share/doc/debz/legacy-cutover-policy.json"
 if "$zig" build \
-  --cache-dir "$root/cache" \
+  --cache-dir "$cache_dir" \
   -Dtarget=x86_64-linux-gnu \
-  -Doptimize=ReleaseSafe \
   -Dversion="$version" \
   release-install --prefix "$root/invalid-gnu-release" >/dev/null 2>&1
 then
@@ -44,9 +43,8 @@ then
 fi
 
 "$zig" build \
-  --cache-dir "$root/cache" \
+  --cache-dir "$cache_dir" \
   -Dtarget=x86_64-linux-musl \
-  -Doptimize=ReleaseSafe \
   -Dversion="$version" \
   release-install --prefix "$release_prefix"
 

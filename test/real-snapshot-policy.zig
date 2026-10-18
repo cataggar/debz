@@ -19,8 +19,6 @@ const Scenario = struct {
     expected_package_count: []const u8 = "",
 };
 
-var fixture_compiled = false;
-
 const Driver = struct {
     work: support.Work,
     script: []const u8,
@@ -70,11 +68,7 @@ const Driver = struct {
             \\  if [[ $directory == true ]]; then [[ -d $path ]] || exit 1; else [[ -f $path ]] || exit 1; fi
             \\done
         ++ "\n");
-        const reference_paths_bin = try work.path("zig-out/bin/debz-reference-paths");
-        defer support.allocator.free(reference_paths_bin);
-        const reference_paths_mode = try support.run(&.{ "chmod", "0700", reference_paths_bin });
-        defer reference_paths_mode.deinit();
-        try reference_paths_mode.ok();
+        try work.directory.dir.setFilePermissions(support.io, "zig-out/bin/debz-reference-paths", .fromMode(0o700), .{});
         const exec_audit_bytes = try std.Io.Dir.cwd().readFileAlloc(
             support.io,
             @import("snapshot_policy_options").exec_audit,
@@ -83,19 +77,13 @@ const Driver = struct {
         );
         defer support.allocator.free(exec_audit_bytes);
         try work.write("zig-out/bin/debz-exec-audit", exec_audit_bytes);
-        const exec_audit_bin = try work.path("zig-out/bin/debz-exec-audit");
-        defer support.allocator.free(exec_audit_bin);
-        const exec_audit_mode = try support.run(&.{ "chmod", "0700", exec_audit_bin });
-        defer exec_audit_mode.deinit();
-        try exec_audit_mode.ok();
+        try work.directory.dir.setFilePermissions(support.io, "zig-out/bin/debz-exec-audit", .fromMode(0o700), .{});
         const script = try work.path("tools/real-snapshot-acceptance.sh");
         errdefer support.allocator.free(script);
         const fixture_script = try std.fmt.allocPrint(support.allocator, "#!/bin/sh\nprintf called > '{s}/called'\nexit 77\n", .{work.root});
         defer support.allocator.free(fixture_script);
         try work.write("fixture-cli", fixture_script);
-        const mode = try support.run(&.{ "chmod", "0700", executable });
-        defer mode.deinit();
-        try mode.ok();
+        try work.directory.dir.setFilePermissions(support.io, "fixture-cli", .fromMode(0o700), .{});
         return .{
             .work = work,
             .script = script,
@@ -137,21 +125,10 @@ const Driver = struct {
     fn initOffline() !Driver {
         var driver = try Driver.init();
         errdefer driver.deinit();
-        const cwd = try std.process.currentPathAlloc(support.io, support.allocator);
-        defer support.allocator.free(cwd);
-        const binary = try std.fmt.allocPrint(support.allocator, "{s}/.zig-cache/issue-214-snapshot-fixture-{s}", .{ cwd, if (@import("builtin").mode == .safe) "ReleaseSafe" else "Debug" });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const fixture_len = try std.Io.Dir.cwd().realPathFile(support.io, @import("snapshot_policy_options").fixture_cli, &path_buf);
+        const binary = try support.allocator.dupe(u8, path_buf[0..fixture_len]);
         errdefer support.allocator.free(binary);
-        if (!fixture_compiled) {
-            const binary_arg = try std.fmt.allocPrint(support.allocator, "-femit-bin={s}", .{binary});
-            defer support.allocator.free(binary_arg);
-            const compiled = try support.runWithTimeout(&.{
-                "zig",                                                            "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
-                if (@import("builtin").mode == .safe) "ReleaseSafe" else "Debug", binary_arg,
-            }, .inherit, 120);
-            defer compiled.deinit();
-            try compiled.ok();
-            fixture_compiled = true;
-        }
         support.allocator.free(driver.executable);
         driver.executable = binary;
         try driver.work.write("strace",
@@ -194,11 +171,7 @@ const Driver = struct {
             \\fi
             \\exec "$@"
         ++ "\n");
-        const strace_path = try driver.work.path("strace");
-        defer support.allocator.free(strace_path);
-        const executable = try support.run(&.{ "chmod", "0700", strace_path });
-        defer executable.deinit();
-        try executable.ok();
+        try driver.work.directory.dir.setFilePermissions(support.io, "strace", .fromMode(0o700), .{});
         return driver;
     }
 
@@ -942,11 +915,9 @@ fn writeAuditRoot(f: *Driver, version: []const u8, status_architecture: []const 
 }
 
 fn auditLink(f: *Driver, target: []const u8, relative: []const u8) !void {
-    const link = try f.work.path(relative);
-    defer support.allocator.free(link);
-    const linked = try support.run(&.{ "ln", "-s", target, link });
-    defer linked.deinit();
-    try linked.ok();
+    if (std.fs.path.dirname(relative)) |parent|
+        try f.work.directory.dir.createDirPath(support.io, parent);
+    try f.work.directory.dir.symLink(support.io, target, relative, .{});
 }
 
 fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, identities: []const u8) !support.Result {
@@ -957,7 +928,25 @@ fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, identities: []cons
     defer support.allocator.free(root);
     if (std.mem.eql(u8, mode, "--audit-exec-trace"))
         return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz });
-    return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz, audit_version, identities });
+    var result = if (std.mem.eql(u8, mode, "--audit-exec-trace-lifecycle-fixture"))
+        try support.runIn(&.{
+            "zig-out/bin/debz-exec-audit", "--lifecycle",
+            trace_path,                    root,
+            f.arch,                        audit_debz,
+            audit_version,                 identities,
+        }, .{ .path = f.work.root })
+    else
+        try support.runIn(&.{
+            "zig-out/bin/debz-exec-audit",
+            trace_path,
+            root,
+            f.arch,
+            audit_debz,
+            audit_version,
+            identities,
+        }, .{ .path = f.work.root });
+    if (result.code != 0 and result.code != 90) result.code = 91;
+    return result;
 }
 
 fn auditFixture(f: *Driver, trace: []const u8) !support.Result {
@@ -1300,6 +1289,8 @@ fn expectIdentityBound(tool: []const u8, argv0: []const u8, arguments: []const u
     const bytes = auditToolBytes(tool);
     const other_tool = if (std.mem.eql(u8, tool, "dpkg")) "dpkg-divert" else "dpkg";
     const Change = enum { none, merged_sbin, digest, size, other_tool_pin, other_tool_bytes, reviewed_pins, usr_sbin, dangling_local, absolute_sbin, symlinked_tool, symlinked_bin_dir, version, status_architecture, no_root };
+    var f = try Driver.init();
+    defer f.deinit();
     for ([_]struct { change: Change, reason: ?[]const u8 }{
         .{ .change = .none, .reason = null },
         .{ .change = .merged_sbin, .reason = null },
@@ -1317,8 +1308,7 @@ fn expectIdentityBound(tool: []const u8, argv0: []const u8, arguments: []const u
         .{ .change = .status_architecture, .reason = "version" },
         .{ .change = .no_root, .reason = "unreadable" },
     }) |case| {
-        var f = try Driver.init();
-        defer f.deinit();
+        try f.work.directory.dir.deleteTree(support.io, "audit-root");
         const wrong_arch = if (std.mem.eql(u8, f.arch, "amd64")) "arm64" else "amd64";
         if (case.change != .no_root)
             try writeAuditRoot(&f, if (case.change == .version) "1.23.7ubuntu1" else audit_version, if (case.change == .status_architecture) wrong_arch else f.arch);
