@@ -569,7 +569,7 @@ The job is **not** part of the `Build and test` aggregate. The pinned
 After that date, authentication fails closed. The #262 repin also changes
 the signed identities that these bindings pin. Make the job required only
 after that repin, with refreshed pins and a green run in both modes.
-`tools/security-audit.py` (`check ci-signed-proc`) and
+`tools/security-audit.zig` (`check ci-signed-proc`) and
 `test/security-policy.zig` keep its runner, modes, timeout, staging,
 refusals and no-skip assertions fixed.
 
@@ -944,6 +944,6 @@ asserts the chroot boundary directly: unprivileged runners observe
 proves the isolation took effect. A host-root positive control runs in the same
 test, so the assertion never degrades into a skip.
 
-`tools/security-audit.py` pins the native child-process boundary
+`tools/security-audit.zig` pins the native child-process boundary
 (`linux.fork`, `linux.execve`, `linux.chroot`) to this module, so no other
 production source can spawn a child outside the audited policy.

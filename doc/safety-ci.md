@@ -341,7 +341,7 @@ changes reference configure semantics or broadens proc/alternatives authority.
 These are dispatch gates, not proof inferred from skipped ordinary PR jobs;
 genuinely protected positive replay still requires retained hosted evidence.
 Bounded evidence is always uploaded, and the tree is always removed.
-`tools/security-audit.py` and `test/security-policy.zig` keep the job opt-in,
+`tools/security-audit.zig` and `test/security-policy.zig` keep the job opt-in,
 `sudo -n`-only and unskippable; see "Hosted protected reference job" in
 [integration roots](integration-roots.md).
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
@@ -393,7 +393,7 @@ unbounded immutable exemption exists.
 - tracked build, coverage or generated binary artifacts.
 
 The required audit step runs Zig-owned policy mutations and offline snapshot
-workflow tests alongside the production Python audit utility. It does not
+workflow tests alongside the production Zig audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
 It needs no passwordless sudo. The same CI job then runs

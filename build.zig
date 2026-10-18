@@ -597,7 +597,21 @@ pub fn build(b: *std.Build) void {
     const install_native_only_candidate = b.addInstallArtifact(native_only_candidate, .{});
     b.getInstallStep().dependOn(&install_native_only_candidate.step);
     b.step("build-native-only-candidate", "Build the native-only production candidate auditor").dependOn(&install_native_only_candidate.step);
-    b.step("build-security-audit", "Build native security-audit policy helpers").dependOn(&install_native_only_candidate.step);
+    const security_audit_module = b.createModule(.{
+        .root_source_file = b.path("tools/security-audit.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .strip = !native_helper_debug_info,
+    });
+    const security_audit = b.addExecutable(.{
+        .name = "debz-security-audit",
+        .root_module = security_audit_module,
+    });
+    const install_security_audit = b.addInstallArtifact(security_audit, .{});
+    b.getInstallStep().dependOn(&install_security_audit.step);
+    const build_security_audit_step = b.step("build-security-audit", "Build native security-audit policy helpers");
+    build_security_audit_step.dependOn(&install_native_only_candidate.step);
+    build_security_audit_step.dependOn(&install_security_audit.step);
     const native_only_candidate_options = b.addOptions();
     native_only_candidate_options.addOption([]const u8, "executable", getInstallPath(b, .bin, "debz-native-only-candidate"));
     const native_only_candidate_test_module = b.createModule(.{
@@ -1205,9 +1219,11 @@ pub fn build(b: *std.Build) void {
         "security-audit",
         "Run hermeticity, dependency-policy, license, secret, and docs gates",
     );
-    const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
+    const audit = b.addRunArtifact(security_audit);
+    audit.setCwd(b.path("."));
     audit.setEnvironmentVariable("DEBZ_NATIVE_ONLY_CANDIDATE", getInstallPath(b, .bin, "debz-native-only-candidate"));
     audit.step.dependOn(&install_native_only_candidate.step);
+    audit.step.dependOn(&install_security_audit.step);
     audit_step.dependOn(&audit.step);
     audit_step.dependOn(&run_native_phase_summary_tests.step);
     audit_step.dependOn(&run_exec_audit_tests.step);
@@ -1215,7 +1231,9 @@ pub fn build(b: *std.Build) void {
         "write-digest-inventory",
         "Regenerate the digest cutover inventories",
     );
-    const write_digest_inventory = b.addSystemCommand(&.{ "python3", "tools/security-audit.py", "--write-digest-inventory" });
+    const write_digest_inventory = b.addRunArtifact(security_audit);
+    write_digest_inventory.setCwd(b.path("."));
+    write_digest_inventory.addArg("--write-digest-inventory");
     write_digest_inventory_step.dependOn(&write_digest_inventory.step);
     const security_policy_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1227,9 +1245,11 @@ pub fn build(b: *std.Build) void {
     });
     const security_policy_options = b.addOptions();
     security_policy_options.addOptionPath("native_only_candidate", native_only_candidate.getEmittedBin());
+    security_policy_options.addOptionPath("security_audit", security_audit.getEmittedBin());
     security_policy_tests.root_module.addOptions("security_policy_options", security_policy_options);
     const run_security_policy_tests = b.addRunArtifact(security_policy_tests);
     run_security_policy_tests.setCwd(b.path("."));
+    b.step("test-security-policy", "Run security-audit policy tests").dependOn(&run_security_policy_tests.step);
     audit_step.dependOn(&run_security_policy_tests.step);
     audit_step.dependOn(&run_native_only_candidate_tests.step);
     const real_snapshot_repin_module = b.createModule(.{

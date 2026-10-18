@@ -864,7 +864,7 @@ with `SHA256SUMS` and `result.txt`. It is copied out by `sudo -n tar` and
 uploaded with `if-no-files-found: error`. Cleanup always runs: it kills
 processes whose root or cwd lies under the tree, refuses to delete while a
 mount remains, and removes the tree with `rm -rf --one-file-system`.
-`tools/security-audit.py` and `test/security-policy.zig` pin the gate,
+`tools/security-audit.zig` and `test/security-policy.zig` pin the gate,
 steps, `sudo -n` use and script tokens, so the job cannot silently skip,
 continue on error or lose its protection.
 

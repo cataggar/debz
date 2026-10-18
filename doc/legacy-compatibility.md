@@ -154,7 +154,7 @@ cutover blockers remain.
 ## Opt-in production candidate (#276)
 
 Run `zig-out/bin/debz-native-only-candidate native-only-candidate` (or
-`python3 tools/security-audit.py native-only-candidate`, which delegates to the
+`zig-out/bin/debz-security-audit native-only-candidate`, which delegates to the
 compiled `debz-native-only-candidate` binary) only when rehearsing
 the **future** cutover. It must fail on this legacy-capable release. The output
 names remaining deletion/default tasks by exact source path (#280–#285), not a

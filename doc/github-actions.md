@@ -86,7 +86,7 @@ and native receipt versus unchanged-closure evidence before success outputs.
 
 The shipped defaults, checked-in bundles and documentation above remain
 legacy-capable. The opt-in `actions-native-only` security-policy check
-(`python3 tools/security-audit.py check actions-native-only <fixture.json>`)
+(`zig-out/bin/debz-security-audit check actions-native-only <fixture.json>`)
 evaluates **each** Action's metadata, TypeScript selector, checked-in bundle,
 backend-capability output and native handoff. A fixture is a JSON object with
 `"action": "download"` or `"install"` and `"overrides": {}`; missing override
@@ -111,7 +111,7 @@ In the *single* post-parity #283/#274 cutover, change together:
   from those sources (never copy one Action's bundle alone), their Action
   READMEs, this page, `doc/legacy-compatibility.md`, release examples and
   `security/legacy-cutover-policy.json` generated-contract inventory;
-- `tools/security-audit.py`'s shipped-mode Action/legacy checks and the
+- `tools/security-audit.zig`'s shipped-mode Action/legacy checks and the
   `.github/workflows/{ci,release}.yml` Action, bundle and release gates.
 
 Before claiming readiness, run both normal and candidate Action tests, both
