@@ -86,6 +86,15 @@ pub const Context = opaque {
     }
 
     pub fn validate(self: *const Context) !void {
+        return self.validateInternal(false);
+    }
+
+    /// Configuration observation only; never permission to adopt active work.
+    pub fn validateConfiguration(self: *const Context) !void {
+        return self.validateInternal(true);
+    }
+
+    fn validateInternal(self: *const Context, configuration_only: bool) !void {
         const value = self.data();
         var reopened = try root_fs.openAbsoluteRoot(value.root.root.io, value.request.root);
         defer reopened.close();
@@ -95,12 +104,28 @@ pub const Context = opaque {
             return error.ForeignActiveRoot;
         if (value.projection) |projection|
             try projection.validateRoot(value.request.root, reopened.root.dir.handle);
-        try refuseActiveWork(reopened.root);
+        if (!configuration_only) try refuseActiveWork(reopened.root);
         var loaded = try active.load(value.allocator, reopened.root, value.configuration_root, value.request.state_path, value.request.architecture);
         defer loaded.deinit();
         if (!std.mem.eql(u8, &loaded.snapshot.manifest.manifest.digest_sha256, &value.loaded.snapshot.manifest.manifest.digest_sha256) or
             !std.mem.eql(u8, loaded.pointer.value.digest_sha256, value.loaded.pointer.value.digest_sha256))
             return error.ActiveConfigurationChanged;
+    }
+
+    /// The detached repository array borrows immutable nested facts from this context.
+    pub fn borrowConfiguration(self: *const Context, allocator: std.mem.Allocator) !repository_policy.Configuration {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        errdefer arena.deinit();
+        const facts = self.snapshot().configuration;
+        return .{
+            .repositories = try arena.allocator().dupe(repository_policy.NormalizedRepository, facts.repositories),
+            .canonical_deb822 = facts.canonical_deb822,
+            .identity = facts.identity,
+            .backing_allocator = allocator,
+            .arena = arena,
+        };
     }
 };
 

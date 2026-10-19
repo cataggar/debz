@@ -105,6 +105,24 @@
   },
   "semantic_allowlist": [
     {
+      "id": "healthy-prestate-active-manifest-document-control",
+      "kind": "raw_32_byte_field",
+      "classification": "fixed_control_protocol",
+      "rationale": "The exact v5 planning envelope binds the unchanged target-config manifest document checksum. This is an active configuration document binding, never package/archive content authority; selected archive identities remain algorithm-tagged and installed observations remain SHA512.",
+      "paths": [
+        "src/exact_lock_v5.zig"
+      ]
+    },
+    {
+      "id": "healthy-prestate-versioned-active-context-controls",
+      "kind": "schema_sha256_field",
+      "classification": "fixed_control_protocol",
+      "rationale": "The exact v5 planning schema retains the established normalized configuration coordinate and immutable target-config manifest checksum. Neither field supplies installed-package archive identity, callback permission or mutation authority; the entire envelope is SHA512-bound and explicitly planning-only.",
+      "paths": [
+        "schema/exact-closure-lock-v5.json"
+      ]
+    },
+    {
       "id": "native-baseline-cache-publication-hex-controls",
       "kind": "fixed_64_hex_assumption",
       "classification": "fixed_control_and_versioned_compatibility",

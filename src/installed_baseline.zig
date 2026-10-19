@@ -76,7 +76,7 @@ pub const UnavailableDownloadPrestate = opaque {
         if (entry.device != evidence.root_device or entry.inode != evidence.root_inode or
             entry.uid != evidence.root_uid or entry.gid != evidence.root_gid or entry.mode != evidence.root_mode)
             return error.InstalledBaselineChanged;
-        const actual = try make(allocator, root.io, evidence.root_path, evidence.native_architecture, status_bytes, evidence.packages, true);
+        const actual = try make(allocator, root.io, evidence.root_path, evidence.native_architecture, status_bytes, evidence.packages, true, false);
         defer actual.deinit();
         try requireSamePrestate(actual.value, evidence);
     }
@@ -132,6 +132,7 @@ const Tree = struct {
     directories: std.ArrayList(DirectoryIdentity) = .empty,
     allow_unreadable_exclusions: bool = false,
     read_refusal: ?anyerror = null,
+    require_empty_unincorp: bool = false,
 
     fn charge(self: *Tree, bytes: usize) !void {
         self.metadata_bytes = std.math.add(usize, self.metadata_bytes, bytes) catch
@@ -193,6 +194,9 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
         defer pin.close();
         try requireOwned(root, (try pin.metadata()).entry);
         const observed = try pin.observeStableAlloc(tree.allocator, 64 * 1024 * 1024);
+        if (tree.require_empty_unincorp and std.mem.eql(u8, path, "var/lib/dpkg/triggers/Unincorp") and
+            std.mem.trim(u8, observed.bytes, " \t\r\n").len != 0)
+            return error.InstalledPrestateRecoveryRequired;
         tree.bytes = std.math.add(usize, tree.bytes, observed.bytes.len) catch
             return error.InstalledBaselineLimitExceeded;
         if (tree.bytes > 256 * 1024 * 1024) return error.InstalledBaselineLimitExceeded;
@@ -225,8 +229,8 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     _ = try pin.metadata();
 }
 
-fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root, allow_unreadable_exclusions: bool) !struct { bytes: []const u8, digest: [64]u8, directories: []const DirectoryIdentity, read_refusal: ?anyerror } {
-    var tree: Tree = .{ .allocator = allocator, .allow_unreadable_exclusions = allow_unreadable_exclusions };
+fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root, allow_unreadable_exclusions: bool, require_empty_unincorp: bool) !struct { bytes: []const u8, digest: [64]u8, directories: []const DirectoryIdentity, read_refusal: ?anyerror } {
+    var tree: Tree = .{ .allocator = allocator, .allow_unreadable_exclusions = allow_unreadable_exclusions, .require_empty_unincorp = require_empty_unincorp };
     tree.hash.update("debz installed database no-op prestate v1\x00");
     try captureTree(&tree, root, "var/lib/dpkg", 0);
     const bytes = tree.status_bytes orelse return error.InstalledBaselineStatusMissing;
@@ -241,6 +245,7 @@ fn make(
     expected_status: ?[]const u8,
     packages: []const Package,
     allow_unreadable_exclusions: bool,
+    require_empty_unincorp: bool,
 ) !*Data {
     if (packages.len == 0 or packages.len > 100_000) return error.InvalidInstalledBaseline;
     var root = try root_fs.openAbsoluteRoot(io, root_path);
@@ -250,13 +255,13 @@ fn make(
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const first = try captureIdentity(owned, root.root, allow_unreadable_exclusions);
+    const first = try captureIdentity(owned, root.root, allow_unreadable_exclusions, require_empty_unincorp);
     if (expected_status) |expected| {
         if (!std.mem.eql(u8, first.bytes, expected)) return error.InstalledBaselineChanged;
     }
     var check_arena: std.heap.ArenaAllocator = .init(allocator);
     defer check_arena.deinit();
-    const second = try captureIdentity(check_arena.allocator(), root.root, allow_unreadable_exclusions);
+    const second = try captureIdentity(check_arena.allocator(), root.root, allow_unreadable_exclusions, require_empty_unincorp);
     if (!std.mem.eql(u8, &first.digest, &second.digest)) return error.InstalledBaselineChanged;
     var database = switch (try status.parseBorrowed(owned, first.bytes, .{})) {
         .database => |value| value,
@@ -322,7 +327,18 @@ pub fn capture(
     expected_status: []const u8,
     packages: []const Package,
 ) !*Verified {
-    return @ptrCast(try make(allocator, io, root_path, architecture, expected_status, packages, false));
+    return @ptrCast(try make(allocator, io, root_path, architecture, expected_status, packages, false, false));
+}
+
+pub fn captureHealthy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    architecture: []const u8,
+    expected_status: []const u8,
+    packages: []const Package,
+) !*Verified {
+    return @ptrCast(try make(allocator, io, root_path, architecture, expected_status, packages, false, true));
 }
 
 pub fn captureDownloadPrestate(
@@ -333,7 +349,7 @@ pub fn captureDownloadPrestate(
     expected_status: []const u8,
     packages: []const Package,
 ) !DownloadPrestate {
-    const data = try make(allocator, io, root_path, architecture, expected_status, packages, true);
+    const data = try make(allocator, io, root_path, architecture, expected_status, packages, true, false);
     if (data.read_refusal != null) return .{ .unavailable = @ptrCast(data) };
     return .{ .verified = @ptrCast(data) };
 }
@@ -353,10 +369,33 @@ pub fn verify(
     expected_status: []const u8,
     evidence: Evidence,
 ) !*Verified {
+    return verifyPolicy(allocator, io, root_path, architecture, expected_status, evidence, false);
+}
+
+pub fn verifyHealthy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    architecture: []const u8,
+    expected_status: []const u8,
+    evidence: Evidence,
+) !*Verified {
+    return verifyPolicy(allocator, io, root_path, architecture, expected_status, evidence, true);
+}
+
+fn verifyPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    architecture: []const u8,
+    expected_status: []const u8,
+    evidence: Evidence,
+    require_empty_unincorp: bool,
+) !*Verified {
     if (!std.mem.eql(u8, root_path, evidence.root_path) or
         !std.mem.eql(u8, architecture, evidence.native_architecture))
         return error.InstalledBaselineRootMismatch;
-    const result: *Verified = @ptrCast(try make(allocator, io, root_path, architecture, expected_status, evidence.packages, false));
+    const result: *Verified = @ptrCast(try make(allocator, io, root_path, architecture, expected_status, evidence.packages, false, require_empty_unincorp));
     errdefer result.deinit();
     const actual = result.evidence();
     try requireSamePrestate(actual, evidence);

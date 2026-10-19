@@ -1,6 +1,9 @@
 const std = @import("std");
 const installed_baseline = @import("installed_baseline.zig");
 const exact_lock_v4 = @import("exact_lock_v4.zig");
+const exact_lock_v5 = @import("exact_lock_v5.zig");
+const healthy_installed_prestate = @import("healthy_installed_prestate.zig");
+const system_product_context = @import("system_product_context.zig");
 const content_digest = @import("content_digest.zig");
 const api = @import("product_api.zig");
 const deb_payload = @import("deb_payload.zig");
@@ -228,6 +231,8 @@ pub const Backend = struct {
     native_runtime_allocator: ?std.mem.Allocator = null,
     legacy_execution_capable: bool = true,
     root_projection: ?*const live_root.Projection = null,
+    /// Borrowed read-only context; must outlive calls. Not v1 defaults or host permission.
+    active_context: ?*const system_product_context.Context = null,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
     process_runner: ?transaction_executor.ProcessRunner = null,
@@ -453,6 +458,7 @@ pub const Backend = struct {
         };
         defer lock.deinit();
         return switch (lock) {
+            .active_install => error.UnsupportedLockSchema,
             .installed_baseline => |*owned| {
                 if (self.transaction_backend != .native) return error.InstalledBaselineExecutionUnsupported;
                 var baseline: NativeBaselineCacheGuard = .{};
@@ -515,6 +521,7 @@ pub const Backend = struct {
             else => return error.InvalidExactLock,
         };
         defer owned_lock.deinit();
+        if (owned_lock == .active_install) return error.UnsupportedLockSchema;
         if (owned_lock == .installed_baseline and kind != .native) return error.InstalledBaselineExecutionUnsupported;
         var baseline: NativeBaselineCacheGuard = .{};
         defer baseline.deinit();
@@ -1065,14 +1072,37 @@ pub const Backend = struct {
         request: api.Request,
         workflow: ?WorkflowDirective,
     ) !api.Result {
+        if (self.active_context != null and workflowMode(request.operation, workflow) != .plan_only)
+            return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: healthy active-context planning cannot grant historical execution authority");
+        if (self.active_context) |context| context.validate() catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "active-context preflight refused: {s}", .{@errorName(err)}));
+        };
+        if (workflowMode(request.operation, workflow) != .plan_only) {
+            if (request.options.lock_input_path) |path| {
+                const bytes = readFile(allocator, self.io, path, exact_lock_v5.maximum_document_bytes) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => null,
+                };
+                if (bytes) |document| {
+                    defer allocator.free(document);
+                    const is_prestate = exact_lock_v5.hasSchema(allocator, document) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => false,
+                    };
+                    if (is_prestate)
+                        return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: v5 healthy planning authority cannot be unwrapped into a historical archive execution");
+                }
+            }
+        }
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
         if (request.options.lock_input_path == null)
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v3 exact-lock input");
         if (!request.options.assume_yes or request.options.conffile == .unspecified)
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires confirmation and an explicit conffile policy");
-        if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
-            request.options.keyring_paths.len == 0)
+        if (self.active_context == null and (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
+            request.options.keyring_paths.len == 0))
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires authenticated repository configuration");
         var guard: RootOperationGuard = .{
             .backend = self,
@@ -1166,9 +1196,9 @@ pub const Backend = struct {
                 }
             }
         }
-        if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
+        if (self.active_context == null and request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "repository command requires --source or --config");
-        if (request.options.keyring_paths.len == 0)
+        if (self.active_context == null and request.options.keyring_paths.len == 0)
             return api.failure(request.operation, .usage, .configuration_required, "authenticated repository command requires --keyring");
 
         // Rank 0 of the total lock order. Every root mutation this backend can
@@ -1238,28 +1268,28 @@ pub const Backend = struct {
             .deadline_ms = request.options.deadline_ms,
             .offline = request.options.offline,
         };
-        var loaded = try self.loadRepositoryDocuments(allocator, repository_options);
-        defer loaded.deinit();
-        const normalized = try repository_policy.normalize(
-            allocator,
-            loaded.documents,
-            request.options.architecture,
-            .{},
-        );
-        var configuration = switch (normalized) {
-            .diagnostic => |diagnostic| return api.failure(
-                request.operation,
-                .usage,
-                .configuration_required,
-                diagnostic.message(),
-            ),
-            .configuration => |value| value,
+        var loaded: ?LoadedDocuments = null;
+        defer if (loaded) |*value| value.deinit();
+        var configuration = if (self.active_context) |context| active_config: {
+            if (request.options.source_paths.len != 0 or request.options.config_paths.len != 0 or
+                request.options.keyring_paths.len != 0 or request.options.status_path != null or
+                !std.mem.eql(u8, request.options.install_root, context.options().install_root) or
+                !std.mem.eql(u8, request.options.architecture, context.options().architecture))
+                return api.failure(request.operation, .usage, .invalid_request, "active configuration cannot be combined with explicit repositories, foreign roots, status overrides or architecture");
+            try context.validateConfiguration();
+            break :active_config try context.borrowConfiguration(allocator);
+        } else explicit_config: {
+            loaded = try self.loadRepositoryDocuments(allocator, repository_options);
+            break :explicit_config switch (try repository_policy.normalize(allocator, loaded.?.documents, request.options.architecture, .{})) {
+                .diagnostic => |diagnostic| return api.failure(request.operation, .usage, .configuration_required, diagnostic.message()),
+                .configuration => |value| value,
+            };
         };
         defer configuration.deinit();
         for (configuration.repositories) |repository| {
             if (repository.signed_by.len == 0)
                 return api.failure(request.operation, .usage, .configuration_required, "every repository source must declare Signed-By");
-            for (repository.signed_by) |path| if (!containsString(request.options.keyring_paths, path))
+            for (repository.signed_by) |path| if (self.active_context == null and !containsString(request.options.keyring_paths, path))
                 return api.failure(request.operation, .usage, .configuration_required, "Signed-By path was not declared with --keyring");
         }
 
@@ -1298,6 +1328,17 @@ pub const Backend = struct {
         var now = self.now_unix orelse realNow(self.io);
         const runtimes = try makeRuntimes(allocator, repository_options, &configuration, now, credentials);
         defer freeRuntimes(allocator, runtimes);
+        if (self.active_context) |context| {
+            for (configuration.repositories, runtimes) |repository, *runtime| {
+                const trust = try context.runtimeTrust(allocator, repository.id);
+                const original = runtime.authentication.in_release.keyrings.many;
+                allocator.free(original);
+                runtime.authentication = trust.authentication(now);
+                runtime.acquisition.deadlines.connect_ms = @min(runtime.acquisition.deadlines.connect_ms, repository.deadlines.connect_ms);
+                runtime.acquisition.deadlines.read_ms = @min(runtime.acquisition.deadlines.read_ms, repository.deadlines.read_ms);
+                runtime.acquisition.deadlines.overall_ms = @min(runtime.acquisition.deadlines.overall_ms, repository.deadlines.overall_ms);
+            }
+        }
         var refresh_outcome = try repository_policy.refreshAll(allocator, .{
             .configuration = &configuration,
             .runtimes = runtimes,
@@ -1352,6 +1393,10 @@ pub const Backend = struct {
 
         var installed = try self.loadInstalled(allocator, request);
         defer installed.deinit();
+        if (self.active_context != null) healthy_installed_prestate.requireHealthy(allocator, installed.source) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "healthy installed prestate refused: {s}", .{@errorName(err)}));
+        };
         const planning_records = if (workflowMode(request.operation, workflow) == .recover)
             try healthyInstalledRecords(allocator, installed.database.packages)
         else
@@ -1395,6 +1440,14 @@ pub const Backend = struct {
         else
             null;
         defer if (lock) |*value| value.deinit();
+        if (lock) |*value| if (value.* == .active_install) {
+            if (mode != .plan_only or self.active_context == null)
+                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: a v5 plan requires its authenticated active context and cannot be executed as a v3/v4 lock");
+            const context = self.active_context.?;
+            if (!std.mem.eql(u8, &value.active_install.context().configuration_sha256, &context.snapshot().configuration.identity.bytes) or
+                !std.mem.eql(u8, &value.active_install.context().manifest_sha256, &context.snapshot().manifest.digest_sha256))
+                return api.failure(request.operation, .planning, .lock_verification_failed, "healthy installed prestate active configuration does not match the retained exact lock");
+        };
         if (download_baseline.contract) |contract| {
             if (lock == null or lock.? != .installed_baseline)
                 return api.failure(request.operation, .planning, .lock_verification_failed, "native baseline download lock changed during preparation");
@@ -1404,7 +1457,15 @@ pub const Backend = struct {
                 return api.failure(request.operation, .planning, .lock_verification_failed, "native baseline download lock changed during preparation");
         }
         var baseline_proof: ?*installed_baseline.Verified = null;
-        defer if (baseline_proof) |value| value.deinit();
+        var healthy_proof: ?*healthy_installed_prestate.Verified = null;
+        defer if (healthy_proof) |value| value.deinit() else if (baseline_proof) |value| value.deinit();
+        if (lock) |*value| if (value.* == .active_install) {
+            healthy_proof = healthy_installed_prestate.verify(allocator, self.io, request.options.install_root, request.options.architecture, installed.source, value.active_install.evidence()) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "healthy installed prestate refused: {s}", .{@errorName(err)}));
+            };
+            baseline_proof = healthy_proof.?.baselineProof();
+        };
         if (lock) |*value| if (value.baselineEvidence()) |evidence| {
             if (request.options.status_path != null)
                 return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline requires the selected root's actual package database");
@@ -1506,6 +1567,7 @@ pub const Backend = struct {
                     self.io,
                     installed.source,
                     download_baseline.capture_error,
+                    self.active_context,
                 ) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1620,11 +1682,12 @@ pub const Backend = struct {
                 .architecture = request.options.architecture,
                 .status_bytes = installed.source,
                 .wait_ms = request.options.lock_wait_ms,
+                .active_context = self.active_context,
             }, if (download_baseline.contract != null) &download_baseline else null) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 error.LockTimeout, error.LockUnavailable, error.LockCanceled, error.LockLost, error.LockFailed, error.LockOrderViolation => return mapRootOperationError(request.operation, err),
                 error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
-                else => return if (output.baselineEvidence() != null)
+                else => return if (output.baselineEvidence() != null or output.* == .active_install)
                     api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused before publication: {s}", .{@errorName(err)}))
                 else
                     err,
@@ -3598,7 +3661,15 @@ pub const Backend = struct {
             bound_ids,
             archives,
         );
-        if (generated.* == .installed_baseline) {
+        if (generated.* == .active_install) {
+            defer {
+                var release = bound;
+                release.deinit();
+            }
+            const rebound = try exact_lock_v5.rebindArchives(allocator, &generated.active_install, bound.lock);
+            generated.deinit();
+            generated.* = .{ .active_install = rebound };
+        } else if (generated.* == .installed_baseline) {
             defer {
                 var release = bound;
                 release.deinit();
@@ -5524,6 +5595,7 @@ const BaselinePublication = struct {
     architecture: []const u8,
     status_bytes: []const u8,
     wait_ms: u64,
+    active_context: ?*const system_product_context.Context = null,
 };
 
 const BaselinePublicationLocks = struct {
@@ -5901,6 +5973,7 @@ const BaselinePublicationCheck = struct {
     fn hit(context: *anyopaque, point: root_fs.PublishPoint) !void {
         if (point != .before_rename) return;
         const self: *BaselinePublicationCheck = @ptrCast(@alignCast(context));
+        if (self.publication.active_context) |active| try active.validate();
         const proof = try installed_baseline.verify(self.allocator, self.io, self.publication.root_path, self.publication.architecture, self.publication.status_bytes, self.evidence);
         defer proof.deinit();
         try proof.requireOutputOutsideDatabase(self.destination);
@@ -5911,6 +5984,7 @@ const ProductLock = union(enum) {
     legacy_dpkg: exact_lock.OwnedLock,
     native: exact_lock_v3.OwnedLock,
     installed_baseline: exact_lock_v4.OwnedLock,
+    active_install: exact_lock_v5.OwnedLock,
 
     fn deinit(self: *ProductLock) void {
         switch (self.*) {
@@ -5931,12 +6005,14 @@ const ProductLock = union(enum) {
             .native => |*owned| &owned.lock,
             .legacy_dpkg => null,
             .installed_baseline => |*owned| if (owned.backend() == .native) &owned.archive_lock.lock else null,
+            .active_install => |*owned| if (owned.backend() == .native) &owned.archive_lock.lock else null,
         };
     }
 
     fn planningLockV3(self: *const ProductLock) ?*const exact_lock_v3.Lock {
         return switch (self.*) {
             .installed_baseline => |*owned| &owned.archive_lock.lock,
+            .active_install => |*owned| &owned.archive_lock.lock,
             else => self.nativeLock(),
         };
     }
@@ -5960,6 +6036,7 @@ const ProductLock = union(enum) {
     fn requestDigest(self: ProductLock) [32]u8 {
         return switch (self) {
             .installed_baseline => |owned| owned.archive_lock.lock.request_sha256,
+            .active_install => |owned| owned.archive_lock.lock.request_sha256,
             inline else => |owned| owned.lock.request_sha256,
         };
     }
@@ -5967,6 +6044,7 @@ const ProductLock = union(enum) {
     fn policyDigest(self: ProductLock) [32]u8 {
         return switch (self) {
             .installed_baseline => |owned| owned.archive_lock.lock.policy_sha256,
+            .active_install => |owned| owned.archive_lock.lock.policy_sha256,
             inline else => |owned| owned.lock.policy_sha256,
         };
     }
@@ -5992,6 +6070,51 @@ const ProductLock = union(enum) {
                 );
             },
             .native => |owned| try writeLockVersion(exact_lock_v3, allocator, io, path, owned.lock),
+            .active_install => |*owned| {
+                const bytes = try owned.canonicalJson(allocator);
+                defer allocator.free(bytes);
+                const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+                var directory = try root_fs.openAbsoluteRoot(io, parent);
+                defer directory.close();
+                const output_owner = try directory.root.rootEntry();
+                if (!output_owner.modeled or output_owner.uid != owned.evidence().observed.root_uid or
+                    output_owner.mode & 0o022 != 0)
+                    return error.UnsafeInstalledPrestateOutput;
+                var locks: BaselinePublicationLocks = .{ .allocator = allocator, .io = io };
+                defer locks.deinit();
+                try locks.acquire(publication, owned.evidence().observed);
+                const proof = try healthy_installed_prestate.verify(allocator, io, publication.root_path, publication.architecture, publication.status_bytes, owned.evidence());
+                defer proof.deinit();
+                try proof.requireOutputOutsideDatabase(directory.root);
+                if (publication.active_context) |context| try context.validate();
+                const leaf = try root_fs.Path.init(std.fs.path.basename(path));
+                if (try directory.root.entryIfExists(leaf) != null) {
+                    var pinned = try directory.root.pinRegularFile(leaf);
+                    defer pinned.close();
+                    const entry = (try pinned.metadata()).entry;
+                    if (!entry.modeled or !entry.isRegularFile() or entry.link_count != 1 or
+                        entry.uid != output_owner.uid or entry.mode & 0o022 != 0)
+                        return error.UnsafeInstalledPrestateOutput;
+                    const original = try pinned.observeStableAlloc(allocator, exact_lock_v5.maximum_document_bytes);
+                    defer allocator.free(original.bytes);
+                    if (!std.mem.eql(u8, original.bytes, bytes)) return error.InstalledPrestateOutputConflict;
+                    if (publication.active_context) |context| try context.validate();
+                    return;
+                }
+                var check: BaselinePublicationCheck = .{
+                    .allocator = allocator,
+                    .io = io,
+                    .publication = publication,
+                    .evidence = owned.evidence().observed,
+                    .destination = directory.root,
+                };
+                try directory.root.publishFile(leaf, bytes, .{
+                    .permissions = .fromMode(0o600),
+                    .durable = true,
+                    .overwrite = .fail_if_exists,
+                    .observer = .{ .context = &check, .hitFn = BaselinePublicationCheck.hit },
+                });
+            },
             .installed_baseline => |*owned| {
                 const bytes = try owned.canonicalJson(allocator);
                 defer allocator.free(bytes);
@@ -6052,6 +6175,12 @@ fn readProductLock(
 ) !ProductLock {
     const probe = try readFile(allocator, io, path, exact_lock_v4.maximum_document_bytes);
     defer allocator.free(probe);
+    if (try exact_lock_v5.hasSchema(allocator, probe)) {
+        var result = try exact_lock_v5.decode(allocator, probe);
+        errdefer result.deinit();
+        if (result.backend() != backend) return error.UnsupportedSchema;
+        return .{ .active_install = result };
+    }
     if (try exact_lock_v4.hasSchema(allocator, probe)) {
         var result = try exact_lock_v4.decode(allocator, probe);
         errdefer result.deinit();
@@ -6114,13 +6243,14 @@ fn resolveProductLock(
     io: std.Io,
     status_bytes: []const u8,
     baseline_capture_error: ?anyerror,
+    active_context: ?*const system_product_context.Context,
 ) !ProductLock {
     var baseline_packages: std.ArrayList(installed_baseline.Package) = .empty;
     defer baseline_packages.deinit(allocator);
     for (installed) |package| {
         if (!package.status.isFullyInstalled() or planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
             continue;
-        if (findRetainedOrigin(refreshed.universe.repositories, package.name.value, package.version.spelling.value, package.architecture.value) != null)
+        if (active_context == null and findRetainedOrigin(refreshed.universe.repositories, package.name.value, package.version.spelling.value, package.architecture.value) != null)
             continue;
         try baseline_packages.append(allocator, .{
             .name = package.name.value,
@@ -6129,13 +6259,30 @@ fn resolveProductLock(
             .selection = package.status.want,
         });
     }
+    if (active_context != null and baseline_packages.items.len == 0)
+        return error.InstalledPrestateRetainedFactRequired;
     if (baseline_packages.items.len != 0) {
         if (baseline_capture_error) |err| return err;
         if (request.options.status_path != null) return error.InstalledBaselineStatusOverrideUnsupported;
-        const verified = try installed_baseline.capture(allocator, io, request.options.install_root, request.options.architecture, status_bytes, baseline_packages.items);
-        defer verified.deinit();
+        const healthy_proof = if (active_context != null)
+            try healthy_installed_prestate.capture(allocator, io, request.options.install_root, request.options.architecture, status_bytes, baseline_packages.items)
+        else
+            null;
+        defer if (healthy_proof) |value| value.deinit();
+        const verified = if (healthy_proof) |value|
+            value.baselineProof()
+        else
+            try installed_baseline.capture(allocator, io, request.options.install_root, request.options.architecture, status_bytes, baseline_packages.items);
+        defer if (healthy_proof == null) verified.deinit();
         var archive_lock = try lockFromPlan(exact_lock_v3, allocator, request, refreshed, installed, plan, semantic_request_digest, solver_policy_digest, verified);
         defer archive_lock.deinit();
+        if (active_context) |context| {
+            try context.validateConfiguration();
+            return .{ .active_install = try exact_lock_v5.create(allocator, backend, .{
+                .configuration_sha256 = context.snapshot().configuration.identity.bytes,
+                .manifest_sha256 = context.snapshot().manifest.digest_sha256,
+            }, archive_lock.lock, healthy_proof.?) };
+        }
         return .{ .installed_baseline = try exact_lock_v4.create(allocator, backend, archive_lock.lock, verified) };
     }
     switch (backend) {
@@ -8995,6 +9142,239 @@ test "production native-only rehearsal refuses new legacy locks and results befo
 
 const installed_only_status =
     "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+
+fn activateHealthyPlanningFixture(allocator: std.mem.Allocator, fixture: *const ProductionWorkflowFixture) !*system_product_context.Context {
+    const target = @import("target_apt_config.zig");
+    const active = @import("active_repository_config.zig");
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer root.close();
+    try root.root.createDirectoryPath(try root_fs.Path.init("etc/apt/sources.list.d"), .fromMode(0o755));
+    try root.root.createDirectoryPath(try root_fs.Path.init("usr/share/keyrings"), .fromMode(0o755));
+    const repository = try std.fmt.allocPrint(allocator, "{s}/repo", .{std.fs.path.dirname(fixture.install_root).?});
+    const sources = try std.fmt.allocPrint(allocator, "deb [arch=amd64 signed-by=/usr/share/keyrings/vendor.gpg] file://{s} stable main\n", .{repository});
+    try root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/vendor.list"), sources, .{});
+    try root.root.publishFile(try root_fs.Path.init("usr/share/keyrings/vendor.gpg"), @embedFile("fixtures/native_baseline/keyring.gpg"), .{});
+    var files: target.ProductionFileSystem = .{ .io = std.testing.io, .root = root.root.dir, .host_root = false };
+    var snapshot = try target.snapshot(allocator, .{
+        .root_path = fixture.install_root,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer snapshot.deinit();
+    const manifest_path = "/var/lib/debz/repository/operations/" ++ @as([64]u8, @splat('1')) ++ "/apt-config-snapshot-v1.json";
+    const path = try root_fs.Path.fromAbsolute(manifest_path);
+    try root.root.createDirectoryPath(path.parent().?, .fromMode(0o700));
+    const bytes = try snapshot.manifest.manifest.canonicalJson(allocator);
+    try root.root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600), .durable = true });
+    var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+    var coordinator = try root_operation.Coordinator.open(std.testing.io, root.root, fixture.install_root, locks.interface());
+    var attempt = try coordinator.acquire(allocator, .{
+        .backend = .legacy_dpkg,
+        .operation = .{ .repository_bootstrap = .add },
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .target_architecture = "amd64",
+    });
+    defer attempt.release();
+    try active.publish(allocator, &attempt, "/var/lib/debz", manifest_path, snapshot.manifest.manifest, null);
+    try attempt.complete(allocator, .abandoned_before_mutation);
+    try attempt.clear();
+    return system_product_context.resolve(allocator, std.testing.io, .{
+        .root = fixture.install_root,
+        .architecture = "amd64",
+    });
+}
+
+test "production healthy installed prestate retains private and published packages with active trust on both backends" {
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        const status = installed_only_status ++
+            "Package: beta\nStatus: hold ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+        var fixture = try ProductionWorkflowFixture.initWithRepository(
+            allocator,
+            &directory,
+            status,
+            @embedFile("fixtures/native_baseline/InRelease"),
+            @embedFile("fixtures/native_baseline/Packages"),
+            @embedFile("fixtures/native_baseline/keyring.gpg"),
+        );
+        defer fixture.deinit();
+        try prepareBaselinePublicationLocks(&directory);
+        const context = try activateHealthyPlanningFixture(allocator, &fixture);
+        defer context.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = 1_788_796_860 };
+        var options = context.options();
+        options.lock_output_path = fixture.lock_path;
+        const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        }));
+        var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, kind);
+        defer lock.deinit();
+        try std.testing.expect(lock == .active_install);
+        const facts = lock.active_install.evidence().observed;
+        try std.testing.expectEqual(@as(usize, 2), facts.packages.len);
+        try std.testing.expectEqualStrings("beta", facts.packages[0].name);
+        try std.testing.expectEqual(dpkg_status.Want.hold, facts.packages[0].selection);
+        try std.testing.expectEqualStrings("private-baseline", facts.packages[1].name);
+        try std.testing.expectEqual(@as(usize, 1), lock.active_install.archive_lock.lock.packages.len);
+        try std.testing.expectEqualStrings("alpha", lock.active_install.archive_lock.lock.packages[0].name);
+        try std.testing.expectEqualSlices(u8, &context.snapshot().manifest.digest_sha256, &lock.active_install.context().manifest_sha256);
+        const original = try lock.active_install.canonicalJson(allocator);
+        try std.testing.expectError(error.InvalidEnumTag, exact_lock_v4.decode(allocator, original));
+        const corrupt = try allocator.dupe(u8, original);
+        const digest_start = (std.mem.indexOf(u8, corrupt, "\"digest_sha512\":\"") orelse return error.MissingLockDigest) + "\"digest_sha512\":\"".len;
+        corrupt[digest_start] = if (corrupt[digest_start] == '0') '1' else '0';
+        try std.testing.expectError(error.NonCanonicalDocument, exact_lock_v5.decode(allocator, corrupt));
+        {
+            const previous = lock.active_install.parsed.value.payload.context.configuration_sha256[0];
+            lock.active_install.parsed.value.payload.context.configuration_sha256[0] = 'G';
+            defer lock.active_install.parsed.value.payload.context.configuration_sha256[0] = previous;
+            const invalid_context = try lock.active_install.canonicalJson(allocator);
+            try std.testing.expectError(error.InvalidContextBinding, exact_lock_v5.decode(allocator, invalid_context));
+        }
+        try std.testing.expectError(error.UnsupportedSchema, readProductLock(allocator, std.testing.io, fixture.lock_path, if (kind == .native) .legacy_dpkg else .native));
+        try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, historicalPlanningFence(allocator, &lock.active_install));
+        options.lock_output_path = fixture.second_lock_path;
+        options.lock_input_path = fixture.lock_path;
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        }));
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        }));
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "single-lock.json", .data = "foreign lock bytes\n" });
+        const conflict = try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, conflict.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, conflict.diagnostics[0].message, "InstalledPrestateOutputConflict") != null);
+        const foreign_output = try directory.dir.readFileAlloc(std.testing.io, "single-lock.json", allocator, .limited(1024));
+        try std.testing.expectEqualStrings("foreign lock bytes\n", foreign_output);
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "single-lock.json", .data = original });
+        {
+            var output = try directory.dir.openFile(std.testing.io, "single-lock.json", .{ .mode = .read_write, .follow_symlinks = false });
+            defer output.close(std.testing.io);
+            try output.setPermissions(std.testing.io, .fromMode(0o666));
+        }
+        const unsafe = try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .plan_only,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, unsafe.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, unsafe.diagnostics[0].message, "UnsafeInstalledPrestateOutput") != null);
+        options.lock_output_path = null;
+        options.assume_yes = true;
+        const refused = try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .execute,
+            .selectors = &selectors,
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(!refused.changed);
+        var generic: Backend = .{ .io = std.testing.io, .transaction_backend = kind };
+        try std.testing.expectError(error.UnsupportedLockSchema, generic.packageCacheFingerprint(allocator, .{
+            .lock_input_path = fixture.lock_path,
+            .cache_root = fixture.cache_path,
+            .architecture = "amd64",
+        }, "test"));
+        try std.testing.expectError(error.UnsupportedLockSchema, generic.packageCachePrepare(allocator, .{
+            .lock_input_path = fixture.lock_path,
+            .cache_root = fixture.cache_path,
+            .architecture = "amd64",
+            .source_paths = &fixture.source_paths,
+            .keyring_paths = &fixture.keyring_paths,
+        }, "test"));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, fixture.cache_path, .{}));
+        const installed_after = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+        try std.testing.expectEqualStrings(status, installed_after);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.record_path, .{}));
+    }
+}
+
+fn historicalPlanningFence(allocator: std.mem.Allocator, lock: *const exact_lock_v5.OwnedLock) !void {
+    const verified = try installed_baseline.verify(allocator, std.testing.io, lock.evidence().observed.root_path, "amd64", installed_only_status ++
+        "Package: beta\nStatus: hold ok installed\nVersion: 1.0\nArchitecture: amd64\n\n", lock.evidence().observed);
+    defer verified.deinit();
+    var historical = try exact_lock_v4.create(allocator, lock.backend(), lock.archive_lock.lock, verified);
+    defer historical.deinit();
+    try historical.requireExecutionAuthority();
+}
+
+test "production healthy installed prestate refuses root health drift and foreign active trust without publishing" {
+    for ([_]enum { unhealthy, unincorp, all_changed, prestate_drift, source_drift, key_drift, architecture_drift, owned_work, foreign_context }{ .unhealthy, .unincorp, .all_changed, .prestate_drift, .source_drift, .key_drift, .architecture_drift, .owned_work, .foreign_context }) |scenario| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/native_baseline/InRelease"), @embedFile("fixtures/native_baseline/Packages"), @embedFile("fixtures/native_baseline/keyring.gpg"));
+        defer fixture.deinit();
+        try prepareBaselinePublicationLocks(&directory);
+        const context = try activateHealthyPlanningFixture(allocator, &fixture);
+        defer context.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .active_context = context, .now_unix = 1_788_796_860 };
+        var options = context.options();
+        const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+        if (scenario == .prestate_drift) {
+            options.lock_output_path = fixture.lock_path;
+            try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options }));
+            options.lock_input_path = fixture.lock_path;
+            options.lock_output_path = fixture.second_lock_path;
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = installed_only_status ++ "\n" });
+        } else {
+            options.lock_output_path = fixture.second_lock_path;
+            switch (scenario) {
+                .unhealthy => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = installed_only_status ++
+                    "Package: unrelated\nStatus: install ok unpacked\nVersion: 2\nArchitecture: amd64\n\n" }),
+                .all_changed => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "Package: alpha\nStatus: install ok installed\nVersion: 0.9\nArchitecture: amd64\n\n" }),
+                .unincorp => {
+                    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
+                    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/Unincorp", .data = "ldconfig libc-bin\n" });
+                },
+                .source_drift => {
+                    var changed = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+                    defer changed.close();
+                    try changed.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/vendor.list"), "# changed\n", .{});
+                },
+                .key_drift => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/usr/share/keyrings/vendor.gpg", .data = "changed keyring\n" }),
+                .architecture_drift => options.architecture = "arm64",
+                .owned_work => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ root_operation.record_path, .data = "foreign operation owner\n" }),
+                .foreign_context => options.install_root = "/",
+                .prestate_drift => unreachable,
+            }
+        }
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expect(refused.exit_status != .success);
+        try std.testing.expect(!refused.changed);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "single-lock.json", .{}));
+        if (scenario == .owned_work) {
+            const owner = try directory.dir.readFileAlloc(std.testing.io, "root/" ++ root_operation.record_path, allocator, .limited(1024));
+            try std.testing.expectEqualStrings("foreign operation owner\n", owner);
+        } else try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.record_path, .{}));
+        if (scenario == .source_drift or scenario == .key_drift or scenario == .architecture_drift or scenario == .owned_work)
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, context.options().cache_path, .{}));
+    }
+}
 
 fn nativeBaselineFixture(allocator: std.mem.Allocator, directory: *std.testing.TmpDir) !ProductionWorkflowFixture {
     var fixture = try ProductionWorkflowFixture.initWithRepository(

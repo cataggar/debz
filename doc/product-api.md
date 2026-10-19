@@ -419,6 +419,22 @@ present in successful typed v4 download evidence. Existing signed-only v3
 results remain command.v1. This does not select a default backend, authorize
 execution, or provide durable auto-lock/retry orchestration.
 
+The production backend's explicitly supplied `active_context` now supports
+healthy active-context **planning only**. It verifies the active root and
+configuration before repository work, authenticates using the captured
+target-root keyring bytes, and caps runtime acquisition deadlines to the
+snapshot's declared bounds. Caller-supplied repository lists, status overrides,
+foreign roots and mismatched architecture cannot be mixed with that context.
+The v5 planning envelope binds the immutable configuration/manifest, every
+unchanged installed or held tuple (published and private alike), and the
+whole-database SHA512 prestate separately from authenticated archive origins.
+It refuses incomplete/reinstallation-required, trigger-pending or unincorporated state and
+revalidates configuration/prestate under the owned publication exclusions.
+V5 is not a product API v1 default, package-cache contract or mutation token;
+historical execution/cache consumers refuse it before unwrapping its archives.
+The simple CLI, exact-owned retry and scoped native host execution remain
+unimplemented, rather than receiving a success-shaped fallback.
+
 Fresh v4 generation currently supports already published native archive
 identities. The opted-in `signed_sha256_derived_sha512` path refuses with
 `lock_verification_failed` / `InstalledBaselineImplicitBindingUnsupported`
