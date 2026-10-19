@@ -139,7 +139,7 @@ test "healthy_installed_prestate.test healthy capture preserves historical ident
     try std.testing.expectEqualStrings(historical.evidence().database_identity.value, healthy.evidence().observed.database_identity.value);
     const replay = try verify(allocator, std.testing.io, path, "amd64", status, healthy.evidence());
     defer replay.deinit();
-    try std.testing.checkAllAllocationFailures(allocator, captureAllocationCase, .{ path, status, &packages });
+    try std.testing.checkAllAllocationFailures(.{ .ptr = allocator.ptr, .vtable = &.{ .alloc = allocator.vtable.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = allocator.vtable.free } }, captureAllocationCase, .{ path, status, &packages });
 }
 
 fn captureAllocationCase(allocator: std.mem.Allocator, path: []const u8, status: []const u8, packages: []const baseline.Package) !void {
