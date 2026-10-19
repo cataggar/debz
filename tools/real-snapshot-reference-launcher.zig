@@ -3185,6 +3185,17 @@ test "reference single-handler trigger bindings validate options and status tran
     try std.testing.expect(triggerStatusMatches(dpkg_omitted_config_version_status, trigger_bindings[0]));
     try std.testing.expect(!triggerStatusMatches(dpkg_omitted_config_version_status, trigger_bindings[1]));
 
+    const dpkg_step2_omitted_config_version_status =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(!triggerStatusMatches(dpkg_step2_omitted_config_version_status, trigger_bindings[0]));
+    try std.testing.expect(triggerStatusMatches(dpkg_step2_omitted_config_version_status, trigger_bindings[1]));
+
     try std.testing.expect(!triggerStatusMatches(step1_status ++
         "Package: extra-pending\nVersion: 1\nArchitecture: amd64\n" ++
         "Status: install ok triggers-pending\nConfig-Version: 1\n" ++
