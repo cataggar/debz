@@ -1218,7 +1218,8 @@ symlinks, the contents of explicitly unowned runtime products
 (`etc/machine-id`, `var/cache/ldconfig/aux-cache`, `var/log/alternatives.log`),
 and the contents/sizes of the four unowned debconf cache files
 (`var/cache/debconf/config.dat`, `var/cache/debconf/config.dat-old`,
-`var/cache/debconf/templates.dat`, `var/cache/debconf/templates.dat-old`);
+`var/cache/debconf/templates.dat`, `var/cache/debconf/templates.dat-old`, with
+variable byte size allowed only on those four unowned debconf cache files);
 their presence, mode, ownership, and captured hashes remain recorded, and a
 package claim on any of those paths fails comparison. Two independent healthy
 amd64 dpkg roots compared successfully under these rules. Missing

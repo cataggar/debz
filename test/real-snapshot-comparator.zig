@@ -573,6 +573,12 @@ test "real snapshot comparison normalizes debconf cache size and status_old life
         defer right.deinit();
         try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
 
+        testFile(&left.value).getPtr("path").?.* = .{ .string = "etc/machine-id" };
+        testFile(&right.value).getPtr("path").?.* = .{ .string = "etc/machine-id" };
+        try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+
+        testFile(&left.value).getPtr("path").?.* = .{ .string = "var/cache/debconf/config.dat" };
+        testFile(&right.value).getPtr("path").?.* = .{ .string = "var/cache/debconf/config.dat" };
         right.value.object.getPtr("dpkg").?.object.getPtr("status_old").?.array.items[0]
             .object.getPtr("version").?.* = .{ .string = "2:4.0.4-9ubuntu2" };
         try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));

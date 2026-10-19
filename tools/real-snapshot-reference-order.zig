@@ -6061,6 +6061,18 @@ test "ubuntu arm64 base cycle, openssl cycle, kbd cycle, trigger handlers, and p
             .status = "install ok installed",
         });
         try std.testing.expect(!try shouldDeferFullRootConfigure(sudo_pkg, arch, 0, &defer_statuses, &defer_configured));
+
+        try defer_configured.put(.{ .name = sudo_prestate_companion.name, .architecture = arch }, {});
+        try defer_statuses.put(.{ .name = sudo_prestate_companion.name, .architecture = arch }, .{
+            .name = sudo_prestate_companion.name,
+            .architecture = arch,
+            .version = "0.0.0",
+            .status = "install ok installed",
+        });
+        try std.testing.expectError(
+            error.MissingSudoPrestateCompanion,
+            shouldDeferFullRootConfigure(sudo_pkg, arch, 0, &defer_statuses, &defer_configured),
+        );
     }
 }
 
