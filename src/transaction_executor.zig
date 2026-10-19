@@ -329,574 +329,10 @@ pub fn execute(
     request: Request,
     dependencies: Dependencies,
 ) !Report {
-    const arena_ptr = try allocator.create(std.heap.ArenaAllocator);
-    errdefer allocator.destroy(arena_ptr);
-    arena_ptr.* = .init(allocator);
-    errdefer arena_ptr.deinit();
-    const arena = arena_ptr.allocator();
-
-    var state: State = .{ .arena = arena };
-    var cancellation_context: DeadlineCancellationContext = .{
-        .base = dependencies.cancellation,
-        .deadline = dependencies.deadline,
-    };
-    const cancellation = cancellation_context.interface();
-    if (deadlineExpired(dependencies.deadline)) {
-        state.failure = deadlineFailure(arena, null, null, 0);
-        return finish(allocator, arena_ptr, &state, hashPlan(request.plan.*));
-    }
-    const plan_sha256 = hashPlan(request.plan.*);
-    state.root_identity = recovery.rootIdentity(request.install_root);
-    state.policy_sha256 = hashPolicy(request.policy);
-    state.lock_sha256 = if (request.exact_lock) |lock|
-        lock.digest_sha256
-    else if (request.exact_lock_v2) |lock|
-        lock.digest_sha256
-    else if (request.exact_lock_v3) |lock|
-        lock.digest_sha256
-    else
-        null;
-
-    preflight(arena, request, dependencies.filesystem) catch |err| {
-        state.failure = .{
-            .code = preflightCode(err),
-            .diagnostic = try arena.dupe(u8, @errorName(err)),
-        };
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-
-    const root_flag = try std.fmt.allocPrint(arena, "--root={s}", .{request.install_root});
-    const admin_path = try rootPath(arena, request.install_root, "var/lib/dpkg");
-    const admin_flag = try std.fmt.allocPrint(arena, "--admindir={s}", .{admin_path});
-    const lock_paths = [_][]const u8{
-        try rootPath(arena, request.install_root, "var/lib/debz/transaction.lock"),
-        try rootPath(arena, request.install_root, "var/lib/dpkg/lock-frontend"),
-        try rootPath(arena, request.install_root, "var/lib/dpkg/lock"),
-    };
-    var held: [lock_paths.len]?LockToken = @splat(null);
-    var bootstrap_normalized = !requiresRootBootstrap(request.plan.actions);
-    defer for (held, 0..) |token, index| {
-        if (token) |value| dependencies.locks.release(value);
-        held[index] = null;
-    };
-
-    for (lock_paths, 0..) |path, index| {
-        const wait_ms = remainingTimeout(
-            dependencies.deadline,
-            request.policy.locks.wait_ms,
-        ) catch {
-            state.failure = deadlineFailure(arena, null, null, 0);
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        held[index] = dependencies.locks.acquire(path, wait_ms) catch |err| {
-            state.failure = .{
-                .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
-                .lock_path = path,
-                .diagnostic = try arena.dupe(u8, @errorName(err)),
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-    }
-    // Dpkg must acquire its database lock itself. Probe it under the same
-    // bounded policy, then release only that lock before spawning dpkg while
-    // retaining debz's transaction lock and dpkg's frontend lock.
-    dependencies.locks.release(held[2].?);
-    held[2] = null;
-
-    const existing_bytes = dependencies.journal.load(arena, request.install_root) catch |err| {
-        state.failure = journalFailure(arena, err, .journal_io, "cannot inspect existing transaction journal");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    if (existing_bytes) |bytes| {
-        var existing = recovery.decode(arena, bytes) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_corrupt, "existing transaction journal is invalid");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        defer existing.deinit();
-        if (existing.journal.state != .complete) {
-            state.transaction_state = existing.journal.state;
-            state.failure = .{
-                .code = .invalid_recovery_transition,
-                .diagnostic = "an unfinished transaction requires explicit recover",
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-    }
-
-    const journal_commands = try buildJournalCommands(
-        arena,
-        request,
-        root_flag,
-        admin_flag,
-    );
-    var journal: recovery.Journal = .{
-        .state = .not_started,
-        .boundary = .prepared,
-        .plan_sha256 = plan_sha256,
-        .root_identity = state.root_identity,
-        .policy_sha256 = state.policy_sha256,
-        .lock_sha256 = state.lock_sha256,
-        .next_command = 0,
-        .commands = journal_commands,
-    };
-    dependencies.crash.hit(.before_initial_journal, 0) catch |err| {
-        state.failure = journalFailure(arena, err, .journal_io, "crash before initial journal");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-        state.failure = journalFailure(arena, err, .journal_io, "cannot create transaction journal");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    dependencies.crash.hit(.after_initial_journal, 0) catch |err| {
-        journal.state = .interrupted;
-        journal.failure = @errorName(err);
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .interrupted;
-        state.failure = journalFailure(arena, err, .interrupted, "interrupted after initial journal");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-
-    for (request.plan.ordered_actions, 0..) |ordered, command_index| {
-        if (!bootstrap_normalized and ordered.kind != .bootstrap_extract) {
-            dependencies.filesystem.normalizeBootstrapRoot(request.install_root) catch |err| {
-                state.failure = .{
-                    .code = .invalid_root,
-                    .phase = try toPhase(ordered.kind),
-                    .diagnostic = try arena.dupe(u8, @errorName(err)),
-                    .completed_commands = state.commands.items.len,
-                };
-                return finish(allocator, arena_ptr, &state, plan_sha256);
-            };
-            bootstrap_normalized = true;
-        }
-        if (cancellation.cancelled()) {
-            journal.state = .interrupted;
-            journal.failure = "cancelled before dpkg invocation";
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = interruption(null, null, state.commands.items.len, "cancelled before dpkg invocation");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-
-        if (!locksHeld(dependencies.locks, &held)) {
-            state.failure = .{
-                .code = .lock_lost,
-                .phase = try toPhase(ordered.kind),
-                .package = if (ordered.kind == .configure_pending) null else try arena.dupe(u8, ordered.package),
-                .diagnostic = "transaction lock ownership was lost",
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
-            state.failure = .{
-                .code = .invalid_root,
-                .phase = try toPhase(ordered.kind),
-                .package = try arena.dupe(u8, ordered.package),
-                .diagnostic = try arena.dupe(u8, @errorName(err)),
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-
-        const phase = try toPhase(ordered.kind);
-        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
-            findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
-        else
-            null;
-        var artifact_digest: ?[32]u8 = null;
-        var artifact_identity: ?content_digest.Identity = null;
-        if (artifact) |item| {
-            const action = findPlanAction(request.plan.actions, item.package, item.version, item.architecture).?;
-            const verified = validateArtifact(arena, dependencies.filesystem, item, action, request.policy.validation_limits) catch |err| {
-                state.failure = .{
-                    .code = artifactCode(err),
-                    .phase = phase,
-                    .package = try arena.dupe(u8, ordered.package),
-                    .diagnostic = try arena.dupe(u8, @errorName(err)),
-                    .completed_commands = state.commands.items.len,
-                };
-                return finish(allocator, arena_ptr, &state, plan_sha256);
-            };
-            artifact_digest = verified.identity.digests.sha256;
-            artifact_identity = verified.identity;
-        }
-
-        const argv = try buildArgv(
-            arena,
-            request.install_root,
-            root_flag,
-            admin_flag,
-            phase,
-            ordered.package,
-            ordered.architecture,
-            if (artifact) |item| item.path else null,
-            request.policy,
-        );
-        const provenance: CommandProvenance = .{
-            .phase = phase,
-            .package = try arena.dupe(u8, ordered.package),
-            .version = try arena.dupe(u8, ordered.version),
-            .architecture = try arena.dupe(u8, ordered.architecture),
-            .argv = argv,
-            .environment = &audited_environment,
-            .command_sha256 = hashInvocation(argv, &audited_environment),
-            .artifact_sha256 = artifact_digest,
-            .artifact_identity = artifact_identity,
-        };
-        journal.state = .in_progress;
-        journal.boundary = .before_command;
-        journal.next_command = command_index;
-        journal.failure = null;
-        state.transaction_state = .in_progress;
-        dependencies.crash.hit(.before_command_journal, command_index) catch |err| {
-            journal.state = .interrupted;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = journalFailure(arena, err, .interrupted, "interrupted before command journal");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_io, "cannot persist command boundary");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        const configured_before = if (phase == .configure_pending)
-            configuredPackageCount(arena, dependencies.status, request.install_root) catch null
-        else
-            null;
-        const result = dependencies.process.run(.{
-            .argv = argv,
-            .environment = &audited_environment,
-            .phase = phase,
-            .package = if (phase == .configure_pending) null else ordered.package,
-            .timeout_ms = remainingTimeout(
-                dependencies.deadline,
-                request.policy.process_timeout_ms,
-            ) catch {
-                journal.state = .interrupted;
-                journal.failure = "operation deadline expired before dpkg invocation";
-                recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-                state.transaction_state = .interrupted;
-                state.failure = deadlineFailure(
-                    arena,
-                    phase,
-                    if (phase == .configure_pending) null else ordered.package,
-                    state.commands.items.len,
-                );
-                return finish(allocator, arena_ptr, &state, plan_sha256);
-            },
-            .cancellation = cancellation,
-        }) catch |err| {
-            state.failure = .{
-                .code = if (err == error.Timeout) .process_timeout else .process_spawn,
-                .phase = phase,
-                .package = if (phase == .configure_pending) null else try arena.dupe(u8, ordered.package),
-                .diagnostic = try arena.dupe(u8, @errorName(err)),
-                .completed_commands = state.commands.items.len,
-            };
-            journal.state = if (err == error.Timeout) .interrupted else .dpkg_failed;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = journal.state;
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        if (deadlineExpired(dependencies.deadline)) {
-            journal.state = .interrupted;
-            journal.failure = "operation deadline expired during dpkg invocation";
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = deadlineFailure(
-                arena,
-                phase,
-                if (phase == .configure_pending) null else ordered.package,
-                state.commands.items.len,
-            );
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        try state.commands.append(arena, provenance);
-        const made_configuration_progress = if (!successful(result.termination) and configured_before != null)
-            if (configuredPackageCount(arena, dependencies.status, request.install_root) catch null) |after|
-                after > configured_before.?
-            else
-                false
-        else
-            false;
-        if (!successful(result.termination) and !made_configuration_progress) {
-            state.failure = try processFailure(arena, result, phase, ordered.package, request.policy.maximum_diagnostic_bytes, state.commands.items.len);
-            journal.state = if (state.failure.?.code == .interrupted) .interrupted else .dpkg_failed;
-            journal.failure = state.failure.?.diagnostic;
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = journal.state;
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        journal.boundary = .after_command;
-        journal.next_command = command_index + 1;
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_io, "cannot persist completed command");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        dependencies.crash.hit(.after_command_journal, command_index) catch |err| {
-            journal.state = .interrupted;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = journalFailure(arena, err, .interrupted, "interrupted after command journal");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        if (!locksHeld(dependencies.locks, &held)) {
-            state.failure = .{
-                .code = .lock_lost,
-                .phase = phase,
-                .package = try arena.dupe(u8, ordered.package),
-                .diagnostic = "transaction lock ownership was lost during dpkg",
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-    }
-
-    if (request.plan.ordered_actions.len != 0) {
-        if (cancellation.cancelled()) {
-            journal.state = .interrupted;
-            journal.failure = "cancelled before trigger processing";
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = interruption(.triggers, null, state.commands.items.len, "cancelled before trigger processing");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        if (!locksHeld(dependencies.locks, &held)) {
-            state.failure = .{
-                .code = .lock_lost,
-                .phase = .triggers,
-                .diagnostic = "transaction lock ownership was lost",
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        dependencies.filesystem.validateRoot(request.install_root) catch |err| {
-            state.failure = .{
-                .code = .invalid_root,
-                .phase = .triggers,
-                .diagnostic = try arena.dupe(u8, @errorName(err)),
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        const argv = try buildTriggerArgv(arena, root_flag, admin_flag, request.policy);
-        const trigger_index = request.plan.ordered_actions.len;
-        journal.state = .in_progress;
-        journal.boundary = .before_command;
-        journal.next_command = trigger_index;
-        journal.failure = null;
-        state.transaction_state = .in_progress;
-        dependencies.crash.hit(.before_command_journal, trigger_index) catch |err| {
-            journal.state = .interrupted;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = journalFailure(arena, err, .interrupted, "interrupted before trigger journal");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_io, "cannot persist trigger boundary");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        const result = dependencies.process.run(.{
-            .argv = argv,
-            .environment = &audited_environment,
-            .phase = .triggers,
-            .package = null,
-            .timeout_ms = remainingTimeout(
-                dependencies.deadline,
-                request.policy.process_timeout_ms,
-            ) catch {
-                journal.state = .interrupted;
-                journal.failure = "operation deadline expired before triggers";
-                recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-                state.transaction_state = .interrupted;
-                state.failure = deadlineFailure(
-                    arena,
-                    .triggers,
-                    null,
-                    state.commands.items.len,
-                );
-                return finish(allocator, arena_ptr, &state, plan_sha256);
-            },
-            .cancellation = cancellation,
-        }) catch |err| {
-            state.failure = .{
-                .code = if (err == error.Timeout) .process_timeout else .process_spawn,
-                .phase = .triggers,
-                .diagnostic = try arena.dupe(u8, @errorName(err)),
-                .completed_commands = state.commands.items.len,
-            };
-            journal.state = if (err == error.Timeout) .interrupted else .dpkg_failed;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = journal.state;
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        if (deadlineExpired(dependencies.deadline)) {
-            journal.state = .interrupted;
-            journal.failure = "operation deadline expired during triggers";
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = deadlineFailure(
-                arena,
-                .triggers,
-                null,
-                state.commands.items.len,
-            );
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        try state.commands.append(arena, .{
-            .phase = .triggers,
-            .package = null,
-            .version = null,
-            .architecture = null,
-            .argv = argv,
-            .environment = &audited_environment,
-            .command_sha256 = hashInvocation(argv, &audited_environment),
-            .artifact_sha256 = null,
-        });
-        if (!successful(result.termination)) {
-            state.failure = try processFailure(arena, result, .triggers, null, request.policy.maximum_diagnostic_bytes, state.commands.items.len);
-            journal.state = if (state.failure.?.code == .interrupted) .interrupted else .dpkg_failed;
-            journal.failure = state.failure.?.diagnostic;
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = journal.state;
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-        journal.boundary = .after_command;
-        journal.next_command = trigger_index + 1;
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-            state.failure = journalFailure(arena, err, .journal_io, "cannot persist completed triggers");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        dependencies.crash.hit(.after_command_journal, trigger_index) catch |err| {
-            journal.state = .interrupted;
-            journal.failure = @errorName(err);
-            recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-            state.transaction_state = .interrupted;
-            state.failure = journalFailure(arena, err, .interrupted, "interrupted after trigger journal");
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        };
-        if (!locksHeld(dependencies.locks, &held)) {
-            state.failure = .{
-                .code = .lock_lost,
-                .phase = .triggers,
-                .diagnostic = "transaction lock ownership was lost during dpkg",
-                .completed_commands = state.commands.items.len,
-            };
-            return finish(allocator, arena_ptr, &state, plan_sha256);
-        }
-    }
-
-    const verification_wait_ms = remainingTimeout(
-        dependencies.deadline,
-        request.policy.locks.wait_ms,
-    ) catch {
-        journal.state = .interrupted;
-        journal.failure = "operation deadline expired before verification lock";
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .interrupted;
-        state.failure = deadlineFailure(arena, null, null, state.commands.items.len);
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    held[2] = dependencies.locks.acquire(lock_paths[2], verification_wait_ms) catch |err| {
-        journal.state = .interrupted;
-        journal.failure = "cannot establish stable verification lock";
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .interrupted;
-        state.failure = .{
-            .code = if (err == error.LockTimeout or err == error.WouldBlock) .lock_timeout else .lock_error,
-            .lock_path = lock_paths[2],
-            .diagnostic = try arena.dupe(u8, @errorName(err)),
-            .completed_commands = state.commands.items.len,
-        };
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    dependencies.filesystem.validateRoot(request.install_root) catch |err| {
-        journal.state = .interrupted;
-        journal.failure = "install root changed before verification";
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .interrupted;
-        state.failure = .{
-            .code = .invalid_root,
-            .diagnostic = try arena.dupe(u8, @errorName(err)),
-            .completed_commands = state.commands.items.len,
-        };
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-
-    journal.boundary = .verifying;
-    dependencies.crash.hit(.before_verification_journal, journal.next_command) catch |err| {
-        journal.state = .interrupted;
-        journal.failure = @errorName(err);
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .interrupted;
-        state.failure = journalFailure(arena, err, .interrupted, "interrupted before verification");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-        state.failure = journalFailure(arena, err, .journal_io, "cannot persist verification boundary");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    const verification = verifyFinal(
-        arena,
-        request.plan.*,
-        request.exact_lock,
-        request.exact_lock_v2,
-        request.exact_lock_v3,
-        request.policy.exact_lock_verification,
-        journal,
-        request.install_root,
-        dependencies.status,
-    ) catch |err| {
-        journal.state = .verification_failed;
-        journal.failure = @errorName(err);
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .verification_failed;
-        state.failure = journalFailure(arena, err, .verification_failed, "post-state verification failed");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    if (!verification.succeeded()) {
-        journal.state = .verification_failed;
-        journal.failure = @tagName(verification.failure.?);
-        recovery.persist(arena, dependencies.journal, request.install_root, journal) catch {};
-        state.transaction_state = .verification_failed;
-        state.failure = .{
-            .code = .verification_failed,
-            .package = if (verification.package) |value| try arena.dupe(u8, value) else null,
-            .diagnostic = try arena.dupe(u8, @tagName(verification.failure.?)),
-            .completed_commands = state.commands.items.len,
-        };
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    }
-    journal.state = .complete;
-    journal.failure = null;
-    recovery.persist(arena, dependencies.journal, request.install_root, journal) catch |err| {
-        state.failure = journalFailure(arena, err, .journal_io, "cannot persist verified completion");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    dependencies.crash.hit(.after_verification_journal, journal.next_command) catch |err| {
-        state.transaction_state = .complete;
-        state.failure = journalFailure(arena, err, .journal_io, "completion persisted but archive interrupted");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    dependencies.crash.hit(.before_archive, journal.next_command) catch |err| {
-        state.transaction_state = .complete;
-        state.failure = journalFailure(arena, err, .journal_io, "completion persisted but archive interrupted");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    recovery.archive(arena, dependencies.journal, request.install_root, journal) catch |err| {
-        state.transaction_state = .complete;
-        state.failure = journalFailure(arena, err, .journal_io, "cannot archive completed journal");
-        return finish(allocator, arena_ptr, &state, plan_sha256);
-    };
-    state.transaction_state = .complete;
-    return finish(allocator, arena_ptr, &state, plan_sha256);
+    _ = allocator;
+    _ = request;
+    _ = dependencies;
+    return error.LegacyTransactionExecutionRetired;
 }
 
 pub fn recover(
@@ -1257,26 +693,6 @@ fn finishRecovery(
     };
 }
 
-fn finish(
-    allocator: std.mem.Allocator,
-    arena: *std.heap.ArenaAllocator,
-    state: *State,
-    plan_sha256: [32]u8,
-) !Report {
-    const commands = try state.commands.toOwnedSlice(state.arena);
-    return .{
-        .allocator = allocator,
-        .arena = arena,
-        .commands = commands,
-        .plan_sha256 = plan_sha256,
-        .transaction_state = state.transaction_state,
-        .root_identity = state.root_identity,
-        .policy_sha256 = state.policy_sha256,
-        .lock_sha256 = state.lock_sha256,
-        .failure = state.failure,
-    };
-}
-
 fn verifyFinal(
     allocator: std.mem.Allocator,
     plan: solver.Plan,
@@ -1333,57 +749,6 @@ fn verifyFinal(
     return recovery.verify(allocator, plan, root, status, .{});
 }
 
-fn buildJournalCommands(
-    allocator: std.mem.Allocator,
-    request: Request,
-    root_flag: []const u8,
-    admin_flag: []const u8,
-) ![]recovery.Command {
-    var commands: std.ArrayList(recovery.Command) = .empty;
-    for (request.plan.ordered_actions) |ordered| {
-        const phase = try toPhase(ordered.kind);
-        const artifact = if (phase == .bootstrap_extract or phase == .unpack)
-            findArtifact(request.artifacts, ordered.package, ordered.version, ordered.architecture).?
-        else
-            null;
-        const argv = try buildArgv(
-            allocator,
-            request.install_root,
-            root_flag,
-            admin_flag,
-            phase,
-            ordered.package,
-            ordered.architecture,
-            if (artifact) |item| item.path else null,
-            request.policy,
-        );
-        const action = findPlanAction(request.plan.actions, ordered.package, ordered.version, ordered.architecture).?;
-        try commands.append(allocator, .{
-            .phase = @tagName(phase),
-            .package = try allocator.dupe(u8, ordered.package),
-            .command_sha256 = hashInvocation(argv, &audited_environment),
-            .artifact_sha256 = if (phase == .unpack and action.archive_identity == null)
-                try parseHexDigest(action.sha256.?)
-            else
-                null,
-            .artifact_identity = if (phase == .unpack)
-                action.archive_identity
-            else
-                null,
-        });
-    }
-    if (request.plan.ordered_actions.len != 0) {
-        const argv = try buildTriggerArgv(allocator, root_flag, admin_flag, request.policy);
-        try commands.append(allocator, .{
-            .phase = "triggers",
-            .package = null,
-            .command_sha256 = hashInvocation(argv, &audited_environment),
-            .artifact_sha256 = null,
-        });
-    }
-    return commands.toOwnedSlice(allocator);
-}
-
 fn journalFailure(
     allocator: std.mem.Allocator,
     err: anyerror,
@@ -1396,7 +761,7 @@ fn journalFailure(
     };
 }
 
-fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem) !void {
+pub fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem) !void {
     try validateRootLexical(request.install_root, request.policy.risk.allow_host_root);
     if (request.plan.schema_version != 2 and
         request.plan.schema_version != 3 and
@@ -1779,74 +1144,6 @@ fn isLocalArtifactAction(action: solver.PlanAction) bool {
     };
 }
 
-fn buildArgv(
-    allocator: std.mem.Allocator,
-    install_root: []const u8,
-    root_flag: []const u8,
-    admin_flag: []const u8,
-    phase: Phase,
-    package: []const u8,
-    architecture: []const u8,
-    artifact_path: ?[]const u8,
-    policy: Policy,
-) ![]const []const u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    if (phase == .bootstrap_extract) {
-        try argv.append(allocator, "/usr/bin/dpkg-deb");
-        try argv.append(allocator, "--extract");
-        try argv.append(allocator, artifact_path.?);
-        try argv.append(allocator, install_root);
-        return argv.toOwnedSlice(allocator);
-    }
-    try argv.append(allocator, "/usr/bin/dpkg");
-    try argv.append(allocator, root_flag);
-    try argv.append(allocator, admin_flag);
-    try argv.append(allocator, "--no-pager");
-    if (phase != .configure_pending) try argv.append(allocator, "--abort-after=1");
-    try argv.append(allocator, conffileArg(policy.conffile));
-    for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
-    try argv.append(allocator, "--no-triggers");
-    switch (phase) {
-        .remove => {
-            try argv.append(allocator, "--remove");
-            try argv.append(allocator, try packageSpec(allocator, package, architecture));
-        },
-        .unpack => {
-            try argv.append(allocator, "--unpack");
-            try argv.append(allocator, artifact_path.?);
-        },
-        .configure_pending => {
-            try argv.append(allocator, "--configure");
-            try argv.append(allocator, "--pending");
-        },
-        .configure => {
-            try argv.append(allocator, "--configure");
-            try argv.append(allocator, try packageSpec(allocator, package, architecture));
-        },
-        .bootstrap_extract, .triggers, .audit => unreachable,
-    }
-    return argv.toOwnedSlice(allocator);
-}
-
-fn buildTriggerArgv(
-    allocator: std.mem.Allocator,
-    root_flag: []const u8,
-    admin_flag: []const u8,
-    policy: Policy,
-) ![]const []const u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(allocator, "/usr/bin/dpkg");
-    try argv.append(allocator, root_flag);
-    try argv.append(allocator, admin_flag);
-    try argv.append(allocator, "--no-pager");
-    try argv.append(allocator, "--abort-after=1");
-    try argv.append(allocator, conffileArg(policy.conffile));
-    for (policy.risk.force) |risk| try argv.append(allocator, forceArg(risk));
-    try argv.append(allocator, "--triggers-only");
-    try argv.append(allocator, "--pending");
-    return argv.toOwnedSlice(allocator);
-}
-
 fn buildRecoveryArgv(
     allocator: std.mem.Allocator,
     root_flag: []const u8,
@@ -1905,27 +1202,6 @@ fn processFailure(
         },
         .cancelled => interruption(phase, owned_package, completed, diagnostic),
     };
-}
-
-fn configuredPackageCount(
-    allocator: std.mem.Allocator,
-    status: recovery.StatusReader,
-    root: []const u8,
-) !usize {
-    const source = try status.read(allocator, root, 64 * 1024 * 1024);
-    defer allocator.free(source);
-    const parsed = try dpkg_status.parseOwned(allocator, source, .{});
-    var database = switch (parsed) {
-        .diagnostic => return error.InvalidDpkgStatus,
-        .database => |value| value,
-    };
-    defer database.deinit();
-    var count: usize = 0;
-    for (database.database.packages) |package|
-        if (package.status.isFullyInstalled()) {
-            count += 1;
-        };
-    return count;
 }
 
 fn interruption(phase: ?Phase, package: ?[]const u8, completed: usize, diagnostic: []const u8) Failure {
@@ -2084,21 +1360,6 @@ fn conffileArg(policy: ConffilePolicy) []const u8 {
         .keep_existing => "--force-confold",
         .use_package_version => "--force-confnew",
     };
-}
-
-fn forceArg(risk: ForceRisk) []const u8 {
-    return switch (risk) {
-        .depends => "--force-depends",
-        .depends_version => "--force-depends-version",
-        .break_replaces => "--force-breaks",
-        .overwrite => "--force-overwrite",
-        .overwrite_dir => "--force-overwrite-dir",
-        .remove_reinstreq => "--force-remove-reinstreq",
-    };
-}
-
-fn packageSpec(allocator: std.mem.Allocator, package: []const u8, architecture: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ package, architecture });
 }
 
 fn rootPath(allocator: std.mem.Allocator, root: []const u8, suffix: []const u8) ![]const u8 {
@@ -2335,8 +1596,8 @@ fn artifactCode(err: anyerror) FailureCode {
     };
 }
 
-/// Production direct process adapter. It replaces, rather than inherits, the
-/// environment and captures bounded diagnostics. No shell is involved.
+/// Production direct process adapter. Legacy dpkg/dpkg-deb command execution is
+/// retired at cutover (#281) and fails closed without spawning a child process.
 pub const SystemProcessRunner = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2352,76 +1613,8 @@ pub const SystemProcessRunner = struct {
         self.last_stderr = null;
     }
 
-    fn run(context: *anyopaque, invocation: Invocation) !ProcessResult {
-        const self: *SystemProcessRunner = @ptrCast(@alignCast(context));
-        if (self.last_stderr) |stderr| self.allocator.free(stderr);
-        self.last_stderr = null;
-        var environment = std.process.Environ.Map.init(self.allocator);
-        defer environment.deinit();
-        for (invocation.environment) |entry| try environment.put(entry.key, entry.value);
-
-        const Outcome = union(enum) {
-            result: std.process.RunError!std.process.RunResult,
-            cancelled,
-        };
-        var outcomes: [2]Outcome = undefined;
-        var select = std.Io.Select(Outcome).init(self.io, &outcomes);
-        select.async(.result, runChild, .{ self, invocation, &environment });
-        select.async(.cancelled, waitCancellation, .{ self.io, invocation.cancellation });
-        errdefer select.cancelDiscard();
-        const result = switch (try select.await()) {
-            .result => |result| result: {
-                select.cancelDiscard();
-                break :result try result;
-            },
-            .cancelled => {
-                while (select.cancel()) |outcome| switch (outcome) {
-                    .result => |result| if (result) |completed| {
-                        self.allocator.free(completed.stdout);
-                        self.allocator.free(completed.stderr);
-                    } else |_| {},
-                    .cancelled => {},
-                };
-                return .{ .termination = .cancelled };
-            },
-        };
-        const diagnostics = try std.mem.concat(self.allocator, u8, &.{ result.stdout, result.stderr });
-        self.allocator.free(result.stdout);
-        self.allocator.free(result.stderr);
-        self.last_stderr = diagnostics;
-        const termination: ProcessTermination = switch (result.term) {
-            .exited => |code| .{ .exited = code },
-            .signal => |signal| .{ .signaled = @intFromEnum(signal) },
-            .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
-            .unknown => |status| .{ .signaled = status },
-        };
-        return .{ .termination = termination, .stderr = diagnostics };
-    }
-
-    fn runChild(
-        self: *SystemProcessRunner,
-        invocation: Invocation,
-        environment: *const std.process.Environ.Map,
-    ) std.process.RunError!std.process.RunResult {
-        return std.process.run(self.allocator, self.io, .{
-            .argv = invocation.argv,
-            .environ_map = environment,
-            .stdout_limit = .limited(self.stderr_limit),
-            .stderr_limit = .limited(self.stderr_limit),
-            .timeout = .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(@min(
-                    invocation.timeout_ms,
-                    @as(u64, std.math.maxInt(i64)),
-                ))),
-                .clock = .awake,
-            } },
-        });
-    }
-
-    fn waitCancellation(io: std.Io, cancellation: Cancellation) void {
-        while (!cancellation.cancelled()) {
-            io.sleep(.fromMilliseconds(10), .awake) catch return;
-        }
+    fn run(_: *anyopaque, _: Invocation) !ProcessResult {
+        return error.LegacyTransactionExecutionRetired;
     }
 };
 
@@ -3197,6 +2390,35 @@ test "transaction_executor.test.local artifact preflight and reread require exac
     ));
 }
 
+fn seedTestJournal(
+    harness: *TestHarness,
+    request: RecoveryRequest,
+    state: recovery.State,
+    commands: []const recovery.Command,
+) !void {
+    const journal: recovery.Journal = .{
+        .state = state,
+        .boundary = if (state == .complete) .verifying else .before_command,
+        .plan_sha256 = hashPlan(request.plan.*),
+        .root_identity = recovery.rootIdentity(request.install_root),
+        .policy_sha256 = hashPolicy(request.policy),
+        .lock_sha256 = if (request.exact_lock) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v2) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v3) |lock|
+            lock.digest_sha256
+        else
+            null,
+        .next_command = commands.len,
+        .commands = commands,
+        .failure = if (state == .complete) null else "seeded test interruption",
+    };
+    const encoded = try recovery.encode(std.testing.allocator, journal);
+    defer std.testing.allocator.free(encoded);
+    try TestHarness.writeJournal(harness, request.install_root, encoded);
+}
+
 test "transaction_executor.test.plan v4 SHA512 authority verifies every digest before mutation" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
@@ -3261,34 +2483,51 @@ test "transaction_executor.test.plan v4 SHA512 authority verifies every digest b
     };
 
     var success_harness: TestHarness = .{ .bytes = bytes };
-    var success = try execute(std.testing.allocator, .{
+    try preflight(std.testing.allocator, .{
         .plan = &plan,
         .install_root = "/target",
         .artifacts = &.{artifact},
         .policy = .{ .conffile = .keep_existing },
         .exact_lock_v3 = &lock.lock,
-    }, success_harness.dependencies());
-    defer success.deinit();
-    try std.testing.expect(success.succeeded());
-    try std.testing.expect(success.commands[0].artifact_sha256 == null);
+    }, success_harness.dependencies().filesystem);
+    const verified = try validateArtifact(
+        std.testing.allocator,
+        success_harness.dependencies().filesystem,
+        artifact,
+        actions[0],
+        .{},
+    );
+    try std.testing.expect(verified.identity.digests.sha256 == null);
     try std.testing.expect(content_digest.Identity.eql(
         sha512_identity,
-        success.commands[0].artifact_identity.?,
+        verified.identity,
     ));
-
-    var replay_harness: TestHarness = .{
-        .bytes = bytes,
-        .crash_point = .after_command_journal,
-    };
-    var interrupted = try execute(std.testing.allocator, .{
+    try std.testing.expectError(error.LegacyTransactionExecutionRetired, execute(std.testing.allocator, .{
         .plan = &plan,
         .install_root = "/target",
         .artifacts = &.{artifact},
         .policy = .{ .conffile = .keep_existing },
         .exact_lock_v3 = &lock.lock,
-    }, replay_harness.dependencies());
-    defer interrupted.deinit();
-    try std.testing.expectEqual(FailureCode.interrupted, interrupted.failure.?.code);
+    }, success_harness.dependencies()));
+
+    var replay_harness: TestHarness = .{ .bytes = bytes };
+    try seedTestJournal(
+        &replay_harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+            .exact_lock_v3 = &lock.lock,
+        },
+        .interrupted,
+        &.{.{
+            .phase = "unpack",
+            .package = "demo",
+            .command_sha256 = @splat(1),
+            .artifact_sha256 = null,
+            .artifact_identity = sha512_identity,
+        }},
+    );
     var journal = try recovery.decode(
         std.testing.allocator,
         replay_harness.journal_bytes[0..replay_harness.journal_len],
@@ -3370,18 +2609,13 @@ test "transaction_executor.test.plan v4 SHA512 authority verifies every digest b
     });
     defer wrong_lock.deinit();
     var mismatch_harness: TestHarness = .{ .bytes = bytes };
-    var mismatch = try execute(std.testing.allocator, .{
+    try std.testing.expectError(error.DigestMismatch, preflight(std.testing.allocator, .{
         .plan = &wrong_plan,
         .install_root = "/target",
         .artifacts = &.{artifact},
         .policy = .{ .conffile = .keep_existing },
         .exact_lock_v3 = &wrong_lock.lock,
-    }, mismatch_harness.dependencies());
-    defer mismatch.deinit();
-    try std.testing.expectEqual(
-        FailureCode.artifact_digest_mismatch,
-        mismatch.failure.?.code,
-    );
+    }, mismatch_harness.dependencies().filesystem));
     try std.testing.expectEqual(@as(usize, 0), mismatch_harness.lock_acquires);
     try std.testing.expectEqual(@as(usize, 0), mismatch_harness.invocation_count);
 
@@ -3394,30 +2628,26 @@ test "transaction_executor.test.plan v4 SHA512 authority verifies every digest b
     var downgraded_plan = wrong_plan;
     downgraded_plan.actions = &downgraded_actions;
     var downgrade_harness: TestHarness = .{ .bytes = bytes };
-    var downgrade = try execute(std.testing.allocator, .{
+    try std.testing.expectError(error.PlanLockEvidenceMismatch, preflight(std.testing.allocator, .{
         .plan = &downgraded_plan,
         .install_root = "/target",
         .artifacts = &.{artifact},
         .policy = .{ .conffile = .keep_existing },
         .exact_lock_v3 = &wrong_lock.lock,
-    }, downgrade_harness.dependencies());
-    defer downgrade.deinit();
-    try std.testing.expect(!downgrade.succeeded());
+    }, downgrade_harness.dependencies().filesystem));
     try std.testing.expectEqual(@as(usize, 0), downgrade_harness.lock_acquires);
     try std.testing.expectEqual(@as(usize, 0), downgrade_harness.invocation_count);
 
     var mixed_plan = plan;
     mixed_plan.schema_version = 3;
     var mixed_harness: TestHarness = .{ .bytes = bytes };
-    var mixed = try execute(std.testing.allocator, .{
+    try std.testing.expectError(error.PlanLockVersionMismatch, preflight(std.testing.allocator, .{
         .plan = &mixed_plan,
         .install_root = "/target",
         .artifacts = &.{artifact},
         .policy = .{ .conffile = .keep_existing },
         .exact_lock_v3 = &lock.lock,
-    }, mixed_harness.dependencies());
-    defer mixed.deinit();
-    try std.testing.expect(!mixed.succeeded());
+    }, mixed_harness.dependencies().filesystem));
     try std.testing.expectEqual(@as(usize, 0), mixed_harness.lock_acquires);
     try std.testing.expectEqual(@as(usize, 0), mixed_harness.invocation_count);
 }
@@ -3453,381 +2683,192 @@ fn containsArg(argv: []const []const u8, expected: []const u8) bool {
     return false;
 }
 
-test "transaction_executor.test.argv environment conffile policy and no shell" {
+test "transaction_executor.test.retired legacy execution refuses install remove reinstall downgrade and bootstrap before authority" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
-    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
-    actions[0].essential = true;
-    var ordered = [_]solver.OrderedAction{
+
+    const install_action = testInstallAction(bytes, "demo");
+    var reinstall_action = testInstallAction(bytes, "demo");
+    reinstall_action.kind = .reinstall;
+    reinstall_action.prior_installed = .{
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .installed_size_kib = 4,
+    };
+    var downgrade_action = testInstallAction(bytes, "demo");
+    downgrade_action.kind = .downgrade;
+    downgrade_action.prior_installed = .{
+        .package = "demo",
+        .version = "2.0",
+        .architecture = "amd64",
+        .installed_size_kib = 4,
+    };
+    const remove_action = testRemoveAction("demo");
+
+    const Case = struct {
+        action: solver.PlanAction,
+        ordered: []const solver.OrderedAction,
+        artifacts: []const Artifact,
+    };
+    const artifact: Artifact = .{
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .path = "/cache/demo.deb",
+    };
+    const unpack_ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    const bootstrap_ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .bootstrap_extract, .package = "demo", .version = "1.0", .architecture = "amd64" },
         .{ .sequence = 1, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
         .{ .sequence = 2, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = bytes };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-
-    try std.testing.expect(report.succeeded());
-    try std.testing.expectEqual(@as(usize, 4), harness.invocation_count);
-    try std.testing.expectEqualStrings("/usr/bin/dpkg-deb", harness.invocations[0].argv[0]);
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--extract"));
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "/target"));
-    try std.testing.expectEqualStrings("/usr/bin/dpkg", harness.invocations[1].argv[0]);
-    try std.testing.expect(containsArg(harness.invocations[1].argv, "--root=/target"));
-    try std.testing.expect(containsArg(harness.invocations[1].argv, "--force-confold"));
-    try std.testing.expect(containsArg(harness.invocations[1].argv, "--no-triggers"));
-    try std.testing.expect(containsArg(harness.invocations[2].argv, "--no-triggers"));
-    try std.testing.expect(!containsArg(harness.invocations[0].argv, "sh"));
-    try std.testing.expectEqual(@as(usize, audited_environment.len), harness.invocations[0].environment.len);
-    try std.testing.expectEqualStrings("DEBIAN_FRONTEND", harness.invocations[0].environment[0].key);
-    try std.testing.expectEqual(@as(u64, 5 * 60 * 1000), harness.invocations[0].timeout_ms);
-    try std.testing.expectEqualStrings("1.0", report.commands[0].version.?);
-    try std.testing.expectEqualStrings("amd64", report.commands[0].architecture.?);
-}
-
-test "transaction_executor.test.plan order cycles and final triggers are deterministic" {
-    var actions = [_]solver.PlanAction{ testRemoveAction("old"), testRemoveAction("cycle-a"), testRemoveAction("cycle-b") };
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "old", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .remove, .package = "cycle-b", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 2, .kind = .remove, .package = "cycle-a", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "" };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .use_package_version },
-    }, harness.dependencies());
-    defer report.deinit();
-
-    try std.testing.expect(report.succeeded());
-    try std.testing.expectEqual(@as(usize, 4), harness.invocation_count);
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "old:amd64"));
-    try std.testing.expect(containsArg(harness.invocations[1].argv, "cycle-b:amd64"));
-    try std.testing.expect(containsArg(harness.invocations[2].argv, "cycle-a:amd64"));
-    try std.testing.expect(containsArg(harness.invocations[3].argv, "--triggers-only"));
-    try std.testing.expect(containsArg(harness.invocations[3].argv, "--pending"));
-    try std.testing.expect(!containsArg(harness.invocations[3].argv, "--configure"));
-    try std.testing.expect(containsArg(harness.invocations[3].argv, "--force-confnew"));
-}
-
-test "transaction_executor.test.explicit typed force policy only" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
+    const remove_ordered = [_]solver.OrderedAction{
         .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "" };
-    var default_report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer default_report.deinit();
-    try std.testing.expect(!containsArg(harness.invocations[0].argv, "--force-depends"));
 
-    harness.invocation_count = 0;
-    var forced_report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing, .risk = .{ .force = &.{.depends} } },
-    }, harness.dependencies());
-    defer forced_report.deinit();
-    try std.testing.expect(containsArg(harness.invocations[0].argv, "--force-depends"));
-}
-
-test "transaction_executor.test.lock timeout happens before mutation and identifies lock" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "", .lock_fail_at = 1 };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing, .locks = .{ .wait_ms = 17 } },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expect(!report.succeeded());
-    try std.testing.expectEqual(FailureCode.lock_timeout, report.failure.?.code);
-    try std.testing.expectEqualStrings("/target/var/lib/dpkg/lock-frontend", report.failure.?.lock_path.?);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-    try std.testing.expectEqual(@as(usize, 1), harness.lock_releases);
-}
-
-test "transaction_executor.test.digest mismatch fails before locks and is rechecked before dpkg" {
-    const bytes = try testDeb(std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
-    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = bytes, .corrupt_read = true };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.artifact_digest_mismatch, report.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 0), harness.lock_acquires);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-}
-
-test "transaction_executor.test.dpkg failure has package phase exit and never succeeds partially" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{
-        .bytes = "",
-        .fail_at = 0,
-        .fail_termination = .{ .exited = 42 },
-        .stderr = "demo postrm maintainer script returned error",
-    };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expect(!report.succeeded());
-    try std.testing.expectEqual(FailureCode.dpkg_failed, report.failure.?.code);
-    try std.testing.expectEqual(Phase.remove, report.failure.?.phase.?);
-    try std.testing.expectEqualStrings("demo", report.failure.?.package.?);
-    try std.testing.expectEqual(@as(u8, 42), report.failure.?.exit_code.?);
-    try std.testing.expectEqualStrings("demo postrm maintainer script returned error", report.failure.?.diagnostic);
-    try std.testing.expectEqual(@as(usize, 1), report.failure.?.completed_commands);
-    try std.testing.expectEqual(@as(usize, 1), report.commands.len);
-}
-
-test "transaction_executor.test.configure pending accepts only measured dpkg progress" {
-    const bytes = try testDeb(std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
-    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    const installed =
-        "Package: demo\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n";
-    var harness: TestHarness = .{
-        .bytes = bytes,
-        .fail_at = 1,
-        .fail_termination = .{ .exited = 1 },
-        .stderr = "one pending package remains dependency-blocked",
-        .status_source = "",
-        .status_source_after_first_read = installed,
-    };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expect(report.succeeded());
-    try std.testing.expectEqual(@as(usize, 3), harness.invocation_count);
-    try std.testing.expect(!containsArg(harness.invocations[1].argv, "--abort-after=1"));
-}
-
-test "transaction_executor.test.process timeout is bounded and structured" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "", .run_error = error.Timeout };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing, .process_timeout_ms = 17 },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
-    try std.testing.expectEqual(Phase.remove, report.failure.?.phase.?);
-    try std.testing.expectEqualStrings("demo", report.failure.?.package.?);
-    try std.testing.expectEqual(@as(usize, 0), report.failure.?.completed_commands);
-    try std.testing.expectEqual(@as(u64, 17), harness.invocations[0].timeout_ms);
-    try std.testing.expectEqual(@as(usize, 3), harness.lock_releases);
-}
-
-test "transaction_executor.test.absolute deadline expires between phases" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{.{
-        .sequence = 0,
-        .kind = .remove,
-        .package = "demo",
-        .version = "1.0",
-        .architecture = "amd64",
-    }};
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{
-        .bytes = "",
-        .advance_ms_per_root_validation = 10,
-    };
-    var dependencies = harness.dependencies();
-    dependencies.deadline = .{
-        .context = &harness,
-        .nowMsFn = TestHarness.nowMilliseconds,
-        .expires_at_ms = 10,
-    };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, dependencies);
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-}
-
-test "transaction_executor.test.absolute deadline cancels a running dpkg command" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{.{
-        .sequence = 0,
-        .kind = .remove,
-        .package = "demo",
-        .version = "1.0",
-        .architecture = "amd64",
-    }};
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{
-        .bytes = "",
-        .advance_ms_per_run = 21,
-    };
-    var dependencies = harness.dependencies();
-    dependencies.deadline = .{
-        .context = &harness,
-        .nowMsFn = TestHarness.nowMilliseconds,
-        .expires_at_ms = 20,
-    };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{
-            .conffile = .keep_existing,
-            .process_timeout_ms = 1_000,
-        },
-    }, dependencies);
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 1), harness.invocation_count);
-    try std.testing.expectEqual(@as(u64, 20), harness.invocations[0].timeout_ms);
-    try std.testing.expect(harness.saw_running_cancellation);
-}
-
-// The command list is provenance for *completed* commands: an entry is appended
-// only after `dpkg` returned and the deadline was re-checked. Every way the
-// first command can end without completing therefore reports zero commands
-// while `dpkg` may already have mutated the root, so a caller that resolves the
-// root-operation bridge from a command count alone would clear a root it could
-// not prove untouched. `transaction_state` is the field that separates the two:
-// it is durably `in_progress` before the first spawn and only stays
-// `not_started` when nothing was ever handed to `dpkg`. `root_operation`
-// derives its witness from exactly this pairing, so these expectations are the
-// contract that makes the conservative classification sound.
-test "transaction_executor.test.an unfinished first command reports started evidence without commands" {
-    const Case = struct {
-        name: []const u8,
-        run_error: ?anyerror = null,
-        advance_ms_per_run: u64 = 0,
-        lock_fail_at: ?usize = null,
-        deadline_ms: ?u64 = null,
-        expected_state: recovery.State,
-        expected_invocations: usize,
-    };
+    var bootstrap_action = install_action;
+    bootstrap_action.essential = true;
     const cases = [_]Case{
-        // The process ran and timed out: dpkg was started and may have mutated.
-        .{
-            .name = "first command timeout",
-            .run_error = error.Timeout,
-            .expected_state = .interrupted,
-            .expected_invocations = 1,
-        },
-        // The spawn itself failed. Whether the child reached execve is not
-        // observable here, so the durable state must not claim nothing ran.
-        .{
-            .name = "first command spawn failure",
-            .run_error = error.AccessDenied,
-            .expected_state = .dpkg_failed,
-            .expected_invocations = 1,
-        },
-        // The command completed but the operation deadline expired before its
-        // provenance was appended, so a successful dpkg reports no command.
-        .{
-            .name = "deadline expires during the first command",
-            .advance_ms_per_run = 21,
-            .deadline_ms = 20,
-            .expected_state = .interrupted,
-            .expected_invocations = 1,
-        },
-        // Pre-spawn validation: the target locks were never taken, so nothing
-        // was handed over and `not_started` is real proof.
-        .{
-            .name = "pre-spawn lock validation failure",
-            .lock_fail_at = 0,
-            .expected_state = .not_started,
-            .expected_invocations = 0,
-        },
+        .{ .action = install_action, .ordered = &unpack_ordered, .artifacts = &.{artifact} },
+        .{ .action = remove_action, .ordered = &remove_ordered, .artifacts = &.{} },
+        .{ .action = reinstall_action, .ordered = &unpack_ordered, .artifacts = &.{artifact} },
+        .{ .action = downgrade_action, .ordered = &unpack_ordered, .artifacts = &.{artifact} },
+        .{ .action = bootstrap_action, .ordered = &bootstrap_ordered, .artifacts = &.{artifact} },
     };
+
+    const root_fs = @import("root_fs.zig");
+    const root_operation = @import("root_operation.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_len = try tmp.dir.realPath(std.testing.io, &real_buffer);
+    const root_path = real_buffer[0..real_len];
+    const root = root_fs.Root.init(std.testing.io, tmp.dir);
+    var locks: root_operation.TestLockBackend = .{ .allocator = std.testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        std.testing.io,
+        root,
+        root_path,
+        locks.interface(),
+    );
+    var active_guard = try coordinator.acquire(std.testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .attempt_id = @splat(0x33),
+    });
+    defer active_guard.release();
+
     for (cases) |case| {
-        var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-        var ordered = [_]solver.OrderedAction{.{
-            .sequence = 0,
-            .kind = .remove,
-            .package = "demo",
-            .version = "1.0",
-            .architecture = "amd64",
-        }};
-        var plan = testPlan(&actions, &ordered);
-        var harness: TestHarness = .{
-            .bytes = "",
-            .run_error = case.run_error,
-            .advance_ms_per_run = case.advance_ms_per_run,
-            .lock_fail_at = case.lock_fail_at,
-        };
-        var dependencies = harness.dependencies();
-        if (case.deadline_ms) |expires| dependencies.deadline = .{
-            .context = &harness,
-            .nowMsFn = TestHarness.nowMilliseconds,
-            .expires_at_ms = expires,
-        };
-        var report = try execute(std.testing.allocator, .{
-            .plan = &plan,
+        var actions = [_]solver.PlanAction{case.action};
+        var ordered_buf: [3]solver.OrderedAction = undefined;
+        @memcpy(ordered_buf[0..case.ordered.len], case.ordered);
+        var plan = testPlan(&actions, ordered_buf[0..case.ordered.len]);
+        var harness: TestHarness = .{ .bytes = bytes };
+        try std.testing.expectError(
+            error.LegacyTransactionExecutionRetired,
+            execute(std.testing.allocator, .{
+                .plan = &plan,
+                .install_root = root_path,
+                .artifacts = case.artifacts,
+                .policy = .{ .conffile = .keep_existing },
+            }, harness.dependencies()),
+        );
+        try std.testing.expectEqual(@as(usize, 0), harness.root_validate_count);
+        try std.testing.expectEqual(@as(usize, 0), harness.lock_acquires);
+        try std.testing.expectEqual(@as(usize, 0), harness.journal_writes);
+        try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
+        var second = try root_operation.Coordinator.open(
+            std.testing.io,
+            root,
+            root_path,
+            locks.interface(),
+        );
+        try std.testing.expectError(
+            error.LockTimeout,
+            second.acquire(std.testing.allocator, .{
+                .backend = .native,
+                .operation = .{ .package_transaction = .install },
+                .request_sha256 = @splat(0x44),
+                .policy_sha256 = @splat(0x55),
+                .target_architecture = "amd64",
+                .attempt_id = @splat(0x66),
+            }),
+        );
+    }
+}
+
+test "transaction_executor.test.preflight rejects digest mismatch host root symlink root malformed order and duplicate final versions" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var install_actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    var unpack_ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var install_plan = testPlan(&install_actions, &unpack_ordered);
+    var corrupt_harness: TestHarness = .{ .bytes = bytes, .corrupt_read = true };
+    try std.testing.expectError(
+        error.DigestMismatch,
+        preflight(std.testing.allocator, .{
+            .plan = &install_plan,
+            .install_root = "/target",
+            .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
+            .policy = .{ .conffile = .keep_existing },
+        }, corrupt_harness.dependencies().filesystem),
+    );
+
+    var remove_actions = [_]solver.PlanAction{testRemoveAction("demo")};
+    var remove_ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var remove_plan = testPlan(&remove_actions, &remove_ordered);
+    var harness: TestHarness = .{ .bytes = "" };
+    try std.testing.expectError(
+        error.HostRootDenied,
+        preflight(std.testing.allocator, .{
+            .plan = &remove_plan,
+            .install_root = "/",
+            .artifacts = &.{},
+            .policy = .{ .conffile = .keep_existing },
+        }, harness.dependencies().filesystem),
+    );
+
+    harness.root_valid = false;
+    try std.testing.expectError(
+        error.UnsafeInstallRoot,
+        preflight(std.testing.allocator, .{
+            .plan = &remove_plan,
             .install_root = "/target",
             .artifacts = &.{},
-            .policy = .{ .conffile = .keep_existing, .process_timeout_ms = 1_000 },
-        }, dependencies);
-        defer report.deinit();
-        errdefer std.debug.print("case: {s}\n", .{case.name});
-        try std.testing.expect(!report.succeeded());
-        // Every case looks identical through a command count.
-        try std.testing.expectEqual(@as(usize, 0), report.commands.len);
-        try std.testing.expectEqual(case.expected_state, report.transaction_state);
-        try std.testing.expectEqual(case.expected_invocations, harness.invocation_count);
-    }
+            .policy = .{ .conffile = .keep_existing },
+        }, harness.dependencies().filesystem),
+    );
+
+    var duplicate_actions = [_]solver.PlanAction{ testRemoveAction("demo"), testRemoveAction("demo") };
+    duplicate_actions[1].version = "2.0";
+    var duplicate_ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .remove, .package = "demo", .version = "2.0", .architecture = "amd64" },
+    };
+    var duplicate_plan = testPlan(&duplicate_actions, &duplicate_ordered);
+    harness.root_valid = true;
+    try std.testing.expectError(
+        error.DuplicatePlanAction,
+        preflight(std.testing.allocator, .{
+            .plan = &duplicate_plan,
+            .install_root = "/target",
+            .artifacts = &.{},
+            .policy = .{ .conffile = .keep_existing },
+        }, harness.dependencies().filesystem),
+    );
 }
 
 // A recovery that decoded a journal has durable evidence that an earlier
@@ -3856,17 +2897,17 @@ test "transaction_executor.test.recovery reports journal evidence before its fir
     try std.testing.expectEqual(@as(usize, 0), missing_report.commands.len);
     try std.testing.expectEqual(recovery.State.not_started, missing_report.state);
 
-    var interrupted: TestHarness = .{ .bytes = "", .run_error = error.Timeout };
-    var first = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, interrupted.dependencies());
-    first.deinit();
-    // The interrupted journal survives, so recovery's own first command failing
-    // still reports the durable evidence rather than an untouched root.
-    interrupted.run_error = error.AccessDenied;
+    var interrupted: TestHarness = .{ .bytes = "", .run_error = error.AccessDenied };
+    try seedTestJournal(
+        &interrupted,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+        },
+        .interrupted,
+        &.{},
+    );
     var recovered = try recover(std.testing.allocator, .{
         .plan = &plan,
         .install_root = "/target",
@@ -3878,136 +2919,6 @@ test "transaction_executor.test.recovery reports journal evidence before its fir
     try std.testing.expect(recovered.state != .not_started);
 }
 
-test "transaction_executor.test.provenance is stable redacted and interruption is recovery ready" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var first: TestHarness = .{ .bytes = "" };
-    var first_report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, first.dependencies());
-    defer first_report.deinit();
-    var second: TestHarness = .{ .bytes = "" };
-    var second_report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, second.dependencies());
-    defer second_report.deinit();
-    try std.testing.expectEqualSlices(u8, &first_report.plan_sha256, &second_report.plan_sha256);
-    try std.testing.expectEqualSlices(u8, &first_report.commands[0].command_sha256, &second_report.commands[0].command_sha256);
-
-    var interrupted_harness: TestHarness = .{ .bytes = "", .cancelled_value = true };
-    var interrupted = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, interrupted_harness.dependencies());
-    defer interrupted.deinit();
-    try std.testing.expectEqual(FailureCode.interrupted, interrupted.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 0), interrupted.failure.?.completed_commands);
-    try std.testing.expectEqual(@as(usize, 0), interrupted_harness.invocation_count);
-}
-
-test "transaction_executor.test.host root symlink root malformed order and lock loss are refused" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "" };
-    var host = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer host.deinit();
-    try std.testing.expectEqual(FailureCode.invalid_root, host.failure.?.code);
-
-    harness.root_valid = false;
-    var symlink = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer symlink.deinit();
-    try std.testing.expectEqual(FailureCode.invalid_root, symlink.failure.?.code);
-
-    harness.root_valid = true;
-    harness.lock_held = false;
-    var lost = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer lost.deinit();
-    try std.testing.expectEqual(FailureCode.lock_lost, lost.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-}
-
-test "transaction_executor.test.install root is revalidated after locking before mutation" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "", .root_fail_after = 1 };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.invalid_root, report.failure.?.code);
-    try std.testing.expectEqual(Phase.remove, report.failure.?.phase.?);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-    try std.testing.expectEqual(@as(usize, 3), harness.lock_releases);
-}
-
-test "transaction_executor.test.each durable boundary leaves explicit non-success state" {
-    const points = [_]recovery.CrashPoint{
-        .before_initial_journal,
-        .after_initial_journal,
-        .before_command_journal,
-        .after_command_journal,
-        .before_verification_journal,
-        .after_verification_journal,
-        .before_archive,
-    };
-    for (points) |point| {
-        var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-        var ordered = [_]solver.OrderedAction{
-            .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        };
-        var plan = testPlan(&actions, &ordered);
-        var harness: TestHarness = .{
-            .bytes = "",
-            .crash_point = point,
-            .crash_index = if (point == .after_command_journal) 0 else if (point == .before_command_journal) 0 else if (point == .before_initial_journal or point == .after_initial_journal) 0 else 2,
-        };
-        var report = try execute(std.testing.allocator, .{
-            .plan = &plan,
-            .install_root = "/target",
-            .artifacts = &.{},
-            .policy = .{ .conffile = .keep_existing },
-        }, harness.dependencies());
-        defer report.deinit();
-        try std.testing.expect(!report.succeeded());
-        if (point != .before_initial_journal) try std.testing.expect(harness.journal_len != 0);
-    }
-}
-
 test "transaction_executor.test.explicit recovery audits repairs verifies archives and repeats idempotently" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{
@@ -4016,20 +2927,19 @@ test "transaction_executor.test.explicit recovery audits repairs verifies archiv
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{
         .bytes = "",
-        .fail_at = 0,
-        .fail_termination = .{ .signaled = 15 },
         .status_source = "",
     };
-    var interrupted = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer interrupted.deinit();
-    try std.testing.expectEqual(recovery.State.interrupted, interrupted.transaction_state);
+    try seedTestJournal(
+        &harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+        },
+        .interrupted,
+        &.{},
+    );
 
-    harness.fail_at = null;
     const before = harness.invocation_count;
     var repaired = try recover(std.testing.allocator, .{
         .plan = &plan,
@@ -4068,27 +2978,23 @@ test "transaction_executor.test.absolute deadline cancels a running recovery com
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{
         .bytes = "",
-        .fail_at = 0,
-        .fail_termination = .{ .signaled = 15 },
         .status_source = "",
+        .advance_ms_per_run = 21,
     };
-    var interrupted = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{
-            .conffile = .keep_existing,
-            .process_timeout_ms = 1_000,
+    const policy: Policy = .{
+        .conffile = .keep_existing,
+        .process_timeout_ms = 1_000,
+    };
+    try seedTestJournal(
+        &harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = policy,
         },
-    }, harness.dependencies());
-    defer interrupted.deinit();
-    try std.testing.expectEqual(recovery.State.interrupted, interrupted.transaction_state);
-
-    harness.fail_at = null;
-    harness.invocation_count = 0;
-    harness.now_ms = 0;
-    harness.advance_ms_per_run = 21;
-    harness.saw_running_cancellation = false;
+        .interrupted,
+        &.{},
+    );
     var dependencies = harness.dependencies();
     dependencies.deadline = .{
         .context = &harness,
@@ -4098,10 +3004,7 @@ test "transaction_executor.test.absolute deadline cancels a running recovery com
     var report = try recover(std.testing.allocator, .{
         .plan = &plan,
         .install_root = "/target",
-        .policy = .{
-            .conffile = .keep_existing,
-            .process_timeout_ms = 1_000,
-        },
+        .policy = policy,
     }, dependencies);
     defer report.deinit();
     try std.testing.expectEqual(FailureCode.process_timeout, report.failure.?.code);
@@ -4116,16 +3019,18 @@ test "transaction_executor.test.recovery rejects corrupt wrong-root lock content
         .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
     };
     var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "", .cancelled_value = true, .status_source = "" };
-    var interrupted = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    interrupted.deinit();
+    var harness: TestHarness = .{ .bytes = "", .status_source = "" };
+    try seedTestJournal(
+        &harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+        },
+        .interrupted,
+        &.{},
+    );
 
-    harness.cancelled_value = false;
     harness.journal_bytes[10] ^= 1;
     var corrupt = try recover(std.testing.allocator, .{
         .plan = &plan,
@@ -4169,63 +3074,6 @@ test "transaction_executor.test.recovery rejects corrupt wrong-root lock content
     try std.testing.expect(!failed.succeeded());
 }
 
-test "transaction_executor.test.unfinished journal blocks normal retry and binds package digest" {
-    const bytes = try testDeb(std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
-    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = bytes, .cancelled_value = true };
-    var first = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer first.deinit();
-    var decoded = try recovery.decode(std.testing.allocator, harness.journal_bytes[0..harness.journal_len]);
-    defer decoded.deinit();
-    try std.testing.expect(
-        decoded.journal.commands[0].artifact_identity.?.digests.sha256 != null,
-    );
-    try std.testing.expectEqual(recovery.State.interrupted, decoded.journal.state);
-
-    harness.cancelled_value = false;
-    const before = harness.invocation_count;
-    var retry = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{.{ .package = "demo", .version = "1.0", .architecture = "amd64", .path = "/cache/demo.deb" }},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer retry.deinit();
-    try std.testing.expectEqual(FailureCode.invalid_recovery_transition, retry.failure.?.code);
-    try std.testing.expectEqual(before, harness.invocation_count);
-}
-
-test "transaction_executor.test.verification reacquires dpkg lock and never queries an unstable state" {
-    var actions = [_]solver.PlanAction{testRemoveAction("demo")};
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "", .lock_fail_at = 3, .status_source = "" };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.lock_timeout, report.failure.?.code);
-    try std.testing.expectEqual(recovery.State.interrupted, report.transaction_state);
-    try std.testing.expectEqual(@as(usize, 2), harness.invocation_count);
-    try std.testing.expectEqual(@as(usize, 0), harness.status_reads);
-}
-
 test "transaction_executor.test.recovery verification reacquires dpkg lock" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{
@@ -4234,19 +3082,19 @@ test "transaction_executor.test.recovery verification reacquires dpkg lock" {
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{
         .bytes = "",
-        .fail_at = 0,
-        .fail_termination = .{ .signaled = 15 },
         .status_source = "",
     };
-    var interrupted = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    interrupted.deinit();
+    try seedTestJournal(
+        &harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+        },
+        .interrupted,
+        &.{},
+    );
 
-    harness.fail_at = null;
     harness.lock_acquires = 0;
     harness.lock_fail_at = 3;
     var report = try recover(std.testing.allocator, .{
@@ -4260,27 +3108,6 @@ test "transaction_executor.test.recovery verification reacquires dpkg lock" {
     try std.testing.expectEqual(@as(usize, 0), harness.status_reads);
 }
 
-test "transaction_executor.test.plan rejects multiple final versions for one package architecture" {
-    var actions = [_]solver.PlanAction{ testRemoveAction("demo"), testRemoveAction("demo") };
-    actions[1].version = "2.0";
-    var ordered = [_]solver.OrderedAction{
-        .{ .sequence = 0, .kind = .remove, .package = "demo", .version = "1.0", .architecture = "amd64" },
-        .{ .sequence = 1, .kind = .remove, .package = "demo", .version = "2.0", .architecture = "amd64" },
-    };
-    var plan = testPlan(&actions, &ordered);
-    var harness: TestHarness = .{ .bytes = "" };
-    var report = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expectEqual(FailureCode.invalid_plan, report.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 0), harness.lock_acquires);
-    try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
-}
-
 test "transaction_executor.test.completed recovery retains unhealthy-state evidence" {
     var actions = [_]solver.PlanAction{testRemoveAction("demo")};
     var ordered = [_]solver.OrderedAction{
@@ -4288,13 +3115,16 @@ test "transaction_executor.test.completed recovery retains unhealthy-state evide
     };
     var plan = testPlan(&actions, &ordered);
     var harness: TestHarness = .{ .bytes = "", .status_source = "" };
-    var completed = try execute(std.testing.allocator, .{
-        .plan = &plan,
-        .install_root = "/target",
-        .artifacts = &.{},
-        .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    completed.deinit();
+    try seedTestJournal(
+        &harness,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .policy = .{ .conffile = .keep_existing },
+        },
+        .complete,
+        &.{},
+    );
     harness.status_source =
         \\Package: broken
         \\Version: 1
@@ -4735,34 +3565,24 @@ test "transaction_executor.test.system lock acquisition failure releases kernel 
     next_locks.release(token);
 }
 
-test "transaction_executor.test.production process adapter observes cancellation and reaps child" {
-    var harness: TestHarness = .{ .bytes = "", .cancelled_value = true };
+test "transaction_executor.test.production process adapter refuses legacy child execution" {
     var process: SystemProcessRunner = .{
         .allocator = std.testing.allocator,
         .io = std.testing.io,
     };
     defer process.deinit();
-    const result = try process.interface().run(.{
-        .argv = &.{ "/usr/bin/sleep", "30" },
+    try std.testing.expectError(error.LegacyTransactionExecutionRetired, process.interface().run(.{
+        .argv = &.{ "/usr/bin/dpkg", "--version" },
         .environment = &audited_environment,
         .phase = .configure,
         .package = "demo",
-        .timeout_ms = 10_000,
-        .cancellation = harness.dependencies().cancellation,
-    });
-    try std.testing.expectEqual(ProcessTermination.cancelled, result.termination);
-}
-
-test "transaction_executor.test.production process adapter enforces timeout and reaps child" {
-    var process: SystemProcessRunner = .{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-    };
-    defer process.deinit();
-    try std.testing.expectError(error.Timeout, process.interface().run(.{
-        .argv = &.{ "/usr/bin/sleep", "30" },
+        .timeout_ms = 10,
+        .cancellation = Cancellation.never(),
+    }));
+    try std.testing.expectError(error.LegacyTransactionExecutionRetired, process.interface().run(.{
+        .argv = &.{ "/usr/bin/dpkg-deb", "--version" },
         .environment = &audited_environment,
-        .phase = .configure,
+        .phase = .bootstrap_extract,
         .package = "demo",
         .timeout_ms = 10,
         .cancellation = Cancellation.never(),
@@ -4987,14 +3807,11 @@ test "transaction_executor.test.legacy execution rejects native purge actions" {
     ));
     try std.testing.expectError(error.UnsupportedPurgeAction, toPhase(.purge));
 
-    var report = try execute(std.testing.allocator, .{
+    try std.testing.expectError(error.LegacyTransactionExecutionRetired, execute(std.testing.allocator, .{
         .plan = &plan,
         .install_root = "/target",
         .artifacts = &.{},
         .policy = .{ .conffile = .keep_existing },
-    }, harness.dependencies());
-    defer report.deinit();
-    try std.testing.expect(!report.succeeded());
-    try std.testing.expectEqual(FailureCode.invalid_plan, report.failure.?.code);
+    }, harness.dependencies()));
     try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
 }

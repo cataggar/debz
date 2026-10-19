@@ -3598,9 +3598,8 @@ pub fn auditProductionSources(ctx: *AuditContext) !void {
             return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
-    if (process_paths.items.len != 2 or
-        !std.mem.eql(u8, process_paths.items[0], "src/target_apt_config.zig") or
-        !std.mem.eql(u8, process_paths.items[1], "src/transaction_executor.zig"))
+    if (process_paths.items.len != 1 or
+        !std.mem.eql(u8, process_paths.items[0], "src/target_apt_config.zig"))
     {
         try ctx.fail("production process boundary changed");
     }

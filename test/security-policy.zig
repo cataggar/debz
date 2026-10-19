@@ -358,7 +358,7 @@ test "security: native-only production candidate refuses shipped routes and exac
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
         "build.zig: candidate cutover task: change CLI shipped native-only mode",
-        "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
+        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
         "src/transaction_executor.zig: active legacy journal recovery still launches dpkg",
         "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode",
         "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default",
@@ -370,6 +370,9 @@ test "security: native-only production candidate refuses shipped routes and exac
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |message| try baseline.failsWith(message);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: candidate cutover task: remove legacy dpkg/dpkg-deb executor (#281)") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.zig:") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "test/native_differential_cli.zig:") == null);
 
@@ -381,7 +384,7 @@ test "security: native-only production candidate refuses shipped routes and exac
         .{ .path = "actions/install/src/inputs.ts", .from = "|| 'legacy_dpkg';", .to = "|| 'native';", .message = "install inputs.ts: candidate must refuse legacy before reading lock" },
         .{ .path = "actions/download/dist/index.js", .from = "legacy-dpkg-execution-deprecated-v1", .to = "forged-legacy-capability", .message = "actions/download/dist/index.js: stale reviewed inventory fingerprint" },
         .{ .path = "src/transaction_recovery.zig", .from = "pub fn persist(allocator:", .to = "pub fn persistLegacy(allocator:", .message = "src/transaction_recovery.zig: stale reviewed inventory fingerprint" },
-        .{ .path = "src/transaction_executor.zig", .from = ".argv = invocation.argv,", .to = ".argv = &.{ \"/usr/bin/dpkg\" },", .message = "src/transaction_executor.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "src/transaction_executor.zig", .from = "return error.LegacyTransactionExecutionRetired;", .to = "return error.LegacyTransactionExecutionRetired; // stale", .message = "src/transaction_executor.zig: stale reviewed inventory fingerprint" },
         .{ .path = "src/live_root.zig", .from = "const forked = linux.fork();", .to = "const other = linux.syscall5(.execveat, fd, path, argv, envp, flags);\n        const forked = linux.fork();", .message = "src/live_root.zig: unreviewed/stale child-process allowance" },
         .{ .path = "src/package_family_backend.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\nfn unreviewedLaunch() void { _ = std.process.run(allocator, io, args); }", .message = "src/package_family_backend.zig: unreviewed production child-process launch" },
         .{ .path = "test/native_differential_cli.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\n// changed oracle", .message = "test/native_differential_cli.zig: stale reviewed inventory fingerprint" },

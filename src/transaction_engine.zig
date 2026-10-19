@@ -16,6 +16,7 @@ pub const Kind = enum {
 
 pub const SelectionError = error{
     BackendUnavailable,
+    LegacyTransactionExecutionRetired,
 };
 
 /// Native execution requires an explicit native transaction authorization.
@@ -99,15 +100,18 @@ fn recoverLegacy(
 }
 
 /// Native preparation returns a typed authorization and program, not a
-/// command-shaped executor. Selection remains unavailable before acquisition
-/// or mutation until typed product/CLI lock and result contracts are wired.
+/// command-shaped executor. Legacy dpkg execution is retired at cutover (#281)
+/// and fails closed before any root or journal authority is created.
 pub fn select(
     kind: Kind,
     legacy_dpkg: Executor,
     native: ?Executor,
 ) SelectionError!Executor {
     return switch (kind) {
-        .legacy_dpkg => legacy_dpkg,
+        .legacy_dpkg => {
+            _ = legacy_dpkg;
+            return error.LegacyTransactionExecutionRetired;
+        },
         .native => {
             _ = native;
             return error.BackendUnavailable;
@@ -655,9 +659,14 @@ test "transaction_engine.test.selection is explicit and never falls back" {
     var legacy: SelectionHarness = .{};
     var native: SelectionHarness = .{};
 
-    const selected_legacy = try select(.legacy_dpkg, legacy.executor(), null);
-    try std.testing.expectEqual(legacy.executor().context, selected_legacy.context);
-
+    try std.testing.expectError(
+        error.LegacyTransactionExecutionRetired,
+        select(.legacy_dpkg, legacy.executor(), null),
+    );
+    try std.testing.expectError(
+        error.LegacyTransactionExecutionRetired,
+        select(.legacy_dpkg, legacy.executor(), native.executor()),
+    );
     try std.testing.expectError(
         error.BackendUnavailable,
         select(.native, legacy.executor(), null),
@@ -1498,3 +1507,149 @@ test "transaction_engine.test.an unauthorized program never reaches the executor
     try std.testing.expectEqual(@as(usize, 0), legacy.recover_calls);
     try std.testing.expectEqual(@as(usize, 0), native.recover_calls);
 }
+
+test "transaction_engine.test.retired legacy execution refuses install remove reinstall downgrade and preserves active root guard" {
+    const root_fs = @import("root_fs.zig");
+    const root_operation = @import("root_operation.zig");
+    const fixture = try AuthorizationFixture.init(std.testing.allocator);
+    defer fixture.deinit(std.testing.allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_len = try tmp.dir.realPath(std.testing.io, &real_buf);
+    const root_path = try std.testing.allocator.dupe(u8, real_buf[0..real_len]);
+    defer std.testing.allocator.free(root_path);
+
+    const root = root_fs.Root.init(std.testing.io, tmp.dir);
+    var locks: root_operation.TestLockBackend = .{ .allocator = std.testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        std.testing.io,
+        root,
+        root_path,
+        locks.interface(),
+    );
+    var active = try coordinator.acquire(std.testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .attempt_id = @splat(0x33),
+    });
+    defer active.release();
+
+    const record_rel = try root_fs.Path.init(root_operation.record_path);
+    const before_record = try root.readFileAlloc(std.testing.allocator, record_rel, 64 * 1024);
+    defer std.testing.allocator.free(before_record);
+
+    const OperationCase = struct {
+        kind: solver.ActionKind,
+        prior_version: ?[]const u8,
+        ordered_kind: solver.OrderedActionKind,
+    };
+    const cases = [_]OperationCase{
+        .{ .kind = .install, .prior_version = null, .ordered_kind = .unpack },
+        .{ .kind = .remove, .prior_version = "1.2", .ordered_kind = .remove },
+        .{ .kind = .reinstall, .prior_version = "1.2", .ordered_kind = .unpack },
+        .{ .kind = .downgrade, .prior_version = "2.0", .ordered_kind = .unpack },
+    };
+
+    var legacy: SelectionHarness = .{};
+    var native: SelectionHarness = .{};
+    const dependencies: transaction_executor.Dependencies = undefined;
+
+    for (cases) |case| {
+        var action = fixture.actions[0];
+        action.kind = case.kind;
+        action.prior_installed = if (case.prior_version) |ver| .{
+            .package = action.package,
+            .version = ver,
+            .architecture = action.architecture,
+            .installed_size_kib = null,
+        } else null;
+        if (case.kind == .remove) {
+            action.repository = null;
+            action.sha256 = null;
+            action.package_size = null;
+            action.origin = null;
+        }
+        var actions = [_]solver.PlanAction{action};
+        var ordered = [_]solver.OrderedAction{.{
+            .sequence = 0,
+            .kind = case.ordered_kind,
+            .package = action.package,
+            .version = action.version,
+            .architecture = action.architecture,
+        }};
+        var plan = fixture.plan;
+        plan.actions = &actions;
+        plan.ordered_actions = &ordered;
+        var request = fixture.request();
+        request.plan = &plan;
+        request.install_root = root_path;
+        request.exact_lock_v2 = null;
+
+        try std.testing.expectError(
+            error.LegacyTransactionExecutionRetired,
+            select(.legacy_dpkg, legacy.executor(), native.executor()),
+        );
+        try std.testing.expectError(
+            error.LegacyTransactionExecutionRetired,
+            executeAuthorized(
+                std.testing.allocator,
+                .legacy_dpkg,
+                legacy.executor(),
+                native.executor(),
+                request,
+                null,
+                dependencies,
+            ),
+        );
+        try std.testing.expectError(
+            error.LegacyTransactionExecutionRetired,
+            executeAuthorizedProgram(
+                std.testing.allocator,
+                .legacy_dpkg,
+                legacy.executor(),
+                native.executor(),
+                request,
+                null,
+                null,
+                null,
+                dependencies,
+            ),
+        );
+        try std.testing.expectError(
+            error.LegacyTransactionExecutionRetired,
+            Executor.legacy_dpkg.execute(std.testing.allocator, request, dependencies),
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), legacy.execute_calls);
+    try std.testing.expectEqual(@as(usize, 0), native.execute_calls);
+
+    const after_record = try root.readFileAlloc(std.testing.allocator, record_rel, 64 * 1024);
+    defer std.testing.allocator.free(after_record);
+    try std.testing.expectEqualStrings(before_record, after_record);
+
+    var second_coordinator = try root_operation.Coordinator.open(
+        std.testing.io,
+        root,
+        root_path,
+        locks.interface(),
+    );
+    try std.testing.expectError(
+        error.LockTimeout,
+        second_coordinator.acquire(std.testing.allocator, .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .install },
+            .request_sha256 = @splat(0x44),
+            .policy_sha256 = @splat(0x55),
+            .target_architecture = "amd64",
+            .attempt_id = @splat(0x66),
+        }),
+    );
+}
+

@@ -197,12 +197,12 @@ const native_operator_specs = [_]OperatorSpec{
 
 const legacy_operator_specs = [_]OperatorSpec{
     .{ .path = "src/target_apt_config.zig", .operators = &.{"std.process.run"} },
-    .{ .path = "src/transaction_executor.zig", .operators = &.{"std.process.run"} },
 };
 
 fn matchesCutoverRoute(path: []const u8, prod: []const u8) bool {
     if (std.mem.eql(u8, path, "src/transaction_executor.zig")) {
-        return containsTokenSeq(prod, &.{ "pub fn execute", "(" }) or
+        return (containsTokenSeq(prod, &.{ "pub fn execute", "(" }) and
+            !containsTokenSeq(prod, &.{ "return", "error.LegacyTransactionExecutionRetired", ";" })) or
             containsTokenSeq(prod, &.{ "fn buildArgv", "(" });
     }
     if (std.mem.eql(u8, path, "src/exact_lock.zig")) {
@@ -1581,13 +1581,25 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
         "build.zig: candidate cutover task: change CLI shipped native-only mode",
-        "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
+        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
         "src/transaction_executor.zig: active legacy journal recovery still launches dpkg",
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |expected| {
         try testing.expect(hasFailureContaining(&failures, expected));
     }
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_executor.zig: candidate cutover task: remove legacy dpkg/dpkg-deb executor (#281)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)",
+    ));
 
     const options = @import("native_only_candidate_options");
     var env = std.process.Environ.Map.init(alloc);
