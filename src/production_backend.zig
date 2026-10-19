@@ -1078,23 +1078,6 @@ pub const Backend = struct {
             if (err == error.OutOfMemory) return err;
             return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "active-context preflight refused: {s}", .{@errorName(err)}));
         };
-        if (workflowMode(request.operation, workflow) != .plan_only) {
-            if (request.options.lock_input_path) |path| {
-                const bytes = readFile(allocator, self.io, path, exact_lock_v5.maximum_document_bytes) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => null,
-                };
-                if (bytes) |document| {
-                    defer allocator.free(document);
-                    const is_prestate = exact_lock_v5.hasSchema(allocator, document) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => false,
-                    };
-                    if (is_prestate)
-                        return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: v5 healthy planning authority cannot be unwrapped into a historical archive execution");
-                }
-            }
-        }
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
         if (request.options.lock_input_path == null)
@@ -1104,6 +1087,24 @@ pub const Backend = struct {
         if (self.active_context == null and (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
             request.options.keyring_paths.len == 0))
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires authenticated repository configuration");
+        // Usage refusals above never read the lock; a v5 lock is refused before
+        // the root operation is reserved. The guarded path refuses it again.
+        if (workflowMode(request.operation, workflow) != .plan_only) {
+            const path = request.options.lock_input_path.?;
+            const bytes = readFile(allocator, self.io, path, exact_lock_v5.maximum_document_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            if (bytes) |document| {
+                defer allocator.free(document);
+                const is_prestate = exact_lock_v5.hasSchema(allocator, document) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => false,
+                };
+                if (is_prestate)
+                    return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledPrestateExecutionUnsupported: v5 healthy planning authority cannot be unwrapped into a historical archive execution");
+            }
+        }
         var guard: RootOperationGuard = .{
             .backend = self,
             .allocator = allocator,
@@ -9292,6 +9293,20 @@ test "production healthy installed prestate retains private and published packag
         try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
         try std.testing.expect(!refused.changed);
         var generic: Backend = .{ .io = std.testing.io, .transaction_backend = kind };
+        if (kind == .native) {
+            var historical = options;
+            historical.source_paths = &fixture.source_paths;
+            historical.keyring_paths = &fixture.keyring_paths;
+            const unwrapped = try generic.executeWorkflow(allocator, .{
+                .operation = .install,
+                .mode = .execute,
+                .selectors = &selectors,
+                .options = historical,
+            });
+            try std.testing.expectEqual(api.ErrorId.lock_verification_failed, unwrapped.diagnostics[0].id);
+            try std.testing.expect(std.mem.indexOf(u8, unwrapped.diagnostics[0].message, "cannot be unwrapped into a historical archive execution") != null);
+            try std.testing.expect(!unwrapped.changed);
+        }
         try std.testing.expectError(error.UnsupportedLockSchema, generic.packageCacheFingerprint(allocator, .{
             .lock_input_path = fixture.lock_path,
             .cache_root = fixture.cache_path,
@@ -11175,6 +11190,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var dependencies: usize = 0;
     switch (lock) {
         .installed_baseline => return error.UnexpectedInstalledBaseline,
+        .active_install => return error.UnexpectedActiveInstall,
         inline else => |owned| {
             try std.testing.expectEqual(@as(usize, 3), owned.lock.packages.len);
             for (owned.lock.packages) |package| switch (package.retention) {
