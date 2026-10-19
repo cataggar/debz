@@ -140,11 +140,42 @@ const debian_libc_bin_trigger_binding: TriggerBinding = .{
     .triggers_size = 440,
     .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
 };
+const arm64_trigger_bindings = [_]TriggerBinding{
+    .{
+        .package = "libc-bin",
+        .version = "2.43-2ubuntu2.4",
+        .architecture = "arm64",
+        .pending_triggers = "ldconfig",
+        .archive_size = 597592,
+        .archive_sha512 = "e964f5753787fa44c95c7144507b178b970359b1ea90a732b2f2b6a1831d67ef3bf5b900d57ae682d3481676f8080b6382a130c6e13112a40fb698435ee124cc",
+        .postinst_size = 847,
+        .postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+        .triggers_size = 440,
+        .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
+    },
+    .{
+        .package = "procps",
+        .version = "2:4.0.4-9ubuntu1",
+        .architecture = "arm64",
+        .pending_triggers = "/usr/lib/sysctl.d",
+        .archive_size = 706618,
+        .archive_sha512 = "a48bfd2db8380eda8a125773a07872ce61fb594da8a9aaad0d428597dabffe34ec8f723c8f893ae785d712e1b39aefc021fade472f8c08a0c0caeff46e5d9965",
+        .postinst_size = 2757,
+        .postinst_sha256 = "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
+        .triggers_size = 35,
+        .triggers_sha256 = "f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79",
+    },
+};
 fn triggerBindingFor(selector: []const u8) ?TriggerBinding {
     const colon = std.mem.indexOfScalar(u8, selector, ':') orelse return null;
     const name = selector[0..colon];
     const architecture = selector[colon + 1 ..];
     for (trigger_bindings) |binding| {
+        if (std.mem.eql(u8, binding.package, name) and
+            std.mem.eql(u8, binding.architecture, architecture))
+            return binding;
+    }
+    for (arm64_trigger_bindings) |binding| {
         if (std.mem.eql(u8, binding.package, name) and
             std.mem.eql(u8, binding.architecture, architecture))
             return binding;
@@ -198,6 +229,25 @@ const debian_openssl_cycle = [_]CycleBinding{
 const debian_libc6_breaks = "base-files (<< 13.3~), chrony (<< 4.2-3~), dhcpcd (<< 1:10.1.0-7~), fakechroot (<< 2.19-3.5), firefox (<< 91~), firefox-esr (<< 91~), gnumach-image-1.8-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-486-dbg (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486-dbg (<< 2:1.8+git20210923~), hurd (<< 1:0.9.git20220301-2), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3+b1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.41), locales-all (<< 2.41), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.41), pd-scaf (<< 1:0.14.1+darcs20180201-6+b4), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-iptables (<< 1.0.0-2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), tinydns (<< 1:1.05-14), uwsgi-plugin-pypy3 (<< 0.0.2+b1), valgrind (<< 1:3.19.0-1~)";
 const debian_base_triggers = "# Triggers added by dh_makeshlibs/13.24.1\nactivate-noawait ldconfig\n";
 const debian_openssl_triggers = "# Triggers added by dh_makeshlibs/13.24.2\nactivate-noawait ldconfig\n";
+const arm64_base_cycle = [_]CycleBinding{
+    .{ .name = "libc6", .version = "2.43-2ubuntu2.4", .architecture = "arm64", .depends = "libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)", .archive_size = 1642036, .archive_sha512 = "865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7" },
+    .{ .name = "libgcc-s1", .version = "16-20260322-1ubuntu1", .architecture = "arm64", .depends = "gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)", .archive_size = 61034, .archive_sha512 = "a1afc1e2dc5be8b0d159d567516a7491ee4fe90971b659cb0b61bab1d2691a2370f4cce0a75c50b0b5c93374bd14879387450bb27913277cee4eec2d5afdb3a1" },
+    .{ .name = "gcc-16-base", .version = "16-20260322-1ubuntu1", .architecture = "arm64", .depends = "", .archive_size = 38310, .archive_sha512 = "c557ecda2cd90b0ad8714227748f0cb150cbbce2d1154ef399e53f10f906909294d5ffed6c45349451c824360ac3f02fd7bf210a241bd52cc3037c9328cf79f7" },
+    .{ .name = "libc-gconv-modules-extra", .version = "2.43-2ubuntu2.4", .architecture = "arm64", .depends = "", .archive_size = 1382148, .archive_sha512 = "62c8aea50b6c0df65ee51d3573e7421f1e64e216e06b9fe6296eb6db5649693c99fcd854347c0a552350f6a34aeaa76af304e93b839a05ccec477e26c24f662c" },
+};
+const arm64_openssl_cycle = [_]CycleBinding{
+    .{ .name = "libssl3t64", .version = "3.5.5-1ubuntu3.6", .architecture = "arm64", .depends = "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy", .archive_size = 2766746, .archive_sha512 = "821a980a02adee3d97d12ab268e78c58e27659857541108733ee6f6905a6e989712af7f9afd99ab593a62c8519c3f144f2ce9dc748a30f5d4f26cb1208f3dd36" },
+    .{ .name = "openssl-provider-legacy", .version = "3.5.5-1ubuntu3.6", .architecture = "arm64", .depends = "libc6 (>= 2.38), libssl3t64 (>= 3.0.3)", .archive_size = 38418, .archive_sha512 = "70e73840948c617197dca314ffaed9e42dd520a28994c05b9d21e34104048c66de1971019abe7d11d9364f86fe62d873e44746e9fb482409ffe1f43eb8a67ff7" },
+    arm64_base_cycle[0],
+    .{ .name = "libzstd1", .version = "1.5.7+dfsg-3", .architecture = "arm64", .depends = "libc6 (>= 2.34)", .archive_size = 277154, .archive_sha512 = "be44525b3f59a5209ef9fb7e8b0691e43c2eb85f79a74a0a0519ab38b062c9fa0d5f6a7bae759b710a71ce66020001dd88240fdaa871afe96d2ecb95e03ee879" },
+    .{ .name = "zlib1g", .version = "1:1.3.dfsg+really1.3.1-1ubuntu3.1", .architecture = "arm64", .depends = "libc6 (>= 2.17)", .archive_size = 61436, .archive_sha512 = "c3a0e72dece0ad67a335123e9636ccd9660d2733826803d3bd265bab174eeffcdf3b0a8c88421d15eade0e66c0e1b674d953f62080e29315e6a8ee514e5ade2c" },
+};
+const arm64_kbd_cycle = [_]CycleBinding{
+    .{ .name = "kbd", .version = "2.7.1-2ubuntu2", .architecture = "arm64", .depends = "libc6 (>= 2.38), console-setup | console-setup-mini", .archive_size = 228060, .archive_sha512 = "255058dc78e76444f0af86a9160be55aefd5ec6b960a2bef9fdc0cb671a721fd414894a32733188b546d2cd9fcd78c86c66bad797933128b55212a52cec72624" },
+    kbd_cycle[1],
+    kbd_cycle[2],
+    arm64_base_cycle[0],
+};
 const CycleKind = enum { base, openssl, kbd };
 const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
 const cycle_graph_keys = [_][]const u8{
@@ -326,6 +376,45 @@ fn kbdGraphField(index: usize, key: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(key, "Replaces")) return if (index == 1) "console-setup (<< 1.71), console-terminus" else "";
     if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index == 1 or index == 2) "foreign" else "";
     return "";
+}
+
+fn arm64CycleGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return arm64_base_cycle[index].depends;
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => libc6_breaks,
+        1 => "libgcc-7-dev (<< 7.5.0-4), libgcc-8-dev (<< 8.3.0-27), libgcc-9-dev (<< 9.2.1-26)",
+        2 => "gnat (<< 7)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libc6-lse",
+        1 => "libgcc1 (<< 1:10)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return if (index == 1) "libgcc1 (= 1:16-20260322-1ubuntu1)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return "same";
+    if (std.ascii.eqlIgnoreCase(key, "Protected")) return if (index == 1) "yes" else "";
+    return "";
+}
+
+fn arm64OpensslGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return arm64_openssl_cycle[index].depends;
+    if (index == 2) return arm64CycleGraphField(0, key);
+    return opensslGraphField(index, key);
+}
+
+fn arm64KbdGraphField(index: usize, key: []const u8) []const u8 {
+    if (index == 3) return arm64CycleGraphField(0, key);
+    return kbdGraphField(index, key);
+}
+
+fn arm64KbdCycleArchive(name: []const u8) CycleBinding {
+    for (arm64_kbd_cycle) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return binding;
+    }
+    unreachable;
 }
 
 fn scriptBinding(profile: Profile) ?ScriptBinding {
@@ -472,29 +561,38 @@ fn validateOptions(options: Options) !void {
     if (options.trigger_archive) |path| {
         if (!validAbsolute(path)) return error.InvalidArguments;
         const binding = triggerBindingFor(options.selector.?) orelse return error.InvalidTriggerHandler;
-        if (options.profile != binding.profile or architecture_index != 0)
+        if (options.profile != binding.profile or !std.mem.eql(u8, options.architecture, binding.architecture))
             return error.InvalidTriggerHandler;
     }
     if (options.kbd_archives) |paths| {
         for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
-        if (options.profile != .kbd_cycle or architecture_index != 0 or
-            !std.mem.eql(u8, options.selector.?, "kbd:amd64"))
+        if (options.profile != .kbd_cycle or
+            (if (architecture_index == 1)
+                !std.mem.eql(u8, options.selector.?, "kbd:arm64")
+            else
+                !std.mem.eql(u8, options.selector.?, "kbd:amd64")))
             return error.InvalidCycleProfile;
     } else if (options.profile == .kbd_cycle) {
         return error.InvalidCycleProfile;
     }
     if (options.openssl_archives) |paths| {
         for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
-        if (options.profile != .openssl_cycle or architecture_index != 0 or
-            !std.mem.eql(u8, options.selector.?, "libssl3t64:amd64"))
+        if (options.profile != .openssl_cycle or
+            (if (architecture_index == 1)
+                !std.mem.eql(u8, options.selector.?, "libssl3t64:arm64")
+            else
+                !std.mem.eql(u8, options.selector.?, "libssl3t64:amd64")))
             return error.InvalidCycleProfile;
     } else if (options.profile == .openssl_cycle) {
         return error.InvalidCycleProfile;
     }
     if (options.cycle_archives) |paths| {
         for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
-        if (options.profile != .libgcc_cycle or architecture_index != 0 or
-            !std.mem.eql(u8, options.selector.?, "libgcc-s1:amd64"))
+        if (options.profile != .libgcc_cycle or
+            (if (architecture_index == 1)
+                !std.mem.eql(u8, options.selector.?, "libgcc-s1:arm64")
+            else
+                !std.mem.eql(u8, options.selector.?, "libgcc-s1:amd64")))
             return error.InvalidCycleProfile;
     } else if (options.profile == .libgcc_cycle) {
         return error.InvalidCycleProfile;
@@ -507,12 +605,13 @@ fn validateOptions(options: Options) !void {
     if (options.verb == .continue_prestate and options.profile != .systemd and options.profile != .udev)
         return error.InvalidProfile;
     if (scriptBinding(options.profile)) |binding| {
-        if ((options.verb != .configure and options.verb != .continue_prestate) or architecture_index != 0)
+        if (options.verb != .configure and options.verb != .continue_prestate)
             return error.InvalidProfile;
+        const arch_suffix = if (architecture_index == 1) ":arm64" else ":amd64";
         const selector_name = options.selector.?;
-        if (selector_name.len != binding.name.len + ":amd64".len or
+        if (selector_name.len != binding.name.len + arch_suffix.len or
             !std.mem.startsWith(u8, selector_name, binding.name) or
-            !std.mem.eql(u8, selector_name[binding.name.len..], ":amd64"))
+            !std.mem.eql(u8, selector_name[binding.name.len..], arch_suffix))
             return error.InvalidProfile;
     } else if (options.verb == .configure) {
         for (script_bindings) |binding| {
@@ -674,6 +773,10 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
 }
 
 fn bindingStatusMatchesFor(status: []const u8, binding: ScriptBinding, verb: Verb) bool {
+    return bindingStatusMatchesForArch(status, binding, verb, "amd64");
+}
+
+fn bindingStatusMatchesForArch(status: []const u8, binding: ScriptBinding, verb: Verb, expected_arch: []const u8) bool {
     const expected_state: []const u8 = switch (verb) {
         .configure => "install ok unpacked",
         .continue_prestate => if (std.mem.eql(u8, binding.name, "systemd") or std.mem.eql(u8, binding.name, "udev"))
@@ -724,7 +827,7 @@ fn bindingStatusMatchesFor(status: []const u8, binding: ScriptBinding, verb: Ver
         }
         if (name != null and std.mem.eql(u8, name.?, binding.name)) {
             if (matched or architecture == null or version == null or state == null or
-                !std.mem.eql(u8, architecture.?, "amd64") or
+                !std.mem.eql(u8, architecture.?, expected_arch) or
                 !std.mem.eql(u8, version.?, binding.version) or
                 !std.mem.eql(u8, state.?, expected_state)) return false;
             matched = true;
@@ -767,13 +870,14 @@ fn readInstalledStatus() ![]u8 {
     return readInstalledFile("/var/lib/dpkg/status", 4 * 1024 * 1024);
 }
 
-fn verifyInstalledBinding(binding: ScriptBinding, verb: Verb) !void {
+fn verifyInstalledBinding(binding: ScriptBinding, verb: Verb, architecture: []const u8) !void {
     const bytes = try readInstalledStatus();
     defer std.heap.page_allocator.free(bytes);
-    const active = if (bindingStatusMatchesFor(bytes, binding, verb))
+    const active = if (bindingStatusMatchesForArch(bytes, binding, verb, architecture))
         binding
-    else if (std.mem.eql(u8, binding.name, debian_systemd_script_binding.name) and
-        bindingStatusMatchesFor(bytes, debian_systemd_script_binding, verb))
+    else if (std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, binding.name, debian_systemd_script_binding.name) and
+        bindingStatusMatchesForArch(bytes, debian_systemd_script_binding, verb, architecture))
         debian_systemd_script_binding
     else
         return error.InvalidInstalledBinding;
@@ -801,10 +905,13 @@ fn cycleStatusMatches(status: []const u8) bool {
 fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
     return switch (kind) {
         .base => cycleStatusMatchesBindings(status, .base, base_cycle, cycleGraphField) or
-            cycleStatusMatchesBindings(status, .base, debian_base_cycle, debianCycleGraphField),
+            cycleStatusMatchesBindings(status, .base, debian_base_cycle, debianCycleGraphField) or
+            cycleStatusMatchesBindings(status, .base, arm64_base_cycle, arm64CycleGraphField),
         .openssl => cycleStatusMatchesBindings(status, .openssl, openssl_cycle, opensslGraphField) or
-            cycleStatusMatchesBindings(status, .openssl, debian_openssl_cycle, debianOpensslGraphField),
-        .kbd => cycleStatusMatchesBindings(status, .kbd, kbd_cycle, kbdGraphField),
+            cycleStatusMatchesBindings(status, .openssl, debian_openssl_cycle, debianOpensslGraphField) or
+            cycleStatusMatchesBindings(status, .openssl, arm64_openssl_cycle, arm64OpensslGraphField),
+        .kbd => cycleStatusMatchesBindings(status, .kbd, kbd_cycle, kbdGraphField) or
+            cycleStatusMatchesBindings(status, .kbd, arm64_kbd_cycle, arm64KbdGraphField),
     };
 }
 
@@ -893,13 +1000,20 @@ fn verifyCycle(comptime kind: CycleKind) !void {
         const pending = readInstalledFile(unincorp_path, 0) catch return error.CycleCallbackChanged;
         std.heap.page_allocator.free(pending);
     } else if (linux.errno(unincorp) != .NOENT) return error.CycleCallbackChanged;
+    const is_arm64 = switch (kind) {
+        .base => cycleStatusMatchesBindings(bytes, .base, arm64_base_cycle, arm64CycleGraphField),
+        .openssl => cycleStatusMatchesBindings(bytes, .openssl, arm64_openssl_cycle, arm64OpensslGraphField),
+        .kbd => cycleStatusMatchesBindings(bytes, .kbd, arm64_kbd_cycle, arm64KbdGraphField),
+    };
     const activation_name = switch (kind) {
         .base => "libgcc-s1",
         .openssl => "libssl3t64",
         .kbd => "kbd",
     };
-    const activation_path = if (kind == .kbd)
+    const activation_path: [:0]const u8 = if (kind == .kbd)
         "/var/lib/dpkg/info/kbd.triggers"
+    else if (is_arm64)
+        "/var/lib/dpkg/info/" ++ activation_name ++ ":arm64.triggers"
     else
         "/var/lib/dpkg/info/" ++ activation_name ++ ":amd64.triggers";
     const triggers = readInstalledFile(activation_path, 1024) catch return error.CycleCallbackChanged;
@@ -917,8 +1031,8 @@ fn verifyCycle(comptime kind: CycleKind) !void {
     };
     if (!std.mem.eql(u8, triggers, expected_triggers))
         return error.CycleCallbackChanged;
-    const other_path = if (kind == .kbd)
-        "/var/lib/dpkg/info/kbd:amd64.triggers"
+    const other_path: [:0]const u8 = if (kind == .kbd)
+        (if (is_arm64) "/var/lib/dpkg/info/kbd:arm64.triggers" else "/var/lib/dpkg/info/kbd:amd64.triggers")
     else
         "/var/lib/dpkg/info/" ++ activation_name ++ ".triggers";
     const unqualified = linux.open(other_path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
@@ -929,7 +1043,10 @@ fn verifyCycle(comptime kind: CycleKind) !void {
     if (linux.errno(unqualified) != .NOENT) return error.CycleCallbackChanged;
     if (kind == .openssl) {
         try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy.triggers");
-        try verifyCycleAbsent("/var/lib/dpkg/info/openssl-provider-legacy:amd64.triggers");
+        try verifyCycleAbsent(if (is_arm64)
+            "/var/lib/dpkg/info/openssl-provider-legacy:arm64.triggers"
+        else
+            "/var/lib/dpkg/info/openssl-provider-legacy:amd64.triggers");
     }
     const names = switch (kind) {
         .base => .{ "libgcc-s1", "libgcc-s1:amd64" },
@@ -937,6 +1054,17 @@ fn verifyCycle(comptime kind: CycleKind) !void {
         .kbd => .{ "kbd", "kbd:amd64" },
     };
     inline for (names) |name| {
+        inline for (.{ "preinst", "postinst", "prerm", "postrm", "config" }) |script| {
+            const path = "/var/lib/dpkg/info/" ++ name ++ "." ++ script;
+            try verifyCycleAbsent(path);
+        }
+    }
+    const arm64_names = switch (kind) {
+        .base => .{"libgcc-s1:arm64"},
+        .openssl => .{ "libssl3t64:arm64", "openssl-provider-legacy:arm64" },
+        .kbd => .{"kbd:arm64"},
+    };
+    inline for (arm64_names) |name| {
         inline for (.{ "preinst", "postinst", "prerm", "postrm", "config" }) |script| {
             const path = "/var/lib/dpkg/info/" ++ name ++ "." ++ script;
             try verifyCycleAbsent(path);
@@ -973,6 +1101,8 @@ fn triggerStatusMatches(status: []const u8, target: TriggerBinding) bool {
     const is_debian = std.mem.eql(u8, target.version, debian_libc_bin_trigger_binding.version);
     const handlers: []const TriggerBinding = if (is_debian)
         &.{debian_libc_bin_trigger_binding}
+    else if (std.mem.eql(u8, target.architecture, "arm64"))
+        &arm64_trigger_bindings
     else
         &trigger_bindings;
     var matched: [trigger_bindings.len]bool = .{ false, is_debian };
@@ -1130,16 +1260,16 @@ fn verifyTriggerHandler(selector: []const u8) !void {
     if ((triggers.metadata.mode & 0o7777) != 0o644) return error.TriggerCallbackChanged;
     const qualified_postinst = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
-        "/var/lib/dpkg/info/{s}:amd64.postinst",
-        .{active.package},
+        "/var/lib/dpkg/info/{s}:{s}.postinst",
+        .{ active.package, active.architecture },
         0,
     );
     defer std.heap.page_allocator.free(qualified_postinst);
     verifyCycleAbsent(qualified_postinst) catch return error.TriggerCallbackChanged;
     const qualified_triggers = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
-        "/var/lib/dpkg/info/{s}:amd64.triggers",
-        .{active.package},
+        "/var/lib/dpkg/info/{s}:{s}.triggers",
+        .{ active.package, active.architecture },
         0,
     );
     defer std.heap.page_allocator.free(qualified_triggers);
@@ -1808,7 +1938,7 @@ fn childMain(input: Child) noreturn {
         fail(status, 13, .STALE);
     };
     if (scriptBinding(child.options.profile)) |binding| {
-        verifyInstalledBinding(binding, child.options.verb) catch
+        verifyInstalledBinding(binding, child.options.verb, child.options.architecture) catch
             fail(status, 10, .STALE);
     }
     if (child.options.verb == .break_base_cycle)
@@ -1844,13 +1974,17 @@ fn childMain(input: Child) noreturn {
         "dpkg", "--root=/", "--force-not-root", "--force-bad-path", "--force-confold",
     };
     const selector: ?[*:0]const u8 = if (child.options.selector) |value| value.ptr else null;
+    const is_arm64 = std.mem.eql(u8, child.options.architecture, "arm64");
     const extra: [*:null]const ?[*:0]const u8 = switch (child.options.verb) {
         .probe_unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--unpack", archive_target, null },
         .unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--unpack", archive_target, null },
         .probe_configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--configure", selector, null },
         .configure, .continue_prestate => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
-        .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
+        .configure_openssl_cycle => if (is_arm64)
+            &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:arm64", "openssl-provider-legacy:arm64", null }
+        else
+            &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
         .break_kbd_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", "kbd:amd64", null },
         .triggers_only => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--triggers-only", selector, null },
     };
@@ -1873,6 +2007,9 @@ fn childMain(input: Child) noreturn {
         if (count + 1 >= arguments.len) fail(status, 14, .@"2BIG");
         arguments[count] = argument;
         count += 1;
+    }
+    if (child.options.verb == .break_kbd_cycle and is_arm64) {
+        arguments[count - 1] = "kbd:arm64";
     }
     must(linux.syscall5(
         .execveat,
@@ -1980,89 +2117,119 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         if (archive) |value| _ = linux.close(value.fd);
     }
     if (options.cycle_archives) |paths| {
-        var debian_cycle: ?bool = null;
-        for (paths, base_cycle) |path, binding| {
-            const debian_binding = debianBaseCycleArchive(binding.name);
-            const source = if (debian_cycle == null) blk: {
-                if (openVerified(
+        if (std.mem.eql(u8, options.architecture, "arm64")) {
+            for (paths, arm64_base_cycle) |path, binding| {
+                const source = openVerified(
                     path,
                     std.crypto.hash.sha2.Sha512,
                     binding.archive_sha512,
                     binding.archive_size,
                     binding.archive_size,
-                )) |verified| {
-                    debian_cycle = false;
-                    break :blk verified;
-                } else |_| {
-                    const verified = openVerified(
+                ) catch return error.CycleIdentityChanged;
+                _ = linux.close(source.fd);
+            }
+        } else {
+            var debian_cycle: ?bool = null;
+            for (paths, base_cycle) |path, binding| {
+                const debian_binding = debianBaseCycleArchive(binding.name);
+                const source = if (debian_cycle == null) blk: {
+                    if (openVerified(
                         path,
                         std.crypto.hash.sha2.Sha512,
-                        debian_binding.archive_sha512,
-                        debian_binding.archive_size,
-                        debian_binding.archive_size,
+                        binding.archive_sha512,
+                        binding.archive_size,
+                        binding.archive_size,
+                    )) |verified| {
+                        debian_cycle = false;
+                        break :blk verified;
+                    } else |_| {
+                        const verified = openVerified(
+                            path,
+                            std.crypto.hash.sha2.Sha512,
+                            debian_binding.archive_sha512,
+                            debian_binding.archive_size,
+                            debian_binding.archive_size,
+                        ) catch return error.CycleIdentityChanged;
+                        debian_cycle = true;
+                        break :blk verified;
+                    }
+                } else blk: {
+                    const expected = if (debian_cycle.?) debian_binding else binding;
+                    break :blk openVerified(
+                        path,
+                        std.crypto.hash.sha2.Sha512,
+                        expected.archive_sha512,
+                        expected.archive_size,
+                        expected.archive_size,
                     ) catch return error.CycleIdentityChanged;
-                    debian_cycle = true;
-                    break :blk verified;
-                }
-            } else blk: {
-                const expected = if (debian_cycle.?) debian_binding else binding;
-                break :blk openVerified(
-                    path,
-                    std.crypto.hash.sha2.Sha512,
-                    expected.archive_sha512,
-                    expected.archive_size,
-                    expected.archive_size,
-                ) catch return error.CycleIdentityChanged;
-            };
-            _ = linux.close(source.fd);
+                };
+                _ = linux.close(source.fd);
+            }
         }
     }
     if (options.openssl_archives) |paths| {
-        var debian_cycle: ?bool = null;
-        for (paths, openssl_cycle) |path, binding| {
-            const debian_binding = debianOpensslCycleArchive(binding.name);
-            const source = if (debian_cycle == null) blk: {
-                if (openVerified(
+        if (std.mem.eql(u8, options.architecture, "arm64")) {
+            for (paths, arm64_openssl_cycle) |path, binding| {
+                const source = openVerified(
                     path,
                     std.crypto.hash.sha2.Sha512,
                     binding.archive_sha512,
                     binding.archive_size,
                     binding.archive_size,
-                )) |verified| {
-                    debian_cycle = false;
-                    break :blk verified;
-                } else |_| {
-                    const verified = openVerified(
+                ) catch return error.CycleIdentityChanged;
+                _ = linux.close(source.fd);
+            }
+        } else {
+            var debian_cycle: ?bool = null;
+            for (paths, openssl_cycle) |path, binding| {
+                const debian_binding = debianOpensslCycleArchive(binding.name);
+                const source = if (debian_cycle == null) blk: {
+                    if (openVerified(
                         path,
                         std.crypto.hash.sha2.Sha512,
-                        debian_binding.archive_sha512,
-                        debian_binding.archive_size,
-                        debian_binding.archive_size,
+                        binding.archive_sha512,
+                        binding.archive_size,
+                        binding.archive_size,
+                    )) |verified| {
+                        debian_cycle = false;
+                        break :blk verified;
+                    } else |_| {
+                        const verified = openVerified(
+                            path,
+                            std.crypto.hash.sha2.Sha512,
+                            debian_binding.archive_sha512,
+                            debian_binding.archive_size,
+                            debian_binding.archive_size,
+                        ) catch return error.CycleIdentityChanged;
+                        debian_cycle = true;
+                        break :blk verified;
+                    }
+                } else blk: {
+                    const expected = if (debian_cycle.?) debian_binding else binding;
+                    break :blk openVerified(
+                        path,
+                        std.crypto.hash.sha2.Sha512,
+                        expected.archive_sha512,
+                        expected.archive_size,
+                        expected.archive_size,
                     ) catch return error.CycleIdentityChanged;
-                    debian_cycle = true;
-                    break :blk verified;
-                }
-            } else blk: {
-                const expected = if (debian_cycle.?) debian_binding else binding;
-                break :blk openVerified(
-                    path,
-                    std.crypto.hash.sha2.Sha512,
-                    expected.archive_sha512,
-                    expected.archive_size,
-                    expected.archive_size,
-                ) catch return error.CycleIdentityChanged;
-            };
-            _ = linux.close(source.fd);
+                };
+                _ = linux.close(source.fd);
+            }
         }
     }
     if (options.kbd_archives) |paths| {
         for (paths, kbd_cycle) |path, binding| {
+            const expected = if (std.mem.eql(u8, options.architecture, "arm64"))
+                arm64KbdCycleArchive(binding.name)
+            else
+                binding;
             const source = openVerified(
                 path,
                 std.crypto.hash.sha2.Sha512,
-                binding.archive_sha512,
-                binding.archive_size,
-                binding.archive_size,
+                expected.archive_sha512,
+                expected.archive_size,
+                expected.archive_size,
             ) catch return error.CycleIdentityChanged;
             _ = linux.close(source.fd);
         }
@@ -3113,5 +3280,143 @@ test "reference launcher binds Debian stable amd64 systemd script and cycle stat
         "Replaces: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\n\n";
     try std.testing.expect(cycleStatusMatchesFor(debian_openssl_status, .openssl));
     try std.testing.expect(!cycleStatusMatchesFor(debian_openssl_status, .base));
+}
+
+test "reference launcher binds Ubuntu arm64 profiles, cycles, and trigger handlers" {
+    for ([_]Profile{ .systemd, .udev, .sudo }, script_bindings) |profile, binding| {
+        const selector = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}:arm64", .{binding.name}, 0);
+        defer std.testing.allocator.free(selector);
+        const options: Options = .{
+            .root = "/root/proof/root",
+            .dpkg = "/root/proof/dpkg",
+            .runtime = "/root/proof/runtime",
+            .architecture = "arm64",
+            .profile = profile,
+            .verb = .configure,
+            .selector = selector,
+        };
+        try validateOptions(options);
+        const unpacked = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "Package: {s}\nVersion: {s}\nArchitecture: arm64\nStatus: install ok unpacked\n\n",
+            .{ binding.name, binding.version },
+        );
+        defer std.testing.allocator.free(unpacked);
+        try std.testing.expect(bindingStatusMatchesForArch(unpacked, binding, .configure, "arm64"));
+        try std.testing.expect(!bindingStatusMatchesForArch(unpacked, binding, .configure, "amd64"));
+    }
+
+    try validateOptions(.{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
+        .architecture = "arm64",
+        .profile = .libgcc_cycle,
+        .verb = .break_base_cycle,
+        .selector = "libgcc-s1:arm64",
+        .cycle_archives = .{ "/protected/libc6", "/protected/libgcc", "/protected/gcc-base", "/protected/gconv" },
+    });
+    try validateOptions(.{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
+        .architecture = "arm64",
+        .profile = .openssl_cycle,
+        .verb = .configure_openssl_cycle,
+        .selector = "libssl3t64:arm64",
+        .openssl_archives = .{ "/protected/ssl", "/protected/provider", "/protected/libc", "/protected/zstd", "/protected/zlib" },
+    });
+    try validateOptions(.{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .runtime = "/protected/runtime",
+        .architecture = "arm64",
+        .profile = .kbd_cycle,
+        .verb = .break_kbd_cycle,
+        .selector = "kbd:arm64",
+        .kbd_archives = .{ "/protected/kbd", "/protected/linux", "/protected/console", "/protected/libc" },
+    });
+    for (arm64_trigger_bindings) |binding| {
+        const selector = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}:arm64", .{binding.package}, 0);
+        defer std.testing.allocator.free(selector);
+        try validateOptions(.{
+            .root = "/srv/root",
+            .dpkg = "/srv/dpkg",
+            .runtime = "/srv/runtime",
+            .architecture = "arm64",
+            .profile = .none,
+            .verb = .triggers_only,
+            .selector = selector,
+            .trigger_archive = "/srv/cache/handler.deb",
+        });
+    }
+
+    const arm64_base_status =
+        "Package: gcc-16-base\nArchitecture: arm64\nVersion: 16-20260322-1ubuntu1\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nBreaks: gnat (<< 7)\n\n" ++
+        "Package: libc-gconv-modules-extra\nArchitecture: arm64\nVersion: 2.43-2ubuntu2.4\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nBreaks: libc6 (<< 2.42-1)\nReplaces: libc6 (<< 2.42-1)\n\n" ++
+        "Package: libc6\nArchitecture: arm64\nVersion: 2.43-2ubuntu2.4\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\n" ++
+        "Breaks: " ++ libc6_breaks ++ "\nReplaces: libc6-lse\n\n" ++
+        "Package: libgcc-s1\nArchitecture: arm64\nVersion: 16-20260322-1ubuntu1\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\nProtected: yes\n" ++
+        "Depends: gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)\n" ++
+        "Breaks: libgcc-7-dev (<< 7.5.0-4), libgcc-8-dev (<< 8.3.0-27), libgcc-9-dev (<< 9.2.1-26)\n" ++
+        "Provides: libgcc1 (= 1:16-20260322-1ubuntu1)\nReplaces: libgcc1 (<< 1:10)\n\n";
+    try std.testing.expect(cycleStatusMatchesFor(arm64_base_status, .base));
+
+    const arm64_openssl_status =
+        "Package: libc6\nArchitecture: arm64\nVersion: 2.43-2ubuntu2.4\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\n" ++
+        "Breaks: " ++ libc6_breaks ++ "\nReplaces: libc6-lse\n\n" ++
+        "Package: libzstd1\nArchitecture: arm64\nVersion: 1.5.7+dfsg-3\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libc6 (>= 2.34)\n\n" ++
+        "Package: zlib1g\nArchitecture: arm64\nVersion: 1:1.3.dfsg+really1.3.1-1ubuntu3.1\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libc6 (>= 2.17)\n" ++
+        "Breaks: libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2023.20230311.66589-8)\n" ++
+        "Conflicts: zlib1 (<= 1:1.0.4-7)\nProvides: libz1\n\n" ++
+        "Package: libssl3t64\nArchitecture: arm64\nVersion: 3.5.5-1ubuntu3.6\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\n" ++
+        "Depends: libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy\n" ++
+        "Breaks: libssl3 (<< 3.5.5-1ubuntu3.6), openssh-client (<< 1:9.4p1), openssh-server (<< 1:9.4p1), python3-m2crypto (<< 0.38.0-4)\n" ++
+        "Provides: libssl3 (= 3.5.5-1ubuntu3.6)\nReplaces: libssl3\n\n" ++
+        "Package: openssl-provider-legacy\nArchitecture: arm64\nVersion: 3.5.5-1ubuntu3.6\n" ++
+        "Status: install ok unpacked\nMulti-Arch: foreign\n" ++
+        "Depends: libc6 (>= 2.38), libssl3t64 (>= 3.0.3)\n" ++
+        "Breaks: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\n" ++
+        "Replaces: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\n\n";
+    try std.testing.expect(cycleStatusMatchesFor(arm64_openssl_status, .openssl));
+
+    const arm64_kbd_status =
+        "Package: kbd\nArchitecture: arm64\nVersion: 2.7.1-2ubuntu2\n" ++
+        "Status: install ok unpacked\nDepends: libc6 (>= 2.38), console-setup | console-setup-mini\n" ++
+        "Conflicts: console-utilities\nProvides: console-utilities\n\n" ++
+        "Package: console-setup-linux\nArchitecture: all\nVersion: 1.237ubuntu3.1\n" ++
+        "Status: install ok unpacked\nMulti-Arch: foreign\n" ++
+        "Depends: kbd (>= 0.99-12) | console-tools (>= 1:0.2.3-16), keyboard-configuration (= 1.237ubuntu3.1), init-system-helpers (>= 1.29~) | initscripts\n" ++
+        "Breaks: console-cyrillic (<= 0.9-11), console-setup (<< 1.71), console-terminus\n" ++
+        "Provides: console-terminus\nReplaces: console-setup (<< 1.71), console-terminus\n\n" ++
+        "Package: console-setup\nArchitecture: all\nVersion: 1.237ubuntu3.1\n" ++
+        "Status: install ok unpacked\nMulti-Arch: foreign\nPre-Depends: debconf | debconf-2.0\n" ++
+        "Depends: console-setup-linux | hurd, xkb-data (>= 0.9), keyboard-configuration (= 1.237ubuntu3.1), debconf (>= 0.5) | debconf-2.0\n" ++
+        "Breaks: lsb (<< 2.0-6), lsb-base (<< 3.0-6), lsb-core (<< 2.0-6)\n" ++
+        "Conflicts: console-setup-mini\n\n" ++
+        "Package: libc6\nArchitecture: arm64\nVersion: 2.43-2ubuntu2.4\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\n" ++
+        "Breaks: " ++ libc6_breaks ++ "\nReplaces: libc6-lse\n\n";
+    try std.testing.expect(cycleStatusMatchesFor(arm64_kbd_status, .kbd));
+
+    const arm64_step1_triggers =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: arm64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2.43-2ubuntu2.4\n" ++
+        "Triggers-Pending: ldconfig\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2:4.0.4-9ubuntu1\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(triggerStatusMatches(arm64_step1_triggers, arm64_trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(arm64_step1_triggers, arm64_trigger_bindings[1]));
 }
 
