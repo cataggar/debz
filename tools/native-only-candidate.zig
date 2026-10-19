@@ -1635,6 +1635,14 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         &failures,
         "src/system_profile.zig: candidate cutover task: stop executing profile v1/default; retain exact-byte decoder (#282)",
     ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/production_backend.zig: candidate cutover task: remove product legacy route/default (#284)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)",
+    ));
 
     const options = @import("native_only_candidate_options");
     var env = std.process.Environ.Map.init(alloc);

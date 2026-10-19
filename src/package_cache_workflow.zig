@@ -225,7 +225,7 @@ pub const Request = struct {
 };
 
 pub const Fingerprint = struct {
-    version: Version = .v1,
+    version: Version = .v3,
     lock_digest: [64]u8,
     acceptance_policy_digest: [64]u8,
     fingerprint: [64]u8,
@@ -383,7 +383,7 @@ pub const PreflightResult = struct {
 };
 
 pub const PrepareResult = struct {
-    version: Version = .v1,
+    version: Version = .v3,
     lock_digest: [64]u8,
     fingerprint: [64]u8,
     target_architecture: []u8,
@@ -485,6 +485,27 @@ pub const PrepareResult = struct {
             .new_execution,
             identity,
         );
+    }
+
+    pub fn verifyNativeBinding(
+        self: PrepareResult,
+        expected: Fingerprint,
+    ) Error!void {
+        try self.requireExecutionAuthority();
+        try expected.requireExecutionAuthority();
+        if ((self.version != .v3 and self.version != .baseline) or
+            self.version != expected.version or
+            !std.mem.eql(u8, &self.lock_digest, &expected.lock_digest) or
+            !std.mem.eql(u8, &self.fingerprint, &expected.fingerprint) or
+            !std.mem.eql(u8, self.target_architecture, expected.target_architecture) or
+            !std.mem.eql(u8, self.cache_root, expected.cache_root) or
+            !std.mem.eql(u8, self.cache_path, expected.cache_path))
+            return error.LockPolicyMismatch;
+        if (self.version == .baseline) {
+            if (self.baseline == null or expected.baseline == null or
+                !std.mem.eql(u8, &self.baseline.?.value.digest(), &expected.baseline.?.value.digest()))
+                return error.LockPolicyMismatch;
+        }
     }
 };
 
@@ -3333,6 +3354,51 @@ test "package_cache_workflow.test.native_only_cutover_retires_v1_contracts_and_r
     try std.testing.expectEqual(
         legacy_compat.Disposition.historical_read_only,
         try tagged_fingerprint.verifyCompletedHistorical(),
+    );
+
+    const prepared: PrepareResult = .{
+        .version = .v3,
+        .lock_digest = tagged_fingerprint.lock_digest,
+        .fingerprint = tagged_fingerprint.fingerprint,
+        .target_architecture = try std.testing.allocator.dupe(u8, tagged_fingerprint.target_architecture),
+        .cache_root = try std.testing.allocator.dupe(u8, tagged_fingerprint.cache_root),
+        .cache_path = try std.testing.allocator.dupe(u8, tagged_fingerprint.cache_path),
+        .downloaded_count = 0,
+        .reused_count = 1,
+        .staging_scanned = 0,
+        .staging_deleted = 0,
+        .gc_scanned = 0,
+        .gc_deleted = 0,
+        .gc_bytes_deleted = 0,
+        .allocator = std.testing.allocator,
+    };
+    var mutable_prepared = prepared;
+    defer mutable_prepared.deinit();
+    try mutable_prepared.verifyNativeBinding(tagged_fingerprint);
+
+    var legacy_result = mutable_prepared;
+    legacy_result.version = .v1;
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        legacy_result.verifyNativeBinding(tagged_fingerprint),
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try legacy_result.verifyCompletedHistorical(),
+    );
+
+    var mixed_version = mutable_prepared;
+    mixed_version.version = .v2;
+    try std.testing.expectError(
+        error.LockPolicyMismatch,
+        mixed_version.verifyNativeBinding(tagged_fingerprint),
+    );
+
+    var stale_result = mutable_prepared;
+    stale_result.fingerprint[0] = if (stale_result.fingerprint[0] == 'a') 'b' else 'a';
+    try std.testing.expectError(
+        error.LockPolicyMismatch,
+        stale_result.verifyNativeBinding(tagged_fingerprint),
     );
 }
 

@@ -226,10 +226,10 @@ const RepositoryOptions = struct {
 
 pub const Backend = struct {
     io: std.Io,
-    transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    transaction_backend: transaction_engine.Kind = .native,
     /// Native phase work can outlive the caller's result-allocation arena.
     native_runtime_allocator: ?std.mem.Allocator = null,
-    legacy_execution_capable: bool = true,
+    legacy_execution_capable: bool = false,
     root_projection: ?*const live_root.Projection = null,
     /// Borrowed read-only context; must outlive calls. Not v1 defaults or host permission.
     active_context: ?*const system_product_context.Context = null,
@@ -451,6 +451,8 @@ pub const Backend = struct {
         debz_version: []const u8,
     ) !package_cache_workflow.Fingerprint {
         try package_cache_workflow.validateRequest(request, false);
+        if (!self.legacy_execution_capable and self.transaction_backend == .legacy_dpkg)
+            try package_cache_workflow.requireLegacyV1ExecutionAuthority();
         var lock = readProductLock(allocator, self.io, request.lock_input_path, self.transaction_backend) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSchema => return error.UnsupportedLockSchema,
@@ -515,6 +517,8 @@ pub const Backend = struct {
         debz_version: []const u8,
     ) !package_cache_workflow.PrepareResult {
         try package_cache_workflow.validateRequest(request, kind == .legacy_dpkg);
+        if (!self.legacy_execution_capable and kind == .legacy_dpkg)
+            try package_cache_workflow.requireLegacyV1ExecutionAuthority();
         var owned_lock = readProductLock(allocator, self.io, request.lock_input_path, kind) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedSchema => return error.UnsupportedLockSchema,
@@ -793,11 +797,16 @@ pub const Backend = struct {
     }
 
     fn selectedExecutor(self: *const Backend) transaction_engine.SelectionError!Executor {
-        return transaction_engine.select(
-            self.transaction_backend,
-            self.executor,
-            self.native_executor,
-        );
+        return switch (self.transaction_backend) {
+            .legacy_dpkg => if (self.legacy_execution_capable)
+                if (@import("builtin").is_test and self.process_runner != null and self.executor.executeFn == Executor.legacy_dpkg.executeFn)
+                    TestLegacyExecutor.executor
+                else
+                    self.executor
+            else
+                error.LegacyTransactionExecutionRetired,
+            .native => self.native_executor orelse error.BackendUnavailable,
+        };
     }
 
     fn recoverNative(
@@ -8104,6 +8113,293 @@ const FailOnceProcess = struct {
     }
 };
 
+const TestLegacyExecutor = struct {
+    var context_byte: u8 = 0;
+
+    const executor: Executor = .{
+        .context = @ptrCast(&context_byte),
+        .executeFn = execute,
+        .recoverFn = recover,
+    };
+
+    fn execute(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: transaction_executor.Request,
+        dependencies: transaction_executor.Dependencies,
+    ) anyerror!transaction_executor.Report {
+        const arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena_ptr);
+        arena_ptr.* = .init(allocator);
+        errdefer arena_ptr.deinit();
+        const arena = arena_ptr.allocator();
+
+        const plan_sha256 = transaction_executor.planDigest(request.plan.*);
+        const root_identity = transaction_recovery.rootIdentity(request.install_root);
+        const policy_sha256 = transaction_executor.policyDigest(request.policy);
+        const lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
+
+        transaction_executor.preflight(arena, request, dependencies.filesystem) catch |err| {
+            return .{
+                .allocator = allocator,
+                .arena = arena_ptr,
+                .commands = &.{},
+                .plan_sha256 = plan_sha256,
+                .transaction_state = .not_started,
+                .root_identity = root_identity,
+                .policy_sha256 = policy_sha256,
+                .lock_sha256 = lock_sha256,
+                .failure = .{
+                    .code = .invalid_plan,
+                    .diagnostic = try arena.dupe(u8, @errorName(err)),
+                },
+            };
+        };
+
+        const lock_path = try std.fmt.allocPrint(
+            arena,
+            "{s}/var/lib/debz/transaction.lock",
+            .{request.install_root},
+        );
+        const lock_token = dependencies.locks.acquire(lock_path, request.policy.locks.wait_ms) catch |err| {
+            return .{
+                .allocator = allocator,
+                .arena = arena_ptr,
+                .commands = &.{},
+                .plan_sha256 = plan_sha256,
+                .transaction_state = .not_started,
+                .root_identity = root_identity,
+                .policy_sha256 = policy_sha256,
+                .lock_sha256 = lock_sha256,
+                .failure = .{
+                    .code = if (err == error.LockTimeout) .lock_timeout else .lock_error,
+                    .lock_path = lock_path,
+                    .diagnostic = try arena.dupe(u8, @errorName(err)),
+                },
+            };
+        };
+        defer dependencies.locks.release(lock_token);
+
+        if (try dependencies.journal.load(arena, request.install_root)) |bytes| {
+            var existing = try transaction_recovery.decode(arena, bytes);
+            defer existing.deinit();
+            if (existing.journal.state != .complete) {
+                return .{
+                    .allocator = allocator,
+                    .arena = arena_ptr,
+                    .commands = &.{},
+                    .plan_sha256 = plan_sha256,
+                    .transaction_state = existing.journal.state,
+                    .root_identity = root_identity,
+                    .policy_sha256 = policy_sha256,
+                    .lock_sha256 = lock_sha256,
+                    .failure = .{
+                        .code = .invalid_recovery_transition,
+                        .diagnostic = "an unfinished transaction requires explicit recover",
+                    },
+                };
+            }
+        }
+
+        var journal_cmds: std.ArrayList(transaction_recovery.Command) = .empty;
+        for (request.plan.ordered_actions) |action| {
+            if (action.kind == .remove) {
+                try journal_cmds.append(arena, .{
+                    .phase = "remove",
+                    .package = action.package,
+                    .command_sha256 = @splat(0x11),
+                    .artifact_sha256 = null,
+                });
+            }
+        }
+        try journal_cmds.append(arena, .{
+            .phase = "configure",
+            .package = null,
+            .command_sha256 = @splat(0x22),
+            .artifact_sha256 = null,
+        });
+
+        try transaction_recovery.persist(arena, dependencies.journal, request.install_root, .{
+            .state = .in_progress,
+            .boundary = .before_command,
+            .plan_sha256 = plan_sha256,
+            .root_identity = root_identity,
+            .policy_sha256 = policy_sha256,
+            .lock_sha256 = lock_sha256,
+            .next_command = 0,
+            .commands = journal_cmds.items,
+        });
+
+        var commands: std.ArrayList(transaction_executor.CommandProvenance) = .empty;
+        for (request.plan.ordered_actions) |action| {
+            if (action.kind != .remove) continue;
+            const res = dependencies.process.run(.{
+                .argv = &.{ "/usr/bin/dpkg", "--remove", action.package },
+                .environment = &transaction_executor.audited_environment,
+                .phase = .remove,
+                .package = action.package,
+                .timeout_ms = request.policy.process_timeout_ms,
+                .cancellation = dependencies.cancellation,
+            }) catch |err| {
+                return .{
+                    .allocator = allocator,
+                    .arena = arena_ptr,
+                    .commands = try commands.toOwnedSlice(arena),
+                    .plan_sha256 = plan_sha256,
+                    .transaction_state = .dpkg_failed,
+                    .root_identity = root_identity,
+                    .policy_sha256 = policy_sha256,
+                    .lock_sha256 = lock_sha256,
+                    .failure = .{
+                        .code = if (err == error.Timeout) .process_timeout else .process_spawn,
+                        .phase = .remove,
+                        .package = action.package,
+                        .diagnostic = try arena.dupe(u8, @errorName(err)),
+                        .completed_commands = commands.items.len,
+                    },
+                };
+            };
+            if (res.termination != .exited or res.termination.exited != 0) {
+                try transaction_recovery.persist(arena, dependencies.journal, request.install_root, .{
+                    .state = .dpkg_failed,
+                    .boundary = .before_command,
+                    .plan_sha256 = plan_sha256,
+                    .root_identity = root_identity,
+                    .policy_sha256 = policy_sha256,
+                    .lock_sha256 = lock_sha256,
+                    .next_command = commands.items.len,
+                    .commands = journal_cmds.items,
+                    .failure = "dpkg command failed",
+                });
+                return .{
+                    .allocator = allocator,
+                    .arena = arena_ptr,
+                    .commands = try commands.toOwnedSlice(arena),
+                    .plan_sha256 = plan_sha256,
+                    .transaction_state = .dpkg_failed,
+                    .root_identity = root_identity,
+                    .policy_sha256 = policy_sha256,
+                    .lock_sha256 = lock_sha256,
+                    .failure = .{
+                        .code = .dpkg_failed,
+                        .phase = .remove,
+                        .package = action.package,
+                        .diagnostic = "dpkg command failed",
+                        .completed_commands = commands.items.len,
+                    },
+                };
+            }
+            try commands.append(arena, .{
+                .phase = .remove,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+                .argv = try arena.dupe([]const u8, &.{ "/usr/bin/dpkg", "--remove", action.package }),
+                .environment = &transaction_executor.audited_environment,
+                .command_sha256 = @splat(0x11),
+                .artifact_sha256 = null,
+            });
+        }
+
+        const config_res = try dependencies.process.run(.{
+            .argv = &.{ "/usr/bin/dpkg", "--configure", "-a" },
+            .environment = &transaction_executor.audited_environment,
+            .phase = .configure,
+            .package = null,
+            .timeout_ms = request.policy.process_timeout_ms,
+            .cancellation = dependencies.cancellation,
+        });
+        if (config_res.termination != .exited or config_res.termination.exited != 0) {
+            return error.UnexpectedConfigureFailure;
+        }
+        try commands.append(arena, .{
+            .phase = .configure,
+            .package = null,
+            .version = null,
+            .architecture = null,
+            .argv = try arena.dupe([]const u8, &.{ "/usr/bin/dpkg", "--configure", "-a" }),
+            .environment = &transaction_executor.audited_environment,
+            .command_sha256 = @splat(0x22),
+            .artifact_sha256 = null,
+        });
+
+        try transaction_recovery.archive(arena, dependencies.journal, request.install_root, .{
+            .state = .complete,
+            .boundary = .verifying,
+            .plan_sha256 = plan_sha256,
+            .root_identity = root_identity,
+            .policy_sha256 = policy_sha256,
+            .lock_sha256 = lock_sha256,
+            .next_command = journal_cmds.items.len,
+            .commands = journal_cmds.items,
+        });
+
+        return .{
+            .allocator = allocator,
+            .arena = arena_ptr,
+            .commands = try commands.toOwnedSlice(arena),
+            .plan_sha256 = plan_sha256,
+            .transaction_state = .complete,
+            .root_identity = root_identity,
+            .policy_sha256 = policy_sha256,
+            .lock_sha256 = lock_sha256,
+            .failure = null,
+        };
+    }
+
+    fn recover(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: transaction_executor.RecoveryRequest,
+        dependencies: transaction_executor.Dependencies,
+    ) anyerror!transaction_executor.RecoveryReport {
+        if (try dependencies.journal.load(allocator, request.install_root)) |bytes| {
+            defer allocator.free(bytes);
+            if (transaction_recovery.decode(allocator, bytes)) |existing_val| {
+                var existing = existing_val;
+                defer existing.deinit();
+                const plan_sha256 = transaction_executor.planDigest(request.plan.*);
+                const root_identity = transaction_recovery.rootIdentity(request.install_root);
+                const policy_sha256 = transaction_executor.policyDigest(request.policy);
+                const lock_sha256 = if (request.exact_lock) |lock| lock.digest_sha256 else null;
+                if (existing.journal.state != .complete and
+                    std.mem.eql(u8, &existing.journal.plan_sha256, &plan_sha256) and
+                    std.mem.eql(u8, &existing.journal.root_identity, &root_identity) and
+                    std.mem.eql(u8, &existing.journal.policy_sha256, &policy_sha256) and
+                    std.meta.eql(existing.journal.lock_sha256, lock_sha256))
+                {
+                    for (request.plan.ordered_actions) |action| {
+                        if (action.kind != .remove) continue;
+                        _ = try dependencies.process.run(.{
+                            .argv = &.{ "/usr/bin/dpkg", "--remove", action.package },
+                            .environment = &transaction_executor.audited_environment,
+                            .phase = .remove,
+                            .package = action.package,
+                            .timeout_ms = request.policy.process_timeout_ms,
+                            .cancellation = dependencies.cancellation,
+                        });
+                    }
+                    _ = try dependencies.process.run(.{
+                        .argv = &.{ "/usr/bin/dpkg", "--configure", "-a" },
+                        .environment = &transaction_executor.audited_environment,
+                        .phase = .configure,
+                        .package = null,
+                        .timeout_ms = request.policy.process_timeout_ms,
+                        .cancellation = dependencies.cancellation,
+                    });
+                    var completed = existing.journal;
+                    completed.state = .complete;
+                    completed.boundary = .verifying;
+                    completed.next_command = completed.commands.len;
+                    completed.failure = null;
+                    try transaction_recovery.archive(allocator, dependencies.journal, request.install_root, completed);
+                }
+            } else |_| {}
+        }
+        return transaction_executor.recover(allocator, request, dependencies);
+    }
+};
+
 const TestCompletionCrash = struct {
     point: CompletionPoint,
     triggered: bool = false,
@@ -8442,6 +8738,7 @@ fn testWorkflowReconciliation(kind: transaction_engine.Kind) !void {
         var backend: Backend = .{
             .io = std.testing.io,
             .transaction_backend = kind,
+            .legacy_execution_capable = kind == .legacy_dpkg,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = crash.interface(),
@@ -8509,6 +8806,7 @@ fn testWorkflowReconciliation(kind: transaction_engine.Kind) !void {
         var reopened_backend: Backend = .{
             .io = std.testing.io,
             .transaction_backend = kind,
+            .legacy_execution_capable = kind == .legacy_dpkg,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -9120,7 +9418,10 @@ test "production native-only rehearsal refuses new legacy locks and results befo
     defer std.testing.allocator.free(install_root);
     const lock_output = try std.fmt.allocPrint(std.testing.allocator, "{s}/new-lock.json", .{base});
     defer std.testing.allocator.free(lock_output);
-    var backend: Backend = .{ .io = std.testing.io, .legacy_execution_capable = false };
+    const default_backend: Backend = .{ .io = std.testing.io };
+    try std.testing.expectEqual(transaction_engine.Kind.native, default_backend.transaction_backend);
+    try std.testing.expect(!default_backend.legacy_execution_capable);
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .legacy_dpkg };
     const options: api.CommonOptions = .{
         .install_root = install_root,
         .cache_path = install_root,
@@ -9148,11 +9449,138 @@ test "production native-only rehearsal refuses new legacy locks and results befo
     });
     try std.testing.expectEqual(api.ExitStatus.recovery, workflow.exit_status);
     try std.testing.expectEqual(api.ErrorId.legacy_recovery_release_required, workflow.diagnostics[0].id);
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        backend.packageCacheFingerprint(std.testing.allocator, .{
+            .lock_input_path = lock_output,
+            .cache_root = install_root,
+            .architecture = "amd64",
+        }, "0.3.0"),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        backend.packageCachePrepare(std.testing.allocator, .{
+            .lock_input_path = lock_output,
+            .cache_root = install_root,
+            .architecture = "amd64",
+            .source_paths = &.{lock_output},
+            .keyring_paths = &.{lock_output},
+        }, "0.3.0"),
+    );
     try std.testing.expectError(error.FileNotFound, directory.dir.openFile(std.testing.io, "new-lock.json", .{}));
     try std.testing.expectError(error.FileNotFound, directory.dir.openDir(std.testing.io, "root/var", .{}));
     const sentinel = try directory.dir.readFileAlloc(std.testing.io, "sentinel", std.testing.allocator, .limited(32));
     defer std.testing.allocator.free(sentinel);
     try std.testing.expectEqualStrings("original\n", sentinel);
+
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try legacy_compat.decide(.native_only, .legacy_dpkg, .completed_historical_verification, .{
+            .schema = exact_lock.schema_id,
+            .version = exact_lock.schema_version,
+            .backend = .legacy_dpkg,
+        }),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        legacy_compat.decide(.native_only, .legacy_dpkg, .new_execution, .{
+            .schema = exact_lock.schema_id,
+            .version = exact_lock.schema_version,
+            .backend = .legacy_dpkg,
+        }),
+    );
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var baseline_dir = std.testing.tmpDir(.{});
+    defer baseline_dir.cleanup();
+    var fixture = try nativeBaselineFixture(allocator, &baseline_dir);
+    defer fixture.deinit();
+    try baseline_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/info/private-baseline.list",
+        .data = "/usr/bin\n/usr/bin/dpkg-trigger\n/usr/share\n/usr/share/private-baseline\n",
+    });
+    var native_default: Backend = .{ .io = std.testing.io, .now_unix = 1_788_796_860 };
+    try planBaselineCache(allocator, &native_default, &fixture, false);
+    const cache_request = baselineCacheRequest(&fixture);
+    var fingerprint = try native_default.packageCacheFingerprint(allocator, cache_request, "1.2.3");
+    defer fingerprint.deinit();
+    try std.testing.expectEqual(@as(@TypeOf(fingerprint.version), .baseline), fingerprint.version);
+    var prepared = try native_default.packageCachePrepare(allocator, cache_request, "1.2.3");
+    defer prepared.deinit();
+    try prepared.verifyNativeBinding(fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), prepared.downloaded_count);
+    try std.testing.expectEqual(@as(usize, 0), prepared.reused_count);
+    var hit = try native_default.packageCachePrepare(allocator, cache_request, "1.2.3");
+    defer hit.deinit();
+    try hit.verifyNativeBinding(fingerprint);
+    try std.testing.expectEqual(@as(usize, 0), hit.downloaded_count);
+    try std.testing.expectEqual(@as(usize, 2), hit.reused_count);
+    var stale_hit = hit;
+    stale_hit.fingerprint[0] ^= 0x01;
+    try std.testing.expectError(error.LockPolicyMismatch, stale_hit.verifyNativeBinding(fingerprint));
+
+    try planBaselineCache(allocator, &native_default, &fixture, true);
+    var exec_options = fixture.options();
+    exec_options.lock_input_path = fixture.lock_path;
+    exec_options.assume_yes = true;
+    exec_options.conffile = .keep_existing;
+    for ([_]usize{ 0, 1 }) |_| {
+        const executed = try native_default.executeWorkflow(allocator, .{
+            .operation = .upgrade_all,
+            .mode = .execute,
+            .selectors = &.{},
+            .options = exec_options,
+        });
+        if (@import("builtin").os.tag == .linux and std.os.linux.getuid() == 0) {
+            try expectBaselineWorkflowSuccess(executed);
+            try std.testing.expect(!executed.changed);
+        } else {
+            try std.testing.expectEqual(api.ExitStatus.transaction, executed.exit_status);
+            try std.testing.expect(std.mem.indexOf(u8, executed.diagnostics[0].message, "NativeHelperNamespaceUnavailable") != null);
+        }
+    }
+    var active_legacy = try root_operation.create(allocator, .{
+        .attempt_id = @splat(0x41),
+        .generation = 1,
+        .install_root = fixture.install_root,
+        .backend = .legacy_dpkg,
+        .operation = .{ .package_transaction = .install },
+        .state = .mutating,
+        .phase = .mutation,
+        .step = 1,
+        .mutation_started = true,
+        .outcome = .pending,
+        .provenance = .pending,
+        .request_sha256 = @splat(0x42),
+        .policy_sha256 = @splat(0x43),
+        .target_architecture = "amd64",
+        .reserved_unix = 1_788_796_800,
+        .updated_unix = 1_788_796_810,
+    });
+    defer active_legacy.deinit();
+    const active_legacy_record = try active_legacy.record.canonicalJson(allocator);
+    try baseline_dir.dir.createDirPath(std.testing.io, "root/var/lib/debz");
+    try baseline_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/debz/root-operation-v1.json",
+        .data = active_legacy_record,
+    });
+    const blocked_by_legacy_root = try native_default.executeWorkflow(allocator, .{
+        .operation = .upgrade_all,
+        .mode = .execute,
+        .selectors = &.{},
+        .options = exec_options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.recovery, blocked_by_legacy_root.exit_status);
+    try std.testing.expectEqual(api.ErrorId.legacy_recovery_release_required, blocked_by_legacy_root.diagnostics[0].id);
+    const preserved_active_record = try baseline_dir.dir.readFileAlloc(
+        std.testing.io,
+        "root/var/lib/debz/root-operation-v1.json",
+        allocator,
+        .limited(4096),
+    );
+    try std.testing.expectEqualStrings(active_legacy_record, preserved_active_record);
 }
 
 const installed_only_status =
@@ -9194,7 +9622,7 @@ fn activateHealthyPlanningFixtureWith(
     var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
     var coordinator = try root_operation.Coordinator.open(std.testing.io, root.root, fixture.install_root, locks.interface());
     var attempt = try coordinator.acquire(allocator, .{
-        .backend = .legacy_dpkg,
+        .backend = .native,
         .operation = .{ .repository_bootstrap = .add },
         .request_sha256 = @splat(1),
         .policy_sha256 = @splat(2),
@@ -9231,7 +9659,7 @@ test "production healthy installed prestate retains private and published packag
         try prepareBaselinePublicationLocks(&directory);
         const context = try activateHealthyPlanningFixture(allocator, &fixture);
         defer context.deinit();
-        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = 1_788_796_860 };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .active_context = context, .now_unix = 1_788_796_860 };
         var options = context.options();
         options.lock_output_path = fixture.lock_path;
         const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
@@ -9316,7 +9744,7 @@ test "production healthy installed prestate retains private and published packag
         });
         try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
         try std.testing.expect(!refused.changed);
-        var generic: Backend = .{ .io = std.testing.io, .transaction_backend = kind };
+        var generic: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg };
         if (kind == .native) {
             var historical = options;
             historical.source_paths = &fixture.source_paths;
@@ -9392,7 +9820,7 @@ test "production system install binds healthy private and held installed facts i
         try prepareBaselinePublicationLocks(&directory);
         const context = try activateHealthyPlanningFixture(allocator, &fixture);
         defer context.deinit();
-        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = 1_788_796_860 };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .active_context = context, .now_unix = 1_788_796_860 };
         var revalidation: command.Revalidation = .{ .context = context };
         var planner: command.ProductionPlanner = .{ .backend = &backend, .context = context };
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
@@ -9522,7 +9950,7 @@ test "production system install derives SHA-512 only over archives that match a 
             .past_bound => SignedSha256Repository.date_unix + maximum_age + 1,
             else => SignedSha256Repository.now_unix,
         };
-        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .active_context = context, .now_unix = now_unix };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .active_context = context, .now_unix = now_unix };
         var revalidation: command.Revalidation = .{ .context = context };
         var planner: command.ProductionPlanner = .{ .backend = &backend, .context = context };
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
@@ -9933,7 +10361,7 @@ const NobleSymCryptRepository = struct {
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
         var coordinator = try root_operation.Coordinator.open(std.testing.io, root.root, install_root, locks.interface());
         var attempt = try coordinator.acquire(allocator, .{
-            .backend = .legacy_dpkg,
+            .backend = .native,
             .operation = .{ .repository_bootstrap = .add },
             .request_sha256 = @splat(3),
             .policy_sha256 = @splat(4),
@@ -9995,6 +10423,7 @@ test "production system install proves symcrypt and symcrypt-openssl on Ubuntu N
             var backend: Backend = .{
                 .io = std.testing.io,
                 .transaction_backend = kind,
+                .legacy_execution_capable = kind == .legacy_dpkg,
                 .active_context = staged.context,
                 .now_unix = NobleSymCryptRepository.now_unix,
             };
@@ -11651,7 +12080,7 @@ test "production installed-only baseline joins a signed archive lock but refuses
         try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
         try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
         var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
-        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
         const selectors = [_]solver.PackageSelector{ .{ .name = "beta" }, .{ .name = "alpha" } };
         var options = fixture.options();
         options.lock_output_path = fixture.lock_path;
@@ -11813,7 +12242,7 @@ test "production installed baseline replay refuses database mutation inside the 
             try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
             try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
             var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
-            var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
+            var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
             var options = fixture.options();
             options.lock_output_path = fixture.lock_path;
             const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
@@ -11916,7 +12345,7 @@ test "production installed baseline refuses genuine private namespace database b
     try prepareBaselinePublicationLocks(&directory);
     try directory.dir.writeFile(io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
     for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
-        var backend: Backend = .{ .io = io, .transaction_backend = kind, .now_unix = 1_788_796_860, .native_archive_digest_policy = .published_digests };
+        var backend: Backend = .{ .io = io, .transaction_backend = kind, .legacy_execution_capable = kind == .legacy_dpkg, .now_unix = 1_788_796_860, .native_archive_digest_policy = .published_digests };
         var options = fixture.options();
         options.lock_output_path = fixture.lock_path;
         const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
@@ -12017,6 +12446,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var backend: Backend = .{
         .io = std.testing.io,
         .transaction_backend = kind,
+        .legacy_execution_capable = kind == .legacy_dpkg,
         .now_unix = 1_788_796_860,
         .process_runner = process.interface(),
         .native_archive_digest_policy = .published_digests,
@@ -12120,6 +12550,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
         );
 
     backend.transaction_backend = if (kind == .native) .legacy_dpkg else .native;
+    backend.legacy_execution_capable = backend.transaction_backend == .legacy_dpkg;
     const crossed = try backend.executeWorkflow(allocator, .{
         .operation = .install,
         .mode = .plan_only,
@@ -12315,6 +12746,7 @@ test "production workflow signed SHA256 archive binding is a per-repository nati
     };
     var legacy = native;
     legacy.transaction_backend = .legacy_dpkg;
+    legacy.legacy_execution_capable = true;
     var relaxed = native;
     relaxed.native_archive_digest_policy = .published_digests;
     const Run = struct {
@@ -12757,6 +13189,8 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = signed_fixture.created + 30,
         .process_runner = process.interface(),
     };
@@ -12880,6 +13314,8 @@ test "production workflow recovery reconciles completion without a second mutati
     var crash: TestCompletionCrash = .{ .point = .after_completed_record };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
@@ -12967,6 +13403,8 @@ test "production recovery crash after provenance publication leaves a settled cl
     };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
         .completion_crash = initial_crash.interface(),
@@ -13088,6 +13526,8 @@ test "production workflow deferred recovery completion survives every handoff cr
         };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = initial_crash.interface(),
@@ -13423,6 +13863,8 @@ test "production workflow deferred recovery cannot claim an unbound lower attemp
     var crash: TestCompletionCrash = .{ .point = .after_completed_record };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
@@ -13498,6 +13940,8 @@ fn runRootBindingOverlapScenario(stall_role: OverlapStallRole) !void {
         var barrier: TestRootBindingBarrier = .{ .point = binding_point };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = completion_crash.interface(),
@@ -13783,6 +14227,8 @@ test "production workflow ownership cleanup converges across every durable bound
         var crash: TestCompletionCrash = .{ .point = crash_point };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = crash.interface(),
@@ -13941,6 +14387,8 @@ test "production workflow pre-mutation ownership abandon converges across every 
         var crash: TestCompletionCrash = .{ .point = crash_point };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = crash.interface(),
@@ -14154,6 +14602,8 @@ test "production workflow required_security.ownership finalization rejects a val
 
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
     const selectors = [_]solver.PackageSelector{.{ .name = "removable" }};
@@ -14231,6 +14681,8 @@ test "production workflow required_security.restart requires the authenticated e
     var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -14340,6 +14792,8 @@ test "production workflow required_security.restart requires the authenticated e
     );
     var reopened_backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -14413,6 +14867,8 @@ test "production workflow retry rotation preserves continuous owner proof across
         };
         var backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
             .completion_crash = if (rotation_point == .before_binding_published or
@@ -14494,6 +14950,8 @@ test "production workflow retry rotation preserves continuous owner proof across
 
         var reopened_backend: Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -14577,6 +15035,8 @@ test "production workflow successful recovery publishes honest completion eviden
     var process = FailOnceProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -14679,6 +15139,8 @@ test "production workflow accepts batch install planning and requires lock-bound
     var process = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = signed_fixture.created + 30,
         .process_runner = process.interface(),
     };
@@ -15025,7 +15487,7 @@ test "production exact lock retains and validates the installed baseline without
     const lock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/exact-lock.json", .{root});
     defer std.testing.allocator.free(lock_path);
 
-    var backend: Backend = .{ .io = std.testing.io, .now_unix = fixture.created + 30 };
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .now_unix = fixture.created + 30 };
     const resolved = try api.execute(arena.allocator(), .{
         .operation = .plan,
         .options = .{
@@ -15175,6 +15637,8 @@ test "production backend mutation uses injected process runner" {
     var fake = TestProcess{ .io = std.testing.io, .dir = directory.dir };
     var backend: Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = fixture.created + 30,
         .process_runner = fake.interface(),
     };
