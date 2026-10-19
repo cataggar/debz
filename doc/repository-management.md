@@ -749,10 +749,13 @@ reflect the live feed, such as a Release older than 14 days or a replaced
 descriptor, rather than a debz regression.
 
 The typed `system_product_context` resolver now retains this profile when it
-loads the active repository configuration described below. It is not yet
-consumed by the `debz apt` system facade or product API v1 package execution, so
-those still refuse this feed unless a product API `--config` explicitly selects
-the same bounded freshness for its source.
+loads the active repository configuration described below. The
+[short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1)
+plans with it and records it explicitly in its program and result as
+`bounded_missing_valid_until` with `maximum_release_age_seconds: 1209600`. It is
+not yet consumed by the `debz apt` system facade or product API v1 package
+execution, so those still refuse this feed unless a product API `--config`
+explicitly selects the same bounded freshness for its source.
 Installed packages do not replace the pinned build inputs that zig-symcrypt
 uses.
 
@@ -821,8 +824,10 @@ archive and exact-lock identities before executing.
 This is the active-configuration/system-context slice of #68, **not completion
 of `sudo debz install symcrypt[-openssl]`**. See
 [the typed context boundary](target-apt-config.md#typed-system-product-context).
-Auto-lock publication, exact recovery-aware retry, evidence-bearing product
-results and the reviewed standalone host-install route remain separate work.
+The [short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1)
+adds auto-lock publication, exact owned retry and evidence-bearing results on
+top of it. Its execution generation, post-mutation recovery and the reviewed
+host mutation remain separate work.
 
 ## Planning and mutation boundary
 

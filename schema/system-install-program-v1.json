@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-program-v1",
+  "title": "debz system install program v1: the exact closure one execution generation may run",
+  "$comment": "Binds the attempt's exact-closure-lock v5, the healthy installed facts it was planned against, and the repository authority behind every archive. The Zig validator additionally enforces sorted unique archives and repositories, an archive's repository_id naming a listed repository, and each published value having its algorithm's full hexadecimal length.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": { "$ref": "#/$defs/payload" },
+    "digest_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+  },
+  "$defs": {
+    "archiveAuthentication": {
+      "enum": ["signed_sha512", "signed_sha256_derived_sha512", "signed_sha256_only"],
+      "description": "signed_sha512: the signed index publishes a SHA-512 for the archive. signed_sha256_derived_sha512: the signed index publishes only a SHA-256 and the repository's reviewed archive_binding admits a SHA-512 computed locally from bytes that first matched that signed SHA-256; the SHA-512 is authenticated-derived evidence (derived_from_signed_sha256), never an upstream SHA-512 record. signed_sha256_only: only a signed SHA-256 binds the archive; the native backend refuses it."
+    },
+    "publishedDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": { "enum": ["sha256", "sha512"] },
+        "value": { "type": "string", "pattern": "^[0-9a-f]+$" }
+      }
+    },
+    "derivedDigest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "provenance"],
+      "properties": {
+        "value": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "provenance": { "const": "derived_from_signed_sha256" }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package", "version", "architecture", "retention", "archive_authentication", "repository_id",
+        "published_digests", "primary", "dpkg_selection_hold", "declared_size"
+      ],
+      "properties": {
+        "package": { "$ref": "system-install-request-v1.json#/$defs/package" },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "retention": { "enum": ["requested", "dependency", "retained"] },
+        "archive_authentication": { "$ref": "#/$defs/archiveAuthentication" },
+        "repository_id": { "$ref": "exact-closure-lock-v3.json#/$defs/repository/properties/id" },
+        "published_digests": {
+          "description": "Exactly the digests the signed index publishes, in algorithm order; primary names one of them.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/publishedDigest" }
+        },
+        "primary": { "enum": ["sha256", "sha512"] },
+        "derived_sha512": { "$ref": "#/$defs/derivedDigest" },
+        "dpkg_selection_hold": { "type": "boolean" },
+        "declared_size": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "archive_authentication": { "const": "signed_sha512" } } },
+          "then": {
+            "properties": { "published_digests": { "contains": { "properties": { "algorithm": { "const": "sha512" } } } } },
+            "not": { "required": ["derived_sha512"] }
+          }
+        },
+        {
+          "if": { "properties": { "archive_authentication": { "const": "signed_sha256_derived_sha512" } } },
+          "then": {
+            "required": ["derived_sha512"],
+            "properties": {
+              "primary": { "const": "sha256" },
+              "published_digests": { "not": { "contains": { "properties": { "algorithm": { "const": "sha512" } } } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "archive_authentication": { "const": "signed_sha256_only" } } },
+          "then": {
+            "properties": { "published_digests": { "not": { "contains": { "properties": { "algorithm": { "const": "sha512" } } } } } },
+            "not": { "required": ["derived_sha512"] }
+          }
+        }
+      ]
+    },
+    "installedFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "architecture", "selection"],
+      "properties": {
+        "name": { "$ref": "system-install-request-v1.json#/$defs/package" },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "selection": { "enum": ["install", "hold"] }
+      }
+    },
+    "installedFacts": {
+      "description": "Healthy observed package-database facts, including private, held, and unpublished packages. They carry no archive origin and never authorize fetching or reinstalling a package.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "origin", "database_sha512", "facts"],
+      "properties": {
+        "authority": { "const": "healthy_installed_prestate" },
+        "origin": { "const": "installed_package_database" },
+        "database_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "facts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/installedFact" } }
+      }
+    },
+    "freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy"],
+      "properties": {
+        "policy": { "enum": ["require_valid_until", "bounded_missing_valid_until", "frozen_release"] },
+        "maximum_release_age_seconds": { "type": "integer", "minimum": 1 }
+      },
+      "if": { "properties": { "policy": { "const": "bounded_missing_valid_until" } } },
+      "then": { "required": ["maximum_release_age_seconds"] },
+      "else": { "not": { "required": ["maximum_release_age_seconds"] } },
+      "description": "bounded_missing_valid_until is the explicit, reviewed repository-specific bound for a moving feed whose signed Release omits Valid-Until; it is never a default."
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "uri", "suite", "component", "archive_binding", "signers", "freshness"],
+      "properties": {
+        "id": { "$ref": "exact-closure-lock-v3.json#/$defs/repository/properties/id" },
+        "uri": { "type": "string", "minLength": 1 },
+        "suite": { "type": "string", "minLength": 1 },
+        "component": { "type": "string", "minLength": 1 },
+        "archive_binding": { "enum": ["published_digests", "signed_sha256_derived_sha512"] },
+        "signers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[0-9A-F]{40}$" }
+        },
+        "freshness": { "$ref": "#/$defs/freshness" }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "version", "attempt_id", "request_document_sha512", "lock", "backend", "target_architecture",
+        "execution_generation", "archives", "installed", "repositories"
+      ],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-program-v1" },
+        "version": { "const": 1 },
+        "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+        "request_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "lock": { "$ref": "system-install-request-v1.json#/$defs/lockReference" },
+        "backend": { "$ref": "system-install-request-v1.json#/$defs/backend" },
+        "target_architecture": { "type": "string", "minLength": 1 },
+        "execution_generation": { "const": "system-install-execution-v1" },
+        "archives": { "type": "array", "items": { "$ref": "#/$defs/archive" } },
+        "installed": { "$ref": "#/$defs/installedFacts" },
+        "repositories": { "type": "array", "items": { "$ref": "#/$defs/repository" } }
+      },
+      "if": { "properties": { "backend": { "const": "native" } } },
+      "then": {
+        "properties": {
+          "archives": { "items": { "properties": { "archive_authentication": { "not": { "const": "signed_sha256_only" } } } } }
+        }
+      }
+    }
+  }
+}

@@ -273,12 +273,14 @@ the active-context binding into archive-only output.
 This planning generation deliberately cannot be unwrapped into v3/v4 mutation
 or package-CAS authority. Historical execution and cache consumers refuse it.
 Historical v4 bytes, its installed-component restrictions and its explicit
-`InstalledBaselineExecutionUnsupported` fence are unchanged. **The #407/#68
-outcome is still incomplete:** a subsequent versioned execution contract must
-connect healthy facts to durable standalone auto-lock ownership, exact owned
-retry/recovery, per-operation results and native scoped host execution. Noble
-amd64/arm64 acceptance for both SymCrypt variants and the pre-mutation OpenSSL
-range-conflict witness remain required. This work does not add a #274 prerequisite.
+`InstalledBaselineExecutionUnsupported` fence are unchanged. The
+[short system-profile install](#short-system-profile-install-system-install-v1)
+connects these healthy facts to durable auto-lock ownership, exact owned retry
+and per-operation evidence. **The #407/#68 outcome is still incomplete:** no
+build provides its execution generation yet, so scoped host execution,
+post-mutation recovery, Noble amd64/arm64 acceptance for both SymCrypt variants
+and the pre-mutation OpenSSL range-conflict witness remain required. This work
+does not add a #274 prerequisite.
 
 **Signed SHA256 with a derived SHA512.** Some signed archives, including
 Debian stable, publish only SHA256 in both
@@ -614,3 +616,146 @@ Actions installation, including when the mutating process ran under explicit
 sudo. It verifies canonical transaction-result v1 bytes and digest, successful
 exact final state, and complete repository/package evidence against the
 supplied canonical lock before emitting the bounded summary schema above.
+
+## Short system-profile install (system-install v1)
+
+```sh
+sudo debz install [--json] [-y] [--noninteractive] \
+  [--transaction-backend legacy_dpkg|native] [--deadline-ms N] [--lock-wait-ms N] PACKAGE
+```
+
+Exactly one Debian package name and only these options select the fixed
+`system_default` profile. That profile is the host root `/`, cache
+`/var/cache/debz`, state `/var/lib/debz`, exact locks under
+`/var/lib/debz/locks`, evidence under `/var/lib/debz/system-install`, the
+active configuration's architecture, keep-existing conffiles and no
+interaction. Any product API v1 option, such as `--install-root`, keeps the
+unchanged [product API v1](product-api.md) contract. Usage errors exit 2 before
+root access. Without root privilege the command refuses before any projection
+(exit 3). The backend defaults as for the other CLI commands. Native-only
+rehearsal builds refuse legacy planning with
+`legacy_recovery_release_required`.
+
+The privileged command opens the host root only through the authenticated
+private root projection. It plans with the production backend against the
+verified [typed system context](target-apt-config.md#typed-system-product-context)
+created by `sudo debz repo add`; without one it refuses with
+`configuration_required`. Only the canonical result document leaves the
+projection.
+
+**Ownership and exact owned retry.** `system-install/owner.lock` serializes
+system installs for the whole run, including planning. The shared
+root-operation lock guards every state transition. Contention refuses before
+any attempt state. A new attempt receives a random 128-bit `attempt_id` and a
+`system-install-active-v1` pointer before planning begins. Every later run
+reads that pointer **before any refresh, planning or new attempt**:
+
+- Only the exact recorded command adopts the unsettled attempt. The
+  `request_sha512` binds the package, backend and root. Any other request
+  refuses with `interrupted` (exit 8) and starts nothing.
+- A reserved attempt without a published lock plans again under the same
+  attempt and lock path. A published or bound lock is re-verified, never
+  replanned.
+- An attempt interrupted at or after `executing` becomes sticky
+  `recovery_required` (exit 8). No run retries, refreshes or replans it.
+- Another surface's pending recovery leaves the attempt unchanged.
+
+**Versioned evidence chain.** The planner writes the attempt's
+`exact-closure-lock-v5` to exactly `/var/lib/debz/locks/install-<attempt_id>.json`.
+Every other document lives in
+`/var/lib/debz/system-install/operations/<attempt_id>/`:
+
+| Document | Schema | Binds |
+| --- | --- | --- |
+| `request-v1.json` | [`system-install-request-v1`](../schema/system-install-request-v1.json) | What was asked: package, backend, profile, normalized command and `request_sha512`, never the solved closure. |
+| `progress-v1.json` | [`system-install-progress-v1`](../schema/system-install-progress-v1.json) | Phase `reserved` → `lock_bound` → `authorized` → `executing` → `recovery_required`, or `terminal`. Replaced in place; each generation chains its predecessor's SHA-512. |
+| `program-v1.json` | [`system-install-program-v1`](../schema/system-install-program-v1.json) | The exact lock's SHA-512, every archive's authentication class and digests, the healthy installed facts and each repository's authority and freshness. |
+| `authorization-v1.json` | [`system-install-authorization-v1`](../schema/system-install-authorization-v1.json) | Request, program and lock bound to `system-install-execution-v1`, `keep_existing` conffiles and no interaction. |
+| `receipt-v1.json` | [`system-install-receipt-v1`](../schema/system-install-receipt-v1.json) | The final progress and terminal outcome, written before the pointer is removed. |
+| `recovery-v1.json` | [`system-install-recovery-v1`](../schema/system-install-recovery-v1.json) | The sticky recovery reason and guidance after execution may have begun. |
+
+The pointer is [`system-install-active-v1`](../schema/system-install-active-v1.json).
+Every document is a canonical `{payload, digest_sha512}` envelope:
+
+- Documents are create-once. An existing document must be byte-identical.
+- Files are `0600` and directories `0700`.
+- Every file must have the root owner, a single link and no group or other
+  write permission; violations refuse.
+
+**Binding verification.** Each bind re-reads the retained lock and compares
+its recorded SHA-512. It then verifies the backend, the active configuration
+identity and manifest digest, the root and architecture, and the complete
+healthy installed database. It also checks the requested package and each
+repository's current authority and `archive_binding`. Any drift abandons the
+attempt before mutation (`abandoned_before_mutation`, exit 5). The attempt keeps
+its lock and evidence, and a rerun plans a new attempt.
+
+**Installed facts.** Healthy private, held and unpublished packages appear in
+the program as `installed_package_database` facts. They carry no repository or
+archive identity and are never downloaded. Holds stay visible as
+`selection: hold` in the program and in the result's installed summary.
+
+**Archive authentication.** Each archive records exactly the digests its
+signed index published (`published_digests`) and one class:
+
+- `signed_sha512`: the signed index publishes a SHA-512.
+- `signed_sha256_derived_sha512`: the signed index publishes only a SHA-256,
+  and the repository's explicit `archive_binding` opt-in (see **Signed SHA256
+  with a derived SHA512** above) admits a SHA-512 computed from bytes that
+  first matched it. The value appears only as
+  `derived_sha512` with provenance `derived_from_signed_sha256`. It is
+  authenticated-derived evidence, never an upstream SHA-512 record.
+- `signed_sha256_only`: only the signed SHA-256 binds the archive. The native
+  backend refuses it before mutation (`planning_failed`, exit 5); the legacy
+  backend records it as-is.
+
+Microsoft's Noble `Packages` index lists only a SHA-256 for each archive
+(checked 2026-10-13); its `InRelease` lists SHA-512 only for the index files.
+Its reviewed profile `microsoft-ubuntu-24.04-prod` does not opt in to a derived
+binding, so its archives are `signed_sha256_only` until that opt-in is
+reviewed.
+Each repository also records its freshness policy. The reviewed
+repository-specific moving-feed bound appears explicitly as
+`bounded_missing_valid_until` with `maximum_release_age_seconds: 1209600`, as
+described in [reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
+No default bound is applied.
+
+**Execution is pending.** No build provides `system-install-execution-v1` yet.
+An authorized attempt therefore settles as `refused_before_mutation` with
+`transaction_backend_unavailable` (exit 3). The exact lock is retained and
+nothing is changed. A request already satisfied by the healthy installed
+database completes with no actions and `changed: false`. The v5 lock keeps
+its planning-only meaning. Historical v4 bytes and the
+`InstalledBaselineExecutionUnsupported` and legacy v4 execution fences are
+unchanged.
+
+**Results.** `--json` prints one canonical
+[`system-install-result-v1`](../schema/system-install-result-v1.json) line. It
+names the attempt, whether it was resumed, the profile, the exact lock, the
+evidence directory, every evidence document by SHA-512, the planned actions,
+repositories and installed summary, and the diagnostics. Human output reports
+the same facts on stdout for success and on stderr otherwise.
+
+| Exit | Outcome |
+| ---: | --- |
+| 0 | `completed` |
+| 2 | Usage error (`command-result-v1`, before any root access) |
+| 3 | Unavailable: no privilege or configuration, contention, or pending execution |
+| 5 | `abandoned_before_mutation`, or a planning refusal |
+| 8 | `interrupted` or `recovery_required` |
+| 70 | Internal error; evidence is left as written |
+
+A planner refusal settles as `rejected` and keeps the product exit status and
+error ID it reported, for example 4 for repository authentication or 6 for
+downloads.
+
+**Remaining work:**
+
+- the execution generation, with same-lock final verification under the dpkg
+  locks;
+- post-mutation recovery and an operator recovery command;
+- refusal of unsettled system-install attempts by other root surfaces;
+- the Microsoft derived-binding review;
+- removal of settled attempts and their retained locks;
+- #68 option overrides;
+- hosted Noble amd64/arm64 acceptance.

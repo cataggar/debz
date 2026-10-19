@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-receipt-v1",
+  "title": "debz system install receipt v1",
+  "$comment": "Written once when an attempt settles. It binds the final progress document and whichever of the lock, program, and authorization the attempt reached. A refusal before mutation retains the exact lock it names.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "attempt_id", "request_document_sha512", "progress_document_sha512", "terminal"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-receipt-v1" },
+        "version": { "const": 1 },
+        "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+        "request_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "progress_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "terminal": { "$ref": "system-install-progress-v1.json#/$defs/terminal" },
+        "lock": { "$ref": "system-install-request-v1.json#/$defs/lockReference" },
+        "program_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "authorization_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+      },
+      "dependentRequired": {
+        "authorization_document_sha512": ["program_document_sha512"],
+        "program_document_sha512": ["lock"]
+      }
+    },
+    "digest_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+  }
+}

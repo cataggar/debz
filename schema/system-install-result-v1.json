@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-result-v1",
+  "title": "debz short system-profile install result v1",
+  "$comment": "The per-operation result of 'debz install --json <package>' without product options: one canonical line on stdout, exit status equal to exit_status. It names the owned attempt, the exact lock, every evidence document by SHA-512, and the planned actions. Usage errors detected before the profile is selected use command-result-v1 instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "operation", "exit_status", "outcome", "changed", "package", "summary", "resumed", "documents", "diagnostics"],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/system-install-result-v1" },
+    "version": { "const": 1 },
+    "operation": { "const": "install" },
+    "exit_status": { "$ref": "system-install-progress-v1.json#/$defs/exitStatus" },
+    "outcome": {
+      "enum": ["rejected", "refused_before_mutation", "abandoned_before_mutation", "completed", "recovery_required", "interrupted"],
+      "description": "interrupted: an owned attempt (or another surface's root operation) was left unsettled; rerunning the same command adopts it before any refresh or replanning. recovery_required: execution may have begun; automatic retry is refused."
+    },
+    "changed": { "type": "boolean" },
+    "package": { "$ref": "system-install-request-v1.json#/$defs/package" },
+    "summary": { "type": "string", "minLength": 1 },
+    "backend": { "$ref": "system-install-request-v1.json#/$defs/backend" },
+    "command": { "$ref": "system-install-request-v1.json#/$defs/command" },
+    "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+    "resumed": { "type": "boolean" },
+    "profile": { "$ref": "system-install-request-v1.json#/$defs/profile" },
+    "lock": { "type": "string", "pattern": "^/var/lib/debz/locks/install-[0-9a-f]{32}\\.json$" },
+    "evidence_path": { "$ref": "system-install-request-v1.json#/$defs/absolutePath" },
+    "documents": { "type": "array", "maxItems": 7, "items": { "$ref": "#/$defs/document" } },
+    "plan": { "$ref": "#/$defs/plan" },
+    "diagnostics": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/diagnostic" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exit_status": { "const": 0 } } },
+      "then": { "properties": { "outcome": { "const": "completed" } } },
+      "else": { "properties": { "outcome": { "not": { "const": "completed" } }, "diagnostics": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "changed": { "const": true } } },
+      "then": { "properties": { "outcome": { "enum": ["completed", "recovery_required"] } } }
+    },
+    {
+      "if": { "properties": { "resumed": { "const": true } } },
+      "then": { "required": ["attempt_id"] }
+    }
+  ],
+  "$defs": {
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "document_sha512"],
+      "properties": {
+        "kind": { "enum": ["request", "progress", "lock", "program", "authorization", "receipt", "recovery"] },
+        "path": { "$ref": "system-install-request-v1.json#/$defs/absolutePath" },
+        "document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+      }
+    },
+    "heldFact": {
+      "allOf": [
+        { "$ref": "system-install-program-v1.json#/$defs/installedFact" },
+        { "properties": { "selection": { "const": "hold" } } }
+      ]
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_architecture", "archives", "installed", "repositories"],
+      "properties": {
+        "target_architecture": { "type": "string", "minLength": 1 },
+        "archives": { "type": "array", "items": { "$ref": "system-install-program-v1.json#/$defs/archive" } },
+        "installed": {
+          "description": "A summary of the healthy installed facts the plan is bound to. Held, private, and unpublished packages are reported without any archive origin.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authority", "origin", "database_sha512", "fact_count", "held"],
+          "properties": {
+            "authority": { "const": "healthy_installed_prestate" },
+            "origin": { "const": "installed_package_database" },
+            "database_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+            "fact_count": { "type": "integer", "minimum": 0 },
+            "held": { "type": "array", "items": { "$ref": "#/$defs/heldFact" } }
+          }
+        },
+        "repositories": { "type": "array", "items": { "$ref": "system-install-program-v1.json#/$defs/repository" } }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "message"],
+      "properties": {
+        "id": { "$ref": "system-install-progress-v1.json#/$defs/errorId" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

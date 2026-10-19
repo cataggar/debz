@@ -67,10 +67,18 @@ product API v1 request, result, schema, exit meaning, and host-root denial.
 Repository add now also publishes a root-scoped active configuration. The
 separate read-only [`system_product_context`](target-apt-config.md#typed-system-product-context)
 resolver exposes its verified snapshot and core system path defaults. It
-does not reinterpret empty v1 options, authorize host mutation, or make
-`debz install symcrypt[-openssl]` a working short command. Exact locks,
+does not reinterpret empty v1 options or authorize host mutation. Exact locks,
 confirmation, backend/capability selection, and existing explicit
 plan/review/replay remain unchanged.
+
+`debz install PACKAGE` with exactly one package and no root, cache, state or
+other product options is not a product API v1 request; v1 always rejected it
+for the missing paths. It selects the separate
+[short system profile](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1).
+That profile plans against the active context, retains owned exact-lock
+evidence and emits `system-install-result-v1`. It does not install yet. Any
+product option, such as `--install-root`, keeps the unchanged v1 request,
+result, schema, exit meaning and host-root denial.
 
 Explicit product `plan --lock-output` can now preserve a healthy
 installed-only exact package absent from signed repository metadata. Such
@@ -432,8 +440,10 @@ It refuses incomplete/reinstallation-required, trigger-pending or unincorporated
 revalidates configuration/prestate under the owned publication exclusions.
 V5 is not a product API v1 default, package-cache contract or mutation token;
 historical execution/cache consumers refuse it before unwrapping its archives.
-The simple CLI, exact-owned retry and scoped native host execution remain
-unimplemented, rather than receiving a success-shaped fallback.
+The [short system profile](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1)
+consumes it with exact owned retry and versioned evidence, but scoped host
+execution remains unimplemented rather than receiving a success-shaped
+fallback.
 
 Fresh v4 generation currently supports already published native archive
 identities. The opted-in `signed_sha256_derived_sha512` path refuses with
