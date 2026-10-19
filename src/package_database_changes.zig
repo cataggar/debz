@@ -315,14 +315,30 @@ const Builder = struct {
 
     fn setPosition(self: *Builder, identity: Identity, position: usize) PlanError!void {
         const key = try self.identityKey(identity);
-        const entry = try self.positions.getOrPut(self.scratch, key);
-        if (!entry.found_existing) {
-            entry.key_ptr.* = self.scratch.dupe(u8, key) catch |err| {
-                _ = self.positions.remove(key);
-                return err;
-            };
+        if (self.positions.getPtr(key)) |slot| {
+            slot.* = position;
+            return;
         }
-        entry.value_ptr.* = position;
+        try self.positions.ensureUnusedCapacity(self.scratch, 1);
+        const owned = try self.scratch.dupe(u8, key);
+        self.positions.putAssumeCapacityNoClobber(owned, position);
+    }
+
+    fn seed(self: *Builder, changes_len: usize) PlanError!void {
+        const record_capacity = self.base.packages.len + changes_len;
+        try self.records.ensureTotalCapacity(self.scratch, record_capacity);
+        if (record_capacity <= std.math.maxInt(u32)) {
+            try self.positions.ensureTotalCapacity(self.scratch, @intCast(record_capacity));
+        }
+        if (changes_len <= std.math.maxInt(u32)) {
+            try self.targets.set.ensureTotalCapacity(self.scratch, @intCast(changes_len));
+        }
+        try self.targets.owned_keys.ensureTotalCapacity(self.scratch, changes_len);
+        try self.writes.ensureTotalCapacity(self.scratch, changes_len);
+        for (self.base.packages, 0..) |package, index| {
+            self.records.appendAssumeCapacity(package);
+            try self.setPosition(package.identity(), index);
+        }
     }
 
     fn positionOf(self: *Builder, identity: Identity) PlanError!?usize {
@@ -383,7 +399,22 @@ const Builder = struct {
     /// change costs one pass over the changed package's own paths.
     fn prepareCoverage(self: *Builder) PlanError!void {
         if (self.coverage_ready) return;
-        self.coverage_ready = true;
+        if (self.base.diversions.len <= std.math.maxInt(u32) / 2) {
+            try self.diverted_paths.set.ensureTotalCapacity(
+                self.scratch,
+                @intCast(self.base.diversions.len * 2),
+            );
+            try self.diverted_packages.set.ensureTotalCapacity(
+                self.scratch,
+                @intCast(self.base.diversions.len),
+            );
+        }
+        if (self.base.stat_overrides.len <= std.math.maxInt(u32)) {
+            try self.overridden_paths.set.ensureTotalCapacity(
+                self.scratch,
+                @intCast(self.base.stat_overrides.len),
+            );
+        }
         for (self.base.diversions) |diversion| {
             _ = try self.diverted_paths.insert(diversion.from);
             _ = try self.diverted_paths.insert(diversion.to);
@@ -403,16 +434,18 @@ const Builder = struct {
             try self.identities.appendKey(owner.name);
             try self.identities.appendKey(owner.architecture);
             const key = self.identities.key.items;
-            const slot = try self.opaque_owners.getOrPut(self.scratch, key);
-            if (!slot.found_existing) {
-                slot.key_ptr.* = self.scratch.dupe(u8, key) catch |err| {
-                    _ = self.opaque_owners.remove(key);
-                    return err;
-                };
-                slot.value_ptr.* = .empty;
+            if (self.opaque_owners.getPtr(key)) |list| {
+                try list.append(self.scratch, index);
+                continue;
             }
-            try slot.value_ptr.append(self.scratch, index);
+            try self.opaque_owners.ensureUnusedCapacity(self.scratch, 1);
+            const owned = try self.scratch.dupe(u8, key);
+            errdefer self.scratch.free(owned);
+            var list: std.ArrayList(usize) = .empty;
+            try list.append(self.scratch, index);
+            self.opaque_owners.putAssumeCapacityNoClobber(owned, list);
         }
+        self.coverage_ready = true;
     }
 
     fn opaqueFilesOf(self: *Builder, identity: Identity) PlanError![]const usize {
@@ -485,6 +518,9 @@ const Builder = struct {
         const limits = self.options.database.limits;
         if (paths.len > limits.max_paths_per_package) return self.fail(.path_limit, package);
         self.scratch_index.reset();
+        if (paths.len <= std.math.maxInt(u32)) {
+            try self.scratch_index.set.ensureTotalCapacity(self.scratch, @intCast(paths.len));
+        }
         for (paths) |path| {
             if (path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validListPath(path)) return self.fail(.invalid_path, package);
@@ -502,6 +538,9 @@ const Builder = struct {
         const limits = self.options.database.limits;
         if (entries.len > limits.max_md5sums_per_package) return self.fail(.checksum_limit, package);
         self.scratch_index.reset();
+        if (entries.len <= std.math.maxInt(u32)) {
+            try self.scratch_index.set.ensureTotalCapacity(self.scratch, @intCast(entries.len));
+        }
         for (entries) |entry| {
             if (entry.path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validRelativePath(entry.path)) return self.fail(.invalid_path, package);
@@ -520,6 +559,9 @@ const Builder = struct {
         const limits = self.options.database.limits;
         if (paths.len > limits.max_conffiles_per_package) return self.fail(.conffile_limit, package);
         self.scratch_index.reset();
+        if (paths.len <= std.math.maxInt(u32)) {
+            try self.scratch_index.set.ensureTotalCapacity(self.scratch, @intCast(paths.len));
+        }
         for (paths) |declaration| {
             const path = database.declaredConffilePath(declaration) orelse
                 return self.fail(.invalid_path, package);
@@ -540,6 +582,13 @@ const Builder = struct {
             return self.fail(.trigger_limit, package);
         }
         self.scratch_index.reset();
+        if (declarations.len <= std.math.maxInt(u32)) {
+            try self.scratch_index.set.ensureTotalCapacity(
+                self.scratch,
+                @intCast(declarations.len),
+            );
+        }
+        try self.scratch_index.owned_keys.ensureTotalCapacity(self.scratch, declarations.len);
         for (declarations) |declaration| {
             if (declaration.name.len > limits.max_trigger_name_bytes or
                 !database.validTriggerName(declaration.name))
@@ -557,22 +606,21 @@ const Builder = struct {
 
     fn guardCoverage(self: *Builder, subject: database.PackageRecord) PlanError!void {
         try self.prepareCoverage();
-        if (self.options.diversion_policy == .refuse_affected and
-            self.diverted_packages.contains(subject.name))
-        {
+        const check_diversions = self.options.diversion_policy == .refuse_affected;
+        if (check_diversions and self.diverted_packages.contains(subject.name)) {
             return self.fail(.unsupported_diversion, subject.name);
         }
+        const check_diverted_paths = check_diversions and self.diverted_paths.set.count() != 0;
+        const check_overridden_paths = self.options.statoverride_policy == .refuse_affected and
+            self.overridden_paths.set.count() != 0;
+        if (!check_diverted_paths and !check_overridden_paths) return;
         const paths = subject.paths orelse return;
         for (paths) |path| {
             const logical = database.logicalListPath(path);
-            if (self.options.diversion_policy == .refuse_affected and
-                self.diverted_paths.contains(logical))
-            {
+            if (check_diverted_paths and self.diverted_paths.contains(logical)) {
                 return self.fail(.unsupported_diversion, subject.name);
             }
-            if (self.options.statoverride_policy == .refuse_affected and
-                self.overridden_paths.contains(logical))
-            {
+            if (check_overridden_paths and self.overridden_paths.contains(logical)) {
                 return self.fail(.unsupported_statoverride, subject.name);
             }
         }
@@ -1032,8 +1080,7 @@ const Builder = struct {
             .sha256 = self.base.status.sha256,
         });
 
-        const info_writes = try self.scratch.dupe(PlannedWrite, self.writes.items);
-        defer self.scratch.free(info_writes);
+        const info_writes = self.writes.items;
         std.sort.heap(PlannedWrite, info_writes, {}, lessWrite);
         for (info_writes, 0..) |write, index| {
             if (index != 0 and std.mem.eql(u8, info_writes[index - 1].path, write.path)) {
@@ -1336,10 +1383,7 @@ fn build(
     source: database.Database,
     changes: []const Change,
 ) PlanError!Built {
-    for (source.model.packages, 0..) |package, index| {
-        try builder.records.append(builder.scratch, package);
-        try builder.setPosition(package.identity(), index);
-    }
+    try builder.seed(changes.len);
     for (changes) |change| try builder.apply(change);
 
     const packages = try builder.livePackages();
@@ -2925,3 +2969,102 @@ test "package_database_changes.test.long status fields stay plannable" {
         reimported.model.find("solo", "amd64").?.field("Description").?.value_lines[0].len,
     );
 }
+
+test "package_database_changes.test.multi-package planning preserves deterministic write order and guard coverage" {
+    var snapshot = database.test_fixtures.snapshot();
+    snapshot.diversions = database.regularFile("/usr/bin/toolz\n/usr/bin/toolz.distrib\nother\n");
+    snapshot.statoverride = database.regularFile("#0 #0 0755 /usr/bin/toolz\n");
+    var source = switch (try database.importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer source.deinit();
+
+    var staged_new = newPackage();
+    staged_new.metadata = .{ .replace = &.{
+        .{ .kind = .templates, .bytes = "Template: newpkg/flag\nType: boolean\n" },
+        .{ .kind = .shlibs, .bytes = "libnewpkg 1 newpkg\n" },
+    } };
+    const updated_toolz_fields = [_]database.StatusField{
+        .{ .name = "Package", .value_lines = &.{"toolz"} },
+        .{ .name = "Status", .value_lines = &.{"install ok unpacked"} },
+        .{ .name = "Architecture", .value_lines = &.{"amd64"} },
+        .{ .name = "Version", .value_lines = &.{"2.2"} },
+        .{ .name = "Conffiles", .value_lines = &.{
+            "",
+            "/etc/toolz.conf d41d8cd98f00b204e9800998ecf8427e",
+        } },
+        .{ .name = "Description", .value_lines = &.{"updated tool"} },
+    };
+    const changes = [_]Change{
+        .{ .put_package = staged_new },
+        .{ .put_package = .{
+            .fields = &updated_toolz_fields,
+            .paths = &.{ "/.", "/etc", "/etc/toolz.conf", "/usr", "/usr/bin", "/usr/bin/toolz" },
+            .declared_conffiles = &.{"/etc/toolz.conf"},
+            .metadata = .{ .replace = &.{.{ .kind = .symbols, .bytes = "libtoolz.so.1 toolz #MINVER#\n" }} },
+        } },
+        .{ .set_state = .{
+            .identity = .{ .name = "libfoo", .architecture = "amd64" },
+            .want = .install,
+            .error_state = .ok,
+            .current = .half_configured,
+        } },
+        .{ .set_trigger_state = .{} },
+    };
+
+    try expectPlanDiagnostic(
+        try plan(testing.allocator, source, &changes, .{}),
+        .unsupported_diversion,
+    );
+    try expectPlanDiagnostic(
+        try plan(testing.allocator, source, &changes, .{ .diversion_policy = .preserve }),
+        .unsupported_statoverride,
+    );
+
+    var staged = switch (try plan(testing.allocator, source, &changes, .{
+        .diversion_policy = .preserve,
+        .statoverride_policy = .preserve,
+    })) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer staged.deinit();
+
+    const expected = [_]struct { path: []const u8, kind: WriteKind }{
+        .{ .path = "status-old", .kind = .copy },
+        .{ .path = "info/newpkg.conffiles", .kind = .replace },
+        .{ .path = "info/newpkg.list", .kind = .replace },
+        .{ .path = "info/newpkg.md5sums", .kind = .replace },
+        .{ .path = "info/newpkg.postinst", .kind = .replace },
+        .{ .path = "info/newpkg.shlibs", .kind = .replace },
+        .{ .path = "info/newpkg.templates", .kind = .replace },
+        .{ .path = "info/toolz.conffiles", .kind = .replace },
+        .{ .path = "info/toolz.list", .kind = .replace },
+        .{ .path = "info/toolz.md5sums", .kind = .remove },
+        .{ .path = "info/toolz.postinst", .kind = .remove },
+        .{ .path = "info/toolz.prerm", .kind = .remove },
+        .{ .path = "info/toolz.symbols", .kind = .replace },
+        .{ .path = "info/toolz.triggers", .kind = .remove },
+        .{ .path = "triggers/File", .kind = .remove },
+        .{ .path = "triggers/Unincorp", .kind = .replace },
+        .{ .path = "status", .kind = .replace },
+    };
+    try testing.expectEqual(expected.len, staged.writes.len);
+    for (expected, staged.writes) |want, write| {
+        try testing.expectEqualStrings(want.path, write.path);
+        try testing.expectEqual(want.kind, write.kind);
+    }
+
+    try testing.expectEqualStrings("libnewpkg 1 newpkg\n", staged.writes[5].bytes);
+    try testing.expectEqualStrings("Template: newpkg/flag\nType: boolean\n", staged.writes[6].bytes);
+    try testing.expectEqualStrings(
+        "/.\n/etc\n/etc/toolz.conf\n/usr\n/usr/bin\n/usr/bin/toolz\n",
+        staged.writes[8].bytes,
+    );
+    try testing.expectEqualStrings("libtoolz.so.1 toolz #MINVER#\n", staged.writes[12].bytes);
+}
+
