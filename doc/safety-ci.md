@@ -474,6 +474,12 @@ The checker also requires:
 - **dpkg state:** `/var/lib/dpkg` is unchanged, both content and metadata,
   after every install run. Any dpkg status change fails the proof.
 
+Hermetic `test-system-install` coverage complements this live job by proving
+`symcrypt` and `symcrypt-openssl` planning, `signed_sha256_derived_sha512`
+derivation, installed `symcrypt` dependency satisfaction, `-y --noninteractive`
+repeat runs, interruption/resume, and OpenSSL range-conflict refusal across
+Ubuntu Noble `amd64` and `arm64` roots.
+
 If the feed's Release is older than the reviewed 14-day bound, debz refuses
 it (`ReleaseExpired`). The proof then fails; it neither retries nor widens the
 bound. Once `system-install-execution-v1` lands, root installs are expected to
