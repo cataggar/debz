@@ -1,8 +1,9 @@
 const std = @import("std");
-const native_alternatives = @import("debz").native_alternatives;
-const native_provenance = @import("debz").native_provenance;
-const root_fs = @import("debz").root_fs;
-const package_database = @import("debz").package_database;
+const debz = @import("debz");
+const native_alternatives = debz.native_alternatives;
+const native_provenance = debz.native_provenance;
+const root_fs = debz.root_fs;
+const package_database = debz.package_database;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const dpkg_query = @import("native_dpkg_query.zig");
@@ -497,6 +498,63 @@ pub fn expectUnchanged(
     return expectZeroAction(fixture, driver, root, architecture, destination, expected, detail);
 }
 
+fn verifyTransactionResult(
+    fixture: *foundation.Fixture,
+    root: []const u8,
+) !void {
+    var guarded = try foundation.guardedRoot(fixture.io, root);
+    defer guarded.close(fixture.io);
+    const selected: root_fs.Root = .init(fixture.io, guarded);
+    var receipt = (try native_provenance.read(fixture.allocator, selected)) orelse
+        return error.MissingNativeProvenance;
+    defer receipt.deinit();
+    var authorization_path: ?[]const u8 = null;
+    for (receipt.document.evidence_files) |file| {
+        if (file.kind == .authorization) {
+            authorization_path = file.path;
+            break;
+        }
+    }
+    const auth_bytes = try selected.readFileAlloc(
+        fixture.allocator,
+        try root_fs.Path.init(authorization_path orelse return error.MissingAuthorizationEvidence),
+        native_provenance.maximum_evidence_file_bytes,
+    );
+    defer fixture.allocator.free(auth_bytes);
+    var authorization = try debz.native_authorization.decode(
+        fixture.allocator,
+        auth_bytes,
+        native_provenance.maximum_evidence_file_bytes,
+    );
+    defer authorization.deinit();
+    try native_provenance.verifyEvidence(fixture.allocator, selected, receipt.document);
+    try debz.native_unpack.Runtime.verifyCompletedState(
+        fixture.allocator,
+        selected,
+        authorization.authorization,
+        receipt.document,
+    );
+}
+
+fn expectTransactionResultError(
+    fixture: *foundation.Fixture,
+    root: []const u8,
+    expected: anyerror,
+) !void {
+    if (verifyTransactionResult(fixture, root)) |_| {
+        std.debug.print("expected transaction-result verify error {s}, got success\n", .{
+            @errorName(expected),
+        });
+        return error.ArchNativeTransactionVerifyUnexpectedSuccess;
+    } else |err| if (err != expected) {
+        std.debug.print("expected transaction-result verify error {s}, got {s}\n", .{
+            @errorName(expected),
+            @errorName(err),
+        });
+        return error.ArchNativeTransactionVerifyMismatch;
+    }
+}
+
 /// A postinst that writes `arch-native` exactly like dpkg's own must leave a
 /// root that a zero-action `upgrade-all` proves unchanged (changed=false),
 /// while foreign, malformed, linked, or writable entries stay typed refusals.
@@ -508,7 +566,8 @@ fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8
     var scenario = try support.Scenario.init(fixture, "arch-native-import", driver, dpkg, architecture, false);
     defer scenario.deinit();
     const chosen = [_]foundation.PackageIdentity{.{ .name = arch_native_writer, .architecture = architecture }};
-    try scenario.phase(.{ .operation = "install", .archives = &.{archive}, .packages = &chosen }, false);
+    try scenario.phase(.{ .operation = "install", .archives = &.{archive}, .packages = &chosen, .recovery = true }, false);
+    try checkProvenance(fixture, scenario.native_root);
     const expected = try std.fmt.allocPrint(fixture.allocator, "{s}\n", .{architecture});
     defer fixture.allocator.free(expected);
     for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root| {
@@ -518,6 +577,8 @@ fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8
         const entry = try (root_fs.Root.init(fixture.io, guarded)).entry(try root_fs.Path.init(arch_native));
         if (!entry.isRegularFile() or entry.mode & 0o7777 != 0o644) return error.ArchNativeModeMismatch;
     }
+
+    try verifyTransactionResult(fixture, scenario.native_root);
 
     const foreign = try cloneRoot(fixture, scenario.native_root, "arch-native-foreign", architecture);
     defer fixture.allocator.free(foreign);
@@ -532,9 +593,25 @@ fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8
     try expectUnchanged(fixture, driver, scenario.native_root, architecture, "arch-native-import/unchanged-upgrade-all-again", "unchanged");
 
     const other = if (std.mem.eql(u8, architecture, "amd64")) "arm64\n" else "amd64\n";
-    try fixture.write("arch-native-foreign/" ++ arch_native, other, 0o644);
     const doubled = try std.fmt.allocPrint(fixture.allocator, "{s}\n\n", .{architecture});
     defer fixture.allocator.free(doubled);
+    const native_arch_path = "arch-native-import/native/" ++ arch_native;
+    // Changing arch-native bytes after install makes transaction-result verify
+    // fail (even when stripped of the trailing newline so architecture admission
+    // still passes, proving generation-digest binding) and refuses zero-action
+    // upgrade-all when invalid.
+    try fixture.write(native_arch_path, architecture, 0o644);
+    try expectTransactionResultError(fixture, scenario.native_root, error.FinalStateMismatch);
+    try fixture.write(native_arch_path, other, 0o644);
+    try expectTransactionResultError(fixture, scenario.native_root, error.DatabaseNativeArchitectureMismatch);
+    try expectUnchanged(fixture, driver, scenario.native_root, architecture, "arch-native-import/post-install-foreign-unchanged", "DatabaseNativeArchitectureMismatch");
+    try fixture.write(native_arch_path, doubled, 0o644);
+    try expectTransactionResultError(fixture, scenario.native_root, error.DatabaseNativeArchitectureMismatch);
+    try expectUnchanged(fixture, driver, scenario.native_root, architecture, "arch-native-import/post-install-trailing-unchanged", "DatabaseNativeArchitectureMismatch");
+    try fixture.write(native_arch_path, expected, 0o644);
+    try verifyTransactionResult(fixture, scenario.native_root);
+
+    try fixture.write("arch-native-foreign/" ++ arch_native, other, 0o644);
     try fixture.write("arch-native-trailing/" ++ arch_native, doubled, 0o644);
     try fixture.dir.deleteFile(fixture.io, "arch-native-linked/" ++ arch_native);
     try fixture.dir.symLink(fixture.io, "status", "arch-native-linked/" ++ arch_native, .{});
