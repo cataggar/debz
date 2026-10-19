@@ -162,16 +162,11 @@ test "CLI smoke help version and package-family capability contracts" {
 
     const original = try f.check("package-family-capabilities", 0, null, null);
     defer original.deinit();
-    const legacy = try f.check("package-family-capabilities --transaction-backend legacy_dpkg", 0, null, null);
-    defer legacy.deinit();
-    try testing.expectEqualSlices(u8, original.stdout, legacy.stdout);
-    const legacy_value = try document(&f, original.stdout);
-    try integerField(legacy_value, "version", 1);
-    try testing.expect(std.mem.endsWith(u8, legacy_value.object.get("exact_lock_schema").?.string, "exact-closure-lock-v1"));
-
     const native = try f.check("package-family-capabilities --transaction-backend native", 0, null, null);
     defer native.deinit();
+    try empty(original.stderr);
     try empty(native.stderr);
+    try testing.expectEqualSlices(u8, original.stdout, native.stdout);
     const value = try document(&f, native.stdout);
     try integerField(value, "version", 2);
     try stringField(value, "transaction_backend", "native");
@@ -187,6 +182,7 @@ test "CLI smoke help version and package-family capability contracts" {
     for ([_][]const u8{
         "package-family-capabilities --transaction-backend",
         "package-family-capabilities --transaction-backend invalid",
+        "package-family-capabilities --transaction-backend legacy_dpkg",
         "package-family-capabilities --transaction-backend native --transaction-backend legacy_dpkg",
         "package-family-capabilities --unknown",
         "package-family-capabilities native",
@@ -289,8 +285,10 @@ test "CLI smoke removed commands and transaction-result capability exact JSON co
         .{ .arguments = "repo", .diagnostic = "missing command for 'debz repo'" },
         .{ .arguments = "repo unknown", .diagnostic = "unknown repository command 'unknown'" },
         .{ .arguments = "package-cache unknown", .diagnostic = "unknown package-cache command 'unknown'" },
-        .{ .arguments = "transaction-result verify --state-path relative --lock-input /missing --architecture amd64 --json", .diagnostic = "invalid explicit path or architecture" },
-        .{ .arguments = "transaction-result verify --state-path $state --lock-input /missing --architecture amd64 --json", .code = 7, .diagnostic = "transaction result verification failed" },
+        .{ .arguments = "transaction-result verify --install-root relative --lock-input /missing --architecture amd64 --json", .diagnostic = "invalid explicit path or architecture" },
+        .{ .arguments = "transaction-result verify --install-root $root --lock-input /missing --architecture amd64 --json", .code = 7, .diagnostic = "transaction result verification failed" },
+        .{ .arguments = "transaction-result verify --transaction-backend legacy_dpkg --state-path relative --lock-input /missing --architecture amd64 --json", .diagnostic = "invalid explicit path or architecture" },
+        .{ .arguments = "transaction-result verify --transaction-backend legacy_dpkg --state-path $state --lock-input /missing --architecture amd64 --json", .code = 7, .diagnostic = "transaction result verification failed" },
     }) |case| {
         const result = try f.check(case.arguments, case.code, null, case.diagnostic);
         defer result.deinit();
@@ -327,7 +325,8 @@ test "CLI smoke removed commands and transaction-result capability exact JSON co
         "transaction-result verify --transaction-backend native --state-path $state --lock-input /missing --architecture amd64 --json",
         "transaction-result verify --transaction-backend native --lock-input /missing --architecture amd64 --json",
         "transaction-result verify --transaction-backend native --install-root relative --lock-input /missing --architecture amd64 --json",
-        "transaction-result verify --install-root /unused --lock-input /missing --architecture amd64 --json",
+        "transaction-result verify --state-path $state --lock-input /missing --architecture amd64 --json",
+        "transaction-result verify --transaction-backend legacy_dpkg --install-root /unused --lock-input /missing --architecture amd64 --json",
     }) |arguments| {
         const result = try f.check(arguments, 2, null, null);
         defer result.deinit();
@@ -343,11 +342,17 @@ test "CLI smoke native-result cache and repository input refusals happen before 
         "install --json --transaction-backend native --native-result",
         "install --json --transaction-backend native --native-result --native-result --lock-input /missing",
         "plan --json --transaction-backend native --native-result --lock-input /missing",
-        "install --json --transaction-backend legacy_dpkg --native-result --lock-input /missing",
     }) |arguments| {
         const result = try f.check(arguments, 2, "\"id\":\"invalid_request\"", null);
         defer result.deinit();
     }
+    const legacy_native_result = try f.check(
+        "install --json --transaction-backend legacy_dpkg --native-result --lock-input /missing",
+        8,
+        "\"id\":\"legacy_recovery_release_required\"",
+        null,
+    );
+    defer legacy_native_result.deinit();
     for ([_][]const u8{
         "package-cache fingerprint --json --lock-input relative --cache-path $cache --architecture amd64",
         "package-cache fingerprint --json --lock-input /missing --cache-path $cache --architecture amd64 --offline",
@@ -357,12 +362,22 @@ test "CLI smoke native-result cache and repository input refusals happen before 
         "package-cache prepare --json --transaction-backend native --transaction-backend legacy_dpkg --lock-input /missing --cache-path $cache --architecture amd64",
         "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --repair-corrupt-cache --offline",
         "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64 --restored-cache exact",
-        "package-cache prepare --json --lock-input /missing --cache-path $cache --architecture amd64",
+        "package-cache prepare --json --lock-input relative --cache-path $cache --architecture amd64",
     }) |arguments| {
         const result = try f.check(arguments, 2, "\"schema\":\"io.github.cataggar.debz.package-cache-error.v1\"", null);
         defer result.deinit();
         try empty(result.stderr);
         try support.contains(result.stdout, "\"id\":\"invalid_request\"");
+    }
+    for ([_][]const u8{
+        "package-cache fingerprint --json --transaction-backend legacy_dpkg --lock-input /missing --cache-path $cache --architecture amd64",
+        "package-cache prepare --json --transaction-backend legacy_dpkg --lock-input /missing --cache-path $cache --architecture amd64",
+    }) |arguments| {
+        const result = try f.check(arguments, 8, "\"schema\":\"io.github.cataggar.debz.package-cache-error.v1\"", null);
+        defer result.deinit();
+        try empty(result.stderr);
+        try support.contains(result.stdout, "\"id\":\"legacy_recovery_release_required\"");
+        try support.contains(result.stdout, ">=0.3.0,<0.4.0");
     }
     for ([_][]const u8{
         "repo add --json",

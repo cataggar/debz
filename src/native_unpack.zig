@@ -41307,6 +41307,7 @@ test "native_unpack.test.public runtime refuses legacy and host-root identities 
         var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
         defer locks.deinit();
         var coordinator = try root_operation.Coordinator.open(testing.io, fixture.root(), install_root, locks.interface());
+        coordinator.legacy_execution_capable = !host;
         var attempt = try coordinator.acquire(testing.allocator, .{
             .backend = if (host) .native else .legacy_dpkg,
             .operation = .{ .package_transaction = .install },
@@ -41791,6 +41792,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     var coordinator: root_operation.Coordinator = undefined;
     if (case != .owned) {
         coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
+        coordinator.legacy_execution_capable = case == .legacy_backend;
         caller = try coordinator.acquire(testing.allocator, .{
             .backend = if (case == .legacy_backend) .legacy_dpkg else .native,
             .operation = .{ .repository_bootstrap = .add },

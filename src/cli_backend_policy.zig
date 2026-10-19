@@ -13,10 +13,7 @@ pub fn select(
     requested: ?debz.transaction_engine.Kind,
     surface: Surface,
 ) compat.PolicyError!debz.transaction_engine.Kind {
-    const backend = requested orelse switch (runtime) {
-        .legacy_capable => debz.transaction_engine.Kind.legacy_dpkg,
-        .native_only => debz.transaction_engine.Kind.native,
-    };
+    const backend = requested orelse debz.transaction_engine.Kind.native;
     const compatible: compat.Backend = switch (backend) {
         .legacy_dpkg => .legacy_dpkg,
         .native => .native,
@@ -73,7 +70,7 @@ pub fn authorizeNativeV3(
 test "cli_backend_policy.test.native-only selection refuses new legacy but preserves completed verification" {
     for ([_]Surface{ .product, .repository }) |surface| {
         try std.testing.expectEqual(
-            debz.transaction_engine.Kind.legacy_dpkg,
+            debz.transaction_engine.Kind.native,
             try select(.legacy_capable, null, surface),
         );
         try std.testing.expectEqual(

@@ -5,6 +5,7 @@ const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const exact_lock_v4 = @import("exact_lock_v4.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const native_baseline = @import("native_baseline_contract.zig");
 const content_digest = @import("content_digest.zig");
 const package_acquisition = @import("package_acquisition.zig");
@@ -224,7 +225,7 @@ pub const Request = struct {
 };
 
 pub const Fingerprint = struct {
-    version: Version = .v1,
+    version: Version = .v3,
     lock_digest: [64]u8,
     acceptance_policy_digest: [64]u8,
     fingerprint: [64]u8,
@@ -250,6 +251,8 @@ pub const Fingerprint = struct {
     }
 
     pub fn canonicalJson(self: Fingerprint, allocator: std.mem.Allocator) ![]u8 {
+        if (!@import("builtin").is_test and self.version == .v1)
+            return error.LegacyPackageCacheContractRetired;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
@@ -294,6 +297,45 @@ pub const Fingerprint = struct {
         try writer.print(",\"maximum_archive_bytes\":{}", .{self.maximum_archive_bytes});
         try writer.writeAll("}\n");
         return output.toOwnedSlice();
+    }
+
+    pub fn legacyIdentity(self: Fingerprint) legacy_compat.Identity {
+        return switch (self.version) {
+            .v1 => .{
+                .schema = "io.github.cataggar.debz.package-cache-fingerprint.v1",
+                .version = 1,
+                .backend = .legacy_dpkg,
+            },
+            .v2, .v3, .baseline => .{
+                .schema = "io.github.cataggar.debz.package-cache-fingerprint.v2",
+                .version = 2,
+                .backend = .native,
+            },
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: Fingerprint,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const identity = self.legacyIdentity();
+        return legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .completed_historical_verification,
+            identity,
+        );
+    }
+
+    pub fn requireExecutionAuthority(
+        self: Fingerprint,
+    ) legacy_compat.PolicyError!void {
+        const identity = self.legacyIdentity();
+        _ = try legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .new_execution,
+            identity,
+        );
     }
 };
 
@@ -341,7 +383,7 @@ pub const PreflightResult = struct {
 };
 
 pub const PrepareResult = struct {
-    version: Version = .v1,
+    version: Version = .v3,
     lock_digest: [64]u8,
     fingerprint: [64]u8,
     target_architecture: []u8,
@@ -366,6 +408,8 @@ pub const PrepareResult = struct {
     }
 
     pub fn canonicalJson(self: PrepareResult, allocator: std.mem.Allocator) ![]u8 {
+        if (!@import("builtin").is_test and self.version == .v1)
+            return error.LegacyPackageCacheContractRetired;
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
@@ -403,9 +447,70 @@ pub const PrepareResult = struct {
         );
         return output.toOwnedSlice();
     }
+
+    pub fn legacyIdentity(self: PrepareResult) legacy_compat.Identity {
+        return switch (self.version) {
+            .v1 => .{
+                .schema = "io.github.cataggar.debz.package-cache-result.v1",
+                .version = 1,
+                .backend = .legacy_dpkg,
+            },
+            .v2, .v3, .baseline => .{
+                .schema = "io.github.cataggar.debz.package-cache-result.v2",
+                .version = 2,
+                .backend = .native,
+            },
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: PrepareResult,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const identity = self.legacyIdentity();
+        return legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .completed_historical_verification,
+            identity,
+        );
+    }
+
+    pub fn requireExecutionAuthority(
+        self: PrepareResult,
+    ) legacy_compat.PolicyError!void {
+        const identity = self.legacyIdentity();
+        _ = try legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .new_execution,
+            identity,
+        );
+    }
+
+    pub fn verifyNativeBinding(
+        self: PrepareResult,
+        expected: Fingerprint,
+    ) Error!void {
+        try self.requireExecutionAuthority();
+        try expected.requireExecutionAuthority();
+        if ((self.version != .v3 and self.version != .baseline) or
+            self.version != expected.version or
+            !std.mem.eql(u8, &self.lock_digest, &expected.lock_digest) or
+            !std.mem.eql(u8, &self.fingerprint, &expected.fingerprint) or
+            !std.mem.eql(u8, self.target_architecture, expected.target_architecture) or
+            !std.mem.eql(u8, self.cache_root, expected.cache_root) or
+            !std.mem.eql(u8, self.cache_path, expected.cache_path))
+            return error.LockPolicyMismatch;
+        if (self.version == .baseline) {
+            if (self.baseline == null or expected.baseline == null or
+                !std.mem.eql(u8, &self.baseline.?.value.digest(), &expected.baseline.?.value.digest()))
+                return error.LockPolicyMismatch;
+        }
+    }
 };
 
 pub const Error = error{
+    LegacyPackageCacheContractRetired,
     InvalidRequest,
     InvalidArchitecture,
     ArchitectureMismatch,
@@ -426,7 +531,21 @@ pub const Error = error{
     LocalArtifactAcquisitionRequired,
     CleanupIncomplete,
     GarbageCollectionIncomplete,
-};
+} || legacy_compat.PolicyError;
+
+pub fn requireLegacyV1ExecutionAuthority() Error!void {
+    _ = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .new_execution,
+        .{
+            .schema = "io.github.cataggar.debz.package-cache-fingerprint.v1",
+            .version = 1,
+            .backend = .legacy_dpkg,
+        },
+    );
+    return error.LegacyPackageCacheContractRetired;
+}
 
 pub fn validateRequest(request: Request, require_repositories: bool) Error!void {
     if (!validAbsolutePath(request.lock_input_path) or
@@ -456,17 +575,6 @@ pub fn validateRequest(request: Request, require_repositories: bool) Error!void 
         ((request.source_paths.len == 0 and request.config_paths.len == 0) or
             request.keyring_paths.len == 0))
         return error.InvalidRequest;
-}
-
-pub fn createFingerprint(
-    allocator: std.mem.Allocator,
-    lock: exact_lock.Lock,
-    architecture: []const u8,
-    debz_version: []const u8,
-    cache_root: []const u8,
-    policy: Policy,
-) !Fingerprint {
-    return createFingerprintVersion(.v1, allocator, lock, architecture, debz_version, cache_root, policy);
 }
 
 pub fn createNativeFingerprint(
@@ -562,6 +670,8 @@ fn createFingerprintVersion(
     cache_root: []const u8,
     policy: Policy,
 ) !Fingerprint {
+    if (version == .v1 and !@import("builtin").is_test)
+        return error.LegacyPackageCacheContractRetired;
     try validateLock(version, allocator, lock, architecture, policy);
     _ = std.SemanticVersion.parse(debz_version) catch return error.InvalidRequest;
     if (!validAbsolutePath(cache_root)) return error.InvalidRequest;
@@ -625,13 +735,6 @@ fn createFingerprintVersion(
     };
 }
 
-pub fn prepare(
-    allocator: std.mem.Allocator,
-    request: PrepareRequest,
-) !PrepareResult {
-    return prepareVersion(.v1, allocator, request);
-}
-
 pub fn prepareNative(
     allocator: std.mem.Allocator,
     request: NativePrepareRequest,
@@ -651,6 +754,8 @@ fn prepareVersion(
     allocator: std.mem.Allocator,
     request: PrepareRequestVersion(version),
 ) !PrepareResult {
+    if (version == .v1 and !@import("builtin").is_test)
+        return error.LegacyPackageCacheContractRetired;
     if (request.cache.limits.maximum_object_bytes != request.policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
     var validated = try createFingerprintVersion(
@@ -681,16 +786,6 @@ fn prepareVersion(
     );
 }
 
-pub fn preflight(
-    allocator: std.mem.Allocator,
-    lock: exact_lock.Lock,
-    cache: *package_acquisition.Cache,
-    policy: Policy,
-    writer_lock: *const package_acquisition.Cache.WriterLock,
-) !PreflightResult {
-    return preflightVersion(.v1, allocator, lock, cache, policy, writer_lock);
-}
-
 pub fn preflightNative(
     allocator: std.mem.Allocator,
     lock: exact_lock_v2.Lock,
@@ -719,6 +814,8 @@ fn preflightVersion(
     policy: Policy,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !PreflightResult {
+    if (version == .v1 and !@import("builtin").is_test)
+        return error.LegacyPackageCacheContractRetired;
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
@@ -765,14 +862,6 @@ fn preflightVersion(
     return result;
 }
 
-pub fn prepareWithWriterLock(
-    allocator: std.mem.Allocator,
-    request: PrepareRequest,
-    writer_lock: *const package_acquisition.Cache.WriterLock,
-) !PrepareResult {
-    return prepareWithWriterVersion(.v1, allocator, request, writer_lock);
-}
-
 pub fn prepareNativeWithWriterLock(
     allocator: std.mem.Allocator,
     request: NativePrepareRequest,
@@ -795,6 +884,8 @@ fn prepareWithWriterVersion(
     request: PrepareRequestVersion(version),
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !PrepareResult {
+    if (version == .v1 and !@import("builtin").is_test)
+        return error.LegacyPackageCacheContractRetired;
     const initial_cleanup = try cleanupStagingForPrepare(
         allocator,
         request.cache,
@@ -827,15 +918,6 @@ pub fn cleanupStagingForPrepare(
     return cleanup;
 }
 
-pub fn prepareWithWriterLockAfterCleanup(
-    allocator: std.mem.Allocator,
-    request: PrepareRequest,
-    writer_lock: *const package_acquisition.Cache.WriterLock,
-    initial_cleanup: package_acquisition.CleanupResult,
-) !PrepareResult {
-    return prepareAfterCleanupVersion(.v1, allocator, request, writer_lock, initial_cleanup);
-}
-
 pub fn prepareNativeWithWriterLockAfterCleanup(
     allocator: std.mem.Allocator,
     request: NativePrepareRequest,
@@ -861,6 +943,8 @@ fn prepareAfterCleanupVersion(
     writer_lock: *const package_acquisition.Cache.WriterLock,
     initial_cleanup: package_acquisition.CleanupResult,
 ) !PrepareResult {
+    if (version == .v1 and !@import("builtin").is_test)
+        return error.LegacyPackageCacheContractRetired;
     if (writer_lock.cache != request.cache or writer_lock.file == null or
         request.cache.limits.maximum_object_bytes != request.policy.limits.maximum_package_bytes)
         return error.InvalidRequest;
@@ -1503,54 +1587,6 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
         else => try writer.writeByte(character),
     };
     try writer.writeByte('"');
-}
-
-fn testLock(
-    allocator: std.mem.Allocator,
-    package_digest: [32]u8,
-    package_size: u64,
-    policy: Policy,
-) !exact_lock.OwnedLock {
-    return testLockForArchitecture(allocator, package_digest, package_size, policy, "amd64");
-}
-
-fn testLockForArchitecture(
-    allocator: std.mem.Allocator,
-    package_digest: [32]u8,
-    package_size: u64,
-    policy: Policy,
-    architecture: []const u8,
-) !exact_lock.OwnedLock {
-    const repository_id: [64]u8 = @splat('a');
-    const snapshot: [32]u8 = @splat(1);
-    return exact_lock.create(allocator, .{
-        .target_architecture = architecture,
-        .request_sha256 = @splat(2),
-        .policy_sha256 = solverPolicyDigest(
-            policy.recommends,
-            policy.allow_downgrade,
-            policy.repository_policy,
-        ),
-        .repositories = &.{.{
-            .id = repository_id,
-            .snapshot_sha256 = snapshot,
-            .release_sha256 = @splat(3),
-            .index_sha256 = @splat(4),
-            .signer_fingerprints = &.{@splat(5)},
-        }},
-        .packages = &.{.{
-            .name = "demo",
-            .version = "1.0-1",
-            .architecture = architecture,
-            .repository_id = repository_id,
-            .repository_snapshot_sha256 = snapshot,
-            .sha256 = package_digest,
-            .declared_size = package_size,
-            .retention = .requested,
-            .dpkg_selection_hold = false,
-        }},
-        .authenticated_metadata = true,
-    });
 }
 
 test "package_cache_workflow.test.fingerprint is deterministic and policy separated" {
@@ -3115,3 +3151,254 @@ test "package_cache_workflow.test.preflight rejects directory symlink and FIFO o
         ));
     }
 }
+
+fn testLock(
+    allocator: std.mem.Allocator,
+    package_digest: [32]u8,
+    package_size: u64,
+    policy: Policy,
+) !exact_lock.OwnedLock {
+    return testLockForArchitecture(allocator, package_digest, package_size, policy, "amd64");
+}
+
+fn testLockForArchitecture(
+    allocator: std.mem.Allocator,
+    package_digest: [32]u8,
+    package_size: u64,
+    policy: Policy,
+    architecture: []const u8,
+) !exact_lock.OwnedLock {
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(1);
+    return exact_lock.create(allocator, .{
+        .target_architecture = architecture,
+        .request_sha256 = @splat(2),
+        .policy_sha256 = solverPolicyDigest(
+            policy.recommends,
+            policy.allow_downgrade,
+            policy.repository_policy,
+        ),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(3),
+            .index_sha256 = @splat(4),
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .packages = &.{.{
+            .name = "demo",
+            .version = "1.0-1",
+            .architecture = architecture,
+            .repository_id = repository_id,
+            .repository_snapshot_sha256 = snapshot,
+            .sha256 = package_digest,
+            .declared_size = package_size,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .authenticated_metadata = true,
+    });
+}
+
+pub fn createFingerprint(
+    allocator: std.mem.Allocator,
+    lock: exact_lock.Lock,
+    architecture: []const u8,
+    debz_version: []const u8,
+    cache_root: []const u8,
+    policy: Policy,
+) !Fingerprint {
+    if (!@import("builtin").is_test) return error.LegacyPackageCacheContractRetired;
+    return createFingerprintVersion(.v1, allocator, lock, architecture, debz_version, cache_root, policy);
+}
+
+pub fn prepare(
+    allocator: std.mem.Allocator,
+    request: PrepareRequest,
+) !PrepareResult {
+    if (!@import("builtin").is_test) return error.LegacyPackageCacheContractRetired;
+    return prepareVersion(.v1, allocator, request);
+}
+
+pub fn preflight(
+    allocator: std.mem.Allocator,
+    lock: exact_lock.Lock,
+    cache: *package_acquisition.Cache,
+    policy: Policy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PreflightResult {
+    if (!@import("builtin").is_test) return error.LegacyPackageCacheContractRetired;
+    return preflightVersion(.v1, allocator, lock, cache, policy, writer_lock);
+}
+
+pub fn prepareWithWriterLock(
+    allocator: std.mem.Allocator,
+    request: PrepareRequest,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !PrepareResult {
+    if (!@import("builtin").is_test) return error.LegacyPackageCacheContractRetired;
+    return prepareWithWriterVersion(.v1, allocator, request, writer_lock);
+}
+
+pub fn prepareWithWriterLockAfterCleanup(
+    allocator: std.mem.Allocator,
+    request: PrepareRequest,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    initial_cleanup: package_acquisition.CleanupResult,
+) !PrepareResult {
+    if (!@import("builtin").is_test) return error.LegacyPackageCacheContractRetired;
+    return prepareAfterCleanupVersion(.v1, allocator, request, writer_lock, initial_cleanup);
+}
+
+test "package_cache_workflow.test.native_only_cutover_retires_v1_contracts_and_retains_historical_verification_and_v3" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const fingerprint_name = "package-cache-fingerprint.json";
+    const sidecar_name = "package-cache-fingerprint.json.legacy-capability-evidence.json";
+
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        requireLegacyV1ExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, fingerprint_name, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    const policy: Policy = .{};
+    var historical_lock = try testLock(std.testing.allocator, @splat(6), 10, policy);
+    defer historical_lock.deinit();
+    var historical_fingerprint = try createFingerprint(
+        std.testing.allocator,
+        historical_lock.lock,
+        "amd64",
+        "0.3.0",
+        "/runner/cache",
+        policy,
+    );
+    defer historical_fingerprint.deinit();
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try historical_fingerprint.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        historical_fingerprint.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(
+            .native_only,
+            .native,
+            .completed_historical_verification,
+            historical_fingerprint.legacyIdentity(),
+        ),
+    );
+
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(1);
+    const index_identity = try content_digest.Identity.init(
+        .{ .sha256 = @splat(4), .sha512 = @splat(9) },
+        .sha512,
+    );
+    const archive_identity = try content_digest.Identity.init(
+        .{ .sha256 = @splat(6), .sha512 = @splat(10) },
+        .sha512,
+    );
+    var tagged_lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(2),
+        .policy_sha256 = nativeSolverPolicyDigest(
+            policy.recommends,
+            policy.allow_downgrade,
+            policy.repository_policy,
+        ),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(3),
+            .index_identity = index_identity,
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "demo",
+            .version = "1.0-1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = archive_identity,
+            .declared_size = 10,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer tagged_lock.deinit();
+    var tagged_fingerprint = try createTaggedFingerprint(
+        std.testing.allocator,
+        tagged_lock.lock,
+        "amd64",
+        "0.3.0",
+        "/runner/cache",
+        policy,
+    );
+    defer tagged_fingerprint.deinit();
+    try tagged_fingerprint.requireExecutionAuthority();
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try tagged_fingerprint.verifyCompletedHistorical(),
+    );
+
+    const prepared: PrepareResult = .{
+        .version = .v3,
+        .lock_digest = tagged_fingerprint.lock_digest,
+        .fingerprint = tagged_fingerprint.fingerprint,
+        .target_architecture = try std.testing.allocator.dupe(u8, tagged_fingerprint.target_architecture),
+        .cache_root = try std.testing.allocator.dupe(u8, tagged_fingerprint.cache_root),
+        .cache_path = try std.testing.allocator.dupe(u8, tagged_fingerprint.cache_path),
+        .downloaded_count = 0,
+        .reused_count = 1,
+        .staging_scanned = 0,
+        .staging_deleted = 0,
+        .gc_scanned = 0,
+        .gc_deleted = 0,
+        .gc_bytes_deleted = 0,
+        .allocator = std.testing.allocator,
+    };
+    var mutable_prepared = prepared;
+    defer mutable_prepared.deinit();
+    try mutable_prepared.verifyNativeBinding(tagged_fingerprint);
+
+    var legacy_result = mutable_prepared;
+    legacy_result.version = .v1;
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        legacy_result.verifyNativeBinding(tagged_fingerprint),
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try legacy_result.verifyCompletedHistorical(),
+    );
+
+    var mixed_version = mutable_prepared;
+    mixed_version.version = .v2;
+    try std.testing.expectError(
+        error.LockPolicyMismatch,
+        mixed_version.verifyNativeBinding(tagged_fingerprint),
+    );
+
+    var stale_result = mutable_prepared;
+    stale_result.fingerprint[0] = if (stale_result.fingerprint[0] == 'a') 'b' else 'a';
+    try std.testing.expectError(
+        error.LockPolicyMismatch,
+        stale_result.verifyNativeBinding(tagged_fingerprint),
+    );
+}
+

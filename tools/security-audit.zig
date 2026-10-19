@@ -3598,10 +3598,7 @@ pub fn auditProductionSources(ctx: *AuditContext) !void {
             return std.mem.lessThan(u8, a, b);
         }
     }.lessThan);
-    if (process_paths.items.len != 2 or
-        !std.mem.eql(u8, process_paths.items[0], "src/target_apt_config.zig") or
-        !std.mem.eql(u8, process_paths.items[1], "src/transaction_executor.zig"))
-    {
+    if (process_paths.items.len != 0) {
         try ctx.fail("production process boundary changed");
     }
 
@@ -11798,8 +11795,8 @@ pub fn auditDownloadAction(ctx: *AuditContext) !void {
                 "cache.save(exportArchive, fingerprint.primary_key, archiveLimit)",
                 "core.setOutput('cache-hit'",
                 "core.setOutput('downloaded-count'",
-                "core.setOutput(\n    'backend-capability'",
-                "legacy-dpkg-execution-deprecated-v1",
+                "core.setOutput('backend-capability'",
+                "native-transaction-execution-v1",
             },
         },
     }) |req| {
@@ -12032,8 +12029,8 @@ pub fn auditInstallAction(ctx: *AuditContext) !void {
                 "validateTransactionSummary",
                 "await composition.saveSetupCache()",
                 "io.setOutput('transaction-result'",
-                "io.setOutput(\n    'backend-capability'",
-                "legacy-dpkg-execution-deprecated-v1",
+                "io.setOutput('backend-capability'",
+                "native-transaction-execution-v1",
             },
         },
     }) |req| {
@@ -12194,14 +12191,14 @@ pub fn auditLegacyCutoverPolicy(ctx: *AuditContext) !void {
     if (!std.mem.eql(u8, getJsonString(policy, "schema") orelse "", "https://debz.dev/schema/legacy-compatibility-policy-v1") or
         (getJsonInt(policy, "version") orelse 0) != 1 or
         (getJsonInt(policy, "issue") orelse 0) != 86 or
-        !std.mem.eql(u8, getJsonString(policy, "current_release_mode") orelse "", "legacy_capable"))
+        !std.mem.eql(u8, getJsonString(policy, "current_release_mode") orelse "", "native_only"))
     {
         try ctx.fail("legacy cutover policy identity or current release mode changed");
     }
     const blockers = policy.get("cutover_blockers");
     const ready = policy.get("native_only_cutover_ready");
-    if (ready == null or ready.? != .bool or ready.?.bool != false or blockers == null or blockers.? != .array or blockers.?.array.items.len == 0) {
-        try ctx.fail("legacy cutover policy cannot claim native-only readiness while blockers remain");
+    if (ready == null or ready.? != .bool or ready.?.bool != true or blockers == null or blockers.? != .array or blockers.?.array.items.len != 0) {
+        try ctx.fail("legacy cutover policy must record completed native-only readiness without blockers");
     }
     const required_invariants = [_][]const u8{
         "legacy_is_never_native_authority",
@@ -12445,7 +12442,6 @@ pub fn auditLegacyCutoverPolicy(ctx: *AuditContext) !void {
             const bundle = try ctx.readText(rel);
             for ([_][]const u8{
                 "backend-capability",
-                "legacy-dpkg-execution-deprecated-v1",
                 "native-transaction-execution-v1",
                 "Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.",
             }) |token| {

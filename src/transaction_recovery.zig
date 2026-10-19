@@ -51,6 +51,14 @@ pub const Journal = struct {
     next_command: usize,
     commands: []const Command,
     failure: ?[]const u8 = null,
+
+    pub fn legacyIdentity(self: Journal) legacy_compat.Identity {
+        return .{
+            .schema = "debz:transaction-journal",
+            .version = self.version,
+            .backend = self.backend,
+        };
+    }
 };
 
 pub const Store = struct {
@@ -134,6 +142,7 @@ pub const SystemJournalStore = struct {
     }
 
     fn writeAtomic(context: *anyopaque, root: []const u8, bytes: []const u8) !void {
+        if (!@import("builtin").is_test) return error.LegacyJournalPublicationRetired;
         const self: *SystemJournalStore = @ptrCast(@alignCast(context));
         try self.checkRoot(root);
         if (bytes.len > maximum_journal_bytes) return error.JournalTooLarge;
@@ -156,6 +165,7 @@ pub const SystemJournalStore = struct {
     }
 
     fn archiveAtomic(context: *anyopaque, root: []const u8, bytes: []const u8) !void {
+        if (!@import("builtin").is_test) return error.LegacyJournalPublicationRetired;
         const self: *SystemJournalStore = @ptrCast(@alignCast(context));
         try writeAtomic(context, root, bytes);
         self.dir.deleteFile(self.io, archive_name) catch |err| switch (err) {
@@ -365,19 +375,11 @@ pub fn policyDigest(
     return hash.finalResult();
 }
 
-pub fn persist(allocator: std.mem.Allocator, store: Store, root: []const u8, journal: Journal) !void {
-    const bytes = try encode(allocator, journal);
-    defer allocator.free(bytes);
-    try store.writeAtomic(root, bytes);
-}
+pub const active_recovery_refusal_diagnostic =
+    "active legacy_dpkg transaction journal cannot be replayed by a native-only release. " ++
+    legacy_compat.recovery_guidance;
 
-pub fn archive(allocator: std.mem.Allocator, store: Store, root: []const u8, journal: Journal) !void {
-    const bytes = try encode(allocator, journal);
-    defer allocator.free(bytes);
-    try store.archiveAtomic(root, bytes);
-}
-
-pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
+pub fn requireCompletedHistorical(journal: Journal) !void {
     if (journal.version < legacy_journal_version or journal.version > journal_version)
         return error.UnsupportedJournalVersion;
     if (journal.backend != .legacy_dpkg) return error.BackendMismatch;
@@ -389,82 +391,41 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
         return error.ContradictoryJournal;
     if (journal.version == legacy_journal_version and journal.lock_sha256 != null)
         return error.ContradictoryJournal;
-    for (journal.commands) |command| {
-        if (journal.version >= journal_version) {
-            if (command.artifact_sha256 != null and command.artifact_identity != null)
-                return error.ContradictoryJournal;
-            if (command.artifact_identity) |identity| {
-                _ = content_digest.Identity.init(
-                    identity.digests,
-                    identity.primary,
-                ) catch return error.ContradictoryJournal;
-            }
-        } else if (command.artifact_identity != null) {
-            return error.ContradictoryJournal;
-        }
+    const identity = journal.legacyIdentity();
+    if (journal.state != .complete) {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .active_recovery,
+            identity,
+        );
+        return error.LegacyCapabilityRequired;
     }
-    var payload: std.Io.Writer.Allocating = .init(allocator);
-    defer payload.deinit();
-    const writer = &payload.writer;
-    try writer.print("DEBZ-TXN\t{d}\nstate\t{s}\nboundary\t{s}\n", .{
-        journal.version,
-        @tagName(journal.state),
-        @tagName(journal.boundary),
-    });
-    try writeDigest(writer, "plan", journal.plan_sha256);
-    try writeDigest(writer, "root", journal.root_identity);
-    try writeDigest(writer, "policy", journal.policy_sha256);
-    if (journal.version >= capability_journal_version) {
-        try writer.print("backend\t{s}\ncapability\t{s}\n", .{
-            @tagName(journal.backend),
-            legacy_compat.legacy_capability,
-        });
-    }
-    if (journal.version >= lock_journal_version) {
-        try writer.writeAll("lock\t");
-        if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
-        try writer.writeByte('\n');
-    }
-    try writer.print("next\t{d}\ncommands\t{d}\n", .{ journal.next_command, journal.commands.len });
-    for (journal.commands) |command| {
-        try writer.writeAll("command\t");
-        try writeHex(writer, command.phase);
-        try writer.writeByte('\t');
-        if (command.package) |package| try writeHex(writer, package) else try writer.writeByte('-');
-        try writer.writeByte('\t');
-        try writeRawDigest(writer, command.command_sha256);
-        try writer.writeByte('\t');
-        if (journal.version >= journal_version) {
-            if (command.artifact_identity) |identity| {
-                try writeArtifactIdentity(writer, identity);
-            } else if (command.artifact_sha256) |sha256| {
-                try writeArtifactIdentity(
-                    writer,
-                    content_digest.Identity.init(
-                        .{ .sha256 = sha256 },
-                        .sha256,
-                    ) catch unreachable,
-                );
-            } else {
-                try writer.writeByte('-');
-            }
-        } else if (command.artifact_sha256) |digest| {
-            try writeRawDigest(writer, digest);
-        } else {
-            try writer.writeByte('-');
-        }
-        try writer.writeByte('\n');
-    }
-    try writer.writeAll("failure\t");
-    if (journal.failure) |failure| try writeHex(writer, failure) else try writer.writeByte('-');
-    try writer.writeByte('\n');
+    if (journal.boundary != .verifying or
+        journal.failure != null or
+        journal.next_command != journal.commands.len)
+        return error.ContradictoryJournal;
+    _ = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .completed_historical_verification,
+        identity,
+    );
+}
 
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(payload.written(), &digest, .{});
-    try writer.writeAll("checksum\t");
-    try writeRawDigest(writer, digest);
-    try writer.writeByte('\n');
-    return payload.toOwnedSlice();
+pub fn decodeCompletedHistorical(allocator: std.mem.Allocator, source: []const u8) !Decoded {
+    return decodeCompletedHistoricalBounded(allocator, source, maximum_journal_bytes);
+}
+
+pub fn decodeCompletedHistoricalBounded(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    maximum_bytes: usize,
+) !Decoded {
+    var decoded = try decodeBounded(allocator, source, maximum_bytes);
+    errdefer decoded.deinit();
+    try requireCompletedHistorical(decoded.journal);
+    return decoded;
 }
 
 pub const Decoded = struct {
@@ -573,6 +534,8 @@ pub fn decodeBounded(
         return error.ContradictoryJournal;
     if (state == .not_started and (boundary != .prepared or next != 0))
         return error.ContradictoryJournal;
+    if (state == .complete and (boundary != .verifying or next != count))
+        return error.ContradictoryJournal;
     if (lines.next()) |trailing| {
         if (trailing.len != 0 or lines.next() != null) return error.MalformedJournal;
     }
@@ -605,168 +568,6 @@ fn parseTextLine(line: ?[]const u8, name: []const u8) ![]const u8 {
     const value = fields.next() orelse return error.MalformedJournal;
     if (value.len == 0 or fields.next() != null) return error.MalformedJournal;
     return value;
-}
-
-test "transaction_recovery journal decoding is caller bounded" {
-    try std.testing.expectError(
-        error.JournalTooLarge,
-        decodeBounded(std.testing.allocator, "12345", 4),
-    );
-}
-
-test "transaction_recovery.test.legacy compatibility preserves v1 through v3 and emits v4 identities" {
-    const identity = try content_digest.Identity.init(
-        .{ .sha512 = @splat(5) },
-        .sha512,
-    );
-    inline for ([_]u32{
-        legacy_journal_version,
-        lock_journal_version,
-        capability_journal_version,
-        journal_version,
-    }) |version| {
-        const historical = version < capability_journal_version;
-        const command: Command = .{
-            .phase = "unpack",
-            .package = "demo",
-            .command_sha256 = @splat(4),
-            .artifact_sha256 = if (version < journal_version) @splat(5) else null,
-            .artifact_identity = if (version >= journal_version) identity else null,
-        };
-        const journal: Journal = .{
-            .version = version,
-            .compatibility = if (historical)
-                .implicit_historical
-            else
-                .legacy_execution_deprecated_v1,
-            .state = if (version == legacy_journal_version) .complete else .interrupted,
-            .boundary = if (version == legacy_journal_version) .verifying else .after_command,
-            .plan_sha256 = @splat(1),
-            .root_identity = @splat(2),
-            .policy_sha256 = @splat(3),
-            .lock_sha256 = if (version >= lock_journal_version) @splat(6) else null,
-            .next_command = 1,
-            .commands = &.{command},
-            .failure = if (version == legacy_journal_version) null else "interrupted",
-        };
-        const encoded = try encode(std.testing.allocator, journal);
-        defer std.testing.allocator.free(encoded);
-        var encoded_sha256: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(encoded, &encoded_sha256, .{});
-        const expected_hex = switch (version) {
-            1 => "6fa7e7e5aa8d13e827708b4b4304f0eacb868a518359976f6d8eb22e7042063c",
-            2 => "fb3d50cb83c91bbf8ed40a140c9bd5bd7b5e1ea2fcc3f4a010922bd5a844efdd",
-            3 => "7202671704e23369de417543f39c12bcc19bf589e4adb5c07a20fbd1eced7096",
-            4 => "48d563b3aa149db8e09e139cfac62ec89b9b4bd2fc0d3f64748af79ddd7936eb",
-            else => unreachable,
-        };
-        var expected_sha256: [32]u8 = undefined;
-        _ = try std.fmt.hexToBytes(&expected_sha256, expected_hex);
-        try std.testing.expectEqualSlices(
-            u8,
-            &expected_sha256,
-            &encoded_sha256,
-        );
-        if (version >= capability_journal_version) {
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                encoded,
-                "backend\tlegacy_dpkg\ncapability\tlegacy-dpkg-execution-deprecated-v1\n",
-            ) != null);
-        } else {
-            try std.testing.expect(std.mem.indexOf(u8, encoded, "backend\t") == null);
-            try std.testing.expect(std.mem.indexOf(u8, encoded, "capability\t") == null);
-        }
-        var decoded = try decode(std.testing.allocator, encoded);
-        defer decoded.deinit();
-        try std.testing.expectEqual(version, decoded.journal.version);
-        try std.testing.expectEqual(
-            if (historical) Compatibility.implicit_historical else .legacy_execution_deprecated_v1,
-            decoded.journal.compatibility,
-        );
-        const round_trip = try encode(std.testing.allocator, decoded.journal);
-        defer std.testing.allocator.free(round_trip);
-        try std.testing.expectEqualSlices(u8, encoded, round_trip);
-    }
-}
-
-test "transaction_recovery.test.legacy compatibility rejects unknown and native journal identities" {
-    var unknown: Journal = .{
-        .version = journal_version + 1,
-        .state = .not_started,
-        .boundary = .prepared,
-        .plan_sha256 = @splat(1),
-        .root_identity = @splat(2),
-        .policy_sha256 = @splat(3),
-        .next_command = 0,
-        .commands = &.{},
-    };
-    try std.testing.expectError(
-        error.UnsupportedJournalVersion,
-        encode(std.testing.allocator, unknown),
-    );
-    unknown.version = journal_version;
-    unknown.backend = .native;
-    try std.testing.expectError(
-        error.BackendMismatch,
-        encode(std.testing.allocator, unknown),
-    );
-}
-
-test "transaction_recovery.test.exact lock v3 recovery requires plan v4" {
-    var lock = try exact_lock_v3.create(std.testing.allocator, .{
-        .target_architecture = "amd64",
-        .request_sha256 = @splat(1),
-        .policy_sha256 = @splat(2),
-        .repositories = &.{},
-        .local_artifacts = &.{},
-        .packages = &.{},
-        .verified_origins = true,
-    });
-    defer lock.deinit();
-    var plan: solver.Plan = .{
-        .schema_version = 3,
-        .target_architecture = "amd64",
-        .mode = .plan_only,
-        .actions = &.{},
-        .ordered_actions = &.{},
-        .summary = .{},
-        .download_bytes = 0,
-        .installed_size_delta_bytes = 0,
-        .backing_allocator = std.testing.allocator,
-        .arena = undefined,
-    };
-    const journal: Journal = .{
-        .version = journal_version,
-        .compatibility = .legacy_execution_deprecated_v1,
-        .state = .complete,
-        .boundary = .verifying,
-        .plan_sha256 = @splat(3),
-        .root_identity = @splat(4),
-        .policy_sha256 = @splat(5),
-        .lock_sha256 = lock.lock.digest_sha256,
-        .next_command = 0,
-        .commands = &.{},
-    };
-    const refused = try verifyExactLockV3Evidence(
-        std.testing.allocator,
-        lock.lock,
-        plan,
-        journal,
-        true,
-    );
-    try std.testing.expectEqual(
-        VerificationFailure.locked_origin_evidence_mismatch,
-        refused.failure.?,
-    );
-    plan.schema_version = 4;
-    try std.testing.expect((try verifyExactLockV3Evidence(
-        std.testing.allocator,
-        lock.lock,
-        plan,
-        journal,
-        true,
-    )).succeeded());
 }
 
 pub fn verify(
@@ -1583,6 +1384,114 @@ fn findAction(actions: []const solver.PlanAction, package: []const u8, architect
     return null;
 }
 
+fn parseDigest(value: []const u8) ![32]u8 {
+    if (value.len != 64) return error.MalformedDigest;
+    var result: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, value) catch return error.MalformedDigest;
+    return result;
+}
+
+fn optionalDigest(value: []const u8) !?[32]u8 {
+    if (std.mem.eql(u8, value, "-")) return null;
+    return try parseDigest(value);
+}
+
+fn optionalArtifactIdentity(
+    value: []const u8,
+) !?content_digest.Identity {
+    if (std.mem.eql(u8, value, "-")) return null;
+    var fields = std.mem.splitScalar(u8, value, ',');
+    const primary_field = fields.next() orelse return error.MalformedDigest;
+    if (!std.mem.startsWith(u8, primary_field, "primary:"))
+        return error.MalformedDigest;
+    const primary = content_digest.Algorithm.parse(
+        primary_field["primary:".len..],
+    ) catch return error.MalformedDigest;
+    var digests: content_digest.Set = .{};
+    var previous: ?content_digest.Algorithm = null;
+    while (fields.next()) |field| {
+        const separator = std.mem.indexOfScalar(u8, field, ':') orelse
+            return error.MalformedDigest;
+        const algorithm = content_digest.Algorithm.parse(
+            field[0..separator],
+        ) catch return error.MalformedDigest;
+        if (previous) |prior| {
+            if (@intFromEnum(algorithm) <= @intFromEnum(prior))
+                return error.MalformedDigest;
+        }
+        previous = algorithm;
+        const digest = content_digest.Value.parse(
+            algorithm,
+            field[separator + 1 ..],
+        ) catch return error.MalformedDigest;
+        digests.put(digest) catch return error.MalformedDigest;
+    }
+    return content_digest.Identity.init(digests, primary) catch
+        return error.MalformedDigest;
+}
+
+fn commandArtifactIdentity(
+    command: Command,
+) ?content_digest.Identity {
+    if (command.artifact_identity) |identity| return identity;
+    const sha256 = command.artifact_sha256 orelse return null;
+    return content_digest.Identity.init(
+        .{ .sha256 = sha256 },
+        .sha256,
+    ) catch unreachable;
+}
+
+fn commandArtifactSha256(command: Command) ?[32]u8 {
+    if (command.artifact_identity) |identity|
+        return identity.digests.sha256;
+    return command.artifact_sha256;
+}
+
+fn parseDigestLine(line: ?[]const u8, name: []const u8) ![32]u8 {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
+    const result = try parseDigest(fields.next() orelse return error.MalformedJournal);
+    if (fields.next() != null) return error.MalformedJournal;
+    return result;
+}
+
+fn parseOptionalDigestLine(line: ?[]const u8, name: []const u8) !?[32]u8 {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
+    const result = try optionalDigest(fields.next() orelse return error.MalformedJournal);
+    if (fields.next() != null) return error.MalformedJournal;
+    return result;
+}
+
+fn parseIntLine(line: ?[]const u8, name: []const u8) !usize {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
+    const result = try std.fmt.parseInt(usize, fields.next() orelse return error.MalformedJournal, 10);
+    if (fields.next() != null) return error.MalformedJournal;
+    return result;
+}
+
+fn parseEnumLine(comptime T: type, line: ?[]const u8, name: []const u8) !T {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
+    const result = std.meta.stringToEnum(T, fields.next() orelse return error.MalformedJournal) orelse
+        return error.MalformedJournal;
+    if (fields.next() != null) return error.MalformedJournal;
+    return result;
+}
+
+fn optionalHexInPlace(value: []u8) !?[]const u8 {
+    if (std.mem.eql(u8, value, "-")) return null;
+    return try decodeHexInPlace(value);
+}
+
+fn decodeHexInPlace(value: []u8) ![]const u8 {
+    if (value.len % 2 != 0) return error.MalformedHex;
+    const length = value.len / 2;
+    _ = std.fmt.hexToBytes(value[0..length], value) catch return error.MalformedHex;
+    return value[0..length];
+}
+
 const TestStatusReader = struct {
     source: []const u8,
 
@@ -1596,6 +1505,168 @@ const TestStatusReader = struct {
         return allocator.dupe(u8, self.source);
     }
 };
+
+test "transaction_recovery journal decoding is caller bounded" {
+    try std.testing.expectError(
+        error.JournalTooLarge,
+        decodeBounded(std.testing.allocator, "12345", 4),
+    );
+}
+
+test "transaction_recovery.test.legacy compatibility preserves v1 through v3 and emits v4 identities" {
+    const identity = try content_digest.Identity.init(
+        .{ .sha512 = @splat(5) },
+        .sha512,
+    );
+    inline for ([_]u32{
+        legacy_journal_version,
+        lock_journal_version,
+        capability_journal_version,
+        journal_version,
+    }) |version| {
+        const historical = version < capability_journal_version;
+        const command: Command = .{
+            .phase = "unpack",
+            .package = "demo",
+            .command_sha256 = @splat(4),
+            .artifact_sha256 = if (version < journal_version) @splat(5) else null,
+            .artifact_identity = if (version >= journal_version) identity else null,
+        };
+        const journal: Journal = .{
+            .version = version,
+            .compatibility = if (historical)
+                .implicit_historical
+            else
+                .legacy_execution_deprecated_v1,
+            .state = if (version == legacy_journal_version) .complete else .interrupted,
+            .boundary = if (version == legacy_journal_version) .verifying else .after_command,
+            .plan_sha256 = @splat(1),
+            .root_identity = @splat(2),
+            .policy_sha256 = @splat(3),
+            .lock_sha256 = if (version >= lock_journal_version) @splat(6) else null,
+            .next_command = 1,
+            .commands = &.{command},
+            .failure = if (version == legacy_journal_version) null else "interrupted",
+        };
+        const encoded = try encode(std.testing.allocator, journal);
+        defer std.testing.allocator.free(encoded);
+        var encoded_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &encoded_sha256, .{});
+        const expected_hex = switch (version) {
+            1 => "6fa7e7e5aa8d13e827708b4b4304f0eacb868a518359976f6d8eb22e7042063c",
+            2 => "fb3d50cb83c91bbf8ed40a140c9bd5bd7b5e1ea2fcc3f4a010922bd5a844efdd",
+            3 => "7202671704e23369de417543f39c12bcc19bf589e4adb5c07a20fbd1eced7096",
+            4 => "48d563b3aa149db8e09e139cfac62ec89b9b4bd2fc0d3f64748af79ddd7936eb",
+            else => unreachable,
+        };
+        var expected_sha256: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected_sha256, expected_hex);
+        try std.testing.expectEqualSlices(
+            u8,
+            &expected_sha256,
+            &encoded_sha256,
+        );
+        if (version >= capability_journal_version) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                encoded,
+                "backend\tlegacy_dpkg\ncapability\tlegacy-dpkg-execution-deprecated-v1\n",
+            ) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "backend\t") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "capability\t") == null);
+        }
+        var decoded = try decode(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(version, decoded.journal.version);
+        try std.testing.expectEqual(
+            if (historical) Compatibility.implicit_historical else .legacy_execution_deprecated_v1,
+            decoded.journal.compatibility,
+        );
+        const round_trip = try encode(std.testing.allocator, decoded.journal);
+        defer std.testing.allocator.free(round_trip);
+        try std.testing.expectEqualSlices(u8, encoded, round_trip);
+    }
+}
+
+test "transaction_recovery.test.legacy compatibility rejects unknown and native journal identities" {
+    var unknown: Journal = .{
+        .version = journal_version + 1,
+        .state = .not_started,
+        .boundary = .prepared,
+        .plan_sha256 = @splat(1),
+        .root_identity = @splat(2),
+        .policy_sha256 = @splat(3),
+        .next_command = 0,
+        .commands = &.{},
+    };
+    try std.testing.expectError(
+        error.UnsupportedJournalVersion,
+        encode(std.testing.allocator, unknown),
+    );
+    unknown.version = journal_version;
+    unknown.backend = .native;
+    try std.testing.expectError(
+        error.BackendMismatch,
+        encode(std.testing.allocator, unknown),
+    );
+}
+
+test "transaction_recovery.test.exact lock v3 recovery requires plan v4" {
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &.{},
+        .ordered_actions = &.{},
+        .summary = .{},
+        .download_bytes = 0,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    const journal: Journal = .{
+        .version = journal_version,
+        .compatibility = .legacy_execution_deprecated_v1,
+        .state = .complete,
+        .boundary = .verifying,
+        .plan_sha256 = @splat(3),
+        .root_identity = @splat(4),
+        .policy_sha256 = @splat(5),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .next_command = 0,
+        .commands = &.{},
+    };
+    const refused = try verifyExactLockV3Evidence(
+        std.testing.allocator,
+        lock.lock,
+        plan,
+        journal,
+        true,
+    );
+    try std.testing.expectEqual(
+        VerificationFailure.locked_origin_evidence_mismatch,
+        refused.failure.?,
+    );
+    plan.schema_version = 4;
+    try std.testing.expect((try verifyExactLockV3Evidence(
+        std.testing.allocator,
+        lock.lock,
+        plan,
+        journal,
+        true,
+    )).succeeded());
+}
 
 test "transaction_recovery.test.exact closure verification rejects drift" {
     const repository_id: [64]u8 = @splat('a');
@@ -2110,6 +2181,111 @@ test "transaction_recovery.test.operation lock verifies exact mutations on popul
     );
 }
 
+pub fn persist(allocator: std.mem.Allocator, store: Store, root: []const u8, journal: Journal) !void {
+    if (!@import("builtin").is_test) @compileError("legacy journal publication is retired in production");
+    const bytes = try encode(allocator, journal);
+    defer allocator.free(bytes);
+    try store.writeAtomic(root, bytes);
+}
+
+pub fn archive(allocator: std.mem.Allocator, store: Store, root: []const u8, journal: Journal) !void {
+    if (!@import("builtin").is_test) @compileError("legacy journal publication is retired in production");
+    const bytes = try encode(allocator, journal);
+    defer allocator.free(bytes);
+    try store.archiveAtomic(root, bytes);
+}
+
+pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
+    if (!@import("builtin").is_test) @compileError("legacy journal publication is retired in production");
+    if (journal.version < legacy_journal_version or journal.version > journal_version)
+        return error.UnsupportedJournalVersion;
+    if (journal.backend != .legacy_dpkg) return error.BackendMismatch;
+    if (journal.version < capability_journal_version and
+        journal.compatibility != .implicit_historical)
+        return error.ContradictoryJournal;
+    if (journal.version >= capability_journal_version and
+        journal.compatibility != .legacy_execution_deprecated_v1)
+        return error.ContradictoryJournal;
+    if (journal.version == legacy_journal_version and journal.lock_sha256 != null)
+        return error.ContradictoryJournal;
+    for (journal.commands) |command| {
+        if (journal.version >= journal_version) {
+            if (command.artifact_sha256 != null and command.artifact_identity != null)
+                return error.ContradictoryJournal;
+            if (command.artifact_identity) |identity| {
+                _ = content_digest.Identity.init(
+                    identity.digests,
+                    identity.primary,
+                ) catch return error.ContradictoryJournal;
+            }
+        } else if (command.artifact_identity != null) {
+            return error.ContradictoryJournal;
+        }
+    }
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    const writer = &payload.writer;
+    try writer.print("DEBZ-TXN\t{d}\nstate\t{s}\nboundary\t{s}\n", .{
+        journal.version,
+        @tagName(journal.state),
+        @tagName(journal.boundary),
+    });
+    try writeDigest(writer, "plan", journal.plan_sha256);
+    try writeDigest(writer, "root", journal.root_identity);
+    try writeDigest(writer, "policy", journal.policy_sha256);
+    if (journal.version >= capability_journal_version) {
+        try writer.print("backend\t{s}\ncapability\t{s}\n", .{
+            @tagName(journal.backend),
+            legacy_compat.legacy_capability,
+        });
+    }
+    if (journal.version >= lock_journal_version) {
+        try writer.writeAll("lock\t");
+        if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
+        try writer.writeByte('\n');
+    }
+    try writer.print("next\t{d}\ncommands\t{d}\n", .{ journal.next_command, journal.commands.len });
+    for (journal.commands) |command| {
+        try writer.writeAll("command\t");
+        try writeHex(writer, command.phase);
+        try writer.writeByte('\t');
+        if (command.package) |package| try writeHex(writer, package) else try writer.writeByte('-');
+        try writer.writeByte('\t');
+        try writeRawDigest(writer, command.command_sha256);
+        try writer.writeByte('\t');
+        if (journal.version >= journal_version) {
+            if (command.artifact_identity) |identity| {
+                try writeArtifactIdentity(writer, identity);
+            } else if (command.artifact_sha256) |sha256| {
+                try writeArtifactIdentity(
+                    writer,
+                    content_digest.Identity.init(
+                        .{ .sha256 = sha256 },
+                        .sha256,
+                    ) catch unreachable,
+                );
+            } else {
+                try writer.writeByte('-');
+            }
+        } else if (command.artifact_sha256) |digest| {
+            try writeRawDigest(writer, digest);
+        } else {
+            try writer.writeByte('-');
+        }
+        try writer.writeByte('\n');
+    }
+    try writer.writeAll("failure\t");
+    if (journal.failure) |failure| try writeHex(writer, failure) else try writer.writeByte('-');
+    try writer.writeByte('\n');
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload.written(), &digest, .{});
+    try writer.writeAll("checksum\t");
+    try writeRawDigest(writer, digest);
+    try writer.writeByte('\n');
+    return payload.toOwnedSlice();
+}
+
 fn writeDigest(writer: anytype, name: []const u8, digest: [32]u8) !void {
     try writer.print("{s}\t", .{name});
     try writeRawDigest(writer, digest);
@@ -2144,112 +2320,107 @@ fn writeHex(writer: anytype, bytes: []const u8) !void {
     }
 }
 
-fn parseDigest(value: []const u8) ![32]u8 {
-    if (value.len != 64) return error.MalformedDigest;
-    var result: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&result, value) catch return error.MalformedDigest;
-    return result;
-}
+test "transaction_recovery.test.completed historical decoder verifies v1 through v4 and refuses active corrupt contradictory and backend-mismatched journals" {
+    const identity = try content_digest.Identity.init(
+        .{ .sha256 = @splat(5), .sha512 = @splat(7) },
+        .sha512,
+    );
+    inline for ([_]u32{
+        legacy_journal_version,
+        lock_journal_version,
+        capability_journal_version,
+        journal_version,
+    }) |version| {
+        const historical = version < capability_journal_version;
+        const command: Command = .{
+            .phase = "unpack",
+            .package = "demo",
+            .command_sha256 = @splat(4),
+            .artifact_sha256 = if (version < journal_version) @splat(5) else null,
+            .artifact_identity = if (version >= journal_version) identity else null,
+        };
+        const completed_journal: Journal = .{
+            .version = version,
+            .compatibility = if (historical)
+                .implicit_historical
+            else
+                .legacy_execution_deprecated_v1,
+            .state = .complete,
+            .boundary = .verifying,
+            .plan_sha256 = @splat(1),
+            .root_identity = @splat(2),
+            .policy_sha256 = @splat(3),
+            .lock_sha256 = if (version >= lock_journal_version) @splat(6) else null,
+            .next_command = 1,
+            .commands = &.{command},
+            .failure = null,
+        };
+        const encoded = try encode(std.testing.allocator, completed_journal);
+        defer std.testing.allocator.free(encoded);
+        var decoded = try decodeCompletedHistorical(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(version, decoded.journal.version);
+        try std.testing.expectEqual(State.complete, decoded.journal.state);
+        try std.testing.expectEqual(Boundary.verifying, decoded.journal.boundary);
+        try requireCompletedHistorical(decoded.journal);
 
-fn optionalDigest(value: []const u8) !?[32]u8 {
-    if (std.mem.eql(u8, value, "-")) return null;
-    return try parseDigest(value);
-}
-
-fn optionalArtifactIdentity(
-    value: []const u8,
-) !?content_digest.Identity {
-    if (std.mem.eql(u8, value, "-")) return null;
-    var fields = std.mem.splitScalar(u8, value, ',');
-    const primary_field = fields.next() orelse return error.MalformedDigest;
-    if (!std.mem.startsWith(u8, primary_field, "primary:"))
-        return error.MalformedDigest;
-    const primary = content_digest.Algorithm.parse(
-        primary_field["primary:".len..],
-    ) catch return error.MalformedDigest;
-    var digests: content_digest.Set = .{};
-    var previous: ?content_digest.Algorithm = null;
-    while (fields.next()) |field| {
-        const separator = std.mem.indexOfScalar(u8, field, ':') orelse
-            return error.MalformedDigest;
-        const algorithm = content_digest.Algorithm.parse(
-            field[0..separator],
-        ) catch return error.MalformedDigest;
-        if (previous) |prior| {
-            if (@intFromEnum(algorithm) <= @intFromEnum(prior))
-                return error.MalformedDigest;
+        const active_cases = [_]struct {
+            state: State,
+            boundary: Boundary,
+            next: usize,
+            failure: ?[]const u8,
+        }{
+            .{ .state = .not_started, .boundary = .prepared, .next = 0, .failure = null },
+            .{ .state = .in_progress, .boundary = .before_command, .next = 0, .failure = null },
+            .{ .state = .dpkg_failed, .boundary = .after_command, .next = 0, .failure = "dpkg failed" },
+            .{ .state = .interrupted, .boundary = .after_command, .next = 1, .failure = "interrupted" },
+            .{ .state = .verification_failed, .boundary = .verifying, .next = 1, .failure = "verification failed" },
+        };
+        for (active_cases) |active| {
+            var active_journal = completed_journal;
+            active_journal.state = active.state;
+            active_journal.boundary = active.boundary;
+            active_journal.next_command = active.next;
+            active_journal.failure = active.failure;
+            const active_bytes = try encode(std.testing.allocator, active_journal);
+            defer std.testing.allocator.free(active_bytes);
+            try std.testing.expectError(
+                error.LegacyCapabilityRequired,
+                decodeCompletedHistorical(std.testing.allocator, active_bytes),
+            );
         }
-        previous = algorithm;
-        const digest = content_digest.Value.parse(
-            algorithm,
-            field[separator + 1 ..],
-        ) catch return error.MalformedDigest;
-        digests.put(digest) catch return error.MalformedDigest;
     }
-    return content_digest.Identity.init(digests, primary) catch
-        return error.MalformedDigest;
-}
 
-fn commandArtifactIdentity(
-    command: Command,
-) ?content_digest.Identity {
-    if (command.artifact_identity) |identity| return identity;
-    const sha256 = command.artifact_sha256 orelse return null;
-    return content_digest.Identity.init(
-        .{ .sha256 = sha256 },
-        .sha256,
-    ) catch unreachable;
-}
+    var contradictory_complete: Journal = .{
+        .state = .complete,
+        .boundary = .after_command,
+        .plan_sha256 = @splat(1),
+        .root_identity = @splat(2),
+        .policy_sha256 = @splat(3),
+        .next_command = 0,
+        .commands = &.{},
+        .failure = null,
+    };
+    const contradictory_bytes = try encode(std.testing.allocator, contradictory_complete);
+    defer std.testing.allocator.free(contradictory_bytes);
+    try std.testing.expectError(
+        error.ContradictoryJournal,
+        decode(std.testing.allocator, contradictory_bytes),
+    );
+    try std.testing.expectError(
+        error.ContradictoryJournal,
+        decodeCompletedHistorical(std.testing.allocator, contradictory_bytes),
+    );
 
-fn commandArtifactSha256(command: Command) ?[32]u8 {
-    if (command.artifact_identity) |identity|
-        return identity.digests.sha256;
-    return command.artifact_sha256;
-}
-
-fn parseDigestLine(line: ?[]const u8, name: []const u8) ![32]u8 {
-    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
-    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
-    const result = try parseDigest(fields.next() orelse return error.MalformedJournal);
-    if (fields.next() != null) return error.MalformedJournal;
-    return result;
-}
-
-fn parseOptionalDigestLine(line: ?[]const u8, name: []const u8) !?[32]u8 {
-    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
-    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
-    const result = try optionalDigest(fields.next() orelse return error.MalformedJournal);
-    if (fields.next() != null) return error.MalformedJournal;
-    return result;
-}
-
-fn parseIntLine(line: ?[]const u8, name: []const u8) !usize {
-    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
-    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
-    const result = try std.fmt.parseInt(usize, fields.next() orelse return error.MalformedJournal, 10);
-    if (fields.next() != null) return error.MalformedJournal;
-    return result;
-}
-
-fn parseEnumLine(comptime T: type, line: ?[]const u8, name: []const u8) !T {
-    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
-    if (!std.mem.eql(u8, fields.next() orelse "", name)) return error.MalformedJournal;
-    const result = std.meta.stringToEnum(T, fields.next() orelse return error.MalformedJournal) orelse
-        return error.MalformedJournal;
-    if (fields.next() != null) return error.MalformedJournal;
-    return result;
-}
-
-fn optionalHexInPlace(value: []u8) !?[]const u8 {
-    if (std.mem.eql(u8, value, "-")) return null;
-    return try decodeHexInPlace(value);
-}
-
-fn decodeHexInPlace(value: []u8) ![]const u8 {
-    if (value.len % 2 != 0) return error.MalformedHex;
-    const length = value.len / 2;
-    _ = std.fmt.hexToBytes(value[0..length], value) catch return error.MalformedHex;
-    return value[0..length];
+    contradictory_complete.boundary = .verifying;
+    contradictory_complete.backend = .native;
+    try std.testing.expectError(
+        error.BackendMismatch,
+        requireCompletedHistorical(contradictory_complete),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, active_recovery_refusal_diagnostic, ">=0.3.0,<0.4.0") != null,
+    );
 }
 
 test "transaction_recovery journal integrity and contradictions" {

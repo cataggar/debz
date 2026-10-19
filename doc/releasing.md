@@ -23,12 +23,11 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
    `zig build write-digest-inventory`, current content authority must remain
    algorithm-tagged, and every retained SHA256 control or historical field must
    stay explicitly classified. A
-   legacy-capable release must keep
-   `native_only_cutover_ready: false`, retain every inventoried production
-   selector, and ship generated Actions capability evidence. A later
-   native-only release must not be tagged until every listed blocker has been
-   discharged in the cutover change and active legacy operations have stable
-   recovery guidance.
+   native-only release must keep
+   `current_release_mode: "native_only"`, `native_only_cutover_ready: true`,
+   and `cutover_blockers: []`, pass `debz-native-only-candidate`, and ship
+   generated Actions native capability evidence while active legacy operations
+   retain stable recovery guidance (`>=0.3.0,<0.4.0`).
 6. Create one annotated tag without changing the commit: `git tag -a v0.3.0 -m "debz 0.3.0"`.
 7. Push only that tag: `git push origin refs/tags/v0.3.0`.
 8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus verified standalone `ghr` v0.8.1 smoke jobs.

@@ -29,7 +29,6 @@ import {
   buildTransactionResultArguments,
   failureDiagnostic,
   transactionResultPath,
-  validateInstallCommandResult,
   validateNativeCapability,
   validateNativeInstallResult,
   validateTransactionSummary,
@@ -44,7 +43,6 @@ import {
   type SetupOutputs,
 } from './subprocess.js';
 
-export const LEGACY_BACKEND_CAPABILITY = 'legacy-dpkg-execution-deprecated-v1';
 export const NATIVE_BACKEND_CAPABILITY = 'native-transaction-execution-v1';
 
 export interface ActionIO {
@@ -104,6 +102,11 @@ export async function runAction(
   io: ActionIO = defaultIO,
   services: Services = defaultServices,
 ): Promise<void> {
+  if (inputs.transactionBackend !== 'native') {
+    throw new InstallActionError(
+      'legacy_dpkg transaction execution is retired. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
+    );
+  }
   const protectedFiles = await Promise.all(
     [
       inputs.lockInput,
@@ -178,16 +181,14 @@ export async function runAction(
       executable,
       services,
     );
-    if (inputs.transactionBackend === 'native') {
-      const capability = await services.runDebz(
-        executable.path, buildNativeCapabilityArguments(), sudoPath, 64 * 1024,
-      );
-      if (capability.code !== 0 || capability.stderr.length !== 0) {
-        throw new InstallActionError('the verified CLI does not support the native install-action contract');
-      }
-      validateNativeCapability(capability.stdout);
-      await verifyIdentities(protectedFiles, mutableDirectories, executable, services);
+    const capability = await services.runDebz(
+      executable.path, buildNativeCapabilityArguments(), sudoPath, 64 * 1024,
+    );
+    if (capability.code !== 0 || capability.stderr.length !== 0) {
+      throw new InstallActionError('the verified CLI does not support the native install-action contract');
     }
+    validateNativeCapability(capability.stdout);
+    await verifyIdentities(protectedFiles, mutableDirectories, executable, services);
     const download = await composition.download(executable.path);
     await verifyIdentities(
       protectedFiles,
@@ -197,9 +198,6 @@ export async function runAction(
     );
 
     let resultPath = transactionResultPath(inputs);
-    const priorResult = inputs.transactionBackend === 'legacy_dpkg'
-      ? await services.captureOptionalFile(resultPath)
-      : undefined;
     const execution = await services.runDebz(
       executable.path,
       buildInstallArguments(inputs),
@@ -209,9 +207,7 @@ export async function runAction(
     if (execution.code !== 0) {
       throw new DebzInstallExitError(
         execution.code,
-        inputs.transactionBackend === 'native'
-          ? path.join(inputs.installRoot, 'var/lib/debz')
-          : inputs.statePath,
+        path.join(inputs.installRoot, 'var/lib/debz'),
         failureDiagnostic(execution.stdout),
         inputs.transactionBackend,
       );
@@ -219,23 +215,20 @@ export async function runAction(
     if (execution.stderr.length !== 0) {
       throw new InstallActionError('debz wrote unexpected stderr on success');
     }
-    const nativeResult = inputs.transactionBackend === 'native'
-      ? validateNativeInstallResult(execution.stdout, inputs, download.lockDigest)
-      : undefined;
-    const changed = nativeResult === undefined
-      ? validateInstallCommandResult(execution.stdout)
-      : nativeResult.changed;
+    const nativeResult = validateNativeInstallResult(
+      execution.stdout,
+      inputs,
+      download.lockDigest,
+    );
+    const changed = nativeResult.changed;
     await verifyIdentities(
       protectedFiles,
       mutableDirectories,
       executable,
       services,
     );
-    const freshResult = priorResult === undefined
-      ? undefined
-      : await services.requireFreshResult(priorResult);
     let installedCount: number;
-    if (nativeResult !== undefined && !nativeResult.changed) {
+    if (!nativeResult.changed) {
       installedCount = nativeResult.installedCount;
       resultPath = '';
     } else {
@@ -266,7 +259,6 @@ export async function runAction(
         'package preparation and final transaction disagree on closure size',
       );
     }
-    if (freshResult !== undefined) await services.verifyOptionalFile(freshResult);
     await verifyIdentities(
       protectedFiles,
       mutableDirectories,
@@ -315,17 +307,7 @@ export async function runAction(
   io.setOutput('provenance', outputs.resultPath);
   io.setOutput('installed-count', String(outputs.installedCount));
   io.setOutput('changed', outputs.changed ? 'true' : 'false');
-  io.setOutput(
-    'backend-capability',
-    inputs.transactionBackend === 'legacy_dpkg'
-      ? LEGACY_BACKEND_CAPABILITY
-      : NATIVE_BACKEND_CAPABILITY,
-  );
-  if (inputs.transactionBackend === 'legacy_dpkg') {
-    io.info(
-      'DEPRECATION[legacy-dpkg-execution-deprecated-v1]: Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
-    );
-  }
+  io.setOutput('backend-capability', NATIVE_BACKEND_CAPABILITY);
 }
 
 async function verifyIdentities(

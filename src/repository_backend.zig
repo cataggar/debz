@@ -2149,8 +2149,8 @@ fn validateNativePreparationEvidence(allocator: std.mem.Allocator, input: Native
 
 pub const Backend = struct {
     io: std.Io,
-    transaction_backend: transaction_engine.Kind = .legacy_dpkg,
-    legacy_execution_capable: bool = true,
+    transaction_backend: transaction_engine.Kind = .native,
+    legacy_execution_capable: bool = false,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
     /// Borrowed only for this native invocation; never request or state data.
@@ -2207,6 +2207,16 @@ pub const Backend = struct {
 
     const ExecutionPath = enum { selected_executor, native_runtime };
 
+    fn selectedExecutor(self: Backend) !Executor {
+        return switch (self.transaction_backend) {
+            .legacy_dpkg => if (self.legacy_execution_capable)
+                self.executor
+            else
+                error.LegacyTransactionExecutionRetired,
+            .native => self.native_executor orelse error.BackendUnavailable,
+        };
+    }
+
     fn executeAdd(
         self: *Backend,
         allocator: std.mem.Allocator,
@@ -2216,8 +2226,6 @@ pub const Backend = struct {
         const transaction_backend = self.transaction_backend;
         reviewed_repository_profile.validateProfiles(self.reviewed_repository_profiles) catch
             return api.failure(.usage, .invalid_request, "policy", "reviewed repository profile is invalid");
-        if (!self.legacy_execution_capable and transaction_backend == .legacy_dpkg)
-            return mapRootOperationError(error.LegacyCapabilityRequired);
         const native = execution_path == .native_runtime;
         if (native and (transaction_backend != .native or self.root_projection == null or self.native_executor != null))
             return api.failure(
@@ -2226,11 +2234,9 @@ pub const Backend = struct {
                 "transaction",
                 "native request dispatch requires explicit native selection and current projection authority",
             );
-        const executor: ?Executor = if (native) null else transaction_engine.select(
-            transaction_backend,
-            self.executor,
-            self.native_executor,
-        ) catch return api.failure(
+        if (!self.legacy_execution_capable and transaction_backend == .legacy_dpkg)
+            return mapRootOperationError(error.LegacyCapabilityRequired);
+        const executor: ?Executor = if (native) null else self.selectedExecutor() catch return api.failure(
             .unavailable,
             .transaction_backend_unavailable,
             "transaction",
@@ -4406,7 +4412,7 @@ const RootOperationGuard = struct {
     attempt: ?root_operation.Attempt = null,
     acquisition_observer: ?root_operation.AcquisitionObserver = null,
     root_projection: ?*const live_root.Projection = null,
-    legacy_execution_capable: bool = true,
+    legacy_execution_capable: bool = false,
     native_completion_only: bool = false,
     native_resume_completion: bool = false,
     deadline: ?transaction_executor.Deadline = null,
@@ -8054,6 +8060,7 @@ fn testNativePreparation(case: NativePreparationCase) !void {
         root_path,
         if (case == .lost_lock) lost_locks.interface() else locks.interface(),
     );
+    coordinator.legacy_execution_capable = case == .legacy_caller;
     const wrong_digest: [32]u8 = @splat(0x11);
     var attempt = if (discovered_architecture) blk: {
         try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
@@ -10880,7 +10887,7 @@ fn projectedRepositoryCaller(case: ProjectedRepositoryCase, projection: *const l
         try root.publishFile(try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"), "/.\n", .{});
 
         try root.dir.createDirPath(io, "fixture/legacy");
-        var legacy: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
+        var legacy: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection, .legacy_execution_capable = true };
         defer legacy.deinit();
         var legacy_request = request;
         legacy_request.root = "/fixture/legacy";
@@ -11380,6 +11387,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
     var locks: root_operation.TestLockBackend = .{ .allocator = allocator };
     defer locks.deinit();
     var coordinator = try root_operation.Coordinator.open(std.testing.io, root, root_path, locks.interface());
+    coordinator.legacy_execution_capable = case == .legacy_caller;
     var attempt = try coordinator.acquire(allocator, .{
         .backend = if (case == .legacy_caller) .legacy_dpkg else .native,
         .operation = .{ .repository_bootstrap = .add },
@@ -12062,14 +12070,14 @@ test "repository backend binds root callers while sharing live and unresolved ex
         try std.testing.expect(!std.mem.eql(u8, &request_digest, &repositoryRequestDigest(request, other)));
         try std.testing.expect(!std.mem.eql(u8, &policy_digest, &repositoryPolicyDigest(request, other)));
         {
-            var owner: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            var owner: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator, .legacy_execution_capable = true };
             defer owner.deinit();
             try std.testing.expect(owner.open(request, backend, 1_700_000_000) == null);
             try std.testing.expectEqual(backend, owner.active().?.record().backend);
             try std.testing.expectEqualSlices(u8, &request_digest, &owner.active().?.record().request_sha256);
             try std.testing.expectEqualSlices(u8, &policy_digest, &owner.active().?.record().policy_sha256);
 
-            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator, .legacy_execution_capable = true };
             defer contender.deinit();
             var refused = contender.open(request, other, 1_700_000_000) orelse
                 return error.TestUnexpectedResult;
@@ -12105,7 +12113,7 @@ test "repository backend binds root callers while sharing live and unresolved ex
         defer stranded.deinit();
         try store.writeAtomic(std.testing.allocator, stranded.record);
         {
-            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+            var contender: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator, .legacy_execution_capable = true };
             defer contender.deinit();
             var refused = contender.open(request, other, 1_700_000_000) orelse
                 return error.TestUnexpectedResult;
@@ -12122,7 +12130,7 @@ test "repository backend binds root callers while sharing live and unresolved ex
         var observed = (try readRootAttempt(directory.dir)).?;
         defer observed.deinit();
         try std.testing.expectEqualSlices(u8, &stranded.record.digest_sha256, &observed.record.digest_sha256);
-        var resumed: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator };
+        var resumed: RootOperationGuard = .{ .io = std.testing.io, .allocator = std.testing.allocator, .legacy_execution_capable = true };
         defer resumed.deinit();
         try std.testing.expect(resumed.open(request, backend, 1_700_000_000) == null);
         try std.testing.expectEqualSlices(u8, &stranded.record.digest_sha256, &resumed.active().?.record().digest_sha256);
@@ -13348,7 +13356,22 @@ test "repository backend native-only rehearsal rejects legacy before root or sid
     try directory.dir.writeFile(std.testing.io, .{ .sub_path = "sentinel", .data = "original\n" });
     const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
     defer std.testing.allocator.free(root);
-    var backend: Backend = .{ .io = std.testing.io, .legacy_execution_capable = false };
+    var default_backend: Backend = .{ .io = std.testing.io };
+    try std.testing.expectEqual(transaction_engine.Kind.native, default_backend.transaction_backend);
+    try std.testing.expect(!default_backend.legacy_execution_capable);
+    var default_refused = try default_backend.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "https://packages.test/config.deb",
+    });
+    defer default_refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, default_refused.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.transaction_backend_unavailable, default_refused.diagnostics[0].id);
+
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = false,
+    };
     const request: api.Request = .{
         .root = root,
         .descriptor_url = "https://packages.test/config.deb",
@@ -13446,7 +13469,7 @@ test "repository backend snapshots selection before acquisition callbacks" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -13496,7 +13519,7 @@ test "repository backend completes and idempotently resumes every production pha
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -13630,7 +13653,7 @@ test "repository repeated operation retains immutable active generation when poi
     defer allocator.free(root_path);
     var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
     var executor: RepositoryTestExecutor = .{ .io = std.testing.io, .directory = directory.dir };
-    var backend: Backend = .{ .io = std.testing.io, .executor = executor.interface(), .acquisition_dependencies = acquisition.dependencies(), .now_unix = @import("fixtures/openpgp.zig").created + 30 };
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(), .acquisition_dependencies = acquisition.dependencies(), .now_unix = @import("fixtures/openpgp.zig").created + 30 };
     const request: api.Request = .{ .root = root_path, .descriptor_url = "file:///descriptor.deb", .expected_sha256 = sha256(descriptor), .architecture = "amd64" };
     var first = try api.execute(allocator, request, backend.interface());
     defer first.deinit();
@@ -13908,7 +13931,7 @@ test "repository backend holds bounded target locks for idempotent verification"
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .target_locks = target_locks.interface(),
             .status_reader = locked_status.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
@@ -14131,7 +14154,7 @@ test "repository backend resumes immediately after durable planned checkpoint" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .state_write_hooks = failure.hooks(),
@@ -14193,7 +14216,7 @@ test "repository backend resumes validated HTTPS descriptor from CAS without tra
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .state_write_hooks = failure.hooks(),
@@ -14250,7 +14273,7 @@ test "repository backend rejects changed transport and unavailable corrupt descr
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .state_write_hooks = failure.hooks(),
@@ -14335,7 +14358,7 @@ test "repository backend binds execution and recovery provenance to the persiste
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14452,7 +14475,7 @@ test "repository backend classifies shared transaction journals before recovery"
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -14603,7 +14626,7 @@ test "repository backend replays the exact durable plan for interrupted dpkg sta
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -14685,7 +14708,7 @@ test "repository backend replays closure when a dependency is partially installe
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14725,7 +14748,7 @@ test "repository backend rejects changed requests during exact-plan recovery" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14764,7 +14787,7 @@ test "repository backend rejects a tampered persisted executable plan" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14820,7 +14843,7 @@ test "repository backend rejects mismatched local artifact evidence on recovery"
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14911,7 +14934,7 @@ test "repository backend reconstructs provenance after successful dpkg publicati
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -14951,7 +14974,7 @@ test "repository backend rejects missing and mismatched executor lock digests" {
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -15004,7 +15027,7 @@ test "repository backend reports and reconciles interrupted state transitions af
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .state_write_hooks = failure.hooks(),
@@ -15084,7 +15107,7 @@ test "opposite no-refresh invocations never reuse or erase durable operation his
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -15337,7 +15360,7 @@ test "repository operation lock wait is capped by the absolute operation budget"
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .operation_locks = operation_lock.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
@@ -15385,7 +15408,7 @@ test "repository backend enforces an operation-wide elapsed deadline" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -15425,7 +15448,7 @@ test "repository backend reports elapsed budget exhaustion after mutation truthf
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -15470,7 +15493,7 @@ test "repository backend retains installed evidence when final refresh fails" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -15515,7 +15538,7 @@ test "repository backend completes no-refresh without a final network phase" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -15550,7 +15573,7 @@ test "repository backend authentication failure never reaches mutation" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -15603,7 +15626,7 @@ test "repository backend refreshes only newly introduced managed repositories" {
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = fixture.created + 30,
     };
@@ -15781,7 +15804,7 @@ test "repository backend refreshes imported repositories only for missing depend
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = fixture.created + 30,
     };
@@ -15930,6 +15953,7 @@ fn packageMutationAdmitted(directory: std.Io.Dir, root_path: []const u8) !bool {
         root_path,
         locks.interface(),
     );
+    coordinator.legacy_execution_capable = true;
     coordinator.now_unix = 1_700_000_000;
     var attempt = coordinator.acquire(std.testing.allocator, .{
         .intent = .mutation,
@@ -15998,7 +16022,7 @@ test "repository backend resumes its own attempt after a failure at every post-e
         }
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .state_write_hooks = state_failure.hooks(),
@@ -16179,7 +16203,7 @@ test "repository backend adopts a crashed attempt at every durable boundary" {
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -16279,7 +16303,7 @@ test "repository backend never discharges an inherited bridge with its own no-st
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -16332,7 +16356,7 @@ test "repository backend still clears a bridge it published itself when nothing 
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
     };
@@ -16410,7 +16434,7 @@ test "repository backend reserves a new attempt instead of adopting a settled re
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -16531,7 +16555,7 @@ test "repository backend refuses to adopt an unrelated unresolved attempt" {
         };
         var backend: Backend = .{
             .io = std.testing.io,
-            .executor = executor.interface(),
+            .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
             .acquisition_dependencies = acquisition.dependencies(),
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
         };
@@ -16600,7 +16624,12 @@ test "repository backend refuses bootstrap while a package transaction attempt i
     defer record.deinit();
     try store.writeAtomic(std.testing.allocator, record.record);
 
-    var backend: Backend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
+        .now_unix = 1_700_000_000,
+    };
     var result = try api.execute(std.testing.allocator, .{
         .root = root_path,
         .descriptor_url = "file:///descriptor.deb",
@@ -16791,7 +16820,7 @@ fn runReviewedRepositoryAdd(
     };
     var backend: Backend = .{
         .io = std.testing.io,
-        .executor = executor.interface(),
+        .transaction_backend = .legacy_dpkg, .legacy_execution_capable = true, .executor = executor.interface(),
         .acquisition_dependencies = acquisition.dependencies(),
         .now_unix = now_unix,
         .reviewed_repository_profiles = profiles,

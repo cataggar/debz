@@ -8,11 +8,11 @@ then **always** executes a normal alternate-root installation with
 
 A package cache hit saves transfer only. It never means that a root is
 installed and never skips the install request or any work required by the
-selected engine. Legacy remains the default. Explicit `transaction-backend:
-native` uses native execution and genuine v3 locks, without fallback.
-Legacy execution is deprecated but remains functional in this increment. A
-successful legacy invocation emits one bounded notice; every successful
-invocation publishes the selected `backend-capability`.
+selected engine. `transaction-backend: native` is the default and uses native
+execution and genuine v3 locks, without fallback. Explicit `legacy_dpkg` is
+refused before setup, cache, or root work with versioned recovery guidance
+(`debz >=0.3.0,<0.4.0`). Every successful invocation publishes the
+`backend-capability` (`native-transaction-execution-v1`).
 When the native planner produces no work, the action accepts an honest unchanged
 result rather than inventing a transaction. An explicit install selector may
 still select a reinstall on an already-installed root; the action preserves
@@ -82,7 +82,8 @@ package cache remains an absolute child of `RUNNER_TEMP`.
 
 ## Policy, cache, and setup inputs
 
-`transaction-backend` is `legacy_dpkg` by default or explicitly `native`.
+`transaction-backend` is `native` by default; explicit `legacy_dpkg` is refused
+with recovery guidance (`debz >=0.3.0,<0.4.0`).
 Native selection is forwarded to both download and install, and accepts only
 v5 cache keys and v3 lock evidence. Before package preparation or mutation, the
 verified CLI must advertise `native-install-v1` through

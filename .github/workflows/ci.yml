@@ -368,7 +368,7 @@ jobs:
           mkdir -p "$workspace/plan-root" "$workspace/plan-cache" "$workspace/plan-state"
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
-            --architecture "$ARCHITECTURE" --sha256-only
+            --architecture "$ARCHITECTURE"
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -435,10 +435,10 @@ jobs:
           workspace="$PWD/.zig-cache/download-action"
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
           "$PWD/zig-out/bin/debz-integration-repository" \
-            --output "$workspace/repository" --suite debian-stable --architecture amd64 \
-            --sha256-only
+            --output "$workspace/repository" --suite debian-stable --architecture amd64
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/native-repository" --suite debian-stable --architecture amd64
+          printf '{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1}\n' >"$workspace/legacy.lock.json"
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -485,10 +485,11 @@ jobs:
             -Doptimize=ReleaseSafe -j2 --summary all
           PATH=/no-host-interpreters zig-out/bin/debz-native-action-empty-lock \
             "$workspace/base.native.lock.json" "$workspace/empty.native.lock.json"
-          printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\n' \
+          printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\nlegacy_lock=%s\n' \
             "$workspace" "$workspace/fixture.sources" \
             "$workspace/repository/fixture-keyring.gpg" \
             "$workspace/base.lock.json" "$workspace/scenario.lock.json" \
+            "$workspace/legacy.lock.json" \
             >>"$GITHUB_OUTPUT"
           printf 'native_base_lock=%s\nnative_scenario_lock=%s\nnative_empty_lock=%s\n' \
             "$workspace/base.native.lock.json" "$workspace/scenario.native.lock.json" \
@@ -697,7 +698,7 @@ jobs:
         uses: ./actions/download
         with:
           transaction-backend: native
-          lock-input: ${{ steps.fixture.outputs.base_lock }}
+          lock-input: ${{ steps.fixture.outputs.legacy_lock }}
           source: ${{ steps.fixture.outputs.source }}
           keyring: ${{ steps.fixture.outputs.keyring }}
           architecture: amd64
@@ -707,6 +708,7 @@ jobs:
         continue-on-error: true
         uses: ./actions/download
         with:
+          transaction-backend: legacy_dpkg
           lock-input: ${{ steps.fixture.outputs.native_base_lock }}
           source: ${{ steps.fixture.outputs.native_source }}
           keyring: ${{ steps.fixture.outputs.native_keyring }}
@@ -751,7 +753,7 @@ jobs:
           zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$PWD/out/download-container/repository" \
-            --suite debian-stable --architecture amd64 --sha256-only
+            --suite debian-stable --architecture amd64
       - name: Upload container fixture
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -785,7 +787,10 @@ jobs:
           ! command -v gh
           workspace="$PWD/out/download-container"
           chmod 0755 "$workspace/release/bin/debz"
-          mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
+          mkdir -p "$workspace/root/var/lib/dpkg" "$workspace/metadata" "$workspace/state"
+          : >"$workspace/root/var/lib/dpkg/status"
+          dpkg --force-architecture --root="$workspace/root" --install \
+            "$workspace/repository/pool/main/native-helper-target_1.0-1_amd64.deb" >/dev/null 2>&1
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -835,7 +840,10 @@ jobs:
           KEYRING: ${{ steps.fixture.outputs.keyring }}
         run: |
           workspace="$PWD/out/download-container"
-          mkdir -p "$workspace/install-root" "$workspace/install-state"
+          mkdir -p "$workspace/install-root/var/lib/dpkg" "$workspace/install-state"
+          : >"$workspace/install-root/var/lib/dpkg/status"
+          dpkg --force-architecture --root="$workspace/install-root" --install \
+            "$workspace/repository/pool/main/native-helper-target_1.0-1_amd64.deb" >/dev/null 2>&1
           "$workspace/release/bin/debz" install \
             --install-root "$workspace/install-root" \
             --cache-path "$CACHE_ROOT" \
@@ -849,7 +857,7 @@ jobs:
             --conffile keep-existing --json scenario-main \
             >"$workspace/install-command.json"
           "$workspace/release/bin/debz" transaction-result verify \
-            --state-path "$workspace/install-state" \
+            --install-root "$workspace/install-root" \
             --lock-input "$LOCK" --architecture amd64 --json \
             >"$workspace/install-summary.json"
           grep -q '"exit_status":0' "$workspace/install-command.json"

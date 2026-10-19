@@ -37,8 +37,8 @@ test('builds one structural cache-only install argv with closed-set force values
   assert.equal(arguments_.includes('--assume-yes'), true);
   assert.equal(arguments_.includes('--noninteractive'), true);
   assert.equal(arguments_.includes('/bin/sh'), false);
-  assert.equal(arguments_.includes('--transaction-backend'), false);
-  assert.equal(arguments_.includes('--native-result'), false);
+  assert.equal(arguments_.includes('--transaction-backend'), true);
+  assert.equal(arguments_.includes('--native-result'), true);
 });
 
 test('native result formats are explicit, bounded, and distinct from legacy evidence', () => {
@@ -98,28 +98,38 @@ test('native summaries accept verified v1 and v2 evidence only as matching schem
 test('accepts only canonical successful command and transaction summaries', () => {
   const inputs = fixtureInputs('/work');
   validateInstallCommandResult(commandResult());
-  const summary = validateTransactionSummary(
-    transactionSummary(),
+  const nativeResult = validateNativeInstallResult(
+    nativeInstallResult(inputs),
     inputs,
     'a'.repeat(64),
+  );
+  const summary = validateTransactionSummary(
+    nativeTransactionSummary(inputs),
+    inputs,
+    'a'.repeat(64),
+    nativeResult,
   );
   assert.equal(summary.installedCount, 4);
 
   assert.throws(
     () =>
       validateTransactionSummary(
-        `${transactionSummary().trim()} \n`,
+        `${nativeTransactionSummary(inputs).trim()} \n`,
         inputs,
         'a'.repeat(64),
+        nativeResult,
       ),
     /not canonical/u,
   );
+  const wrongLock = JSON.parse(nativeTransactionSummary(inputs));
+  wrongLock.lock_sha256 = 'e'.repeat(64);
   assert.throws(
     () =>
       validateTransactionSummary(
-        transactionSummary('e'.repeat(64)),
+        `${JSON.stringify(wrongLock)}\n`,
         inputs,
         'a'.repeat(64),
+        nativeResult,
       ),
     /lock_sha256/u,
   );

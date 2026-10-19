@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const transaction_engine = @import("transaction_engine.zig");
 
 const Io = std.Io;
@@ -72,7 +73,7 @@ pub const NetworkPolicy = struct {
 };
 
 pub const Profile = struct {
-    transaction_backend: TransactionBackend = .legacy_dpkg,
+    transaction_backend: TransactionBackend = .native,
     repositories: []const Repository,
     keyring_paths: []const []const u8,
     architecture: []const u8,
@@ -202,6 +203,47 @@ pub const LoadedProfile = struct {
             evidence,
             limits.maximum_trusted_file_bytes,
         );
+    }
+
+    pub fn legacyIdentity(self: LoadedProfile) legacy_compat.Identity {
+        return .{
+            .schema = self.format.schema(),
+            .version = self.format.version(),
+            .backend = switch (self.profile.transaction_backend) {
+                .legacy_dpkg => .legacy_dpkg,
+                .native => .native,
+            },
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: LoadedProfile,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const identity = self.legacyIdentity();
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .completed_historical_verification,
+            identity,
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(
+        self: LoadedProfile,
+    ) (LoadError || legacy_compat.PolicyError)!void {
+        const identity = self.legacyIdentity();
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            identity.backend.?,
+            .new_execution,
+            identity,
+        );
+        std.debug.assert(disposition == .native_execution);
+        if (self.format != .v2_explicit or
+            self.profile.transaction_backend != .native)
+            return error.LegacyCapabilityRequired;
     }
 };
 
@@ -777,6 +819,28 @@ pub fn loadSystem(
 ) !LoadedProfile {
     var system: SystemFileSystem = .{ .io = io };
     return load(allocator, system.interface(), profile_path, limits);
+}
+
+pub fn loadForExecution(
+    allocator: std.mem.Allocator,
+    file_system: FileSystem,
+    profile_path: []const u8,
+    limits: Limits,
+) !LoadedProfile {
+    var loaded = try load(allocator, file_system, profile_path, limits);
+    errdefer loaded.deinit();
+    try loaded.requireExecutionAuthority();
+    return loaded;
+}
+
+pub fn loadSystemForExecution(
+    io: Io,
+    allocator: std.mem.Allocator,
+    profile_path: []const u8,
+    limits: Limits,
+) !LoadedProfile {
+    var system: SystemFileSystem = .{ .io = io };
+    return loadForExecution(allocator, system.interface(), profile_path, limits);
 }
 
 fn openAbsolutePathNoFollow(io: Io, path: []const u8) !File {
@@ -1474,3 +1538,91 @@ test "system_profile.test.profile schema matches paths and proxy schemes" {
         proxy_pattern,
     );
 }
+
+test "system_profile.test.native_only_cutover_refuses_legacy_execution_and_retains_historical_v1_decoding" {
+    const defaulted_model: Profile = .{
+        .repositories = &.{.{ .source_path = "/etc/debz/debian.sources" }},
+        .keyring_paths = &.{"/usr/share/keyrings/debian-archive-keyring.gpg"},
+        .architecture = "amd64",
+    };
+    try std.testing.expectEqual(TransactionBackend.native, defaulted_model.transaction_backend);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const sidecar_name = "profile.json.legacy-capability-evidence.json";
+
+    var fake: FakeFileSystem = .{ .profile_source = defaulted_profile_json };
+    var historical_v1 = try load(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer historical_v1.deinit();
+    try std.testing.expectEqual(Format.v1_legacy, historical_v1.format);
+    try std.testing.expectEqual(TransactionBackend.legacy_dpkg, historical_v1.profile.transaction_backend);
+    try std.testing.expectEqualSlices(
+        u8,
+        &sha256(defaulted_profile_json),
+        &historical_v1.profile_sha256,
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try historical_v1.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        historical_v1.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        loadForExecution(std.testing.allocator, fake.interface(), default_profile_path, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    fake.profile_source = legacy_backend_profile_json;
+    var historical_v2_legacy = try load(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer historical_v2_legacy.deinit();
+    try std.testing.expectEqual(Format.v2_explicit, historical_v2_legacy.format);
+    try std.testing.expectEqual(
+        TransactionBackend.legacy_dpkg,
+        historical_v2_legacy.profile.transaction_backend,
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try historical_v2_legacy.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        historical_v2_legacy.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        loadForExecution(std.testing.allocator, fake.interface(), default_profile_path, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    fake.profile_source = native_profile_json;
+    var native = try loadForExecution(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer native.deinit();
+    try std.testing.expectEqual(Format.v2_explicit, native.format);
+    try std.testing.expectEqual(TransactionBackend.native, native.profile.transaction_backend);
+    try native.requireExecutionAuthority();
+}
+

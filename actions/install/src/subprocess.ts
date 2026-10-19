@@ -486,6 +486,11 @@ export function validateDownloadOutputs(
   outputs: Map<string, string>,
   inputs: Inputs,
 ): DownloadOutputs {
+  if (inputs.transactionBackend !== 'native') {
+    throw new InstallActionError(
+      'legacy_dpkg transaction execution is retired. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
+    );
+  }
   const cacheHit = booleanOutput(outputs, 'cache-hit');
   const matchedKey = requiredOutput(outputs, 'cache-matched-key', true);
   const cachePath = requiredOutput(outputs, 'cache-path');
@@ -494,10 +499,7 @@ export function validateDownloadOutputs(
   const downloadedCount = countOutput(outputs, 'downloaded-count');
   const reusedCount = countOutput(outputs, 'reused-count');
   const backendCapability = requiredOutput(outputs, 'backend-capability');
-  const expectedBackendCapability =
-    inputs.transactionBackend === 'legacy_dpkg'
-      ? 'legacy-dpkg-execution-deprecated-v1'
-      : 'native-transaction-execution-v1';
+  const expectedBackendCapability = 'native-transaction-execution-v1';
   if (
     cachePath !== inputs.cachePath ||
     cacheRoot !== inputs.cacheRoot ||
@@ -515,10 +517,9 @@ export function validateDownloadOutputs(
   if (
     matchedKey.includes('\n') ||
     (matchedKey.length !== 0 &&
-      !(inputs.transactionBackend === 'native'
-        ? /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
-        : /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
-      ).test(matchedKey)) ||
+      !/^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u.test(
+        matchedKey,
+      )) ||
     (cacheHit && matchedKey.length === 0) ||
     (!cacheHit && matchedKey.length > 512)
   ) {

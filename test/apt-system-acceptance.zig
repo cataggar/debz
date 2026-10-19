@@ -32,7 +32,7 @@ const Runner = struct {
     io: std.Io,
     cwd: []const u8,
     root: []const u8 = "",
-    backend: Backend = .legacy_dpkg,
+    backend: Backend = .native,
     mountinfo: []const u8 = "",
     schema_store: ?schema_validator.Store = null,
     output_limit: usize = max_output,
@@ -318,7 +318,7 @@ const Runner = struct {
         const generator = try std.Io.Dir.cwd().realPathFileAlloc(self.io, @import("apt_acceptance_fixture_options").integration_repository, self.arena);
         _ = try self.command(&.{ generator, "--output", try self.path("/repository"), "--suite", "debian-stable", "--architecture", arch }, 120, null);
         try self.writeRoot("/etc/debz/fixture.sources", try std.fmt.allocPrint(self.arena, "Types: deb\nURIs: file:///repository\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: /repository/fixture-keyring.gpg\n", .{arch}));
-        try self.writeRoot("/etc/debz/default.json", try profile(self.arena, arch, .legacy_dpkg, true));
+        try self.writeRoot("/etc/debz/default.json", try profile(self.arena, arch, .native, false));
         try self.writeRoot("/etc/apt/sources.list", "invalid ambient apt source\n");
         try self.writeRoot("/etc/apt/apt.conf", "invalid ambient apt configuration\n");
     }
@@ -470,7 +470,7 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("HOST DPKG STATUS CHANGED", .{});
     }
     const executable = try std.process.executablePathAlloc(init.io, arena);
-    const selected = if (backend) |b| &[_]Backend{b} else &[_]Backend{ .legacy_dpkg, .native };
+    const selected = if (backend) |b| &[_]Backend{b} else &[_]Backend{.native};
     for (selected) |chosen| {
         const name = try std.fmt.allocPrint(arena, "apt-system-acceptance-{d}", .{linux.getpid()});
         try cache.createDir(init.io, name, File.Permissions.fromMode(0o700));
@@ -702,9 +702,12 @@ fn insideRemaining(runner: *Runner, arch: []const u8, trigger_sha: [32]u8) !void
     try check(number(value(installed, "version")) == 2, "installed list is not result v2");
     try expectNames(value(installed, "items"), "package", &.{ "base-dep", "alt-a", "essential-core" });
     try runner.writeRoot("/etc/debz/legacy-v2.json", try profile(runner.arena, arch, .legacy_dpkg, false));
-    const explicit_legacy = try runner.cli(0, &.{ "apt", "--profile", "/etc/debz/legacy-v2.json", "--json", "list", "--installed" });
-    try check(equalValue(value(explicit_legacy, "items"), value(installed, "items")) and
-        !equalValue(value(value(explicit_legacy, "profile"), "sha256"), value(value(installed, "profile"), "sha256")), "explicit legacy backend changed installed list or profile binding");
+    const explicit_legacy = try runner.cli(3, &.{ "apt", "--profile", "/etc/debz/legacy-v2.json", "--json", "list", "--installed" });
+    const legacy_ds = value(explicit_legacy, "diagnostics");
+    try check(!boolean(value(explicit_legacy, "changed")) and
+        legacy_ds == .array and legacy_ds.array.items.len == 1 and
+        eq(value(legacy_ds.array.items[0], "id"), "profile_invalid") and
+        eq(value(legacy_ds.array.items[0], "phase"), "profile"), "explicit legacy backend profile was not refused");
 
     _ = try runner.apt(0, &.{ "install", "-y", "fixture-upgrade=1.0-1" });
     const upgraded = try runner.apt(0, &.{ "upgrade", "-y" });

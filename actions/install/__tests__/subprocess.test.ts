@@ -46,8 +46,10 @@ test('nested download handoff accepts only the explicitly selected cache key dom
     ['lock-digest', 'a'.repeat(64)], ['downloaded-count', '0'], ['reused-count', '4'],
     ['backend-capability', 'legacy-dpkg-execution-deprecated-v1'],
   ]);
-  assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
-  inputs.transactionBackend = 'native';
+  assert.throws(
+    () => validateDownloadOutputs(outputs, { ...inputs, transactionBackend: 'legacy_dpkg' }),
+    /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u,
+  );
   assert.throws(() => validateDownloadOutputs(outputs, inputs), /backend capability/u);
   outputs.set('backend-capability', 'native-transaction-execution-v1');
   const validated = validateDownloadOutputs(outputs, inputs);

@@ -16,7 +16,10 @@ export async function createInputEnvironment(
   const runner = path.join(root, name, 'runner');
   await mkdir(workspace, { recursive: true });
   await mkdir(runner, { recursive: true });
-  await writeFile(path.join(workspace, 'lock.json'), '{}');
+  await writeFile(
+    path.join(workspace, 'lock.json'),
+    '{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3}\n',
+  );
   await writeFile(path.join(workspace, 'repo.sources'), 'Types: deb\n');
   await writeFile(path.join(workspace, 'keyring.gpg'), 'keyring');
   return {
@@ -77,7 +80,7 @@ export function fixtureInputs(root: string): Inputs {
     workspace: path.join(root, 'workspace'),
     runnerTemp: path.join(root, 'runner'),
     actionPath: path.join(root, 'actions', 'install'),
-    transactionBackend: 'legacy_dpkg',
+    transactionBackend: 'native',
     package: 'scenario-main',
     lockInput: path.join(root, 'workspace', 'lock.json'),
     architecture: 'amd64',

@@ -13,7 +13,7 @@ export function environment(
     RUNNER_TEMP: runnerTemp,
     RUNNER_OS: 'Linux',
     RUNNER_ARCH: process.arch === 'arm64' ? 'ARM64' : 'X64',
-    DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg',
+    DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'native',
     DEBZ_DOWNLOAD_LOCK_INPUT: 'lock.json',
     DEBZ_DOWNLOAD_ARCHITECTURE: 'amd64',
     DEBZ_DOWNLOAD_SOURCE: 'repo.sources',
@@ -48,57 +48,57 @@ export function environment(
 export function fingerprint(inputs: Inputs): FingerprintDocument {
   const policy = 'a'.repeat(64);
   const lock = 'b'.repeat(64);
-  const legacy: FingerprintDocument = {
-    schema: 'io.github.cataggar.debz.package-cache-fingerprint.v3',
-    api_version: 3,
-    capability: 'package-cache-v3',
-    lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
-    lock_schema_version: 1,
+  const v5: FingerprintDocument = {
+    schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
+    api_version: 5,
+    capability: 'package-cache-v5',
+    lock_schema: 'https://debz.dev/schema/exact-closure-lock-v3',
+    lock_schema_version: 3,
     lock_digest: lock,
     target_architecture: inputs.architecture,
     abi: 'debian-package-archive-v1',
     debz_version: '0.3.0',
     cas_layout: 'packages-v2',
-    archive_format: 'debz-package-cache-archive-v1',
+    archive_format: 'debz-package-cache-archive-v3',
     payload_policy: 'deb-payload-default-limits-v1',
-    origin_mode: 'exact-lock-v1-authenticated-repository',
+    origin_mode: 'exact-lock-v3-content-identities',
     acceptance_policy_digest: policy,
     fingerprint: 'c'.repeat(64),
-    primary_key: `debz-package-cas-v3-${inputs.architecture}-${policy}-${lock}`,
-    restore_prefix: `debz-package-cas-v3-${inputs.architecture}-${policy}-`,
+    primary_key: `debz-package-cas-v5-${inputs.architecture}-${policy}-${lock}`,
+    restore_prefix: `debz-package-cas-v5-${inputs.architecture}-${policy}-`,
     cache_root: inputs.cacheRoot,
     cache_path: inputs.cachePath,
     maximum_archive_bytes:
-      Buffer.byteLength('debz-package-cache-archive-v1\n') +
+      Buffer.byteLength('debz-package-cache-archive-v3\n') +
       4 +
       inputs.limits.maximumLockPackages * 40 +
       inputs.limits.maximumTotalPackageBytes +
       32,
   };
   return inputs.transactionBackend === 'native'
-    ? {
-        ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
-        api_version: 5,
-        capability: 'package-cache-v5',
-        lock_schema: 'https://debz.dev/schema/exact-closure-lock-v3',
-        lock_schema_version: 3,
-        archive_format: 'debz-package-cache-archive-v3',
-        origin_mode: 'exact-lock-v3-content-identities',
-        primary_key: `debz-package-cas-v5-${inputs.architecture}-${policy}-${lock}`,
-        restore_prefix: `debz-package-cas-v5-${inputs.architecture}-${policy}-`,
-      }
-    : legacy;
+    ? v5
+    : ({
+        ...v5,
+        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v3',
+        api_version: 3,
+        capability: 'package-cache-v3',
+        lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
+        lock_schema_version: 1,
+        archive_format: 'debz-package-cache-archive-v1',
+        origin_mode: 'exact-lock-v1-authenticated-repository',
+        primary_key: `debz-package-cas-v3-${inputs.architecture}-${policy}-${lock}`,
+        restore_prefix: `debz-package-cas-v3-${inputs.architecture}-${policy}-`,
+      } as unknown as FingerprintDocument);
 }
 
 export function preparation(
   inputs: Inputs,
   expected: FingerprintDocument,
 ): PrepareDocument {
-  const legacy: PrepareDocument = {
-    schema: 'io.github.cataggar.debz.package-cache-result.v3',
-    api_version: 3,
-    capability: 'package-cache-v3',
+  const v5: PrepareDocument = {
+    schema: 'io.github.cataggar.debz.package-cache-result.v5',
+    api_version: 5,
+    capability: 'package-cache-v5',
     lock_digest: expected.lock_digest,
     fingerprint: expected.fingerprint,
     target_architecture: inputs.architecture,
@@ -112,11 +112,11 @@ export function preparation(
     gc: { scanned: 3, deleted: 1, bytes_deleted: 4, complete: true },
   };
   return inputs.transactionBackend === 'native'
-    ? {
-        ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-result.v5',
-        api_version: 5,
-        capability: 'package-cache-v5',
-      }
-    : legacy;
+    ? v5
+    : ({
+        ...v5,
+        schema: 'io.github.cataggar.debz.package-cache-result.v3',
+        api_version: 3,
+        capability: 'package-cache-v3',
+      } as unknown as PrepareDocument);
 }

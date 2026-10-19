@@ -483,7 +483,7 @@ fn expectExecutorRefusal(
     bytes: []const u8,
 ) !MutationHarness {
     var harness: MutationHarness = .{ .bytes = bytes };
-    var result = try transaction_executor.execute(allocator, .{
+    const request: transaction_executor.Request = .{
         .plan = plan,
         .install_root = "/hermetic-root",
         .artifacts = artifacts,
@@ -492,9 +492,15 @@ fn expectExecutorRefusal(
             .exact_lock_verification = .locked_packages,
         },
         .exact_lock_v3 = lock,
-    }, harness.dependencies());
-    defer result.deinit();
-    try testing.expect(!result.succeeded());
+    };
+    try testing.expectError(
+        error.LegacyTransactionExecutionRetired,
+        transaction_executor.execute(allocator, request, harness.dependencies()),
+    );
+    try harness.expectNoMutation();
+    if (transaction_executor.preflight(allocator, request, harness.dependencies().filesystem)) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
     try harness.expectNoMutation();
     return harness;
 }

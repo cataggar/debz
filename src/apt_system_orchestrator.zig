@@ -45,8 +45,8 @@ pub const completion_schema_id =
 pub const completion_schema_version: u32 = 1;
 
 pub const ProfileView = struct {
-    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
-    profile_format: system_profile.Format = .v1_legacy,
+    transaction_backend: system_profile.TransactionBackend = .native,
+    profile_format: system_profile.Format = .v2_explicit,
     binding: api.ProfileBinding,
     source_paths: []const []const u8,
     config_paths: []const []const u8,
@@ -111,14 +111,16 @@ pub const ProfileLoader = struct {
 
 /// Concrete strict-profile adapter. Every referenced source, config, keyring,
 /// and credential is revalidated against the evidence captured by
-/// `system_profile.loadSystem` before each backend invocation.
+/// `system_profile.loadSystemForExecution` before each backend invocation.
 pub const SystemProfileLoader = struct {
     io: std.Io,
+    file_system: ?system_profile.FileSystem = null,
     limits: system_profile.Limits = .{},
 
     const Lease = struct {
         loaded: system_profile.LoadedProfile,
         file_system: system_profile.SystemFileSystem,
+        file_system_override: ?system_profile.FileSystem = null,
         source_paths: []const []const u8,
         config_paths: []const []const u8,
         allocator: std.mem.Allocator,
@@ -147,29 +149,21 @@ pub const SystemProfileLoader = struct {
         const self: *SystemProfileLoader = @ptrCast(@alignCast(context));
         const lease = try allocator.create(Lease);
         errdefer allocator.destroy(lease);
-        var loaded = try system_profile.loadSystem(
-            self.io,
-            allocator,
-            path,
-            self.limits,
-        );
+        var loaded = if (self.file_system) |fs|
+            try system_profile.loadForExecution(
+                allocator,
+                fs,
+                path,
+                self.limits,
+            )
+        else
+            try system_profile.loadSystemForExecution(
+                self.io,
+                allocator,
+                path,
+                self.limits,
+            );
         errdefer loaded.deinit();
-        _ = try legacy_compat.decide(
-            .legacy_capable,
-            switch (loaded.profile.transaction_backend) {
-                .legacy_dpkg => .legacy_dpkg,
-                .native => .native,
-            },
-            .new_execution,
-            .{
-                .schema = loaded.format.schema(),
-                .version = loaded.format.version(),
-                .backend = switch (loaded.profile.transaction_backend) {
-                    .legacy_dpkg => .legacy_dpkg,
-                    .native => .native,
-                },
-            },
-        );
         const sources = try allocator.alloc(
             []const u8,
             loaded.profile.repositories.len,
@@ -191,6 +185,7 @@ pub const SystemProfileLoader = struct {
         lease.* = .{
             .loaded = loaded,
             .file_system = .{ .io = self.io },
+            .file_system_override = self.file_system,
             .source_paths = sources,
             .config_paths = configs,
             .allocator = allocator,
@@ -243,10 +238,11 @@ pub const SystemProfileLoader = struct {
         allocator: std.mem.Allocator,
     ) !void {
         const lease: *Lease = @ptrCast(@alignCast(context.?));
+        const fs = lease.file_system_override orelse lease.file_system.interface();
         for (lease.loaded.trusted_files) |evidence| {
             const bytes = try lease.loaded.readTrustedFile(
                 allocator,
-                lease.file_system.interface(),
+                fs,
                 evidence.path,
                 .{},
             );
@@ -404,7 +400,7 @@ pub const BackendError = error{
 };
 
 pub const Backend = struct {
-    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
+    transaction_backend: system_profile.TransactionBackend = .native,
     root_projection: ?*const live_root.Projection = null,
     context: *anyopaque,
     routeFn: *const fn (
@@ -16879,6 +16875,7 @@ const FakeBackend = struct {
 
     fn interface(self: *FakeBackend) Backend {
         return .{
+            .transaction_backend = .legacy_dpkg,
             .context = self,
             .routeFn = route,
             .workflowFn = workflow,
@@ -17072,17 +17069,21 @@ test "apt_system_orchestrator.test.production dispatch snapshots profile backend
                 .selectors = &.{.{ .name = "alpha" }},
                 .options = options,
             });
+            const expected_status: product_api.ExitStatus = if (selected == .native)
+                .usage
+            else
+                .recovery;
             const expected = if (selected == .native)
                 product_api.ErrorId.invalid_request
             else
-                product_api.ErrorId.configuration_required;
-            try std.testing.expectEqual(product_api.ExitStatus.usage, routed.exit_status);
+                product_api.ErrorId.legacy_recovery_release_required;
+            try std.testing.expectEqual(expected_status, routed.exit_status);
             try std.testing.expectEqual(expected, routed.diagnostics[0].id);
-            try std.testing.expectEqual(product_api.ExitStatus.usage, workflow.exit_status);
+            try std.testing.expectEqual(expected_status, workflow.exit_status);
             try std.testing.expectEqual(expected, workflow.diagnostics[0].id);
             try std.testing.expectEqual(configured, template.transaction_backend);
             try std.testing.expectEqual(@as(?i64, 123), template.now_unix);
-            try std.testing.expectEqual(system_profile.TransactionBackend.legacy_dpkg, base.transaction_backend);
+            try std.testing.expectEqual(system_profile.TransactionBackend.native, base.transaction_backend);
         }
     }
 }
@@ -20264,7 +20265,7 @@ fn expectForeignProductionReservationBlocked(
     defer loaded.deinit();
     var result = try runner.workflow(
         std.testing.allocator,
-        backend,
+        backend.forTransactionBackend(loaded.view.transaction_backend),
         .{
             .operation = .remove,
             .mode = .reserve,
@@ -21534,6 +21535,8 @@ test "apt_system_orchestrator.test.required_privileged.production restart owners
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -21649,6 +21652,8 @@ test "apt_system_orchestrator.test.required_privileged.production restart owners
     };
     var production: production_backend.Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -21728,6 +21733,8 @@ test "apt_system_orchestrator.test.required_privileged.production pre-mutation r
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -21929,6 +21936,8 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -22048,7 +22057,7 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
                 return error.MissingOwnershipAcknowledgment;
             var foreign = try runner.interface().workflow(
                 std.testing.allocator,
-                backend.interface(),
+                backend.interface().forTransactionBackend(.legacy_dpkg),
                 .{
                     .operation = .remove,
                     .mode = .reserve,
@@ -22080,7 +22089,7 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
             );
             var foreign = try runner.interface().workflow(
                 std.testing.allocator,
-                backend.interface(),
+                backend.interface().forTransactionBackend(.legacy_dpkg),
                 .{
                     .operation = .remove,
                     .mode = .reserve,
@@ -22117,7 +22126,7 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
             );
             var foreign_executed = try runner.interface().workflow(
                 std.testing.allocator,
-                backend.interface(),
+                backend.interface().forTransactionBackend(.legacy_dpkg),
                 .{
                     .operation = .remove,
                     .mode = .execute,
@@ -22152,7 +22161,7 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
             );
             var finalized = try runner.interface().workflow(
                 std.testing.allocator,
-                backend.interface(),
+                backend.interface().forTransactionBackend(.legacy_dpkg),
                 .{
                     .operation = .remove,
                     .mode = .recover,
@@ -22244,7 +22253,7 @@ test "apt_system_orchestrator.test.required_privileged.production runner retains
                 defer loaded.deinit();
                 var finalized = try runner.interface().workflow(
                     std.testing.allocator,
-                    backend.interface(),
+                    backend.interface().forTransactionBackend(.legacy_dpkg),
                     .{
                         .operation = .remove,
                         .mode = .recover,
@@ -22310,6 +22319,8 @@ test "apt_system_orchestrator.test.required_privileged.production restart resync
             };
             var production: production_backend.Backend = .{
                 .io = std.testing.io,
+                .transaction_backend = .legacy_dpkg,
+                .legacy_execution_capable = true,
                 .now_unix = @import("fixtures/openpgp.zig").created + 30,
                 .process_runner = process.interface(),
             };
@@ -22546,6 +22557,8 @@ test "apt_system_orchestrator.test.required_privileged.production retained evide
             };
             var production: production_backend.Backend = .{
                 .io = std.testing.io,
+                .transaction_backend = .legacy_dpkg,
+                .legacy_execution_capable = true,
                 .now_unix = @import("fixtures/openpgp.zig").created + 30,
                 .process_runner = process.interface(),
             };
@@ -22767,6 +22780,8 @@ test "apt_system_orchestrator.test.required_privileged.production unknown review
     };
     var production: production_backend.Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -22842,7 +22857,7 @@ test "apt_system_orchestrator.test.required_privileged.production unknown review
     const foreign_id: [32]u8 = @splat(0xb7);
     var foreign_reservation = try runner.interface().workflow(
         std.testing.allocator,
-        backend.interface(),
+        backend.interface().forTransactionBackend(.legacy_dpkg),
         .{
             .operation = .remove,
             .mode = .reserve,
@@ -22909,6 +22924,8 @@ test "apt_system_orchestrator.test.required_privileged.production missing marker
             };
             var production: production_backend.Backend = .{
                 .io = std.testing.io,
+                .transaction_backend = .legacy_dpkg,
+                .legacy_execution_capable = true,
                 .now_unix = @import("fixtures/openpgp.zig").created + 30,
                 .process_runner = process.interface(),
             };
@@ -23101,6 +23118,8 @@ test "apt_system_orchestrator.test.required_privileged.production recovery commi
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -23226,7 +23245,7 @@ test "apt_system_orchestrator.test.required_privileged.production recovery commi
             defer loaded_foreign.deinit();
             var foreign = try runner.interface().workflow(
                 std.testing.allocator,
-                backend.interface(),
+                backend.interface().forTransactionBackend(.legacy_dpkg),
                 .{
                     .operation = .remove,
                     .mode = .reserve,
@@ -23337,6 +23356,8 @@ test "apt_system_orchestrator.test.required_privileged.production post-transfer 
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -23466,6 +23487,8 @@ test "apt_system_orchestrator.test.required_privileged.production lost review re
     };
     var production: production_backend.Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -23575,6 +23598,8 @@ test "apt_system_orchestrator.test.required_privileged.production cancellation g
     };
     var production: production_backend.Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -23781,6 +23806,8 @@ test "apt_system_orchestrator.test.required_privileged.production response loss 
     };
     var production: production_backend.Backend = .{
         .io = std.testing.io,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .now_unix = @import("fixtures/openpgp.zig").created + 30,
         .process_runner = process.interface(),
     };
@@ -24045,6 +24072,8 @@ test "apt_system_orchestrator.test.required_privileged.production runner classif
         };
         var production: production_backend.Backend = .{
             .io = std.testing.io,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .now_unix = @import("fixtures/openpgp.zig").created + 30,
             .process_runner = process.interface(),
         };
@@ -26298,6 +26327,7 @@ test "apt_system_orchestrator.test.only exact abandoned lower record permits pre
         ));
         defer prepared.deinit();
         const profile: ProfileView = .{
+            .transaction_backend = harness.profile.transaction_backend,
             .binding = prepared.profile,
             .source_paths = &harness.profile.source_paths,
             .config_paths = &.{},
@@ -32519,6 +32549,151 @@ test "apt_system_orchestrator.test.retained final state reconciles without regen
     try std.testing.expect(harness.store.active_bytes == null);
     try std.testing.expect(
         harness.runner.inspect_deferred_acknowledgment == null,
+    );
+}
+
+test "apt_system_orchestrator.test.native_only_cutover_defaults_to_native_and_refuses_legacy_profiles" {
+    const default_profile_view: ProfileView = .{
+        .binding = .{
+            .path = "/etc/debz/profile.json",
+            .sha256 = @splat(0x11),
+            .reference_evidence_sha256 = @splat(0x22),
+        },
+        .source_paths = &.{"/etc/debz/debian.sources"},
+        .config_paths = &.{},
+        .keyring_paths = &.{"/usr/share/keyrings/debian-archive-keyring.gpg"},
+        .architecture = "amd64",
+        .foreign_architectures = &.{},
+        .repository_policy = .strict_priority,
+        .cache_path = "/var/cache/debz",
+        .state_path = "/var/lib/debz",
+        .conffile = .keep_existing,
+        .proxy = null,
+        .credential_reference = null,
+    };
+    try std.testing.expectEqual(
+        system_profile.TransactionBackend.native,
+        default_profile_view.transaction_backend,
+    );
+    try std.testing.expectEqual(
+        system_profile.Format.v2_explicit,
+        default_profile_view.profile_format,
+    );
+
+    var prod_template: production_backend.Backend = .{ .io = std.testing.io };
+    var prod_adapter: ProductionBackend = .{ .backend = &prod_template };
+    const default_backend = prod_adapter.interface();
+    try std.testing.expectEqual(
+        system_profile.TransactionBackend.native,
+        default_backend.transaction_backend,
+    );
+
+    const InMemoryProfileFs = struct {
+        profile_source: []const u8,
+
+        fn interface(self: *@This()) system_profile.FileSystem {
+            return .{
+                .context = self,
+                .readFn = read,
+                .inspectDirectoryFn = inspectDirectory,
+            };
+        }
+
+        fn read(
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            path: []const u8,
+            _: u64,
+        ) !system_profile.ReadResult {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const source = if (std.mem.eql(u8, path, "/etc/debz/profile.json"))
+                self.profile_source
+            else if (std.mem.eql(u8, path, "/etc/debz/debian.sources"))
+                "Types: deb\nURIs: https://deb.debian.org/debian\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n"
+            else if (std.mem.eql(u8, path, "/usr/share/keyrings/debian-archive-keyring.gpg"))
+                "keyring-bytes\n"
+            else
+                return error.FileNotFound;
+            return .{
+                .bytes = try allocator.dupe(u8, source),
+                .metadata = .{
+                    .kind = .file,
+                    .size = source.len,
+                    .mode = 0o644,
+                    .uid = 0,
+                    .device = 1,
+                    .inode = std.hash.Wyhash.hash(0, path),
+                    .modified_nanoseconds = 10,
+                },
+            };
+        }
+
+        fn inspectDirectory(
+            _: *anyopaque,
+            path: []const u8,
+        ) !system_profile.Metadata {
+            return .{
+                .kind = .directory,
+                .size = 0,
+                .mode = 0o755,
+                .uid = 0,
+                .device = 1,
+                .inode = std.hash.Wyhash.hash(1, path),
+                .modified_nanoseconds = 10,
+            };
+        }
+    };
+
+    const v1_json =
+        "{\"schema\":\"https://debz.dev/schema/system-profile-v1\",\"version\":1,\"repositories\":[{\"source_path\":\"/etc/debz/debian.sources\"}],\"keyring_paths\":[\"/usr/share/keyrings/debian-archive-keyring.gpg\"],\"architecture\":\"amd64\",\"foreign_architectures\":[],\"repository_policy\":\"strict_priority\",\"cache_path\":\"/var/cache/debz\",\"state_path\":\"/var/lib/debz\",\"default_conffile\":\"keep_existing\",\"network\":{\"proxy_url\":null,\"credential_reference\":null}}\n";
+    const v2_legacy_json =
+        "{\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"legacy_dpkg\",\"repositories\":[{\"source_path\":\"/etc/debz/debian.sources\"}],\"keyring_paths\":[\"/usr/share/keyrings/debian-archive-keyring.gpg\"],\"architecture\":\"amd64\",\"foreign_architectures\":[],\"repository_policy\":\"strict_priority\",\"cache_path\":\"/var/cache/debz\",\"state_path\":\"/var/lib/debz\",\"default_conffile\":\"keep_existing\",\"network\":{\"proxy_url\":null,\"credential_reference\":null}}\n";
+    const v2_native_json =
+        "{\"schema\":\"https://debz.dev/schema/system-profile-v2\",\"version\":2,\"transaction_backend\":\"native\",\"repositories\":[{\"source_path\":\"/etc/debz/debian.sources\"}],\"keyring_paths\":[\"/usr/share/keyrings/debian-archive-keyring.gpg\"],\"architecture\":\"amd64\",\"foreign_architectures\":[],\"repository_policy\":\"strict_priority\",\"cache_path\":\"/var/cache/debz\",\"state_path\":\"/var/lib/debz\",\"default_conffile\":\"keep_existing\",\"network\":{\"proxy_url\":null,\"credential_reference\":null}}\n";
+
+    var fs: InMemoryProfileFs = .{ .profile_source = v1_json };
+    var loader: SystemProfileLoader = .{
+        .io = std.testing.io,
+        .file_system = fs.interface(),
+    };
+    try std.testing.expectError(
+        error.OperationalBoundaryFailure,
+        loader.interface().load(std.testing.allocator, "/etc/debz/profile.json"),
+    );
+
+    fs.profile_source = v2_legacy_json;
+    try std.testing.expectError(
+        error.OperationalBoundaryFailure,
+        loader.interface().load(std.testing.allocator, "/etc/debz/profile.json"),
+    );
+
+    fs.profile_source = v2_native_json;
+    var loaded_native = try loader.interface().load(
+        std.testing.allocator,
+        "/etc/debz/profile.json",
+    );
+    defer loaded_native.deinit();
+    try std.testing.expectEqual(
+        system_profile.TransactionBackend.native,
+        loaded_native.view.transaction_backend,
+    );
+    try std.testing.expectEqual(
+        system_profile.Format.v2_explicit,
+        loaded_native.view.profile_format,
+    );
+    try loaded_native.revalidate(std.testing.allocator);
+
+    fs.profile_source = v1_json;
+    var historical_v1 = try system_profile.load(
+        std.testing.allocator,
+        fs.interface(),
+        "/etc/debz/profile.json",
+        .{},
+    );
+    defer historical_v1.deinit();
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try historical_v1.verifyCompletedHistorical(),
     );
 }
 

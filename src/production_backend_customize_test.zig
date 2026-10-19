@@ -207,6 +207,8 @@ test "an unfinished first dpkg command leaves recovery evidence instead of clear
         var backend: debz.ProductionBackend = .{
             .io = std.testing.io,
             .now_unix = fixture.created + 30,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .process_runner = process.interface(),
         };
         const source_paths = [_][]const u8{staged.source_path};
@@ -293,6 +295,8 @@ test "a transaction that fails before any spawn clears the root attempt" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -338,6 +342,8 @@ test "production customize provisions a missing var/lib/debz lock root" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -374,6 +380,8 @@ test "a root with no dpkg database has nothing installed" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -403,6 +411,8 @@ test "a root that does not exist is still an error, not an empty one" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -467,6 +477,8 @@ test "provenance repositories follow the lock, not every refreshed repository" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -533,6 +545,8 @@ test "production customize failure reports structured diagnostics without leakin
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -635,7 +649,12 @@ test "production package mutation is refused while a repository attempt is unres
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = 1_700_000_000,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
+    };
     const options: api.CommonOptions = .{
         .install_root = install_root,
         .source_paths = &.{source_path},
@@ -726,6 +745,8 @@ test "production mutation clears its root attempt and leaves no active intent" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = fake.interface(),
     };
     const result = try api.execute(arena.allocator(), .{
@@ -792,7 +813,12 @@ test "production recovery on an untouched root never strands the root attempt" {
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = 1_700_000_000 };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = 1_700_000_000,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
+    };
     const options: api.CommonOptions = .{
         .install_root = install_root,
         .source_paths = &.{source_path},
@@ -876,7 +902,12 @@ test "production recovery adopts durable mutation evidence instead of failing cl
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var backend: debz.ProductionBackend = .{ .io = std.testing.io, .now_unix = fixture.created + 30 };
+    var backend: debz.ProductionBackend = .{
+        .io = std.testing.io,
+        .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
+    };
     const options: api.CommonOptions = .{
         .install_root = install_root,
         .source_paths = &.{source_path},
@@ -969,6 +1000,8 @@ test "recovery never discharges a bridge inherited from an earlier run" {
         var backend: debz.ProductionBackend = .{
             .io = std.testing.io,
             .now_unix = fixture.created + 30,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
         };
         const source_paths = [_][]const u8{staged.source_path};
         const keyring_paths = [_][]const u8{staged.keyring_path};
@@ -1206,6 +1239,8 @@ test "recovery discharges a completion interrupted before its provenance" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
     };
@@ -1353,6 +1388,8 @@ test "recovery verifies transaction provenance that survived the crash window" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -1478,6 +1515,8 @@ test "recovery refuses unreadable transaction provenance and never deletes it" {
         var backend: debz.ProductionBackend = .{
             .io = std.testing.io,
             .now_unix = fixture.created + 30,
+            .transaction_backend = .legacy_dpkg,
+            .legacy_execution_capable = true,
             .process_runner = process.interface(),
             .completion_crash = crash.interface(),
         };
@@ -1578,6 +1617,8 @@ test "a completion that cannot delete its recovery intent is still recoverable" 
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -1647,6 +1688,8 @@ test "a completion whose provenance publication fails is recoverable once the pa
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
     };
     const source_paths = [_][]const u8{staged.source_path};
@@ -1712,6 +1755,8 @@ test "a crash between the completion statement and the record republishes the sa
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
     };
@@ -1772,6 +1817,8 @@ test "a crash after the provenance transition leaves a settled record, not a blo
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
     };
@@ -1825,6 +1872,8 @@ test "product recovery never discharges a repository bootstrap's owed provenance
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
     };
     const source_paths = [_][]const u8{staged.source_path};
     const keyring_paths = [_][]const u8{staged.keyring_path};
@@ -1866,6 +1915,8 @@ test "a completion statement that cannot be published leaves the root blocked" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
         .process_runner = process.interface(),
         .completion_crash = crash.interface(),
     };
@@ -1940,6 +1991,8 @@ test "product recovery never discharges an attempt recorded for another root" {
     var backend: debz.ProductionBackend = .{
         .io = std.testing.io,
         .now_unix = fixture.created + 30,
+        .transaction_backend = .legacy_dpkg,
+        .legacy_execution_capable = true,
     };
     const source_paths = [_][]const u8{staged.source_path};
     const keyring_paths = [_][]const u8{staged.keyring_path};

@@ -1,4 +1,5 @@
 const std = @import("std");
+const legacy_compat = @import("legacy_compat.zig");
 
 pub const schema_id = "https://debz.dev/schema/exact-closure-lock-v1";
 pub const schema_version: u32 = 1;
@@ -74,6 +75,36 @@ pub const Lock = struct {
         }
         return null;
     }
+
+    pub fn legacyIdentity(_: Lock) legacy_compat.Identity {
+        return .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: Lock,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(self: Lock) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
+    }
 };
 
 pub const OwnedLock = struct {
@@ -89,6 +120,7 @@ pub const OwnedLock = struct {
 };
 
 pub const ValidationError = error{
+    LegacyExactLockRetired,
     UnauthenticatedMetadata,
     EmptyArchitecture,
     EmptyClosure,
@@ -105,9 +137,26 @@ pub const ValidationError = error{
     DigestMismatch,
     DocumentTooLarge,
     InvalidDigest,
-};
+} || legacy_compat.PolicyError;
 
-pub fn create(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Error || ValidationError)!OwnedLock {
+pub fn createForExecution(
+    _: std.mem.Allocator,
+    _: Input,
+) ValidationError!OwnedLock {
+    _ = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .new_execution,
+        .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
+        },
+    );
+    return error.LegacyExactLockRetired;
+}
+
+fn buildValidated(allocator: std.mem.Allocator, input: Input) (std.mem.Allocator.Error || ValidationError)!OwnedLock {
     if (!input.authenticated_metadata) return error.UnauthenticatedMetadata;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     // An intentionally empty final closure is represented by no packages plus
@@ -272,7 +321,7 @@ pub fn decode(
         .dpkg_selection_hold = package.dpkg_selection_hold,
     };
 
-    var result = try create(allocator, .{
+    var result = try buildValidated(allocator, .{
         .target_architecture = parsed.value.target_architecture,
         .request_sha256 = try parseHex(32, parsed.value.request_sha256),
         .policy_sha256 = try parseHex(32, parsed.value.policy_sha256),
@@ -281,6 +330,7 @@ pub fn decode(
         .authenticated_metadata = true,
     });
     errdefer result.deinit();
+    _ = try result.lock.verifyCompletedHistorical();
     const expected = try parseHex(32, parsed.value.digest_sha256);
     if (!std.mem.eql(u8, &expected, &result.lock.digest_sha256)) return error.DigestMismatch;
     const canonical = try result.lock.canonicalJson(allocator);
@@ -315,6 +365,7 @@ pub const Store = struct {
     }
 
     pub fn writeAtomic(self: Store, allocator: std.mem.Allocator, lock: Lock) !void {
+        if (!@import("builtin").is_test) return error.LegacyExactLockRetired;
         const bytes = try lock.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
@@ -660,3 +711,81 @@ test "exact_lock.test.rejects ambiguous repository ownership and identities" {
         .authenticated_metadata = true,
     }));
 }
+
+pub fn create(
+    allocator: std.mem.Allocator,
+    input: Input,
+) (std.mem.Allocator.Error || ValidationError)!OwnedLock {
+    if (!@import("builtin").is_test) return error.LegacyExactLockRetired;
+    return buildValidated(allocator, input);
+}
+
+test "exact_lock.test.native_only_cutover_retires_v1_creation_and_retains_historical_decode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lock_name = "debz.lock.json";
+    const sidecar_name = "debz.lock.json.legacy-capability-evidence.json";
+
+    const repository: Repository = .{
+        .id = @splat('a'),
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    };
+    const input: Input = .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(5),
+        .policy_sha256 = @splat(6),
+        .repositories = &.{repository},
+        .packages = &.{},
+        .authenticated_metadata = true,
+    };
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        createForExecution(std.testing.allocator, input),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, lock_name, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    var historical_fixture = try create(std.testing.allocator, input);
+    defer historical_fixture.deinit();
+    const historical_bytes = try historical_fixture.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(historical_bytes);
+
+    var decoded = try decode(
+        std.testing.allocator,
+        historical_bytes,
+        maximum_document_bytes,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &historical_fixture.lock.digest_sha256,
+        &decoded.lock.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try decoded.lock.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        decoded.lock.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(
+            .native_only,
+            .native,
+            .completed_historical_verification,
+            decoded.lock.legacyIdentity(),
+        ),
+    );
+}
+

@@ -298,7 +298,7 @@ const Fixture = struct {
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
         var coordinator = try root_operation.Coordinator.open(std.testing.io, self.root.root, self.path, locks.interface());
         var attempt = try coordinator.acquire(allocator, .{
-            .backend = .legacy_dpkg,
+            .backend = .native,
             .operation = .{ .repository_bootstrap = .add },
             .request_sha256 = @splat(1),
             .policy_sha256 = @splat(2),

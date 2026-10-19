@@ -1,5 +1,6 @@
 const std = @import("std");
 const exact_lock = @import("exact_lock.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 
 pub const schema_id = "io.github.cataggar.debz.transaction-result-summary.v1";
@@ -13,39 +14,47 @@ pub const Summary = struct {
     transaction_digest_sha256: [32]u8,
     package_count: usize,
 
-    pub fn canonicalJson(self: Summary, allocator: std.mem.Allocator) ![]u8 {
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        errdefer output.deinit();
-        const writer = &output.writer;
-        try writer.writeAll("{\"schema\":");
-        try writeString(writer, schema_id);
-        try writer.print(",\"api_version\":{},\"transaction_schema\":", .{api_version});
-        try writeString(writer, transaction_provenance.schema_id);
-        try writer.print(",\"transaction_schema_version\":{},\"target_architecture\":", .{
-            transaction_provenance.schema_version,
-        });
-        try writeString(writer, self.target_architecture);
-        try writer.writeAll(",\"request_sha256\":");
-        try writeHex(writer, &self.request_sha256);
-        try writer.writeAll(",\"solver_policy_sha256\":");
-        try writeHex(writer, &self.solver_policy_sha256);
-        try writer.writeAll(",\"lock_sha256\":");
-        try writeHex(writer, &self.lock_sha256);
-        try writer.writeAll(",\"transaction_digest_sha256\":");
-        try writeHex(writer, &self.transaction_digest_sha256);
-        try writer.print(",\"package_count\":{},\"outcome\":\"succeeded\",\"final_verification_status\":\"exact_match\",\"lock_evidence\":\"exact_match\"}}\n", .{
-            self.package_count,
-        });
-        return output.toOwnedSlice();
+    pub const canonicalJson = canonicalJsonRetiredOrTest;
+
+    pub fn legacyIdentity(_: Summary) legacy_compat.Identity {
+        return .{
+            .schema = schema_id,
+            .version = api_version,
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: Summary,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(self: Summary) Error!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
+        return error.LegacyResultSummaryGenerationRetired;
     }
 };
 
 pub const Error = error{
+    LegacyResultSummaryGenerationRetired,
     InvalidTransactionResult,
     TransactionNotSuccessful,
     ArchitectureMismatch,
     LockEvidenceMismatch,
-};
+} || legacy_compat.PolicyError;
 
 pub fn verify(
     allocator: std.mem.Allocator,
@@ -120,7 +129,7 @@ pub fn verify(
     _ = try boundedString(final, "detail", 4096);
 
     try expectHex(document, "digest_sha256", &validated.digest_sha256);
-    return .{
+    const result_summary: Summary = .{
         .target_architecture = expected_architecture,
         .request_sha256 = lock.request_sha256,
         .solver_policy_sha256 = lock.policy_sha256,
@@ -128,6 +137,8 @@ pub fn verify(
         .transaction_digest_sha256 = validated.digest_sha256,
         .package_count = packages.items.len,
     };
+    _ = try result_summary.verifyCompletedHistorical();
+    return result_summary;
 }
 
 fn verifyRepositories(
@@ -580,3 +591,113 @@ test "transaction result summary accepts an exact empty package closure" {
     const summary = try verify(std.testing.allocator, json, lock.lock, "amd64");
     try std.testing.expectEqual(@as(usize, 0), summary.package_count);
 }
+
+fn canonicalJsonRetiredOrTest(self: Summary, allocator: std.mem.Allocator) ![]u8 {
+    if (!@import("builtin").is_test) return error.LegacyResultSummaryGenerationRetired;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    try writer.writeAll("{\"schema\":");
+    try writeString(writer, schema_id);
+    try writer.print(",\"api_version\":{},\"transaction_schema\":", .{api_version});
+    try writeString(writer, transaction_provenance.schema_id);
+    try writer.print(",\"transaction_schema_version\":{},\"target_architecture\":", .{
+        transaction_provenance.schema_version,
+    });
+    try writeString(writer, self.target_architecture);
+    try writer.writeAll(",\"request_sha256\":");
+    try writeHex(writer, &self.request_sha256);
+    try writer.writeAll(",\"solver_policy_sha256\":");
+    try writeHex(writer, &self.solver_policy_sha256);
+    try writer.writeAll(",\"lock_sha256\":");
+    try writeHex(writer, &self.lock_sha256);
+    try writer.writeAll(",\"transaction_digest_sha256\":");
+    try writeHex(writer, &self.transaction_digest_sha256);
+    try writer.print(",\"package_count\":{},\"outcome\":\"succeeded\",\"final_verification_status\":\"exact_match\",\"lock_evidence\":\"exact_match\"}}\n", .{
+        self.package_count,
+    });
+    return output.toOwnedSlice();
+}
+
+test "transaction result summary retires production v1 generation and retains historical verification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const summary_name = "transaction-result-summary.json";
+    const sidecar_name = "transaction-result-summary.json.legacy-capability-evidence.json";
+
+    const repository_id: [64]u8 = @splat('a');
+    const repositories = [_]exact_lock.Repository{.{
+        .id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .index_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+    }};
+    var lock = try exact_lock.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(6),
+        .policy_sha256 = @splat(7),
+        .repositories = &repositories,
+        .packages = &.{},
+        .authenticated_metadata = true,
+    });
+    defer lock.deinit();
+    const evidence_repositories = [_]transaction_provenance.RepositoryEvidence{.{
+        .source_config_id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = @splat(8),
+        .metadata_sha256 = @splat(3),
+        .signer_fingerprints = &.{@splat(4)},
+        .signature_verified = true,
+    }};
+    var result = try transaction_provenance.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = lock.lock.request_sha256,
+        .solver_policy_sha256 = lock.lock.policy_sha256,
+        .executor_policy_sha256 = @splat(10),
+        .plan_sha256 = @splat(11),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .repositories = &evidence_repositories,
+        .packages = &.{},
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(12),
+            .package_origins_sha256 = lock.lock.digest_sha256,
+            .detail = "verified empty closure",
+        },
+        .outcome = .succeeded,
+    });
+    defer result.deinit();
+    const json = try result.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+    const summary = try verify(std.testing.allocator, json, lock.lock, "amd64");
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try summary.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        summary.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, summary_name, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(
+            .native_only,
+            .native,
+            .completed_historical_verification,
+            summary.legacyIdentity(),
+        ),
+    );
+}
+

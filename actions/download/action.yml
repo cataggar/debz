@@ -8,9 +8,9 @@ branding:
 
 inputs:
   transaction-backend:
-    description: Explicit package-cache backend (legacy_dpkg uses v1 locks/v3 cache contracts; native requires v3 locks/v5 cache contracts)
+    description: Explicit package-cache backend (native requires v3 locks/v5 cache contracts; legacy_dpkg is refused)
     required: false
-    default: legacy_dpkg
+    default: native
   lock-input:
     description: Workspace-relative or absolute path to a canonical exact lock matching the selected backend
     required: true

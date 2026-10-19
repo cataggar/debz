@@ -15,7 +15,10 @@ test.beforeEach(async () => {
   await rm(testRoot, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
   await mkdir(runnerTemp, { recursive: true });
-  await writeFile(path.join(workspace, 'lock.json'), '{}\n');
+  await writeFile(
+    path.join(workspace, 'lock.json'),
+    '{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3}\n',
+  );
   await writeFile(path.join(workspace, 'repo.sources'), 'Types: deb\n');
   await writeFile(path.join(workspace, 'keyring.gpg'), 'keyring');
 });
@@ -30,7 +33,7 @@ test('resolves explicit files and creates only the package object cache path', a
   values.DEBZ_DOWNLOAD_CACHE = 'false';
   const inputs = await readInputs(values);
   assert.equal(inputs.lockInput, path.join(workspace, 'lock.json'));
-  assert.equal(inputs.transactionBackend, 'legacy_dpkg');
+  assert.equal(inputs.transactionBackend, 'native');
   assert.deepEqual(inputs.foreignArchitectures, ['arm64']);
   assert.equal(inputs.cacheEnabled, false);
   assert.equal(
@@ -39,10 +42,11 @@ test('resolves explicit files and creates only the package object cache path', a
   );
 });
 
-test('native selection is explicit and permits repository-free closures without weakening legacy inputs', async () => {
+test('native selection is the default and refuses legacy_dpkg and v1 locks before cache creation', async () => {
   const values = environment(workspace, runnerTemp);
   delete values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND;
-  assert.equal((await readInputs(values)).transactionBackend, 'legacy_dpkg');
+  assert.equal((await readInputs(values)).transactionBackend, 'native');
+  await rm(path.join(runnerTemp, 'debz-package-cache'), { recursive: true, force: true });
   values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'native';
   values.DEBZ_DOWNLOAD_SOURCE = '';
   values.DEBZ_DOWNLOAD_KEYRING = '';
@@ -50,17 +54,17 @@ test('native selection is explicit and permits repository-free closures without 
   assert.equal(native.transactionBackend, 'native');
   assert.deepEqual(native.sources, []);
   assert.deepEqual(native.keyrings, []);
+  await rm(path.join(runnerTemp, 'debz-package-cache'), { recursive: true, force: true });
   values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'legacy_dpkg';
-  await assert.rejects(readInputs(values), /explicit 'source' or 'config'/);
-  values.DEBZ_DOWNLOAD_SOURCE = 'repo.sources';
-  await assert.rejects(readInputs(values), /keyring/);
+  await assert.rejects(readInputs(values), /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u);
+  await assert.rejects(lstat(path.join(runnerTemp, 'debz-package-cache')), /ENOENT/u);
   for (const value of ['other', 'Native', 'native\nlegacy_dpkg']) {
     values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = value;
     await assert.rejects(readInputs(values), /transaction-backend|TRANSACTION_BACKEND|one line|multiline/);
   }
 });
 
-if (process.env.DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE === '1') {
+  if (process.env.DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE === '1') {
   test('native-only candidate selects native when backend is omitted', async () => {
     const values = environment(workspace, runnerTemp);
     delete values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND;
@@ -73,6 +77,7 @@ if (process.env.DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE === '1') {
 
   test('native-only candidate refuses legacy selection and v1 locks before CLI or cache work', async () => {
     const values = environment(workspace, runnerTemp);
+    values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'legacy_dpkg';
     const previous = { ...process.env };
     const output = path.join(testRoot, 'candidate-output');
     await writeFile(output, '');
@@ -141,7 +146,10 @@ test('rejects traversal, symlinked inputs, cache overlap, and credential-bearing
   const overlapping = environment(workspace, runnerTemp);
   const nested = path.join(runnerTemp, 'cache', 'lock.json');
   await mkdir(path.dirname(nested), { recursive: true });
-  await writeFile(nested, '{}\n');
+  await writeFile(
+    nested,
+    '{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3}\n',
+  );
   overlapping.DEBZ_DOWNLOAD_LOCK_INPUT = nested;
   overlapping.DEBZ_DOWNLOAD_CACHE_ROOT = path.join(runnerTemp, 'cache');
   await assert.rejects(readInputs(overlapping), /must be outside cache-root/);

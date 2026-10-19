@@ -9,7 +9,8 @@ const apt_cli = debz.apt_system_cli;
 const apt_command = debz.apt_system_command;
 
 fn runtimeMode() debz.legacy_compat.RuntimeMode {
-    return if (native_only_rehearsal) .native_only else .legacy_capable;
+    _ = native_only_rehearsal;
+    return .native_only;
 }
 
 const root_help =
@@ -138,7 +139,7 @@ const repository_add_help =
     \\Target options:
     \\  --root PATH                  Target root (default: /)
     \\  --architecture ARCH          Override target dpkg architecture
-    \\  --transaction-backend legacy_dpkg|native (default: legacy_dpkg)
+    \\  --transaction-backend legacy_dpkg|native (default: native)
     \\    Native requires Linux, root privilege, and --root /; never falls back.
     \\  --cache-path PATH            Logical cache path inside the target root
     \\  --state-path PATH            Logical state path inside the target root
@@ -240,7 +241,7 @@ const package_cache_prepare_help =
     \\
     \\Repository metadata is authenticated normally but is not part of the
     \\externally cacheable object path. Offline mode never falls back online.
-    \\Native selects v2 locks and archives; legacy_dpkg remains the default.
+    \\Native selects v2 locks and archives; native is the default.
     \\Native local artifacts must already be in the verified CAS or archive.
     \\
 ;
@@ -322,16 +323,6 @@ pub fn main(init: std.process.Init) !void {
         try stdout.writeAll(root_help);
         return;
     };
-    if (native_only_rehearsal and
-        !std.mem.eql(u8, command, "version") and
-        !std.mem.eql(u8, command, "repo") and
-        !std.mem.eql(u8, command, "transaction-result") and
-        !(if (debz.parseOperation(command)) |operation| supportsExactLocks(operation) else false))
-    {
-        try stderr.writeAll("debz: native-only rehearsal does not cover this selector (#280/#284)\n");
-        try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
-    }
     if (std.mem.eql(u8, command, "version")) {
         if (args.next()) |argument| {
             try stderr.print("debz: unexpected argument '{s}' for 'debz version'\n", .{argument});
@@ -583,7 +574,7 @@ fn printHelpTopic(topic: HelpTopic, stdout: *std.Io.Writer) !void {
             \\
             \\Options:
             \\  -h, --help  Show this help
-            \\  --transaction-backend legacy_dpkg|native (default: legacy_dpkg)
+            \\  --transaction-backend legacy_dpkg|native (default: native)
             \\
         ),
         .version => try stdout.writeAll(
@@ -811,7 +802,7 @@ fn runTransactionResult(
         .transaction_result_verification,
     );
     if (capabilities) {
-        if (transaction_backend != .native or state_path != null or install_root != null or
+        if (selected_backend != .native or state_path != null or install_root != null or
             lock_input != null or architecture != null)
             return transactionResultUsage(stderr, "capabilities requires only --transaction-backend native --json");
         try stdout.writeAll(if (for_install)
@@ -1023,19 +1014,31 @@ fn runPackageCache(
         args,
         &requested_json,
     ) catch |err| {
+        const status: u8 = if (err == error.LegacyCapabilityRequired)
+            @intFromEnum(api.ExitStatus.recovery)
+        else
+            @intFromEnum(api.ExitStatus.usage);
+        const id = if (err == error.LegacyCapabilityRequired)
+            "legacy_recovery_release_required"
+        else
+            "invalid_request";
+        const message = if (err == error.LegacyCapabilityRequired)
+            debz.legacy_compat.recovery_guidance
+        else
+            @errorName(err);
         try renderPackageCacheError(
             init.arena.allocator(),
             stdout,
             stderr,
             operation,
             requested_json,
-            @intFromEnum(api.ExitStatus.usage),
-            "invalid_request",
-            @errorName(err),
+            status,
+            id,
+            message,
         );
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        std.process.exit(status);
     };
 
     const request = invocation.request;
@@ -1127,7 +1130,8 @@ fn parsePackageCache(
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var seen: std.EnumSet(PackageCacheSingleOption) = .empty;
-    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
+    var selected_backend: ?debz.transaction_engine.Kind = null;
+    var transaction_backend: debz.transaction_engine.Kind = .native;
     var request: debz.package_cache_workflow.Request = .{
         .lock_input_path = "",
         .cache_root = "",
@@ -1140,7 +1144,7 @@ fn parsePackageCache(
             requested_json.* = true;
         } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
             try setPackageCacheOnce(&seen, .transaction_backend);
-            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
+            selected_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
                 return error.InvalidArguments;
         } else if (std.mem.eql(u8, argument, "--lock-input")) {
             try setPackageCacheOnce(&seen, .lock_input);
@@ -1242,6 +1246,10 @@ fn parsePackageCache(
         }
     }
 
+    transaction_backend = backend_policy.select(runtimeMode(), selected_backend, .product) catch |err| switch (err) {
+        error.LegacyCapabilityRequired => return error.LegacyCapabilityRequired,
+        else => return error.InvalidArguments,
+    };
     request.source_paths = try sources.toOwnedSlice(allocator);
     request.config_paths = try configs.toOwnedSlice(allocator);
     request.keyring_paths = try keyrings.toOwnedSlice(allocator);
@@ -1285,6 +1293,12 @@ const PackageCacheFailure = struct {
 
 fn packageCacheFailure(err: anyerror) PackageCacheFailure {
     return switch (err) {
+        error.LegacyCapabilityRequired,
+        error.LegacyPackageCacheContractRetired,
+        => .{
+            .status = @intFromEnum(api.ExitStatus.recovery),
+            .id = "legacy_recovery_release_required",
+        },
         error.InvalidRequest,
         error.InvalidArchitecture,
         error.ArchitectureMismatch,
@@ -1792,7 +1806,7 @@ fn parse(
             else => return error.InvalidArguments,
         }
     else
-        debz.transaction_engine.Kind.legacy_dpkg;
+        debz.transaction_engine.Kind.native;
     if (native_result and (operation != .install or transaction_backend != .native or
         options.output != .json or options.lock_input_path == null))
         return error.InvalidArguments;

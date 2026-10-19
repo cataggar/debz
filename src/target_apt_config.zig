@@ -1112,23 +1112,13 @@ fn discoverArchitecture(
             for (database.packages) |package| {
                 if (!std.mem.eql(u8, package.name.value, "dpkg") or
                     !package.status.isFullyInstalled()) continue;
+                if (!validArchitecture(package.architecture.value))
+                    return error.MalformedArchitectureState;
                 if (native != null and
                     !std.mem.eql(u8, native.?, package.architecture.value))
                     return error.MalformedArchitectureState;
                 native = try owned.dupe(u8, package.architecture.value);
             }
-        }
-        if (native == null and std.mem.eql(u8, request.root_path, "/")) {
-            const process = request.dependencies.process orelse
-                return error.NativeArchitectureUnavailable;
-            const argv = [_][]const u8{ "/usr/bin/dpkg", "--print-architecture" };
-            var output = try process.run(allocator, &argv, &.{});
-            defer output.deinit();
-            if (output.exit_code != 0) return error.ArchitectureProcessFailed;
-            const value = std.mem.trim(u8, output.stdout, " \t\r\n");
-            if (!validArchitecture(value) or std.mem.indexOfAny(u8, value, "\r\n") != null)
-                return error.ArchitectureProcessOutputInvalid;
-            native = try owned.dupe(u8, value);
         }
     }
     const native_value = native orelse return error.NativeArchitectureUnavailable;
@@ -1861,29 +1851,11 @@ pub const SystemProcessRunner = struct {
         environment: []const EnvironmentEntry,
     ) !ProcessOutput {
         const self: *SystemProcessRunner = @ptrCast(@alignCast(context));
-        var environ = std.process.Environ.Map.init(allocator);
-        defer environ.deinit();
-        for (environment) |entry| try environ.put(entry.key, entry.value);
-        const result = try std.process.run(allocator, self.io, .{
-            .argv = argv,
-            .environ_map = &environ,
-            .stdout_limit = .limited(self.stdout_limit),
-            .stderr_limit = .limited(self.stderr_limit),
-            .timeout = .{ .duration = .{
-                .raw = .fromSeconds(10),
-                .clock = .awake,
-            } },
-        });
-        const exit_code: u8 = switch (result.term) {
-            .exited => |code| code,
-            else => 255,
-        };
-        return .{
-            .stdout = result.stdout,
-            .stderr = result.stderr,
-            .exit_code = exit_code,
-            .allocator = allocator,
-        };
+        _ = self;
+        _ = allocator;
+        _ = argv;
+        _ = environment;
+        return error.NativeArchitectureUnavailable;
     }
 };
 
@@ -3574,17 +3546,24 @@ test "target_apt_config architecture discovery uses target state and root-only f
 
     var files: MissingFileSystem = .{};
     var process: ArchitectureProcess = .{};
-    var host = try snapshot(std.testing.allocator, .{
-        .root_path = "/",
-        .dependencies = .{
-            .filesystem = files.interface(true),
-            .process = process.interface(),
+    try std.testing.expectError(error.NativeArchitectureUnavailable, snapshot(
+        std.testing.allocator,
+        .{
+            .root_path = "/",
+            .dependencies = .{
+                .filesystem = files.interface(true),
+                .process = process.interface(),
+            },
         },
-    });
-    defer host.deinit();
-    try std.testing.expectEqualStrings("arm64", host.manifest.manifest.native_architecture);
-    try std.testing.expectEqual(@as(usize, 1), process.calls);
+    ));
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
     try std.testing.expect(!process.invalid_invocation);
+
+    var system_process: SystemProcessRunner = .{ .io = std.testing.io };
+    try std.testing.expectError(
+        error.NativeArchitectureUnavailable,
+        system_process.interface().run(std.testing.allocator, &.{ "/usr/bin/dpkg", "--print-architecture" }, &.{}),
+    );
 
     var alternate_files: MissingFileSystem = .{};
     var alternate_process: ArchitectureProcess = .{};
@@ -3599,6 +3578,22 @@ test "target_apt_config architecture discovery uses target state and root-only f
         },
     ));
     try std.testing.expectEqual(@as(usize, 0), alternate_process.calls);
+
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "Package: dpkg\n" ++
+            "Status: install ok installed\n" ++
+            "Architecture: amd64\n" ++
+            "Version: 1\n\n" ++
+            "Package: dpkg\n" ++
+            "Status: install ok installed\n" ++
+            "Architecture: arm64\n" ++
+            "Version: 1\n\n",
+    });
+    try std.testing.expectError(error.MalformedArchitectureState, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .dependencies = .{ .filesystem = production.interface() },
+    }));
 }
 
 test "target_apt_config explicit architecture reads no ambient configuration" {

@@ -1,10 +1,13 @@
 # Legacy compatibility and native-only cutover policy
 
-This release remains **legacy-capable**. `legacy_dpkg` stays the default and
-continues to execute; this increment does not remove dpkg, change defaults, or
-enable fallback. It makes the compatibility boundary explicit so a later
-native-only release can delete legacy execution without reinterpreting old
-authority.
+This release is **native-only** (`current_release_mode: "native_only"`,
+`native_only_cutover_ready: true`). `native` is the shipped default across the
+CLI, product, package-family, repository, apt/system, and GitHub Actions
+surfaces. New `legacy_dpkg` execution is retired and refused before root or
+cache mutation with versioned recovery guidance (`debz >=0.3.0,<0.4.0`), while
+historical legacy locks, journals, profiles, and transaction results remain
+verifiable read-only through their exact version-specific decoders without
+reinterpreting old authority.
 
 The machine-readable inventory is
 [`security/legacy-cutover-policy.json`](../security/legacy-cutover-policy.json).
@@ -151,17 +154,15 @@ review, if a production selector is not classified, if the action bundles omit
 capability evidence, or if the policy claims native-only readiness while
 cutover blockers remain.
 
-## Opt-in production candidate (#276)
+## Production native-only candidate (#276 / #274)
 
-Run `zig-out/bin/debz-native-only-candidate native-only-candidate` (or
+`zig-out/bin/debz-native-only-candidate native-only-candidate` (and
 `zig-out/bin/debz-security-audit native-only-candidate`, which delegates to the
-compiled `debz-native-only-candidate` binary) only when rehearsing
-the **future** cutover. It must fail on this legacy-capable release. The output
-names remaining deletion/default tasks by exact source path (#280–#285), not a
-claim of #274 readiness. Ordinary `zig build security-audit` continues to
-check the shipped legacy-capable policy and tests the candidate's expected
-failure and negative mutations via `tools/native-only-candidate.zig`; it does
-not enable native-only defaults.
+compiled `debz-native-only-candidate` binary) audits the completed native-only
+cutover (#280–#285, #274) and must pass with zero findings (`security-audit:
+native-only candidate passed`). Ordinary `zig build security-audit` enforces
+the native-only cutover policy and tests exact negative mutations via
+`tools/native-only-candidate.zig`.
 
 `security/native-only-production-policy.json` pins reviewed child-process
 allowances and source/bundle fingerprints. The candidate scans *all* production

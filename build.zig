@@ -210,7 +210,7 @@ pub fn build(b: *std.Build) void {
         .strip = !native_helper_debug_info,
     });
     const release_cli_options = b.addOptions();
-    release_cli_options.addOption(bool, "native_only", false);
+    release_cli_options.addOption(bool, "native_only", true);
     cli_module.addImport("debz", debz);
     cli_module.addImport("repository_cli", repository_cli);
     cli_module.addImport("cli_backend_policy", cli_backend_policy);

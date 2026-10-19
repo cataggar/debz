@@ -18,6 +18,145 @@ const SimulatedDpkg = struct {
         return .{ .context = self, .runFn = run };
     }
 
+    fn executor(self: *SimulatedDpkg) debz.transaction_engine.Executor {
+        return .{
+            .context = self,
+            .executeFn = executePlan,
+            .recoverFn = recoverPlan,
+        };
+    }
+
+    fn executePlan(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: transaction_executor.Request,
+        _: transaction_executor.Dependencies,
+    ) !transaction_executor.Report {
+        const lock_digest = if (request.exact_lock_v3) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v2) |lock|
+            lock.digest_sha256
+        else
+            return error.MissingExactLock;
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        const arena_allocator = arena.allocator();
+        const commands = try arena_allocator.alloc(
+            transaction_executor.CommandProvenance,
+            request.plan.actions.len,
+        );
+        for (request.plan.actions, 0..) |action, index| {
+            const argv = try arena_allocator.dupe([]const u8, &.{ "/usr/bin/dpkg", "--unpack" });
+            _ = try run(context, .{
+                .argv = argv,
+                .environment = &transaction_executor.audited_environment,
+                .phase = .unpack,
+                .package = action.package,
+                .timeout_ms = 60_000,
+                .cancellation = .never(),
+            });
+            commands[index] = .{
+                .phase = .unpack,
+                .package = try arena_allocator.dupe(u8, action.package),
+                .version = try arena_allocator.dupe(u8, action.version),
+                .architecture = try arena_allocator.dupe(u8, action.architecture),
+                .argv = argv,
+                .environment = try arena_allocator.dupe(
+                    transaction_executor.EnvironmentEntry,
+                    &transaction_executor.audited_environment,
+                ),
+                .command_sha256 = @splat(@intCast(index + 1)),
+                .artifact_sha256 = null,
+            };
+        }
+        const self: *SimulatedDpkg = @ptrCast(@alignCast(context));
+        const report: transaction_executor.Report = .{
+            .allocator = allocator,
+            .arena = arena,
+            .commands = commands,
+            .plan_sha256 = transaction_executor.planDigest(request.plan.*),
+            .transaction_state = .complete,
+            .root_identity = debz.transaction_recovery.rootIdentity(request.install_root),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = lock_digest,
+            .failure = null,
+        };
+        try self.writeCompletedJournal(arena_allocator, report);
+        return report;
+    }
+
+    fn recoverPlan(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: transaction_executor.RecoveryRequest,
+        _: transaction_executor.Dependencies,
+    ) !transaction_executor.RecoveryReport {
+        const lock_digest = if (request.exact_lock_v3) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v2) |lock|
+            lock.digest_sha256
+        else
+            return error.MissingExactLock;
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        return .{
+            .allocator = allocator,
+            .arena = arena,
+            .state = .complete,
+            .commands = &.{},
+            .plan_sha256 = transaction_executor.planDigest(request.plan.*),
+            .root_identity = debz.transaction_recovery.rootIdentity(request.install_root),
+            .policy_sha256 = transaction_executor.policyDigest(request.policy),
+            .lock_sha256 = lock_digest,
+            .failure = null,
+        };
+    }
+
+    fn writeCompletedJournal(
+        self: *SimulatedDpkg,
+        allocator: std.mem.Allocator,
+        report: transaction_executor.Report,
+    ) !void {
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "DEBZ-TXN\t4\n" ++
+                "state\tcomplete\n" ++
+                "boundary\tverifying\n" ++
+                "plan\t{s}\n" ++
+                "root\t{s}\n" ++
+                "policy\t{s}\n" ++
+                "backend\tlegacy_dpkg\n" ++
+                "capability\t{s}\n" ++
+                "lock\t{s}\n" ++
+                "next\t0\n" ++
+                "commands\t0\n" ++
+                "failure\t-\n",
+            .{
+                std.fmt.bytesToHex(report.plan_sha256, .lower),
+                std.fmt.bytesToHex(report.root_identity, .lower),
+                std.fmt.bytesToHex(report.policy_sha256, .lower),
+                debz.legacy_compat.legacy_capability,
+                std.fmt.bytesToHex(report.lock_sha256.?, .lower),
+            },
+        );
+        var sum = report.plan_sha256;
+        std.crypto.hash.sha2.Sha256.hash(body, &sum, .{});
+        const document = try std.fmt.allocPrint(
+            allocator,
+            "{s}checksum\t{s}\n",
+            .{ body, std.fmt.bytesToHex(sum, .lower) },
+        );
+        var root = try std.Io.Dir.cwd().openDir(self.io, self.root, .{});
+        defer root.close(self.io);
+        try root.createDirPath(self.io, "var/lib/debz");
+        try root.writeFile(self.io, .{
+            .sub_path = "var/lib/debz/transaction.complete",
+            .data = document,
+        });
+    }
+
     fn run(
         context: *anyopaque,
         invocation: transaction_executor.Invocation,
@@ -122,6 +261,8 @@ pub fn main(init: std.process.Init) !void {
     var backend: debz.ProductionRepositoryBackend = .{
         .io = init.io,
         .transaction_backend = parsed.transaction_backend,
+        .legacy_execution_capable = true,
+        .executor = simulated_dpkg.executor(),
         .process_runner = simulated_dpkg.interface(),
     };
 
@@ -129,9 +270,13 @@ pub fn main(init: std.process.Init) !void {
     defer first.deinit();
     if (first.exit_status != .success) {
         const failure_json = try first.canonicalJson(allocator);
-        std.debug.print("{s}\n", .{failure_json});
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout_file = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        const stdout = &stdout_file.interface;
+        try stdout.print("{s}\n", .{failure_json});
+        try stdout.flush();
+        std.process.exit(@intFromEnum(first.exit_status));
     }
-    try expect(first.exit_status == .success);
     try expect(first.changed);
     try expect(first.installed);
     try expect(first.refreshed == !parsed.request.no_refresh);
@@ -168,6 +313,10 @@ pub fn main(init: std.process.Init) !void {
 
     var second = try api.execute(allocator, parsed.request, backend.interface());
     defer second.deinit();
+    if (second.exit_status != .success) {
+        const failure_json = try second.canonicalJson(allocator);
+        std.debug.print("SECOND_FAIL={s}\n", .{failure_json});
+    }
     try expect(second.exit_status == .success);
     try expect(!second.changed);
     try expect(second.installed);

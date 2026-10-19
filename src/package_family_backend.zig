@@ -11,6 +11,7 @@ const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const native_operation = @import("native_operation.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
+const legacy_compat = @import("legacy_compat.zig");
 
 pub const schema_version: u32 = 1;
 pub const capability_schema = "io.github.cataggar.debz.package-family.capabilities.v1";
@@ -60,6 +61,34 @@ pub const Capabilities = struct {
     pub fn canonicalJson(self: Capabilities, allocator: std.mem.Allocator) ![]u8 {
         return std.json.Stringify.valueAlloc(allocator, self, .{ .whitespace = .minified });
     }
+
+    pub fn legacyIdentity(self: Capabilities) legacy_compat.Identity {
+        return .{
+            .schema = self.schema,
+            .version = @intCast(self.version),
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(self: Capabilities) legacy_compat.PolicyError!legacy_compat.Disposition {
+        if (!std.mem.eql(u8, self.schema, capability_schema) or self.version != schema_version)
+            return error.UnsupportedIdentity;
+        return legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+    }
+
+    pub fn requireExecutionAuthority(self: Capabilities) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
+    }
 };
 
 pub fn capabilities() Capabilities {
@@ -92,10 +121,12 @@ pub fn nativeCapabilities() NativeCapabilities {
 }
 
 pub fn parseCapabilitiesBackend(arguments: []const []const u8) !transaction_engine.Kind {
-    if (arguments.len == 0) return .legacy_dpkg;
+    if (arguments.len == 0) return .native;
     if (arguments.len != 2 or !std.mem.eql(u8, arguments[0], "--transaction-backend"))
         return error.InvalidCapabilityOptions;
-    return std.meta.stringToEnum(transaction_engine.Kind, arguments[1]) orelse error.InvalidTransactionBackend;
+    const selected = std.meta.stringToEnum(transaction_engine.Kind, arguments[1]) orelse return error.InvalidTransactionBackend;
+    if (selected == .legacy_dpkg) return error.LegacyCapabilityRequired;
+    return selected;
 }
 
 /// Stable image-builder boundary. Every host-sensitive input is explicit;
@@ -153,14 +184,51 @@ pub const Result = struct {
     lock_path: ?[]const u8 = null,
     provenance_path: ?[]const u8 = null,
     diagnostic: ?Diagnostic = null,
+
+    pub fn legacyIdentity(self: Result) legacy_compat.Identity {
+        return .{
+            .schema = self.schema,
+            .version = @intCast(self.version),
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(self: Result) legacy_compat.PolicyError!legacy_compat.Disposition {
+        if (!std.mem.eql(u8, self.schema, result_schema) or self.version != schema_version or !self.succeeded or self.exit_status != .success)
+            return error.UnsupportedIdentity;
+        return legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+    }
+
+    pub fn requireExecutionAuthority(self: Result) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
+    }
 };
 
 pub const Backend = struct {
     product_backend: product.Backend,
+    legacy_execution_capable: bool = false,
 
     pub fn execute(self: Backend, allocator: std.mem.Allocator, request: Request) !Result {
         if (!validRequest(request, .legacy_dpkg))
             return failure(request.operation, .usage, .invalid_request, "invalid explicit package-family request", false);
+        if (!self.legacy_execution_capable)
+            return failure(
+                request.operation,
+                .recovery,
+                .backend_unavailable,
+                legacy_compat.recovery_guidance,
+                true,
+            );
 
         var mapped = try MappedRequest.init(allocator, request);
         defer mapped.deinit();
@@ -725,9 +793,9 @@ test "native capabilities advertise integrated native family contracts" {
 }
 
 test "capability backend selection preserves defaults and rejects ambiguous options" {
-    try std.testing.expectEqual(transaction_engine.Kind.legacy_dpkg, try parseCapabilitiesBackend(&.{}));
-    inline for (.{ "legacy_dpkg", "native" }) |value|
-        try std.testing.expectEqual(std.meta.stringToEnum(transaction_engine.Kind, value).?, try parseCapabilitiesBackend(&.{ "--transaction-backend", value }));
+    try std.testing.expectEqual(transaction_engine.Kind.native, try parseCapabilitiesBackend(&.{}));
+    try std.testing.expectEqual(transaction_engine.Kind.native, try parseCapabilitiesBackend(&.{ "--transaction-backend", "native" }));
+    try std.testing.expectError(error.LegacyCapabilityRequired, parseCapabilitiesBackend(&.{ "--transaction-backend", "legacy_dpkg" }));
     try std.testing.expectError(error.InvalidTransactionBackend, parseCapabilitiesBackend(&.{ "--transaction-backend", "other" }));
     for ([_][]const []const u8{
         &.{"--transaction-backend"},
@@ -1113,7 +1181,29 @@ test "native family verification request mapping propagates allocation failures 
 
 test "Ubuntu create maps explicit policy to product API" {
     var fake: Fake = .{ .return_item = true };
-    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const default_backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const refused = try default_backend.execute(std.testing.allocator, .{
+        .operation = .create,
+        .root = "/build/root",
+        .architecture = .arm64,
+        .foreign_architectures = &.{.amd64},
+        .sources = &.{"/build/sources"},
+        .keyrings = &.{"/build/keyring.gpg"},
+        .cache = "/build/cache",
+        .state = "/build/state",
+        .package = "ubuntu-minimal",
+        .lock_input = "/build/core.lock.json",
+        .cache_mode = .offline,
+    });
+    try std.testing.expect(!refused.succeeded);
+    try std.testing.expectEqual(product.ExitStatus.recovery, refused.exit_status);
+    try std.testing.expectEqual(ErrorId.backend_unavailable, refused.diagnostic.?.id);
+    try std.testing.expect(!fake.seen);
+
+    const backend: Backend = .{
+        .product_backend = .{ .context = &fake, .executeFn = Fake.execute },
+        .legacy_execution_capable = true,
+    };
     const result = try backend.execute(std.testing.allocator, .{
         .operation = .create,
         .root = "/build/root",
@@ -1134,7 +1224,10 @@ test "Ubuntu create maps explicit policy to product API" {
 
 test "initial lock resolution is non-mutating and requires a new lock path" {
     var fake: Fake = .{};
-    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const backend: Backend = .{
+        .product_backend = .{ .context = &fake, .executeFn = Fake.execute },
+        .legacy_execution_capable = true,
+    };
     const result = try backend.execute(std.testing.allocator, .{
         .operation = .resolve_lock,
         .root = "/build/root",
@@ -1155,7 +1248,10 @@ test "initial lock resolution is non-mutating and requires a new lock path" {
 
 test "immutable config can provide the repository source" {
     var fake: Fake = .{};
-    const backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    const backend: Backend = .{
+        .product_backend = .{ .context = &fake, .executeFn = Fake.execute },
+        .legacy_execution_capable = true,
+    };
     const result = try backend.execute(std.testing.allocator, .{
         .operation = .resolve_lock,
         .root = "/build/root",
@@ -1171,6 +1267,104 @@ test "immutable config can provide the repository source" {
     });
     try std.testing.expect(result.succeeded);
     try std.testing.expectEqual(product.Operation.plan, fake.operation.?);
+}
+
+test "native-only cutover switches package-family capability default to native, retires legacy execution, and preserves historical read-only verification" {
+    try std.testing.expectEqual(transaction_engine.Kind.native, try parseCapabilitiesBackend(&.{}));
+    try std.testing.expectError(error.LegacyCapabilityRequired, parseCapabilitiesBackend(&.{ "--transaction-backend", "legacy_dpkg" }));
+
+    const historical_capabilities = capabilities();
+    try std.testing.expectEqual(legacy_compat.Disposition.historical_read_only, try historical_capabilities.verifyCompletedHistorical());
+    try std.testing.expectError(error.LegacyCapabilityRequired, historical_capabilities.requireExecutionAuthority());
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(.native_only, .native, .completed_historical_verification, historical_capabilities.legacyIdentity()),
+    );
+
+    const historical_result: Result = .{
+        .operation = .create,
+        .succeeded = true,
+        .changed = true,
+        .exit_status = .success,
+        .lock_path = "/build/core.lock.json",
+        .provenance_path = "/build/state/transaction-result.json",
+    };
+    try std.testing.expectEqual(legacy_compat.Disposition.historical_read_only, try historical_result.verifyCompletedHistorical());
+    try std.testing.expectError(error.LegacyCapabilityRequired, historical_result.requireExecutionAuthority());
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(.native_only, .native, .completed_historical_verification, historical_result.legacyIdentity()),
+    );
+
+    var fake: Fake = .{};
+    const legacy_backend: Backend = .{ .product_backend = .{ .context = &fake, .executeFn = Fake.execute } };
+    for ([_]Request{
+        .{
+            .operation = .resolve_lock,
+            .root = "/build/root",
+            .architecture = .arm64,
+            .sources = &.{"/build/sources"},
+            .keyrings = &.{"/build/keyring.gpg"},
+            .cache = "/build/cache",
+            .state = "/build/state",
+            .package = "ubuntu-minimal",
+            .lock_output = "/build/core.lock.json",
+            .cache_mode = .offline,
+        },
+        .{
+            .operation = .create,
+            .root = "/build/root",
+            .architecture = .arm64,
+            .sources = &.{"/build/sources"},
+            .keyrings = &.{"/build/keyring.gpg"},
+            .cache = "/build/cache",
+            .state = "/build/state",
+            .package = "ubuntu-minimal",
+            .lock_input = "/build/core.lock.json",
+            .cache_mode = .offline,
+        },
+        .{
+            .operation = .customize,
+            .root = "/build/root",
+            .architecture = .arm64,
+            .sources = &.{"/build/sources"},
+            .keyrings = &.{"/build/keyring.gpg"},
+            .cache = "/build/cache",
+            .state = "/build/state",
+            .package = "ubuntu-minimal",
+            .lock_input = "/build/core.lock.json",
+            .cache_mode = .offline,
+        },
+        .{
+            .operation = .update,
+            .root = "/build/root",
+            .architecture = .arm64,
+            .sources = &.{"/build/sources"},
+            .keyrings = &.{"/build/keyring.gpg"},
+            .cache = "/build/cache",
+            .state = "/build/state",
+            .lock_input = "/build/core.lock.json",
+            .cache_mode = .offline,
+        },
+        .{
+            .operation = .recover,
+            .root = "/build/root",
+            .architecture = .arm64,
+            .sources = &.{"/build/sources"},
+            .keyrings = &.{"/build/keyring.gpg"},
+            .cache = "/build/cache",
+            .state = "/build/state",
+            .lock_input = "/build/core.lock.json",
+            .cache_mode = .offline,
+        },
+    }) |request| {
+        const refused = try legacy_backend.execute(std.testing.allocator, request);
+        try std.testing.expect(!refused.succeeded and !refused.changed);
+        try std.testing.expectEqual(product.ExitStatus.recovery, refused.exit_status);
+        try std.testing.expectEqual(ErrorId.backend_unavailable, refused.diagnostic.?.id);
+        try std.testing.expect(refused.provenance_path == null);
+        try std.testing.expect(!fake.seen);
+    }
 }
 
 test "mutations fail closed without required explicit inputs" {
