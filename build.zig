@@ -1735,6 +1735,18 @@ pub fn build(b: *std.Build) void {
     });
     b.step("test-native-baseline", "Run genuine signed native installed-baseline workflows in owned roots")
         .dependOn(&b.addRunArtifact(native_baseline_tests).step);
+    const healthy_prestate_tests = b.addTest(.{
+        .root_module = production_backend_tests.root_module,
+        .filters = &.{
+            "healthy_installed_prestate.test.",
+            "exact_lock_v5.test.",
+            "production healthy installed prestate",
+        },
+    });
+    const run_healthy_prestate_tests = b.addRunArtifact(healthy_prestate_tests);
+    b.step("test-healthy-installed-prestate", "Check healthy active-context exact planning and historical execution refusals")
+        .dependOn(&run_healthy_prestate_tests.step);
+    workload_native.dependOn(&run_healthy_prestate_tests.step);
     const product_result_module = b.createModule(.{
         .root_source_file = b.path("src/product_api.zig"),
         .target = target,
@@ -3634,6 +3646,8 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "exact-closure-lock-v3.json",
         "exact-closure-lock-v4.json",
+        "exact-closure-lock-v5.json",
+        "healthy-installed-prestate-v1.json",
         "installed-baseline-component-v1.json",
         "legacy-capability-evidence-v1.json",
         "legacy-compatibility-policy-v1.json",

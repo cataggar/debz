@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/exact-closure-lock-v5",
+  "title": "Healthy active-context planning lock; execution unsupported",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "backend", "usage", "context", "archive_lock_json", "installed_prestate"],
+      "properties": {
+        "schema": {"const": "https://debz.dev/schema/exact-closure-lock-v5"},
+        "version": {"const": 5},
+        "backend": {"enum": ["legacy_dpkg", "native"]},
+        "usage": {"const": "healthy_prestate_planning_only"},
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["configuration_sha256", "manifest_sha256"],
+          "properties": {
+            "configuration_sha256": {
+              "type": "array", "minItems": 64, "maxItems": 64,
+              "items": {"anyOf": [
+                {"type": "integer", "minimum": 48, "maximum": 57},
+                {"type": "integer", "minimum": 97, "maximum": 102}
+              ]},
+              "description": "Lowercase ASCII hexadecimal configuration identity."
+            },
+            "manifest_sha256": {
+              "type": "array", "minItems": 32, "maxItems": 32,
+              "items": {"type": "integer", "minimum": 0, "maximum": 255}
+            }
+          }
+        },
+        "archive_lock_json": {
+          "type": "string", "minLength": 1,
+          "description": "Canonical exact v3 authenticated archive closure; retained packages are represented exclusively as observed installed facts."
+        },
+        "installed_prestate": {"$ref": "healthy-installed-prestate-v1.json"}
+      }
+    },
+    "digest_sha512": {"type": "string", "pattern": "^[0-9a-f]{128}$"}
+  }
+}

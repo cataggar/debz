@@ -4435,6 +4435,7 @@ pub const WORKLOAD_PARTITIONS = [_]WorkloadPartition{
         .step_name = "test-workload-native",
         .members = &.{
             "native_dpkg_tests",
+            "run_healthy_prestate_tests",
             "run_native_program_corpus_tests",
             "native_outcome_tests",
             "run_native_phase_summary_tests",
