@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/system-install-active-v1",
+  "title": "debz system install owned-attempt pointer v1",
+  "$comment": "Published at /var/lib/debz/system-install/active-v1.json exactly while one attempt is unsettled. While it exists, every other system install request is refused and the same request resumes this attempt before any refresh or replanning.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "attempt_id", "request_sha512", "request_document_sha512", "command"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/system-install-active-v1" },
+        "version": { "const": 1 },
+        "attempt_id": { "$ref": "system-install-request-v1.json#/$defs/attemptId" },
+        "request_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "request_document_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" },
+        "command": { "$ref": "system-install-request-v1.json#/$defs/command" }
+      }
+    },
+    "digest_sha512": { "$ref": "system-install-request-v1.json#/$defs/sha512" }
+  }
+}

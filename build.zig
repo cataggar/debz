@@ -1742,10 +1742,15 @@ pub fn build(b: *std.Build) void {
             "healthy_installed_prestate.test.",
             "exact_lock_v5.test.",
             "production healthy installed prestate",
+            "system_install.test.",
+            "system_install_command.test.",
+            "production system install",
         },
     });
     const run_healthy_prestate_tests = b.addRunArtifact(healthy_prestate_tests);
     b.step("test-healthy-installed-prestate", "Check healthy active-context exact planning and historical execution refusals")
+        .dependOn(&run_healthy_prestate_tests.step);
+    b.step("test-system-install", "Check short system-profile install engine and evidence chain")
         .dependOn(&run_healthy_prestate_tests.step);
     workload_native.dependOn(&run_healthy_prestate_tests.step);
     const product_result_module = b.createModule(.{
@@ -3697,6 +3702,14 @@ fn installReleaseFiles(
         "root-operation-completion-v2.json",
         "root-operation-record-v1.json",
         "root-mutation-journal-v1.json",
+        "system-install-active-v1.json",
+        "system-install-authorization-v1.json",
+        "system-install-program-v1.json",
+        "system-install-progress-v1.json",
+        "system-install-receipt-v1.json",
+        "system-install-recovery-v1.json",
+        "system-install-request-v1.json",
+        "system-install-result-v1.json",
         "system-profile-v1.json",
         "system-profile-v2.json",
         "transaction-plan-v1.json",

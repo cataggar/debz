@@ -16,6 +16,8 @@ pub const repository_api = @import("repository_api.zig");
 pub const repository_state = @import("repository_state.zig");
 pub const repository_backend = @import("repository_backend.zig");
 pub const repository_command = @import("repository_command.zig");
+pub const system_install = @import("system_install.zig");
+pub const system_install_command = @import("system_install_command.zig");
 pub const RepositoryApiVersion = repository_api.api_version;
 pub const RepositoryOperation = repository_api.Operation;
 pub const RepositoryTrustMode = repository_api.TrustMode;
@@ -685,4 +687,6 @@ test {
     _ = repository_state;
     _ = repository_backend;
     _ = repository_command;
+    _ = system_install;
+    _ = system_install_command;
 }

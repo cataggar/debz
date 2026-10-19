@@ -115,10 +115,17 @@ also supported; see
 
 Successful repository add retains a root-scoped active configuration and a
 [typed read-only system context](doc/target-apt-config.md#typed-system-product-context).
-The short `sudo debz install symcrypt[-openssl]` workflow is **not yet wired**;
-use the explicit authenticated plan/review/replay path above where its strict
-installed-baseline and backend requirements can be met. System SymCrypt
-packages do not replace zig-symcrypt's pinned/static build inputs.
+The short `sudo debz install PACKAGE` system profile now plans one package
+against that context. It retains an owned exact lock under
+`/var/lib/debz/locks` and versioned per-operation evidence under
+`/var/lib/debz/system-install`. An interrupted attempt resumes only through
+its exact command, before any refresh or replan. **It does not install
+yet:** no build provides its execution generation, so an authorized attempt
+refuses before mutation (exit 3) and keeps its lock. See
+[short system-profile install](doc/exact-locks-and-provenance.md#short-system-profile-install-system-install-v1).
+Until then, use the explicit authenticated plan/review/replay path above where
+its strict installed-baseline and backend requirements can be met. System
+SymCrypt packages do not replace zig-symcrypt's pinned/static build inputs.
 
 The installed CLI exposes the limited profile-bound system facade:
 
