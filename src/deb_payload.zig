@@ -493,6 +493,20 @@ const ValidationRequest = union(enum) {
     local: LocalExpected,
 };
 
+fn verifyArchiveIdentity(identity: content_digest.Identity, bytes: []const u8, actual: [32]u8) bool {
+    if (identity.digests.get(identity.primary) == null) return false;
+    identity.digests.require() catch return false;
+    if (identity.digests.sha256) |expected| {
+        if (!std.crypto.timing_safe.eql([32]u8, expected, actual))
+            return false;
+    }
+    if (identity.digests.sha512) |expected| {
+        if (!(content_digest.Value{ .sha512 = expected }).verify(bytes))
+            return false;
+    }
+    return true;
+}
+
 fn validateInternal(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -506,19 +520,28 @@ fn validateInternal(
         .local => |expected| expected.profile == .repository_descriptor,
     };
     const inventory_fifos = inventory_fifos_for_application and !descriptor_profile;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     switch (request) {
         .repository => |expected| {
             if (bytes.len != expected.size) return fail(.digest, .size_mismatch, 0, null, null);
             if (expected.sha256 == null and expected.archive_identity == null)
                 return fail(.digest, .digest_mismatch, 0, null, null);
+        },
+        .local => |expected| {
+            if (expected.size) |size| {
+                if (bytes.len != size) return fail(.digest, .size_mismatch, 0, null, null);
+            }
+        },
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    switch (request) {
+        .repository => |expected| {
             if (expected.sha256) |sha256| {
                 if (!std.crypto.timing_safe.eql([32]u8, digest, sha256))
                     return fail(.digest, .digest_mismatch, 0, null, null);
             }
             if (expected.archive_identity) |identity| {
-                identity.verify(bytes) catch
+                if (!verifyArchiveIdentity(identity, bytes, digest))
                     return fail(.digest, .digest_mismatch, 0, null, null);
             }
             if (expected.sha256 != null and expected.archive_identity != null and
@@ -531,15 +554,12 @@ fn validateInternal(
                 return fail(.digest, .digest_mismatch, 0, null, null);
         },
         .local => |expected| {
-            if (expected.size) |size| {
-                if (bytes.len != size) return fail(.digest, .size_mismatch, 0, null, null);
-            }
             if (expected.sha256) |sha256| {
                 if (!std.mem.eql(u8, &digest, &sha256))
                     return fail(.digest, .digest_mismatch, 0, null, null);
             }
             if (expected.archive_identity) |identity| {
-                identity.verify(bytes) catch
+                if (!verifyArchiveIdentity(identity, bytes, digest))
                     return fail(.digest, .digest_mismatch, 0, null, null);
             }
             if (expected.sha256 != null and expected.archive_identity != null and
@@ -2479,6 +2499,20 @@ test "rejects traversal identity digest limits and corrupt tar" {
     var bad_digest = expectedFor(bytes);
     bad_digest.sha256.?[0] ^= 1;
     try std.testing.expectEqual(Code.digest_mismatch, validate(allocator, bytes, bad_digest, .{}).diagnostic.code);
+
+    var dual_expected = expectedFor(bytes);
+    dual_expected.archive_identity = content_digest.Identity.ofSupported(bytes);
+    var dual_result = validate(allocator, bytes, dual_expected, .{});
+    switch (dual_result) {
+        .validation => |*validation| validation.deinit(),
+        .diagnostic => return error.UnexpectedDiagnostic,
+    }
+    var bad_dual_sha256 = dual_expected;
+    bad_dual_sha256.sha256.?[0] ^= 1;
+    try std.testing.expectEqual(Code.digest_mismatch, validate(allocator, bytes, bad_dual_sha256, .{}).diagnostic.code);
+    var bad_dual_identity = dual_expected;
+    bad_dual_identity.archive_identity.?.digests.sha512.?[0] ^= 1;
+    try std.testing.expectEqual(Code.digest_mismatch, validate(allocator, bytes, bad_dual_identity, .{}).diagnostic.code);
     try std.testing.expectEqual(Code.decompression_failed, validate(allocator, bytes, expectedFor(bytes), .{
         .max_data_decompressed_bytes = 1,
     }).diagnostic.code);

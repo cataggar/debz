@@ -2480,16 +2480,39 @@ pub fn verifyGeneration(
 }
 
 const GenerationEntry = struct {
-    path: []const u8,
+    prefix: []const u8 = "",
+    name: []const u8,
     kind: EntryKind,
     mode: u32,
     owner: ?struct { uid: u32, gid: u32 } = null,
     size: usize,
     sha256: [32]u8,
+
+    fn pathLen(self: GenerationEntry) usize {
+        return self.prefix.len + self.name.len;
+    }
+
+    fn pathByteAt(self: GenerationEntry, index: usize) u8 {
+        return if (index < self.prefix.len)
+            self.prefix[index]
+        else
+            self.name[index - self.prefix.len];
+    }
 };
 
 fn lessGenerationEntry(_: void, left: GenerationEntry, right: GenerationEntry) bool {
-    return std.mem.order(u8, left.path, right.path) == .lt;
+    if (std.mem.eql(u8, left.prefix, right.prefix)) {
+        return std.mem.order(u8, left.name, right.name) == .lt;
+    }
+    const left_len = left.pathLen();
+    const right_len = right.pathLen();
+    const shared_len = @min(left_len, right_len);
+    for (0..shared_len) |index| {
+        const left_byte = left.pathByteAt(index);
+        const right_byte = right.pathByteAt(index);
+        if (left_byte != right_byte) return left_byte < right_byte;
+    }
+    return left_len < right_len;
 }
 
 /// Deterministic digest of one complete consumed database generation.
@@ -2498,10 +2521,7 @@ pub fn generation(
     snapshot: Snapshot,
 ) std.mem.Allocator.Error!Generation {
     var entries: std.ArrayList(GenerationEntry) = .empty;
-    defer {
-        for (entries.items) |entry| allocator.free(entry.path);
-        entries.deinit(allocator);
-    }
+    defer entries.deinit(allocator);
 
     const singles = [_]struct { path: []const u8, entry: ?FileEntry }{
         .{ .path = status_path, .entry = snapshot.status },
@@ -2513,12 +2533,14 @@ pub fn generation(
         .{ .path = triggers_file_path, .entry = snapshot.triggers_file },
         .{ .path = triggers_unincorp_path, .entry = snapshot.triggers_unincorp },
     };
+    try entries.ensureTotalCapacity(
+        allocator,
+        singles.len + snapshot.info.len + snapshot.triggers_named.len + snapshot.updates.len,
+    );
     for (singles) |single| {
         const entry = single.entry orelse continue;
-        const path = try allocator.dupe(u8, single.path);
-        errdefer allocator.free(path);
-        try entries.append(allocator, .{
-            .path = path,
+        entries.appendAssumeCapacity(.{
+            .name = single.path,
             .kind = entry.kind,
             .mode = entry.mode,
             .size = entry.bytes.len,
@@ -2526,10 +2548,9 @@ pub fn generation(
         });
     }
     for (snapshot.info) |entry| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ info_directory, entry.name });
-        errdefer allocator.free(path);
-        try entries.append(allocator, .{
-            .path = path,
+        entries.appendAssumeCapacity(.{
+            .prefix = info_directory ++ "/",
+            .name = entry.name,
             .kind = entry.kind,
             .mode = entry.mode,
             .owner = if (std.mem.endsWith(u8, entry.name, ".config"))
@@ -2541,14 +2562,9 @@ pub fn generation(
         });
     }
     for (snapshot.triggers_named) |entry| {
-        const path = try std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}",
-            .{ triggers_directory, entry.name },
-        );
-        errdefer allocator.free(path);
-        try entries.append(allocator, .{
-            .path = path,
+        entries.appendAssumeCapacity(.{
+            .prefix = triggers_directory ++ "/",
+            .name = entry.name,
             .kind = entry.kind,
             .mode = entry.mode,
             .size = entry.bytes.len,
@@ -2556,10 +2572,9 @@ pub fn generation(
         });
     }
     for (snapshot.updates) |entry| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ updates_directory, entry.name });
-        errdefer allocator.free(path);
-        try entries.append(allocator, .{
-            .path = path,
+        entries.appendAssumeCapacity(.{
+            .prefix = updates_directory ++ "/",
+            .name = entry.name,
             .kind = entry.kind,
             .mode = entry.mode,
             .size = entry.bytes.len,
@@ -2576,8 +2591,9 @@ pub fn generation(
     writer.writeAll("debz.package-database.generation.v1\n") catch unreachable;
     var total: u64 = 0;
     for (entries.items) |entry| {
-        writer.print("{s}\x00{s}\x00{o}\x00{d}\x00", .{
-            entry.path,
+        writer.writeAll(entry.prefix) catch unreachable;
+        writer.writeAll(entry.name) catch unreachable;
+        writer.print("\x00{s}\x00{o}\x00{d}\x00", .{
             @tagName(entry.kind),
             entry.mode,
             entry.size,
@@ -5164,3 +5180,88 @@ test "package_database.test.arch-native generation digest binds bytes mode and k
     );
 }
 
+test "package_database.test.generation sorts borrowed two-part paths with one allocation" {
+    const CountingAllocator = struct {
+        backing: std.mem.Allocator,
+        allocations: usize = 0,
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocations += 1;
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+        }
+
+        fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+    };
+
+    const snapshot: Snapshot = .{
+        .status = regularFile("status-bytes"),
+        .status_old = regularFile("status-old-bytes"),
+        .arch = regularFile("amd64\n"),
+        .arch_native = regularFile("amd64\n"),
+        .diversions = regularFile(""),
+        .statoverride = regularFile(""),
+        .triggers_file = regularFile("/usr/bin toolz\n"),
+        .triggers_unincorp = regularFile(""),
+        .info = &.{
+            .{ .name = "z.list", .bytes = "/.\n" },
+            .{ .name = "a.config", .bytes = "#!/bin/sh\n", .mode = 0o755, .uid = 0, .gid = 0 },
+        },
+        .triggers_named = &.{
+            .{ .name = "Zz-after-unincorp", .bytes = "toolz\n" },
+            .{ .name = "Aa-before-file", .bytes = "toolz\n" },
+            .{ .name = "Mm-between-file-and-unincorp", .bytes = "toolz\n" },
+        },
+        .updates = &.{
+            .{ .name = "0001", .bytes = "u1" },
+            .{ .name = "0000", .bytes = "u0" },
+        },
+    };
+
+    var counting: CountingAllocator = .{ .backing = testing.allocator };
+    const actual = try generation(counting.allocator(), snapshot);
+    try testing.expectEqual(@as(usize, 1), counting.allocations);
+    try testing.expectEqual(@as(usize, 15), actual.file_count);
+
+    var reversed_snapshot = snapshot;
+    reversed_snapshot.info = &.{
+        .{ .name = "a.config", .bytes = "#!/bin/sh\n", .mode = 0o755, .uid = 0, .gid = 0 },
+        .{ .name = "z.list", .bytes = "/.\n" },
+    };
+    reversed_snapshot.triggers_named = &.{
+        .{ .name = "Mm-between-file-and-unincorp", .bytes = "toolz\n" },
+        .{ .name = "Aa-before-file", .bytes = "toolz\n" },
+        .{ .name = "Zz-after-unincorp", .bytes = "toolz\n" },
+    };
+    reversed_snapshot.updates = &.{
+        .{ .name = "0000", .bytes = "u0" },
+        .{ .name = "0001", .bytes = "u1" },
+    };
+    const reordered = try generation(testing.allocator, reversed_snapshot);
+    try testing.expect(actual.eql(reordered));
+}
