@@ -162,16 +162,11 @@ test "CLI smoke help version and package-family capability contracts" {
 
     const original = try f.check("package-family-capabilities", 0, null, null);
     defer original.deinit();
-    const legacy = try f.check("package-family-capabilities --transaction-backend legacy_dpkg", 0, null, null);
-    defer legacy.deinit();
-    try testing.expectEqualSlices(u8, original.stdout, legacy.stdout);
-    const legacy_value = try document(&f, original.stdout);
-    try integerField(legacy_value, "version", 1);
-    try testing.expect(std.mem.endsWith(u8, legacy_value.object.get("exact_lock_schema").?.string, "exact-closure-lock-v1"));
-
     const native = try f.check("package-family-capabilities --transaction-backend native", 0, null, null);
     defer native.deinit();
+    try empty(original.stderr);
     try empty(native.stderr);
+    try testing.expectEqualSlices(u8, original.stdout, native.stdout);
     const value = try document(&f, native.stdout);
     try integerField(value, "version", 2);
     try stringField(value, "transaction_backend", "native");
@@ -187,6 +182,7 @@ test "CLI smoke help version and package-family capability contracts" {
     for ([_][]const u8{
         "package-family-capabilities --transaction-backend",
         "package-family-capabilities --transaction-backend invalid",
+        "package-family-capabilities --transaction-backend legacy_dpkg",
         "package-family-capabilities --transaction-backend native --transaction-backend legacy_dpkg",
         "package-family-capabilities --unknown",
         "package-family-capabilities native",

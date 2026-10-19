@@ -358,14 +358,11 @@ test "security: native-only production candidate refuses shipped routes and exac
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
         "build.zig: candidate cutover task: change CLI shipped native-only mode",
-        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
-        "src/repository_backend.zig: candidate cutover task:",
-        "src/apt_system_orchestrator.zig: candidate cutover task:",
-        "src/target_apt_config.zig: candidate cutover task:",
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |message| try baseline.failsWith(message);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: candidate cutover task: remove legacy dpkg/dpkg-deb executor (#281)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: active legacy journal recovery still launches dpkg") == null);
@@ -379,6 +376,10 @@ test "security: native-only production candidate refuses shipped routes and exac
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/system_profile.zig: candidate cutover task: stop executing profile v1/default; retain exact-byte decoder (#282)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/production_backend.zig: candidate cutover task: remove product legacy route/default (#284)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/repository_backend.zig: candidate cutover task: remove repository legacy route/default (#280)") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/repository_cli.zig: candidate cutover task: remove repository CLI legacy default (#280/#283)") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/apt_system_orchestrator.zig: candidate cutover task: remove apt/root legacy profile execution (#280)") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/target_apt_config.zig: candidate cutover task: replace host-root dpkg architecture probe (#280)") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.zig:") == null);
     try testing.expect(std.mem.indexOf(u8, baseline.stderr, "test/native_differential_cli.zig:") == null);
 
@@ -397,6 +398,10 @@ test "security: native-only production candidate refuses shipped routes and exac
         .{ .path = "src/transaction_result_summary.zig", .from = "pub const canonicalJson = canonicalJsonRetiredOrTest;", .to = "pub fn canonicalJson(self: Summary, allocator: std.mem.Allocator) ![]u8 { _ = self; _ = allocator; return error.OutOfMemory; }", .message = "src/transaction_result_summary.zig: candidate cutover task: stop creating legacy result summary v1; retain historical verification (#282)" },
         .{ .path = "src/production_backend.zig", .from = "transaction_backend: transaction_engine.Kind = .native,", .to = "transaction_backend: transaction_engine.Kind = .legacy_dpkg,", .message = "src/production_backend.zig: candidate cutover task: remove product legacy route/default (#284)" },
         .{ .path = "src/package_family_backend.zig", .from = "if (arguments.len == 0) return .native;", .to = "if (arguments.len == 0) return .legacy_dpkg;", .message = "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)" },
+        .{ .path = "src/repository_backend.zig", .from = "transaction_backend: transaction_engine.Kind = .native,", .to = "transaction_backend: transaction_engine.Kind = .legacy_dpkg,", .message = "src/repository_backend.zig: candidate cutover task: remove repository legacy route/default (#280)" },
+        .{ .path = "src/repository_cli.zig", .from = "transaction_backend: debz.transaction_engine.Kind = .native,", .to = "transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg,", .message = "src/repository_cli.zig: candidate cutover task: remove repository CLI legacy default (#280/#283)" },
+        .{ .path = "src/apt_system_orchestrator.zig", .from = "pub const ProfileView = struct {\n    transaction_backend: system_profile.TransactionBackend = .native,", .to = "pub const ProfileView = struct {\n    transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,", .message = "src/apt_system_orchestrator.zig: candidate cutover task: remove apt/root legacy profile execution (#280)" },
+        .{ .path = "src/target_apt_config.zig", .from = "const native_value = native orelse return error.NativeArchitectureUnavailable;", .to = "const argv = [_][]const u8{ \"/usr/bin/dpkg\", \"--print-architecture\" }; _ = argv; const native_value = native orelse return error.NativeArchitectureUnavailable;", .message = "src/target_apt_config.zig: candidate cutover task: replace host-root dpkg architecture probe (#280)" },
         .{ .path = "src/live_root.zig", .from = "const forked = linux.fork();", .to = "const other = linux.syscall5(.execveat, fd, path, argv, envp, flags);\n        const forked = linux.fork();", .message = "src/live_root.zig: unreviewed/stale child-process allowance" },
         .{ .path = "src/package_family_backend.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\nfn unreviewedLaunch() void { _ = std.process.run(allocator, io, args); }", .message = "src/package_family_backend.zig: unreviewed production child-process launch" },
         .{ .path = "test/native_differential_cli.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\n// changed oracle", .message = "test/native_differential_cli.zig: stale reviewed inventory fingerprint" },
@@ -1733,9 +1738,8 @@ test "security: apt import and native child-process owners retain explicit bound
     var f = try Fixture.init();
     defer f.deinit();
     const apt = try f.source("src/target_apt_config.zig");
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, apt, "std.process.run("));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, apt, "std.process.run("));
     for ([_][]const u8{
-        ".environ_map = &environ",
         "const sources_list_path = \"/etc/apt/sources.list\";",
         "const global_keyring_directory_path = \"/etc/apt/trusted.gpg.d\";",
     }) |marker| try support.contains(apt, marker);

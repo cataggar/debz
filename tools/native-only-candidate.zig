@@ -195,9 +195,7 @@ const native_operator_specs = [_]OperatorSpec{
     .{ .path = "src/maintainer_script.zig", .operators = &.{ "linux.clone2", "linux.execve", "linux.fork" } },
 };
 
-const legacy_operator_specs = [_]OperatorSpec{
-    .{ .path = "src/target_apt_config.zig", .operators = &.{"std.process.run"} },
-};
+const legacy_operator_specs = [_]OperatorSpec{};
 
 fn matchesCutoverRoute(path: []const u8, prod: []const u8) bool {
     if (std.mem.eql(u8, path, "src/transaction_executor.zig")) {
@@ -1581,7 +1579,6 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
         "build.zig: candidate cutover task: change CLI shipped native-only mode",
-        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |expected| {
@@ -1590,6 +1587,10 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
     try testing.expect(!hasFailureContaining(
         &failures,
         "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
     ));
     try testing.expect(!hasFailureContaining(
         &failures,
@@ -1642,6 +1643,22 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
     try testing.expect(!hasFailureContaining(
         &failures,
         "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/repository_backend.zig: candidate cutover task: remove repository legacy route/default (#280)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/repository_cli.zig: candidate cutover task: remove repository CLI legacy default (#280/#283)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/apt_system_orchestrator.zig: candidate cutover task: remove apt/root legacy profile execution (#280)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/target_apt_config.zig: candidate cutover task: replace host-root dpkg architecture probe (#280)",
     ));
 
     const options = @import("native_only_candidate_options");

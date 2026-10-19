@@ -10,7 +10,7 @@ pub const OutputFormat = enum {
 
 pub const ParsedAdd = struct {
     request: api.Request,
-    transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg,
+    transaction_backend: debz.transaction_engine.Kind = .native,
     output: OutputFormat = .human,
 };
 
