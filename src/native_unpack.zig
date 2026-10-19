@@ -19264,13 +19264,16 @@ fn snapshotSystemdProcIsBound(
 ) bool {
     const version_and_digest_match =
         (std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
+            std.mem.eql(u8, architecture, "amd64") and
+            std.mem.eql(u8, package.architecture, "amd64") and
             std.mem.eql(u8, &script_sha256, snapshot_systemd_postinst_sha256)) or
         (std.mem.eql(u8, package.version, "257.13-1~deb13u1") and
+            (std.mem.eql(u8, architecture, "amd64") or
+                std.mem.eql(u8, architecture, "arm64")) and
+            std.mem.eql(u8, package.architecture, architecture) and
             std.mem.eql(u8, &script_sha256, snapshot_debian_systemd_postinst_sha256));
-    return std.mem.eql(u8, architecture, "amd64") and
-        std.mem.eql(u8, package.name, "systemd") and
+    return std.mem.eql(u8, package.name, "systemd") and
         version_and_digest_match and
-        std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
         arguments.len == 2 and
@@ -19448,6 +19451,35 @@ test "native_unpack.test.signed systemd configure uses only matching staged and 
         .new_package,
         .script,
         digest,
+        args,
+    ));
+    const debian_digest: native_program.Digest = snapshot_debian_systemd_postinst_sha256.*;
+    for ([_][]const u8{ "amd64", "arm64" }) |arch| {
+        try testing.expect(snapshotSystemdProcIsBound(
+            arch,
+            .{
+                .name = "systemd",
+                .version = "257.13-1~deb13u1",
+                .architecture = arch,
+            },
+            .postinst,
+            .new_package,
+            .script,
+            debian_digest,
+            args,
+        ));
+    }
+    try testing.expect(!snapshotSystemdProcIsBound(
+        "arm64",
+        .{
+            .name = "systemd",
+            .version = "257.13-1~deb13u1",
+            .architecture = "amd64",
+        },
+        .postinst,
+        .new_package,
+        .script,
+        debian_digest,
         args,
     ));
     for ([_]struct {
@@ -22751,8 +22783,10 @@ fn snapshotDebianBashPostinstIsBound(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotDebianBashPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    const arch_matches = (std.mem.eql(u8, architecture, "amd64") or
+        std.mem.eql(u8, architecture, "arm64")) and
+        std.mem.eql(u8, package.architecture, architecture);
+    if (!arch_matches or
         !std.mem.eql(u8, package.name, "bash") or
         !std.mem.eql(u8, package.version, "5.2.37-2+b10") or
         kind != .postinst or source != .new_package or
@@ -22772,10 +22806,14 @@ fn snapshotDebianGawkPostinstIsBound(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotDebianGawkPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    const arch_and_version_matches =
+        ((std.mem.eql(u8, architecture, "amd64") and
+            std.mem.eql(u8, package.version, "1:5.2.1-2+b1")) or
+            (std.mem.eql(u8, architecture, "arm64") and
+                std.mem.eql(u8, package.version, "1:5.2.1-2+b2"))) and
+        std.mem.eql(u8, package.architecture, architecture);
+    if (!arch_and_version_matches or
         !std.mem.eql(u8, package.name, "gawk") or
-        !std.mem.eql(u8, package.version, "1:5.2.1-2+b1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or

@@ -457,7 +457,11 @@ manual native-architecture real-snapshot matrix is intended to exercise this
 sequence for Ubuntu 26.04 `ubuntu-minimal`, but its current reviewed snapshot
 is refused by the explicit finite repository freshness policy before lock
 resolution or mutation; see
-[zvmi Debian-family backend](zvmi-package-family.md).
+[zvmi Debian-family backend](zvmi-package-family.md). For Debian 13 (`trixie`),
+the signed `apt` and `systemd-sysv` exact closures are bound for both `amd64`
+(#271) and `arm64` (#273) across native unpack/script admissions, reference
+runtime/launcher/ordering, and strict differential comparison; see
+[Debian 13 stable signed-input readiness](debian-stable-readiness.md).
 
 ## Dependency solver
 
