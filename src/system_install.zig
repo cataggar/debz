@@ -2078,6 +2078,12 @@ test "system_install.test route accepts only the short system form" {
     try std.testing.expectEqual(Output.human, plain.output);
     try std.testing.expectEqual(@as(?u64, null), plain.deadline_ms);
     try std.testing.expectEqual(@as(u64, 30_000), plain.lock_wait_ms);
+    const symcrypt_route = route(&.{
+        "--json", "-y", "--noninteractive", "--transaction-backend", "native", "symcrypt-openssl",
+    }).system;
+    try std.testing.expectEqualStrings("symcrypt-openssl", symcrypt_route.package);
+    try std.testing.expectEqual(@as(?Kind, .native), symcrypt_route.backend);
+    try std.testing.expectEqual(Output.json, symcrypt_route.output);
     const full = route(&.{
         "--json",         "-y", "--noninteractive", "--transaction-backend", "native", "--deadline-ms", "5",
         "--lock-wait-ms", "0",  "demo",

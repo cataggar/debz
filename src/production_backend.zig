@@ -9640,6 +9640,587 @@ test "production system install derives SHA-512 only over archives that match a 
     }
 }
 
+const NobleSymCryptRepository = struct {
+    const archive_application = @import("archive_application.zig");
+    const test_openpgp_signer = @import("test_openpgp_signer.zig");
+    const target = @import("target_apt_config.zig");
+    const active = @import("active_repository_config.zig");
+
+    architecture: []const u8,
+    symcrypt_archive: []u8,
+    symcrypt_openssl_archive: []u8,
+    microsoft_packages: []u8,
+    microsoft_in_release: []u8,
+    microsoft_keyring: []u8,
+    ubuntu_archive: []u8,
+    ubuntu_packages: []u8,
+    ubuntu_in_release: []u8,
+    ubuntu_keyring: []u8,
+
+    const maximum_age: u64 = 1_209_600;
+    const now_unix: i64 = 1_790_109_000;
+
+    fn init(allocator: std.mem.Allocator, architecture: []const u8) !NobleSymCryptRepository {
+        const symcrypt_data = [_]archive_application.test_fixtures.Entry{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/lib", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/lib/libsymcrypt.so.103", .content = "symcrypt core library\n" },
+        };
+        const symcrypt_archive = try archive_application.test_fixtures.build(allocator, .{
+            .package = "symcrypt",
+            .version = "103.11.0-1",
+            .architecture = architecture,
+            .control_fields = "Depends: libc6 (>= 2.34)\n",
+            .data = &symcrypt_data,
+        });
+        const symcrypt_openssl_data = [_]archive_application.test_fixtures.Entry{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/lib", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/lib/ossl-modules", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/lib/ossl-modules/symcryptprovider.so", .content = "symcrypt openssl 3 provider\n" },
+        };
+        const symcrypt_openssl_archive = try archive_application.test_fixtures.build(allocator, .{
+            .package = "symcrypt-openssl",
+            .version = "1.9.6-1~3.0",
+            .architecture = architecture,
+            .control_fields = "Depends: libc6 (>= 2.34), libssl3t64 (>= 3.0.0), openssl (>= 3.0.0), openssl (<< 3.1.0), symcrypt (>= 103.11.0-1)\n",
+            .data = &symcrypt_openssl_data,
+        });
+        var symcrypt_hex: [128]u8 = undefined;
+        var symcrypt_openssl_hex: [128]u8 = undefined;
+        const microsoft_packages = try std.fmt.allocPrint(
+            allocator,
+            "Package: symcrypt\n" ++
+                "Version: 103.11.0-1\n" ++
+                "Architecture: {s}\n" ++
+                "Maintainer: Microsoft Corporation <linux-packages-key@microsoft.com>\n" ++
+                "Depends: libc6 (>= 2.34)\n" ++
+                "Description: Microsoft SymCrypt cryptographic library\n" ++
+                "Filename: pool/main/s/symcrypt/symcrypt_103.11.0-1_{s}.deb\n" ++
+                "Size: {d}\n" ++
+                "Installed-Size: 1\n" ++
+                "SHA256: {s}\n\n" ++
+                "Package: symcrypt-openssl\n" ++
+                "Version: 1.9.6-1~3.0\n" ++
+                "Architecture: {s}\n" ++
+                "Maintainer: Microsoft Corporation <linux-packages-key@microsoft.com>\n" ++
+                "Depends: libc6 (>= 2.34), libssl3t64 (>= 3.0.0), openssl (>= 3.0.0), openssl (<< 3.1.0), symcrypt (>= 103.11.0-1)\n" ++
+                "Description: SymCrypt provider for OpenSSL 3\n" ++
+                "Filename: pool/main/s/symcrypt-openssl/symcrypt-openssl_1.9.6-1~3.0_{s}.deb\n" ++
+                "Size: {d}\n" ++
+                "Installed-Size: 1\n" ++
+                "SHA256: {s}\n\n",
+            .{
+                architecture,
+                architecture,
+                symcrypt_archive.len,
+                content_digest.Value.of(.sha256, symcrypt_archive).hex(&symcrypt_hex),
+                architecture,
+                architecture,
+                symcrypt_openssl_archive.len,
+                content_digest.Value.of(.sha256, symcrypt_openssl_archive).hex(&symcrypt_openssl_hex),
+            },
+        );
+        var ms_index_sha256: [128]u8 = undefined;
+        var ms_index_sha512: [128]u8 = undefined;
+        const microsoft_release = try std.fmt.allocPrint(
+            allocator,
+            "Origin: microsoft-ubuntu-noble-prod noble\n" ++
+                "Label: microsoft-ubuntu-noble-prod noble\n" ++
+                "Suite: noble\n" ++
+                "Codename: noble\n" ++
+                "Date: Tue, 22 Sep 2026 20:00:00 UTC\n" ++
+                "Architectures: amd64 arm64 armhf\n" ++
+                "Components: main\n" ++
+                "Acquire-By-Hash: no\n" ++
+                "SHA256:\n {s} {d} main/binary-{s}/Packages\n" ++
+                "SHA512:\n {s} {d} main/binary-{s}/Packages\n",
+            .{
+                content_digest.Value.of(.sha256, microsoft_packages).hex(&ms_index_sha256),
+                microsoft_packages.len,
+                architecture,
+                content_digest.Value.of(.sha512, microsoft_packages).hex(&ms_index_sha512),
+                microsoft_packages.len,
+                architecture,
+            },
+        );
+        const microsoft_signer = try test_openpgp_signer.Signer.init(allocator, .{
+            .uid = "Microsoft (Release signing) <gpgsecurity@microsoft.com>",
+            .created = 1_790_100_000,
+        });
+
+        const ubuntu_data = [_]archive_application.test_fixtures.Entry{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/ca-certificates", .content = "noble base\n" },
+        };
+        const ubuntu_archive = try archive_application.test_fixtures.build(allocator, .{
+            .package = "ca-certificates",
+            .version = "20240203",
+            .architecture = architecture,
+            .data = &ubuntu_data,
+        });
+        var ubuntu_sha256: [128]u8 = undefined;
+        var ubuntu_sha512: [128]u8 = undefined;
+        const ubuntu_packages = try std.fmt.allocPrint(
+            allocator,
+            "Package: ca-certificates\n" ++
+                "Version: 20240203\n" ++
+                "Architecture: {s}\n" ++
+                "Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>\n" ++
+                "Description: Common CA certificates\n" ++
+                "Filename: pool/main/c/ca-certificates/ca-certificates_20240203_{s}.deb\n" ++
+                "Size: {d}\n" ++
+                "Installed-Size: 1\n" ++
+                "SHA256: {s}\n" ++
+                "SHA512: {s}\n\n",
+            .{
+                architecture,
+                architecture,
+                ubuntu_archive.len,
+                content_digest.Value.of(.sha256, ubuntu_archive).hex(&ubuntu_sha256),
+                content_digest.Value.of(.sha512, ubuntu_archive).hex(&ubuntu_sha512),
+            },
+        );
+        var ubuntu_index_sha256: [128]u8 = undefined;
+        var ubuntu_index_sha512: [128]u8 = undefined;
+        const ubuntu_release = try std.fmt.allocPrint(
+            allocator,
+            "Origin: Ubuntu\n" ++
+                "Label: Ubuntu\n" ++
+                "Suite: noble\n" ++
+                "Codename: noble\n" ++
+                "Date: Tue, 22 Sep 2026 20:00:00 UTC\n" ++
+                "Valid-Until: Wed, 23 Sep 2026 20:00:00 UTC\n" ++
+                "Architectures: {s}\n" ++
+                "Components: main\n" ++
+                "Acquire-By-Hash: no\n" ++
+                "SHA256:\n {s} {d} main/binary-{s}/Packages\n" ++
+                "SHA512:\n {s} {d} main/binary-{s}/Packages\n",
+            .{
+                architecture,
+                content_digest.Value.of(.sha256, ubuntu_packages).hex(&ubuntu_index_sha256),
+                ubuntu_packages.len,
+                architecture,
+                content_digest.Value.of(.sha512, ubuntu_packages).hex(&ubuntu_index_sha512),
+                ubuntu_packages.len,
+                architecture,
+            },
+        );
+        const ubuntu_signer = try test_openpgp_signer.Signer.init(allocator, .{
+            .uid = "Ubuntu Archive Automatic Signing Key <ftpmaster@ubuntu.com>",
+            .created = 1_790_090_000,
+        });
+
+        return .{
+            .architecture = architecture,
+            .symcrypt_archive = symcrypt_archive,
+            .symcrypt_openssl_archive = symcrypt_openssl_archive,
+            .microsoft_packages = microsoft_packages,
+            .microsoft_in_release = try microsoft_signer.clearsign(allocator, microsoft_release),
+            .microsoft_keyring = microsoft_signer.keyring,
+            .ubuntu_archive = ubuntu_archive,
+            .ubuntu_packages = ubuntu_packages,
+            .ubuntu_in_release = try ubuntu_signer.clearsign(allocator, ubuntu_release),
+            .ubuntu_keyring = ubuntu_signer.keyring,
+        };
+    }
+
+    fn statusText(allocator: std.mem.Allocator, architecture: []const u8, openssl_version: []const u8, symcrypt_installed: bool) ![]u8 {
+        const extra = if (symcrypt_installed)
+            try std.fmt.allocPrint(
+                allocator,
+                "Package: symcrypt\nStatus: install ok installed\nVersion: 103.11.0-1\nArchitecture: {s}\nDepends: libc6 (>= 2.34)\n\n" ++
+                    "Package: symcrypt-openssl\nStatus: install ok installed\nVersion: 1.9.6-1~3.0\nArchitecture: {s}\n" ++
+                    "Depends: libc6 (>= 2.34), libssl3t64 (>= 3.0.0), openssl (>= 3.0.0), openssl (<< 3.1.0), symcrypt (>= 103.11.0-1)\n\n",
+                .{ architecture, architecture },
+            )
+        else
+            "";
+        return std.fmt.allocPrint(
+            allocator,
+            "Package: libc6\nStatus: install ok installed\nVersion: 2.39-0ubuntu8.3\nArchitecture: {s}\n\n" ++
+                "Package: libssl3t64\nStatus: install ok installed\nVersion: 3.0.13-0ubuntu3.4\nArchitecture: {s}\nDepends: libc6 (>= 2.34)\n\n" ++
+                "Package: openssl\nStatus: install ok installed\nVersion: {s}\nArchitecture: {s}\nDepends: libc6 (>= 2.34), libssl3t64 (>= 3.0.0)\n\n" ++
+                "Package: local-fips-policy\nStatus: hold ok installed\nVersion: 1.0-local\nArchitecture: {s}\n\n" ++
+                "Package: legacy-agent\nStatus: deinstall ok config-files\nVersion: 0.9-1\nArchitecture: {s}\n\n" ++
+                "{s}",
+            .{ architecture, architecture, openssl_version, architecture, architecture, architecture, extra },
+        );
+    }
+
+    fn stageRoot(
+        self: *const NobleSymCryptRepository,
+        allocator: std.mem.Allocator,
+        directory: *std.testing.TmpDir,
+        status: []const u8,
+    ) !struct { install_root: []u8, context: *system_product_context.Context } {
+        const ms_binary_dir = try std.fmt.allocPrint(allocator, "repo-microsoft/dists/noble/main/binary-{s}", .{self.architecture});
+        const ubuntu_binary_dir = try std.fmt.allocPrint(allocator, "repo-ubuntu/dists/noble/main/binary-{s}", .{self.architecture});
+        try directory.dir.createDirPath(std.testing.io, ms_binary_dir);
+        try directory.dir.createDirPath(std.testing.io, "repo-microsoft/pool/main/s/symcrypt");
+        try directory.dir.createDirPath(std.testing.io, "repo-microsoft/pool/main/s/symcrypt-openssl");
+        try directory.dir.createDirPath(std.testing.io, ubuntu_binary_dir);
+        try directory.dir.createDirPath(std.testing.io, "repo-ubuntu/pool/main/c/ca-certificates");
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg");
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/debz");
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo-microsoft/dists/noble/InRelease", .data = self.microsoft_in_release });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(allocator, "{s}/Packages", .{ms_binary_dir}),
+            .data = self.microsoft_packages,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(allocator, "repo-microsoft/pool/main/s/symcrypt/symcrypt_103.11.0-1_{s}.deb", .{self.architecture}),
+            .data = self.symcrypt_archive,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(allocator, "repo-microsoft/pool/main/s/symcrypt-openssl/symcrypt-openssl_1.9.6-1~3.0_{s}.deb", .{self.architecture}),
+            .data = self.symcrypt_openssl_archive,
+        });
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo-ubuntu/dists/noble/InRelease", .data = self.ubuntu_in_release });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(allocator, "{s}/Packages", .{ubuntu_binary_dir}),
+            .data = self.ubuntu_packages,
+        });
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(allocator, "repo-ubuntu/pool/main/c/ca-certificates/ca-certificates_20240203_{s}.deb", .{self.architecture}),
+            .data = self.ubuntu_archive,
+        });
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = status });
+        try prepareBaselinePublicationLocks(directory);
+
+        var real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const real_length = try directory.dir.realPath(std.testing.io, &real_buffer);
+        const base = real_buffer[0..real_length];
+        const install_root = try std.fmt.allocPrint(allocator, "{s}/root", .{base});
+
+        var root = try root_fs.openAbsoluteRoot(std.testing.io, install_root);
+        defer root.close();
+        try root.root.createDirectoryPath(try root_fs.Path.init("etc/apt/sources.list.d"), .fromMode(0o755));
+        try root.root.createDirectoryPath(try root_fs.Path.init("usr/share/keyrings"), .fromMode(0o755));
+        try root.root.publishFile(
+            try root_fs.Path.init("etc/apt/sources.list.d/ubuntu.list"),
+            try std.fmt.allocPrint(allocator, "deb [arch={s} signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] file://{s}/repo-ubuntu noble main\n", .{ self.architecture, base }),
+            .{},
+        );
+        try root.root.publishFile(
+            try root_fs.Path.init("etc/apt/sources.list.d/vendor.list"),
+            try std.fmt.allocPrint(allocator, "deb [arch={s} signed-by=/usr/share/keyrings/microsoft-prod.gpg] file://{s}/repo-microsoft noble main\n", .{ self.architecture, base }),
+            .{},
+        );
+        try root.root.publishFile(try root_fs.Path.init("usr/share/keyrings/ubuntu-archive-keyring.gpg"), self.ubuntu_keyring, .{});
+        try root.root.publishFile(try root_fs.Path.init("usr/share/keyrings/microsoft-prod.gpg"), self.microsoft_keyring, .{});
+
+        var files: target.ProductionFileSystem = .{ .io = std.testing.io, .root = root.root.dir, .host_root = false };
+        var snapshot = try target.snapshot(allocator, .{
+            .root_path = install_root,
+            .architecture_override = self.architecture,
+            .source_policies = &.{.{
+                .logical_path = "/etc/apt/sources.list.d/vendor.list",
+                .freshness = .{ .allow_missing_valid_until_with_max_age_seconds = maximum_age },
+                .archive_binding = .signed_sha256_derived_sha512,
+            }},
+            .dependencies = .{ .filesystem = files.interface() },
+        });
+        defer snapshot.deinit();
+        try std.testing.expectEqual(target.ArtifactVersion.v3, snapshot.manifest.manifest.artifact_version);
+
+        const manifest_path = "/var/lib/debz/repository/operations/" ++ @as([64]u8, @splat('2')) ++ "/apt-config-snapshot-v1.json";
+        const path = try root_fs.Path.fromAbsolute(manifest_path);
+        try root.root.createDirectoryPath(path.parent().?, .fromMode(0o700));
+        const bytes = try snapshot.manifest.manifest.canonicalJson(allocator);
+        try root.root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600), .durable = true });
+        var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+        var coordinator = try root_operation.Coordinator.open(std.testing.io, root.root, install_root, locks.interface());
+        var attempt = try coordinator.acquire(allocator, .{
+            .backend = .legacy_dpkg,
+            .operation = .{ .repository_bootstrap = .add },
+            .request_sha256 = @splat(3),
+            .policy_sha256 = @splat(4),
+            .target_architecture = self.architecture,
+        });
+        defer attempt.release();
+        try active.publish(allocator, &attempt, "/var/lib/debz", manifest_path, snapshot.manifest.manifest, null);
+        try attempt.complete(allocator, .abandoned_before_mutation);
+        try attempt.clear();
+        const context = try system_product_context.resolve(allocator, std.testing.io, .{
+            .root = install_root,
+            .architecture = self.architecture,
+        });
+        return .{ .install_root = install_root, .context = context };
+    }
+};
+
+test "production system install proves symcrypt and symcrypt-openssl on Ubuntu Noble across amd64 and arm64 with installed-only baseline and OpenSSL conflict refusal" {
+    const system_install = @import("system_install.zig");
+    const command = @import("system_install_command.zig");
+    const Crash = struct {
+        armed: ?system_install.CrashPoint = null,
+
+        fn hit(raw: ?*anyopaque, point: system_install.CrashPoint) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.armed != point) return;
+            self.armed = null;
+            return error.InjectedCrash;
+        }
+    };
+
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        var repo_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer repo_arena.deinit();
+        const noble = try NobleSymCryptRepository.init(repo_arena.allocator(), architecture);
+        var symcrypt_sha256_hex: [128]u8 = undefined;
+        var symcrypt_sha512_hex: [128]u8 = undefined;
+        var symcrypt_openssl_sha256_hex: [128]u8 = undefined;
+        var symcrypt_openssl_sha512_hex: [128]u8 = undefined;
+        const symcrypt_sha256 = content_digest.Value.of(.sha256, noble.symcrypt_archive).hex(&symcrypt_sha256_hex);
+        const symcrypt_sha512 = content_digest.Value.of(.sha512, noble.symcrypt_archive).hex(&symcrypt_sha512_hex);
+        const symcrypt_openssl_sha256 = content_digest.Value.of(.sha256, noble.symcrypt_openssl_archive).hex(&symcrypt_openssl_sha256_hex);
+        const symcrypt_openssl_sha512 = content_digest.Value.of(.sha512, noble.symcrypt_openssl_archive).hex(&symcrypt_openssl_sha512_hex);
+
+        // 1. Healthy Ubuntu Noble prestate (`libc6`, `libssl3t64`, `openssl 3.0.13-0ubuntu3.4`,
+        // held `local-fips-policy`, removed `legacy-agent`): prove `debz install symcrypt`
+        // and `debz install symcrypt-openssl` across both backends, including interruption
+        // and deterministic resume.
+        for ([_]transaction_engine.Kind{ .native, .legacy_dpkg }) |kind| {
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const status = try NobleSymCryptRepository.statusText(allocator, architecture, "3.0.13-0ubuntu3.4", false);
+            const staged = try noble.stageRoot(allocator, &directory, status);
+            defer staged.context.deinit();
+
+            var backend: Backend = .{
+                .io = std.testing.io,
+                .transaction_backend = kind,
+                .active_context = staged.context,
+                .now_unix = NobleSymCryptRepository.now_unix,
+            };
+            var revalidation: command.Revalidation = .{ .context = staged.context };
+            var planner: command.ProductionPlanner = .{ .backend = &backend, .context = staged.context };
+            var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+            const authority = try command.authorityOf(allocator, staged.context, staged.install_root, &revalidation);
+            var crash: Crash = .{};
+            const runner: system_install.Engine = .{
+                .io = std.testing.io,
+                .authority = authority,
+                .planner = planner.interface(),
+                .observer = .{ .context = &crash, .hitFn = Crash.hit },
+                .locks = locks.interface(),
+            };
+
+            // `debz install symcrypt` selects only `symcrypt` (1 archive), never `symcrypt-openssl`.
+            var symcrypt_result = try runner.run(std.testing.allocator, .{ .package = "symcrypt" }, kind);
+            defer symcrypt_result.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, symcrypt_result.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, symcrypt_result.value.outcome);
+            try std.testing.expectEqual(api.ErrorId.transaction_backend_unavailable, symcrypt_result.value.diagnostics[0].id);
+            try std.testing.expect(!symcrypt_result.value.changed);
+            try std.testing.expect(!symcrypt_result.value.resumed);
+            const symcrypt_plan = symcrypt_result.value.plan.?;
+            try std.testing.expectEqualStrings(architecture, symcrypt_plan.target_architecture);
+            try std.testing.expectEqual(@as(usize, 1), symcrypt_plan.archives.len);
+            try std.testing.expectEqualStrings("symcrypt", symcrypt_plan.archives[0].package);
+            try std.testing.expectEqualStrings("103.11.0-1", symcrypt_plan.archives[0].version);
+            try std.testing.expectEqualStrings(architecture, symcrypt_plan.archives[0].architecture);
+            try std.testing.expectEqual(.requested, symcrypt_plan.archives[0].retention);
+            try std.testing.expectEqual(content_digest.Algorithm.sha256, symcrypt_plan.archives[0].primary);
+            try std.testing.expectEqual(@as(usize, 1), symcrypt_plan.archives[0].published_digests.len);
+            try std.testing.expectEqualStrings(symcrypt_sha256, symcrypt_plan.archives[0].published_digests[0].value);
+            try std.testing.expectEqual(@as(u64, 4), symcrypt_plan.installed.fact_count);
+            try std.testing.expectEqual(@as(usize, 1), symcrypt_plan.installed.held.len);
+            try std.testing.expectEqualStrings("local-fips-policy", symcrypt_plan.installed.held[0].name);
+            try std.testing.expectEqual(@as(usize, 2), staged.context.snapshot().configuration.repositories.len);
+            try std.testing.expectEqual(@as(usize, 1), symcrypt_plan.repositories.len);
+            try std.testing.expectEqual(system_install.FreshnessPolicy.bounded_missing_valid_until, symcrypt_plan.repositories[0].freshness.policy);
+            try std.testing.expectEqual(@as(?u64, NobleSymCryptRepository.maximum_age), symcrypt_plan.repositories[0].freshness.maximum_release_age_seconds);
+
+            // `debz install symcrypt-openssl` interrupted after lock binding blocks a
+            // competing `symcrypt` request and resumes cleanly when `symcrypt-openssl` is retried.
+            crash.armed = .after_lock_bound;
+            var interrupted = try runner.run(std.testing.allocator, .{ .package = "symcrypt-openssl" }, kind);
+            defer interrupted.deinit();
+            try std.testing.expectEqual(api.ExitStatus.recovery, interrupted.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.interrupted, interrupted.value.outcome);
+            try std.testing.expect(!interrupted.value.resumed);
+            try directory.dir.access(std.testing.io, "root/" ++ system_install.active_path, .{});
+
+            var competing = try runner.run(std.testing.allocator, .{ .package = "symcrypt" }, kind);
+            defer competing.deinit();
+            try std.testing.expectEqual(api.ExitStatus.recovery, competing.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.interrupted, competing.value.outcome);
+            try std.testing.expect(!competing.value.resumed);
+
+            var resumed = try runner.run(std.testing.allocator, .{ .package = "symcrypt-openssl" }, kind);
+            defer resumed.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, resumed.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, resumed.value.outcome);
+            try std.testing.expect(resumed.value.resumed);
+            try std.testing.expectEqualStrings(&interrupted.value.attempt_id.?, &resumed.value.attempt_id.?);
+            try std.testing.expectEqualStrings(interrupted.value.lock.?, resumed.value.lock.?);
+            try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ system_install.active_path, .{}));
+
+            const provider_plan = resumed.value.plan.?;
+            try std.testing.expectEqualStrings(architecture, provider_plan.target_architecture);
+            try std.testing.expectEqual(@as(usize, 2), provider_plan.archives.len);
+            try std.testing.expectEqualStrings("symcrypt", provider_plan.archives[0].package);
+            try std.testing.expectEqualStrings("103.11.0-1", provider_plan.archives[0].version);
+            try std.testing.expectEqual(.dependency, provider_plan.archives[0].retention);
+            try std.testing.expectEqualStrings(symcrypt_sha256, provider_plan.archives[0].published_digests[0].value);
+            try std.testing.expectEqualStrings("symcrypt-openssl", provider_plan.archives[1].package);
+            try std.testing.expectEqualStrings("1.9.6-1~3.0", provider_plan.archives[1].version);
+            try std.testing.expectEqual(.requested, provider_plan.archives[1].retention);
+            try std.testing.expectEqualStrings(symcrypt_openssl_sha256, provider_plan.archives[1].published_digests[0].value);
+
+            const json = try resumed.canonicalJson(allocator);
+            var human: std.Io.Writer.Allocating = .init(allocator);
+            try system_install.render(allocator, &resumed.value, .human, &human.writer, &human.writer);
+            for ([_][]const u8{ json, human.written() }) |evidence|
+                try std.testing.expect(std.mem.indexOf(u8, evidence, "upstream") == null);
+
+            const lock_file = try std.fs.path.join(allocator, &.{ staged.install_root, resumed.value.lock.? });
+            var lock = try readProductLock(allocator, std.testing.io, lock_file, kind);
+            defer lock.deinit();
+            try std.testing.expect(lock == .active_install);
+            const observed = lock.active_install.evidence().observed;
+            try std.testing.expectEqualStrings(architecture, observed.native_architecture);
+            try std.testing.expectEqual(@as(usize, 4), observed.packages.len);
+            for (observed.packages) |pkg| try std.testing.expectEqualStrings(architecture, pkg.architecture);
+            try std.testing.expectEqualSlices(u8, &staged.context.snapshot().manifest.digest_sha256, &lock.active_install.context().manifest_sha256);
+            const locked = lock.active_install.archive_lock.lock;
+            try std.testing.expectEqual(@as(usize, 2), locked.packages.len);
+            if (kind == .native) {
+                try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_derived_sha512, provider_plan.archives[0].archive_authentication);
+                try std.testing.expectEqualStrings(symcrypt_sha512, &provider_plan.archives[0].derived_sha512.?.value);
+                try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_derived_sha512, provider_plan.archives[1].archive_authentication);
+                try std.testing.expectEqualStrings(symcrypt_openssl_sha512, &provider_plan.archives[1].derived_sha512.?.value);
+                try std.testing.expectEqual(content_digest.Value.of(.sha512, noble.symcrypt_archive).sha512, locked.packages[0].derived_sha512.?);
+                try std.testing.expectEqual(content_digest.Value.of(.sha512, noble.symcrypt_openssl_archive).sha512, locked.packages[1].derived_sha512.?);
+                try std.testing.expect(std.mem.indexOf(u8, json, "\"provenance\":\"derived_from_signed_sha256\"") != null);
+            } else {
+                try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_only, provider_plan.archives[0].archive_authentication);
+                try std.testing.expect(provider_plan.archives[0].derived_sha512 == null);
+                try std.testing.expectEqual(system_install.ArchiveClass.signed_sha256_only, provider_plan.archives[1].archive_authentication);
+                try std.testing.expect(provider_plan.archives[1].derived_sha512 == null);
+                try std.testing.expect(locked.packages[0].derived_sha512 == null);
+                try std.testing.expect(locked.packages[1].derived_sha512 == null);
+            }
+
+            const status_after = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+            try std.testing.expectEqualStrings(status, status_after);
+        }
+
+        // 2. When `symcrypt` is already `install ok installed` in `/var/lib/dpkg/status`,
+        // `debz install symcrypt-openssl` satisfies `symcrypt (>= 103.11.0-1)` from the
+        // healthy installed database (`fact_count == 5`) and plans only `symcrypt-openssl`
+        // (`archives.len == 1`), and repeating the install produces a fresh non-resumed
+        // attempt with identical archive closure and unchanged dpkg status.
+        {
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const base_status = try NobleSymCryptRepository.statusText(allocator, architecture, "3.0.13-0ubuntu3.4", false);
+            const status = try std.fmt.allocPrint(
+                allocator,
+                "{s}Package: symcrypt\nStatus: install ok installed\nVersion: 103.11.0-1\nArchitecture: {s}\nDepends: libc6 (>= 2.34)\n\n",
+                .{ base_status, architecture },
+            );
+            const staged = try noble.stageRoot(allocator, &directory, status);
+            defer staged.context.deinit();
+
+            var backend: Backend = .{
+                .io = std.testing.io,
+                .transaction_backend = .native,
+                .active_context = staged.context,
+                .now_unix = NobleSymCryptRepository.now_unix,
+            };
+            var revalidation: command.Revalidation = .{ .context = staged.context };
+            var planner: command.ProductionPlanner = .{ .backend = &backend, .context = staged.context };
+            var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+            const runner: system_install.Engine = .{
+                .io = std.testing.io,
+                .authority = try command.authorityOf(allocator, staged.context, staged.install_root, &revalidation),
+                .planner = planner.interface(),
+                .locks = locks.interface(),
+            };
+            var first = try runner.run(std.testing.allocator, .{ .package = "symcrypt-openssl" }, .native);
+            defer first.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, first.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, first.value.outcome);
+            try std.testing.expect(!first.value.changed and !first.value.resumed);
+            try std.testing.expectEqual(@as(usize, 1), first.value.plan.?.archives.len);
+            try std.testing.expectEqualStrings("symcrypt-openssl", first.value.plan.?.archives[0].package);
+            try std.testing.expectEqual(.requested, first.value.plan.?.archives[0].retention);
+            try std.testing.expectEqual(@as(u64, 5), first.value.plan.?.installed.fact_count);
+
+            const routed = system_install.route(&.{
+                "--json",
+                "-y",
+                "--noninteractive",
+                "--transaction-backend",
+                "native",
+                "symcrypt-openssl",
+            });
+            var repeat = try runner.run(std.testing.allocator, routed.system, .native);
+            defer repeat.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, repeat.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, repeat.value.outcome);
+            try std.testing.expect(!repeat.value.changed and !repeat.value.resumed);
+            try std.testing.expect(!std.mem.eql(u8, &first.value.attempt_id.?, &repeat.value.attempt_id.?));
+            try std.testing.expectEqual(@as(usize, 1), repeat.value.plan.?.archives.len);
+            try std.testing.expectEqualStrings("symcrypt-openssl", repeat.value.plan.?.archives[0].package);
+        }
+
+        // 3. Pre-mutation OpenSSL range conflict refusal: when installed `openssl` is outside
+        // `>= 3.0.0, << 3.1.0`, `symcrypt-openssl` fails closed before lock publication, while
+        // `symcrypt` still plans cleanly.
+        for ([_][]const u8{ "1.1.1w-1", "3.1.0-1" }) |incompatible_openssl| {
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            const status = try NobleSymCryptRepository.statusText(allocator, architecture, incompatible_openssl, false);
+            const staged = try noble.stageRoot(allocator, &directory, status);
+            defer staged.context.deinit();
+
+            var backend: Backend = .{
+                .io = std.testing.io,
+                .transaction_backend = .native,
+                .active_context = staged.context,
+                .now_unix = NobleSymCryptRepository.now_unix,
+            };
+            var revalidation: command.Revalidation = .{ .context = staged.context };
+            var planner: command.ProductionPlanner = .{ .backend = &backend, .context = staged.context };
+            var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+            const runner: system_install.Engine = .{
+                .io = std.testing.io,
+                .authority = try command.authorityOf(allocator, staged.context, staged.install_root, &revalidation),
+                .planner = planner.interface(),
+                .locks = locks.interface(),
+            };
+            var refused = try runner.run(std.testing.allocator, .{ .package = "symcrypt-openssl" }, .native);
+            defer refused.deinit();
+            try std.testing.expectEqual(api.ExitStatus.planning, refused.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.rejected, refused.value.outcome);
+            try std.testing.expectEqual(api.ErrorId.planning_failed, refused.value.diagnostics[0].id);
+            try std.testing.expect(std.mem.indexOf(u8, refused.value.diagnostics[0].message, "openssl") != null);
+            try std.testing.expect(refused.value.plan == null and refused.value.lock == null);
+
+            var standalone = try runner.run(std.testing.allocator, .{ .package = "symcrypt" }, .native);
+            defer standalone.deinit();
+            try std.testing.expectEqual(api.ExitStatus.unavailable, standalone.exitStatus());
+            try std.testing.expectEqual(system_install.Outcome.refused_before_mutation, standalone.value.outcome);
+            try std.testing.expectEqual(@as(usize, 1), standalone.value.plan.?.archives.len);
+            try std.testing.expectEqualStrings("symcrypt", standalone.value.plan.?.archives[0].package);
+        }
+    }
+}
+
 test "production healthy installed prestate refuses root health drift and foreign active trust without publishing" {
     for ([_]enum { unhealthy, unincorp, all_changed, prestate_drift, source_drift, key_drift, architecture_drift, owned_work, foreign_context }{ .unhealthy, .unincorp, .all_changed, .prestate_drift, .source_drift, .key_drift, .architecture_drift, .owned_work, .foreign_context }) |scenario| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

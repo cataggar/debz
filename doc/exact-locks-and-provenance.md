@@ -746,6 +746,17 @@ repository only):
   `signed SHA-256 only; no SHA-512 published by the signed index`.
 - Any other repository that publishes only SHA-256 stays unbound. The
   native backend refuses it (exit 5) unless that repository opts in itself.
+- Hermetic Noble `amd64` and `arm64` integration coverage (`test-system-install`)
+  proves `debz install symcrypt` and `debz install symcrypt-openssl` across
+  `native` (`signed_sha256_derived_sha512`) and `legacy_dpkg`
+  (`signed_sha256_only`) with a signed Ubuntu `noble` repository alongside
+  `microsoft-ubuntu-24.04-prod` in `apt-config-snapshot-v3`, where `libc6`,
+  `libssl3t64` (`Provides: libssl3`), `openssl`, and held local packages exist
+  only in `/var/lib/dpkg/status`. It also verifies single-archive
+  `symcrypt-openssl` planning when `symcrypt` is already installed in
+  `/var/lib/dpkg/status`, repeat-install with `-y --noninteractive`,
+  pre-mutation interruption and exact owned adoption, and pre-mutation planning
+  refusal when installed `openssl` falls outside `>= 3.0.0, << 3.1.0`.
 
 Each repository also records its freshness policy. The reviewed
 repository-specific moving-feed bound appears explicitly as

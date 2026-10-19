@@ -1915,3 +1915,44 @@ test "parseEnvelopeBytes and upstream check behave deterministically" {
     try std.testing.expect(containsAsciiCaseInsensitive("Found UPSTREAM digest", "upstream"));
     try std.testing.expect(!containsAsciiCaseInsensitive("signed_sha256_derived_sha512", "upstream"));
 }
+
+test "parseStatus classifies Ubuntu Noble OpenSSL baseline and held facts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const noble_sample =
+        \\Package: libc6
+        \\Status: install ok installed
+        \\Version: 2.39-0ubuntu8.4
+        \\Architecture: amd64
+        \\
+        \\Package: libssl3t64
+        \\Status: install ok installed
+        \\Version: 3.0.13-0ubuntu3.5
+        \\Architecture: amd64
+        \\Provides: libssl3 (= 3.0.13-0ubuntu3.5)
+        \\
+        \\Package: openssl
+        \\Status: install ok installed
+        \\Version: 3.0.13-0ubuntu3.5
+        \\Architecture: amd64
+        \\
+        \\Package: local-fips-policy
+        \\Status: hold ok installed
+        \\Version: 24.04.1-local
+        \\Architecture: amd64
+        \\
+    ;
+    const parsed = try parseStatus(allocator, noble_sample);
+    try std.testing.expectEqual(@as(usize, 0), parsed.problems.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed.stanza_count);
+    try std.testing.expectEqual(@as(usize, 4), parsed.facts.len);
+    try std.testing.expectEqualStrings("libc6", parsed.facts[0].name);
+    try std.testing.expectEqualStrings("libssl3t64", parsed.facts[1].name);
+    try std.testing.expectEqualStrings("local-fips-policy", parsed.facts[2].name);
+    try std.testing.expectEqualStrings("hold", parsed.facts[2].selection);
+    try std.testing.expectEqualStrings("openssl", parsed.facts[3].name);
+    try std.testing.expectEqualStrings("install", parsed.facts[3].selection);
+}
+
