@@ -401,7 +401,7 @@ pub const debian_openssl_cycle = [_]CyclePackagePin{
         .sha512 = "808addd039e469876a893944288c3e7dfd39005943f2a1b955e40f558a97a268e901c724dd39774d9acc030880996c0d11932867a19f4d73defd0b0d1126ab68",
         .depends = "libc6 (>= 2.14), libssl3t64 (>= 3.0.3)",
         .status = "install ok unpacked",
-        .members = &.{ ".", "./conffiles", "./control", "./md5sums" },
+        .members = &.{ ".", "./control", "./md5sums" },
     },
     .{
         .name = "libc6",
@@ -1006,8 +1006,7 @@ pub fn dpkgCommand(
         const pkg = packages[0];
         if (!std.mem.eql(u8, profile, packageProfile(pkg.name))) return error.RuntimeProfileSelectionMismatch;
         if (!std.mem.eql(u8, profile, "none")) {
-            const pinned_ver = profilePinnedVersion(pkg.name) orelse return error.RuntimeProfileVersionMismatch;
-            if (!std.mem.eql(u8, pkg.version, pinned_ver)) return error.RuntimeProfileVersionMismatch;
+            if (!profileVersionMatches(pkg.name, pkg.version)) return error.RuntimeProfileVersionMismatch;
         }
         if (!std.mem.eql(u8, pkg.architecture, architecture) and !std.mem.eql(u8, pkg.architecture, "all")) {
             return error.PackageArchitectureMismatch;
@@ -4362,6 +4361,22 @@ fn install(
                 if (try shouldDeferFullRootConfigure(pkg, architecture, prestates.len, &statuses, &configured)) {
                     try deferred.append(allocator, sel);
                     continue;
+                }
+            }
+            if (prestates.len == 0 and
+                (std.mem.eql(u8, pkg.name, "dpkg") or std.mem.eql(u8, pkg.name, "util-linux")))
+            {
+                const systemd_key: PackageKey = .{
+                    .name = "systemd",
+                    .architecture = architecture,
+                };
+                if (all_packages.get(systemd_key)) |systemd_pkg| {
+                    if (std.mem.eql(u8, systemd_pkg.version, debian_systemd_profile_version.version) and
+                        !configured.contains(systemd_key))
+                    {
+                        try deferred.append(allocator, sel);
+                        continue;
+                    }
                 }
             }
             _ = targets.remove(sel);

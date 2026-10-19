@@ -130,6 +130,15 @@ const StatIdentity = struct {
             a.ctime_sec == b.ctime_sec and
             a.ctime_nsec == b.ctime_nsec;
     }
+
+    fn sameDirectoryInode(a: StatIdentity, b: StatIdentity) bool {
+        return a.dev_major == b.dev_major and
+            a.dev_minor == b.dev_minor and
+            a.ino == b.ino and
+            a.mode == b.mode and
+            a.uid == b.uid and
+            a.gid == b.gid;
+    }
 };
 
 fn statxAt(dir_fd: linux.fd_t, name: []const u8, nofollow: bool) !StatIdentity {
@@ -361,7 +370,7 @@ fn openAbsoluteDirectory(
             diag.set(allocator, "cannot stat opened {s} component {s}: {s}", .{ label, prefix.items, @errorName(err) });
             return error.CaptureFailed;
         };
-        if (!isDirMode(opened.mode) or !StatIdentity.eql(expected, opened)) {
+        if (!isDirMode(opened.mode) or !StatIdentity.sameDirectoryInode(expected, opened)) {
             closeFd(following);
             diag.set(allocator, "{s} component changed while opening: {s}", .{ label, prefix.items });
             return error.CaptureFailed;

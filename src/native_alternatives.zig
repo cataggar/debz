@@ -1128,6 +1128,12 @@ const snapshot_less_postinst_sha256 = digestLiteral(
 const snapshot_bash_postinst_sha256 = digestLiteral(
     "72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
 );
+const snapshot_debian_bash_postinst_sha256 = digestLiteral(
+    "6d1b5aafa381703582cefe6ba5e4b7b0cfa7f10b0b0a9b299361c4afd5172a21",
+);
+const snapshot_debian_gawk_postinst_sha256 = digestLiteral(
+    "95e1e850c9df6ac5534ec74e67f94b3f1e579216d54ce7e83a06860dc6c40439",
+);
 const snapshot_procps_postinst_sha256 = digestLiteral(
     "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
 );
@@ -1180,6 +1186,26 @@ pub fn matchesSnapshotBashPostinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_bash_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotDebianBashPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_debian_bash_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotDebianGawkPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_debian_gawk_postinst_sha256,
         sha256,
     );
 }
@@ -1422,12 +1448,47 @@ fn snapshotLessPostinstCommand(
     return true;
 }
 
+fn snapshotDebianGawkPostinstCommand(
+    bytes: []const u8,
+    tokens: []const []const u8,
+    command: usize,
+) bool {
+    if (!matchesSnapshotDebianGawkPostinst(bytes)) return false;
+    const expected = [_][]const u8{
+        "update-alternatives",
+        "--quiet",
+        "--install",
+        "/usr/bin/awk",
+        "awk",
+        "/usr/bin/gawk",
+        "10",
+        "--slave",
+        "/usr/share/man/man1/awk.1.gz",
+        "awk.1.gz",
+        "/usr/share/man/man1/gawk.1.gz",
+        "--slave",
+        "/usr/bin/nawk",
+        "nawk",
+        "/usr/bin/gawk",
+        "--slave",
+        "/usr/share/man/man1/nawk.1.gz",
+        "nawk.1.gz",
+        "/usr/share/man/man1/gawk.1.gz",
+    };
+    if (command != 0 or tokens.len != expected.len) return false;
+    for (tokens, &expected) |actual, literal| {
+        if (!std.mem.eql(u8, actual, literal)) return false;
+    }
+    return true;
+}
+
 fn snapshotBashPostinstCommand(
     bytes: []const u8,
     tokens: []const []const u8,
     command: usize,
 ) bool {
-    if (!matchesSnapshotBashPostinst(bytes)) return false;
+    if (!matchesSnapshotBashPostinst(bytes) and
+        !matchesSnapshotDebianBashPostinst(bytes)) return false;
     const expected = [_][]const u8{
         "update-alternatives",
         "--install",
@@ -1607,11 +1668,17 @@ pub fn discoverScriptAuthority(
                 line,
                 "update-alternatives --quiet --remove pager /bin/less",
             ) and matchesSnapshotLessPreinst(bytes);
-            if (!preinst_remove and !snapshotLessPostinstCommand(
-                bytes,
-                tokens.items,
-                command,
-            ))
+            if (!preinst_remove and
+                !snapshotLessPostinstCommand(
+                    bytes,
+                    tokens.items,
+                    command,
+                ) and
+                !snapshotDebianGawkPostinstCommand(
+                    bytes,
+                    tokens.items,
+                    command,
+                ))
                 return error.InvalidAlternativesScript;
             command += 1;
         }

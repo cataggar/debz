@@ -1211,20 +1211,23 @@ filesystem and normalized dpkg
 status/info/trigger/diversion/statoverride/alternatives sections. It compares
 package-owned regular-file timestamps and every payload digest, and normalizes
 only penultimate-step lifecycle fields (`status`, `config_version`,
-`triggers_pending`, `triggers_awaited`) in `status_old` while requiring package
-identities and versions in `status_old` and all fields of final `status` to
-match exactly. It ignores clock-derived timestamps on unowned files and
-symlinks, the contents of explicitly unowned runtime products
-(`etc/machine-id`, `var/cache/ldconfig/aux-cache`, `var/log/alternatives.log`),
-and the contents/sizes of the four unowned debconf cache files
-(`var/cache/debconf/config.dat`, `var/cache/debconf/config.dat-old`,
-`var/cache/debconf/templates.dat`, `var/cache/debconf/templates.dat-old`, with
-variable byte size allowed only on those four unowned debconf cache files);
-their presence, mode, ownership, and captured hashes remain recorded, and a
-package claim on any of those paths fails comparison. Two independent healthy
-amd64 dpkg roots compared successfully under these rules. Missing
-either capture or any mismatch fails the manual job; the always-run cleanup
-retains available diagnostics even after earlier failure.
+`config-version`, `conffiles`, `triggers_pending`, `triggers-pending`,
+`triggers_awaited`, `triggers-awaited`) in `status_old` and the penultimate
+diversion backup `var/lib/dpkg/diversions-old` in `dpkg.files` while requiring
+package identities and versions in `status_old`, all fields of final `status`,
+and `var/lib/dpkg/diversions` to match exactly. It ignores clock-derived
+timestamps on unowned files and symlinks, the contents of explicitly unowned
+runtime products (`etc/machine-id`, `var/cache/ldconfig/aux-cache`,
+`var/log/alternatives.log`), and the contents/sizes of the four unowned debconf
+cache files (`var/cache/debconf/config.dat`,
+`var/cache/debconf/config.dat-old`, `var/cache/debconf/templates.dat`,
+`var/cache/debconf/templates.dat-old`) and unowned `var/log/dpkg.log`
+(including a reference-only unowned `var/log/dpkg.log` when native install does
+not write one); their presence, mode, ownership, and captured hashes remain
+recorded, and a package claim on any of those paths fails comparison. Two
+independent healthy amd64 dpkg roots compared successfully under these rules.
+Missing either capture or any mismatch fails the manual job; the always-run
+cleanup retains available diagnostics even after earlier failure.
 
 This gate is not a completed parity claim until both architecture captures
 compare successfully. The pinned `resolute` Release is frozen (Date Thu,
