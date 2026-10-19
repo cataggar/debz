@@ -3134,6 +3134,8 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "pub fn processTriggers(",
         "fn execBreakKbdCycle(",
         "fn execProcessTriggers(",
+        "pub fn scheduleConserved(",
+        "var lines = std.mem.splitAny(u8, data, \"\\r\\n\");",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{

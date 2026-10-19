@@ -2446,14 +2446,12 @@ fn fetchCtrlTarViaDpkgDeb(allocator: std.mem.Allocator, archive: []const u8) ![]
     return res.stdout;
 }
 
-const StanzaRecord = struct {
+pub const StanzaRecord = struct {
     key: PackageKey,
     fields: std.StringHashMap([]const u8),
 };
 
-fn readDatabaseRecords(allocator: std.mem.Allocator, root: []const u8) ![]StanzaRecord {
-    const text = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", maximum_control_bytes);
-    defer allocator.free(text);
+pub fn parseDatabaseRecords(allocator: std.mem.Allocator, text: []const u8) ![]StanzaRecord {
     var records = std.ArrayList(StanzaRecord).empty;
     errdefer records.deinit(allocator);
     var seen = std.HashMap(PackageKey, void, PackageKeyContext, 80).init(allocator);
@@ -2485,11 +2483,51 @@ fn readDatabaseRecords(allocator: std.mem.Allocator, root: []const u8) ![]Stanza
     return records.toOwnedSlice(allocator);
 }
 
+fn readDatabaseRecords(allocator: std.mem.Allocator, root: []const u8) ![]StanzaRecord {
+    const text = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", 4 * 1024 * 1024);
+    defer allocator.free(text);
+    return parseDatabaseRecords(allocator, text);
+}
+
 fn findRecord(records: []StanzaRecord, key: PackageKey) ?*StanzaRecord {
     for (records) |*rec| {
         if (PackageKey.eql(rec.key, key)) return rec;
     }
     return null;
+}
+
+fn findRecordConst(records: []const StanzaRecord, key: PackageKey) ?*const StanzaRecord {
+    for (records) |*rec| {
+        if (PackageKey.eql(rec.key, key)) return rec;
+    }
+    return null;
+}
+
+pub fn scheduleConserved(
+    candidate: []const StanzaRecord,
+    pending: []const StanzaRecord,
+    half_configured: Package,
+) bool {
+    if (candidate.len != pending.len) return false;
+    for (candidate) |expected| {
+        const pkg_name = expected.fields.get("package") orelse return false;
+        const pkg_arch = expected.fields.get("architecture") orelse return false;
+        const exp_ver = expected.fields.get("version") orelse return false;
+        const exp_status = expected.fields.get("status") orelse return false;
+        const observed = findRecordConst(pending, .{ .name = pkg_name, .architecture = pkg_arch }) orelse return false;
+        if (!std.mem.eql(u8, observed.fields.get("version") orelse "", exp_ver)) return false;
+        if (std.mem.eql(u8, pkg_name, half_configured.name) and std.mem.eql(u8, pkg_arch, half_configured.architecture)) {
+            if (!std.mem.eql(u8, exp_ver, half_configured.version) or
+                !std.mem.eql(u8, exp_status, "install ok unpacked") or
+                !std.mem.eql(u8, observed.fields.get("status") orelse "", "install ok half-configured"))
+            {
+                return false;
+            }
+        } else if (!std.mem.eql(u8, observed.fields.get("status") orelse "", exp_status)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn cloneRecords(allocator: std.mem.Allocator, records: []const StanzaRecord) ![]StanzaRecord {
@@ -2689,13 +2727,33 @@ fn execBreakBaseCycle(
     var before_triggers = try triggerDatabase(allocator, root);
     defer before_triggers.deinit();
 
+    const status_before_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", 4 * 1024 * 1024);
+    var status_before_digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(status_before_bytes, &status_before_digest, .{});
+    const status_before_hex = std.fmt.bytesToHex(status_before_digest, .lower);
     const command = try launcherCommand(allocator, launcher, dpkg, root, architecture, base_cycle_profile, "break_base_cycle", cycle[1], &cycle);
     {
         var out = std.Io.Writer.Allocating.init(allocator);
         defer out.deinit();
-        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"profile\":\"libgcc_cycle\",\"records\":");
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"graph\":{");
+        for ([_]usize{ 2, 3, 0, 1 }, 0..) |c_idx, out_idx| {
+            const pkg = cycle[c_idx];
+            const binding = base_cycle[c_idx];
+            if (out_idx > 0) try out.writer.writeByte(',');
+            try writeJsonString(&out.writer, pkg.name);
+            try out.writer.writeAll(":{\"archive_sha512\":");
+            try writeJsonString(&out.writer, pkg.digest);
+            try out.writer.writeAll(",\"depends\":");
+            try writeJsonString(&out.writer, binding.depends);
+            try out.writer.writeAll(",\"pre_depends\":\"\",\"status\":");
+            try writeJsonString(&out.writer, if (c_idx < 2) "install ok unpacked" else "install ok installed");
+            try out.writer.writeAll(",\"version\":");
+            try writeJsonString(&out.writer, pkg.version);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("},\"profile\":\"libgcc_cycle\",\"records\":");
         try writeJsonRecords(allocator, &out.writer, before_records);
-        try out.writer.writeAll(",\"selected\":\"libgcc-s1:amd64\",\"trigger_database\":");
+        try out.writer.print(",\"selected\":\"libgcc-s1:amd64\",\"status_sha512\":\"{s}\",\"trigger_database\":", .{&status_before_hex});
         try writeJsonTriggers(allocator, &out.writer, &before_triggers);
         try out.writer.writeAll("}\n");
         try writeEvidenceFile(allocator, evidence, "base-cycle-before.json", out.written());
@@ -2822,7 +2880,26 @@ fn execConfigureOpensslCycle(
     {
         var out = std.Io.Writer.Allocating.init(allocator);
         defer out.deinit();
-        try out.writer.writeAll("{\"callbacks\":[],\"force\":[],\"profile\":\"openssl_cycle\",\"records\":");
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[],\"graph\":{");
+        for ([_]usize{ 2, 0, 1 }, 0..) |c_idx, out_idx| {
+            const pkg = cycle[c_idx];
+            const binding = openssl_cycle[c_idx];
+            const multi_arch = if (c_idx < 2) peer_multi_arch[c_idx] else "same";
+            if (out_idx > 0) try out.writer.writeByte(',');
+            try writeJsonString(&out.writer, pkg.name);
+            try out.writer.writeAll(":{\"archive_sha512\":");
+            try writeJsonString(&out.writer, pkg.digest);
+            try out.writer.writeAll(",\"depends\":");
+            try writeJsonString(&out.writer, binding.depends);
+            try out.writer.writeAll(",\"multi_arch\":");
+            try writeJsonString(&out.writer, multi_arch);
+            try out.writer.writeAll(",\"pre_depends\":\"\",\"status\":");
+            try writeJsonString(&out.writer, if (c_idx < 2) "install ok unpacked" else "install ok installed");
+            try out.writer.writeAll(",\"version\":");
+            try writeJsonString(&out.writer, pkg.version);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("},\"profile\":\"openssl_cycle\",\"records\":");
         try writeJsonRecords(allocator, &out.writer, before_records);
         try out.writer.writeAll(",\"trigger_database\":");
         try writeJsonTriggers(allocator, &out.writer, &before_triggers);
@@ -2921,7 +2998,25 @@ fn execBreakKbdCycle(
     {
         var out = std.Io.Writer.Allocating.init(allocator);
         defer out.deinit();
-        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"profile\":\"kbd_cycle\",\"records\":");
+        try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"graph\":{");
+        for ([_]usize{ 2, 1, 0, 3 }, 0..) |c_idx, out_idx| {
+            const pkg = cycle[c_idx];
+            const binding = kbd_cycle[c_idx];
+            if (out_idx > 0) try out.writer.writeByte(',');
+            try writeJsonString(&out.writer, pkg.name);
+            try out.writer.writeAll(":{\"architecture\":");
+            try writeJsonString(&out.writer, pkg.architecture);
+            try out.writer.writeAll(",\"archive_sha512\":");
+            try writeJsonString(&out.writer, pkg.digest);
+            try out.writer.writeAll(",\"depends\":");
+            try writeJsonString(&out.writer, binding.depends);
+            try out.writer.writeAll(",\"status\":");
+            try writeJsonString(&out.writer, if (c_idx == 0 or c_idx == 2) "install ok unpacked" else "install ok installed");
+            try out.writer.writeAll(",\"version\":");
+            try writeJsonString(&out.writer, pkg.version);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("},\"profile\":\"kbd_cycle\",\"records\":");
         try writeJsonRecords(allocator, &out.writer, before_records);
         try out.writer.writeAll(",\"trigger_database\":");
         try writeJsonTriggers(allocator, &out.writer, &before_triggers);
@@ -3027,14 +3122,33 @@ fn execProcessTriggers(
         _ = binding;
     }
 
-    const status_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", maximum_control_bytes);
+    const status_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", 4 * 1024 * 1024);
     var status_digest: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(status_bytes, &status_digest, .{});
     const status_hex = std.fmt.bytesToHex(status_digest, .lower);
     {
         var out = std.Io.Writer.Allocating.init(allocator);
         defer out.deinit();
-        try out.writer.writeAll("{\"records\":");
+        try out.writer.writeAll("{\"handlers\":[");
+        for (handlers, trigger_handlers, 0..) |pkg, binding, h_idx| {
+            if (h_idx > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"archive_sha512\":");
+            try writeJsonString(&out.writer, pkg.digest);
+            try out.writer.writeAll(",\"pending_triggers\":");
+            try writeJsonString(&out.writer, binding.pending);
+            try out.writer.writeAll(",\"postinst_sha256\":");
+            try writeJsonString(&out.writer, binding.postinst_sha256);
+            try out.writer.print(",\"postinst_size\":{d},\"profile\":", .{binding.postinst_size});
+            try writeJsonString(&out.writer, binding.profile);
+            try out.writer.writeAll(",\"selector\":");
+            try writeJsonString(&out.writer, try pkg.selector(allocator));
+            try out.writer.writeAll(",\"triggers_sha256\":");
+            try writeJsonString(&out.writer, binding.triggers_sha256);
+            try out.writer.print(",\"triggers_size\":{d},\"version\":", .{binding.triggers_size});
+            try writeJsonString(&out.writer, pkg.version);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("],\"records\":");
         try writeJsonRecords(allocator, &out.writer, current_records);
         try out.writer.print(",\"status_sha512\":\"{s}\",\"trigger_database\":", .{&status_hex});
         try writeJsonTriggers(allocator, &out.writer, &before_triggers);
@@ -3359,11 +3473,11 @@ fn proveBaseCycle(
         .version = cycle[0].version,
         .status = "install ok half-configured",
     });
-    if (!verifyStatusTransition(&wanted_map, &observed_map, &.{})) {
+    const cand_records = try readDatabaseRecords(allocator, candidate);
+    if (!verifyStatusTransition(&wanted_map, &observed_map, &.{}) or !scheduleConserved(cand_records, after_pending, cycle[0])) {
         return error.CycleProofScheduleChanged;
     }
 
-    const cand_records = try readDatabaseRecords(allocator, candidate);
     var cand_triggers = try triggerDatabase(allocator, candidate);
     defer cand_triggers.deinit();
     {
@@ -3895,7 +4009,7 @@ fn install(
     try execProcessTriggers(allocator, launcher, dpkg, root, evidence, architecture, &all_packages, stdout_path, stderr_path);
 }
 
-fn report(allocator: std.mem.Allocator, root: []const u8, cache: []const u8, evidence: []const u8) !void {
+pub fn report(allocator: std.mem.Allocator, root: []const u8, cache: []const u8, evidence: []const u8) !void {
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}/reference-archives.tsv", .{std.mem.trimEnd(u8, evidence, "/")});
     const packages = try packagesFromManifest(allocator, manifest_path, cache, maximum_packages);
     var records = try currentStatuses(allocator, root);
@@ -3924,9 +4038,8 @@ fn report(allocator: std.mem.Allocator, root: []const u8, cache: []const u8, evi
         if (std.mem.endsWith(u8, entry, ".list")) {
             const rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}", .{entry});
             const data = try reference_paths.readRootFile(allocator, root, rel, 8 * 1024 * 1024);
-            var lines = std.mem.splitScalar(u8, data, '\n');
-            while (lines.next()) |raw_line| {
-                const line = std.mem.trimEnd(u8, raw_line, "\r");
+            var lines = std.mem.splitAny(u8, data, "\r\n");
+            while (lines.next()) |line| {
                 if (std.mem.eql(u8, line, "/dev/null")) return error.PackageClaimsExcludedChrootDevice;
             }
         }
@@ -4709,3 +4822,281 @@ test "reference order launcherCommand and parsePrestateSpec" {
     const remaining = try listDirectoryBeneath(allocator, root_fd, "evidence");
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
+
+test "hosted base cycle pending keeps the original status and version schedule comparison" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const candidate_text =
+        "Package: gcc-16-base\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 16-20260405-0ubuntu1\n\n" ++
+        "Package: libc6\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2.42-2ubuntu2\n" ++
+        "Conffiles:\n" ++
+        " /etc/ld.so.conf.d/x86_64-linux-gnu.conf newconffile\n\n" ++
+        "Package: libgcc-s1\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 16-20260405-0ubuntu1\n";
+    const pending_text =
+        "Package: gcc-16-base\n" ++
+        "Status: install ok installed\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 16-20260405-0ubuntu1\n\n" ++
+        "Package: libc6\n" ++
+        "Status: install ok half-configured\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 2.42-2ubuntu2\n" ++
+        "Conffiles:\n" ++
+        " /etc/ld.so.conf.d/x86_64-linux-gnu.conf cadc57d8e0387642c3de4bb1edff3f02\n\n" ++
+        "Package: libgcc-s1\n" ++
+        "Status: install ok unpacked\n" ++
+        "Architecture: amd64\n" ++
+        "Version: 16-20260405-0ubuntu1\n";
+
+    const candidate = try parseDatabaseRecords(allocator, candidate_text);
+    const pending = try parseDatabaseRecords(allocator, pending_text);
+    const libc: Package = .{
+        .name = "libc6",
+        .version = "2.42-2ubuntu2",
+        .architecture = "amd64",
+        .digest = base_cycle[0].sha512,
+        .declared_size = base_cycle[0].size,
+        .archive = "/cache/libc6.deb",
+    };
+
+    try std.testing.expect(scheduleConserved(candidate, pending, libc));
+
+    const unpacked_libc = try cloneRecords(allocator, pending);
+    try findRecord(unpacked_libc, libc.key()).?.fields.put("status", "install ok unpacked");
+    try std.testing.expect(!scheduleConserved(candidate, unpacked_libc, libc));
+
+    const wrong_libc_ver = try cloneRecords(allocator, pending);
+    try findRecord(wrong_libc_ver, libc.key()).?.fields.put("version", "2.42-2ubuntu3");
+    try std.testing.expect(!scheduleConserved(candidate, wrong_libc_ver, libc));
+
+    const installed_libgcc = try cloneRecords(allocator, pending);
+    try findRecord(installed_libgcc, .{ .name = "libgcc-s1", .architecture = "amd64" }).?.fields.put("status", "install ok installed");
+    try std.testing.expect(!scheduleConserved(candidate, installed_libgcc, libc));
+
+    const wrong_gcc_ver = try cloneRecords(allocator, pending);
+    try findRecord(wrong_gcc_ver, .{ .name = "gcc-16-base", .architecture = "amd64" }).?.fields.put("version", "16-0");
+    try std.testing.expect(!scheduleConserved(candidate, wrong_gcc_ver, libc));
+
+    try std.testing.expect(!scheduleConserved(candidate, pending[0..2], libc));
+
+    var extra = try allocator.alloc(StanzaRecord, pending.len + 1);
+    @memcpy(extra[0..pending.len], pending);
+    var extra_fields = std.StringHashMap([]const u8).init(allocator);
+    try extra_fields.put("package", "extra");
+    try extra_fields.put("architecture", "amd64");
+    try extra_fields.put("version", "1");
+    try extra_fields.put("status", "install ok installed");
+    extra[pending.len] = .{
+        .key = .{ .name = "extra", .architecture = "amd64" },
+        .fields = extra_fields,
+    };
+    try std.testing.expect(!scheduleConserved(candidate, extra, libc));
+}
+
+test "report splits dpkg .list files on bare CR and CRLF like bytes.splitlines and enforces signed closure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    reference_paths.setTestRootOverride(tmp_abs);
+    defer reference_paths.setTestRootOverride(null);
+
+    try tmp.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+    try tmp.dir.createDirPath(std.testing.io, "cache/packages-v2/objects");
+    try tmp.dir.createDirPath(std.testing.io, "evidence");
+
+    const archive_bytes = "fixture-deb-bytes";
+    var archive_digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(archive_bytes, &archive_digest, .{});
+    const archive_hex = std.fmt.bytesToHex(archive_digest, .lower);
+    const obj_rel = try std.fmt.allocPrint(allocator, "cache/packages-v2/objects/sha512-{s}", .{&archive_hex});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = obj_rel, .data = archive_bytes });
+
+    const manifest = try std.fmt.allocPrint(allocator, "fixture\t1.0\tamd64\t{s}\t{d}\n", .{ &archive_hex, archive_bytes.len });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "evidence/reference-archives.tsv", .data = manifest });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/status",
+        .data = "Package: fixture\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1.0\n\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/var/lib/dpkg/info/fixture.list",
+        .data = "/.\n/usr\n/usr/share/doc/fixture\n/dev/null0\r/usr/share/doc/fixture/README\r\n",
+    });
+
+    const root_dir = try std.fs.path.join(allocator, &.{ tmp_abs, "root" });
+    const cache_dir = try std.fs.path.join(allocator, &.{ tmp_abs, "cache" });
+    const evidence_dir = try std.fs.path.join(allocator, &.{ tmp_abs, "evidence" });
+
+    try report(allocator, root_dir, cache_dir, evidence_dir);
+    const installed = try reference_paths.readRootFile(allocator, evidence_dir, "reference-installed.txt", 4096);
+    try std.testing.expectEqualStrings("ii  fixture:amd64 1.0\n", installed);
+
+    for ([_][]const u8{
+        "/dev/null\n",
+        "/usr/share/doc/fixture\r/dev/null",
+        "/dev/null\r/usr/share/doc/fixture\n",
+        "/usr/share/doc/fixture\r\n/dev/null\r\n",
+    }) |bad_list| {
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/var/lib/dpkg/info/fixture.list",
+            .data = bad_list,
+        });
+        try std.testing.expectError(error.PackageClaimsExcludedChrootDevice, report(allocator, root_dir, cache_dir, evidence_dir));
+    }
+}
+
+test "kbd cycle breaker and multi-handler trigger settlement enforce dpkg order and state conservation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    reference_paths.setTestRootOverride(tmp_abs);
+    defer reference_paths.setTestRootOverride(null);
+
+    try tmp.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+    try tmp.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
+    try tmp.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/updates");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/File", .data = "/usr/lib/sysctl.d procps/noawait\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/Lock", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/Unincorp", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/ldconfig", .data = "libc-bin\n" });
+
+    const root_dir = try std.fs.path.join(allocator, &.{ tmp_abs, "root" });
+
+    const NoopArchive = struct {
+        fn verify(_: Package) !void {}
+    };
+    test_verify_archive_hook = NoopArchive.verify;
+    defer test_verify_archive_hook = null;
+
+    var all_pkgs = std.HashMap(PackageKey, Package, PackageKeyContext, 80).init(allocator);
+    for (kbd_cycle) |pin| {
+        const pkg: Package = .{
+            .name = pin.name,
+            .version = pin.version,
+            .architecture = pin.architecture,
+            .digest = pin.sha512,
+            .declared_size = pin.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{pin.name}),
+        };
+        try all_pkgs.put(pkg.key(), pkg);
+    }
+    for (trigger_handlers) |pin| {
+        const pkg: Package = .{
+            .name = pin.name,
+            .version = pin.version,
+            .architecture = pin.architecture,
+            .digest = pin.sha512,
+            .declared_size = pin.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{pin.name}),
+        };
+        try all_pkgs.put(pkg.key(), pkg);
+    }
+
+    const FetchTar = struct {
+        fn fetch(alloc: std.mem.Allocator, archive: []const u8) ![]const u8 {
+            const base_name = std.fs.path.stem(archive);
+            if (findKbdCyclePin(base_name)) |pin| {
+                const ctrl = if (pin.pre_depends.len > 0)
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "Package: {s}\nVersion: {s}\nArchitecture: {s}\nDepends: {s}\nPre-Depends: {s}\n",
+                        .{ pin.name, pin.version, pin.architecture, pin.depends, pin.pre_depends },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "Package: {s}\nVersion: {s}\nArchitecture: {s}\nDepends: {s}\n",
+                        .{ pin.name, pin.version, pin.architecture, pin.depends },
+                    );
+                var entries = std.ArrayList(TarFixtureMember).empty;
+                for (pin.members) |m| {
+                    if (std.mem.eql(u8, m, ".")) {
+                        try entries.append(alloc, .{ .name = ".", .content = null });
+                    } else if (std.mem.eql(u8, m, "./control")) {
+                        try entries.append(alloc, .{ .name = "./control", .content = ctrl });
+                    } else if (std.mem.eql(u8, m, "./triggers") and std.mem.eql(u8, base_name, "kbd")) {
+                        try entries.append(alloc, .{ .name = "./triggers", .content = kbd_triggers });
+                    } else {
+                        try entries.append(alloc, .{ .name = m, .content = "#!/bin/sh\n" });
+                    }
+                }
+                return buildTestControlTar(alloc, entries.items);
+            }
+            return error.MissingControlTarFixture;
+        }
+    };
+
+    const initial_kbd_status =
+        "Package: kbd\nStatus: install ok unpacked\nArchitecture: amd64\nVersion: 2.7.1-2ubuntu2\n\n" ++
+        "Package: console-setup-linux\nStatus: install ok unpacked\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: console-setup\nStatus: install ok unpacked\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = initial_kbd_status });
+
+    const KbdRunner = struct {
+        var dir: ?std.Io.Dir = null;
+        var after_status: []const u8 = "";
+
+        fn run(_: std.mem.Allocator, verb: []const u8, packages: []const Package, profile: []const u8) !DpkgRunResult {
+            try std.testing.expectEqualStrings("break_kbd_cycle", verb);
+            try std.testing.expectEqual(@as(usize, 1), packages.len);
+            try std.testing.expectEqualStrings("kbd", packages[0].name);
+            try std.testing.expectEqualStrings("none", profile);
+            try dir.?.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = after_status });
+            return .{ .returncode = 0, .stdout = "", .stderr = "" };
+        }
+    };
+    KbdRunner.dir = tmp.dir;
+    KbdRunner.after_status =
+        "Package: kbd\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.7.1-2ubuntu2\n\n" ++
+        "Package: console-setup-linux\nStatus: install ok unpacked\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: console-setup\nStatus: install ok unpacked\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n\n";
+
+    const kbd_res = try breakKbdCycle(allocator, root_dir, &all_pkgs, "amd64", FetchTar.fetch, KbdRunner.run);
+    try std.testing.expectEqual(@as(u8, 0), kbd_res.returncode);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = initial_kbd_status });
+    KbdRunner.after_status =
+        "Package: kbd\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.7.1-2ubuntu2\n\n" ++
+        "Package: console-setup-linux\nStatus: install ok unpacked\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: console-setup\nStatus: install ok installed\nArchitecture: all\nVersion: 1.237ubuntu3.1\n\n" ++
+        "Package: libc6\nStatus: install ok installed\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n\n";
+    try std.testing.expectError(
+        error.KbdCycleMutatedUnexpectedPackageStatus,
+        breakKbdCycle(allocator, root_dir, &all_pkgs, "amd64", FetchTar.fetch, KbdRunner.run),
+    );
+
+    var trig_statuses = DatabaseMap.init(allocator);
+    for (trigger_handlers) |pin| {
+        try trig_statuses.put(.{ .name = pin.name, .architecture = pin.architecture }, .{
+            .name = pin.name,
+            .architecture = pin.architecture,
+            .version = pin.version,
+            .status = "install ok triggers-pending",
+        });
+    }
+    const ready_handlers = try triggerHandlerPackages(allocator, &all_pkgs, &trig_statuses, "amd64");
+    try std.testing.expectEqual(@as(usize, 2), ready_handlers.len);
+    try std.testing.expectEqualStrings("libc-bin", ready_handlers[0].name);
+    try std.testing.expectEqualStrings("procps", ready_handlers[1].name);
+}
+

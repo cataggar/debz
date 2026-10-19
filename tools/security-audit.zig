@@ -6652,6 +6652,8 @@ pub const PROTECTED_REFERENCE_SOURCE_TOKENS = [_]SourceTokenList{
             "fn proveBaseCycle(",
             "fn capturePrestate(",
             "fn install(",
+            "pub fn scheduleConserved(",
+            "var lines = std.mem.splitAny(u8, data, \"\\r\\n\");",
         },
     },
     .{
