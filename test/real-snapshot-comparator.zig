@@ -218,8 +218,19 @@ fn equalValue(left: std.json.Value, right: std.json.Value) bool {
 
 const volatile_unowned_files = [_][]const u8{
     "etc/machine-id",
+    "var/cache/debconf/config.dat",
+    "var/cache/debconf/config.dat-old",
+    "var/cache/debconf/templates.dat",
+    "var/cache/debconf/templates.dat-old",
     "var/cache/ldconfig/aux-cache",
     "var/log/alternatives.log",
+};
+
+const volatile_unowned_variable_size_files = [_][]const u8{
+    "var/cache/debconf/config.dat",
+    "var/cache/debconf/config.dat-old",
+    "var/cache/debconf/templates.dat",
+    "var/cache/debconf/templates.dat-old",
 };
 
 fn equalSnapshots(
@@ -230,7 +241,7 @@ fn equalSnapshots(
     const left = reference.object;
     const right = candidate.object;
     const left_dpkg = left.get("dpkg").?;
-    if (!equalValue(left_dpkg, right.get("dpkg").?) or
+    if (!equalDpkg(left_dpkg, right.get("dpkg").?) or
         !equalValue(left.get("trace").?, right.get("trace").?))
         return false;
 
@@ -282,6 +293,7 @@ fn equalFilesystemEntry(
         !owned.contains(path.string);
     const ignore_hash = std.mem.eql(u8, kind.string, "regular") and
         !owned.contains(path.string) and isVolatileUnownedFile(path.string);
+    const ignore_size = ignore_hash and isVolatileVariableSizeFile(path.string);
     if (ignore_mtime and !std.mem.eql(u8, kind.string, "directory")) {
         const before = left.object.get("mtime_ns") orelse return false;
         const after = right.object.get("mtime_ns") orelse return false;
@@ -292,6 +304,12 @@ fn equalFilesystemEntry(
             !validDigest(right.object.get("sha256") orelse return false))
             return false;
     }
+    if (ignore_size) {
+        const before = left.object.get("size") orelse return false;
+        const after = right.object.get("size") orelse return false;
+        if (before != .integer or after != .integer or before.integer < 0 or after.integer < 0)
+            return false;
+    }
 
     var fields = left.object.iterator();
     while (fields.next()) |field| {
@@ -300,6 +318,8 @@ fn equalFilesystemEntry(
             if (field.value_ptr.* != .integer or other != .integer) return false;
         } else if (std.mem.eql(u8, field.key_ptr.*, "sha256") and ignore_hash) {
             if (!validDigest(field.value_ptr.*) or !validDigest(other)) return false;
+        } else if (std.mem.eql(u8, field.key_ptr.*, "size") and ignore_size) {
+            if (field.value_ptr.* != .integer or other != .integer) return false;
         } else if (!equalValue(field.value_ptr.*, other)) {
             return false;
         }
@@ -307,8 +327,65 @@ fn equalFilesystemEntry(
     return true;
 }
 
+fn equalDpkg(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .object or right != .object or left.object.count() != right.object.count())
+        return false;
+    var iterator = left.object.iterator();
+    while (iterator.next()) |entry| {
+        const other = right.object.get(entry.key_ptr.*) orelse return false;
+        if (std.mem.eql(u8, entry.key_ptr.*, "status_old")) {
+            if (!equalStatusOld(entry.value_ptr.*, other)) return false;
+        } else if (!equalValue(entry.value_ptr.*, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn equalStatusOld(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .array or right != .array or left.array.items.len != right.array.items.len)
+        return false;
+    for (left.array.items, right.array.items) |left_item, right_item| {
+        if (!equalStatusOldRecord(left_item, right_item)) return false;
+    }
+    return true;
+}
+
+fn equalStatusOldRecord(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .object or right != .object) return false;
+    var left_it = left.object.iterator();
+    while (left_it.next()) |entry| {
+        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
+        const other = right.object.get(entry.key_ptr.*) orelse return false;
+        if (!equalValue(entry.value_ptr.*, other)) return false;
+    }
+    var right_it = right.object.iterator();
+    while (right_it.next()) |entry| {
+        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
+        if (!left.object.contains(entry.key_ptr.*)) return false;
+    }
+    return true;
+}
+
+fn isStatusOldVolatileField(key: []const u8) bool {
+    return std.mem.eql(u8, key, "status") or
+        std.mem.eql(u8, key, "config_version") or
+        std.mem.eql(u8, key, "config-version") or
+        std.mem.eql(u8, key, "triggers_pending") or
+        std.mem.eql(u8, key, "triggers-pending") or
+        std.mem.eql(u8, key, "triggers_awaited") or
+        std.mem.eql(u8, key, "triggers-awaited");
+}
+
 fn isVolatileUnownedFile(path: []const u8) bool {
     for (volatile_unowned_files) |volatile_path| {
+        if (std.mem.eql(u8, path, volatile_path)) return true;
+    }
+    return false;
+}
+
+fn isVolatileVariableSizeFile(path: []const u8) bool {
+    for (volatile_unowned_variable_size_files) |volatile_path| {
         if (std.mem.eql(u8, path, volatile_path)) return true;
     }
     return false;
@@ -473,3 +550,32 @@ test "real snapshot comparator rejects empty and absent databases" {
     dpkg.object.getPtr("status").?.array.items.len = 0;
     try std.testing.expectError(error.InvalidSnapshot, validateSnapshot(parsed.value));
 }
+
+test "real snapshot comparison normalizes debconf cache size and status_old lifecycle fields only" {
+    for ([_][]const u8{ "amd64", "arm64" }) |arch| {
+        const left_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"var/cache/debconf/config.dat","kind":"regular","mode":"0644","mtime_ns":1,"size":120,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"procps","architecture":"{s}","version":"2:4.0.4-9ubuntu1","status":"install ok installed"}}],"status_old":[{{"package":"procps","architecture":"{s}","version":"2:4.0.4-9ubuntu1","status":"install ok triggers-pending","config_version":"2:4.0.4-9ubuntu1","triggers_pending":["/usr/lib/sysctl.d"]}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        ,
+            .{ schema, arch, arch },
+        );
+        defer std.testing.allocator.free(left_json);
+        const right_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"var/cache/debconf/config.dat","kind":"regular","mode":"0644","mtime_ns":2,"size":240,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"procps","architecture":"{s}","version":"2:4.0.4-9ubuntu1","status":"install ok installed"}}],"status_old":[{{"package":"procps","architecture":"{s}","version":"2:4.0.4-9ubuntu1","status":"install ok installed"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        ,
+            .{ schema, arch, arch },
+        );
+        defer std.testing.allocator.free(right_json);
+        var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, left_json, .{});
+        defer left.deinit();
+        var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, right_json, .{});
+        defer right.deinit();
+        try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+
+        right.value.object.getPtr("dpkg").?.object.getPtr("status_old").?.array.items[0]
+            .object.getPtr("version").?.* = .{ .string = "2:4.0.4-9ubuntu2" };
+        try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+    }
+}
+
