@@ -704,26 +704,39 @@ test "real snapshot comparison normalizes debconf cache size and status_old life
 }
 
 test "real snapshot comparison normalizes reference-only dpkg.log, diversions-old, and status_old conffiles" {
-    const ref_json = std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}},{{"path":"var/log/dpkg.log","kind":"regular","mode":"0644","uid":0,"gid":0,"mtime_ns":1,"xattrs":[],"size":15537,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hardlink_to":null}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed","triggers-pending":"ldconfig","conffiles":"\n/etc/pam.d/su 60fbbe65c90d741bc0d380543cefe8af"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}]}},"trace":[]}}
-    , .{schema});
-    const cand_json = std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","version":"2.41-5","status":"install ok unpacked","conffiles":"\n/etc/pam.d/su newconffile"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":594,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}]}},"trace":[]}}
-    , .{schema});
-    var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ref_json, .{});
-    defer left.deinit();
-    var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cand_json, .{});
-    defer right.deinit();
-    const left_counts = try validateSnapshot(left.value);
-    const right_counts = try validateSnapshot(right.value);
-    try std.testing.expect(countsCompatible(left_counts, right_counts, left.value, right.value));
-    try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
-    try std.testing.expect(!try equalSnapshots(std.testing.allocator, right.value, left.value));
+    for ([_]struct { arch: []const u8, gconv_cache: []const u8 }{
+        .{ .arch = "amd64", .gconv_cache = "usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache" },
+        .{ .arch = "arm64", .gconv_cache = "usr/lib/aarch64-linux-gnu/gconv/gconv-modules.cache" },
+    }) |case| {
+        const ref_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}},{{"path":"{s}","kind":"regular","mode":"0644","mtime_ns":1,"size":27012,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}},{{"path":"var/log/dpkg.log","kind":"regular","mode":"0644","uid":0,"gid":0,"mtime_ns":1,"xattrs":[],"size":15537,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hardlink_to":null}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","architecture":"{s}","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","architecture":"{s}","version":"2.41-5","status":"install ok installed","triggers-pending":"ldconfig","conffiles":"\n/etc/pam.d/su 60fbbe65c90d741bc0d380543cefe8af"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}]}},"trace":[]}}
+        ,
+            .{ schema, case.gconv_cache, case.arch, case.arch },
+        );
+        defer std.testing.allocator.free(ref_json);
+        const cand_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}},{{"path":"{s}","kind":"regular","mode":"0644","mtime_ns":2,"size":27012,"sha256":"1111111111111111111111111111111111111111111111111111111111111111"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","architecture":"{s}","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","architecture":"{s}","version":"2.41-5","status":"install ok unpacked","conffiles":"\n/etc/pam.d/su newconffile"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":594,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}]}},"trace":[]}}
+        ,
+            .{ schema, case.gconv_cache, case.arch, case.arch },
+        );
+        defer std.testing.allocator.free(cand_json);
+        var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ref_json, .{});
+        defer left.deinit();
+        var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cand_json, .{});
+        defer right.deinit();
+        const left_counts = try validateSnapshot(left.value);
+        const right_counts = try validateSnapshot(right.value);
+        try std.testing.expect(countsCompatible(left_counts, right_counts, left.value, right.value));
+        try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+        try std.testing.expect(!try equalSnapshots(std.testing.allocator, right.value, left.value));
 
-    right.value.object.getPtr("dpkg").?.object.getPtr("files").?.array.items[0]
-        .object.getPtr("sha256").?.* = .{
-        .string = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    };
-    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+        right.value.object.getPtr("dpkg").?.object.getPtr("files").?.array.items[0]
+            .object.getPtr("sha256").?.* = .{
+            .string = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+    }
 }
 

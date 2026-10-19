@@ -1723,6 +1723,98 @@ test "reference runtime binds Debian stable amd64 coreutils rm, libc6 gconv, and
     }
 }
 
+test "reference runtime binds Debian stable arm64 coreutils rm, libc6 gconv, and nsswitch providers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const apt_lock_bytes = @embedFile("fixtures/debian-stable-closure-v1/arm64-apt.lock.json");
+    const sysv_lock_bytes = @embedFile("fixtures/debian-stable-closure-v1/arm64-systemd-sysv.lock.json");
+
+    for ([_]struct { bytes: []const u8, has_systemd: bool }{
+        .{ .bytes = apt_lock_bytes, .has_systemd = false },
+        .{ .bytes = sysv_lock_bytes, .has_systemd = true },
+    }) |lock_case| {
+        const decoded = try Recorder.debz.exact_lock_v3.decode(a, lock_case.bytes, 16 * 1024 * 1024);
+        const lock = decoded.lock;
+        try std.testing.expectEqualStrings("arm64", lock.target_architecture);
+        try std.testing.expect(lock.findIdentity("gnu-coreutils", "arm64") == null);
+        try std.testing.expect(lock.findIdentity("coreutils-from-gnu", "all") == null);
+        try std.testing.expect(lock.findIdentity("libc-gconv-modules-extra", "arm64") == null);
+
+        var recorder: Recorder = .{
+            .allocator = a,
+            .architecture = "arm64",
+            .lock = lock,
+            .cache = "/nonexistent-reference-runtime-cache",
+            .payloads = .init(a),
+        };
+        try recorder.payloads.put("coreutils", try fixturePayload(a, "usr/bin/rm", "debian-arm64-coreutils-rm\n"));
+        try recorder.payloads.put(
+            "libc6",
+            try fixturePayload(a, "usr/lib/aarch64-linux-gnu/gconv/gconv-modules.d/gconv-modules-extra.conf", "module\n"),
+        );
+        try recorder.payloads.put("libc-bin", try fixturePayload(a, "usr/share/libc-bin/nsswitch.conf", "passwd: files\n"));
+        if (lock_case.has_systemd) {
+            // Debian trixie systemd 257.13-1~deb13u1 omits usr/share/factory/etc/nsswitch.conf.
+            try recorder.payloads.put("systemd", try fixturePayload(a, "usr/lib/systemd/systemd", "systemd-elf\n"));
+        }
+
+        var self: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "aarch64-linux-gnu",
+            .interpreter = "/lib/ld-linux-aarch64.so.1",
+            .loader_path = "usr/lib/ld-linux-aarch64.so.1",
+            .visited = .init(a),
+        };
+        try self.rmHelper();
+        try self.gconvTree("usr/lib/aarch64-linux-gnu/gconv");
+        try self.nssConfig();
+
+        try std.testing.expectEqual(@as(usize, 3), self.entries.items.len);
+        const rm_entry = self.entries.items[0];
+        try std.testing.expectEqualStrings("/usr/bin/rm", rm_entry.path);
+        try std.testing.expectEqual(guest.Role.helper, rm_entry.role);
+        try std.testing.expect(rm_entry.required);
+        try std.testing.expectEqual(@as(usize, 1), rm_entry.allowed.len);
+        try std.testing.expectEqualStrings("coreutils", rm_entry.allowed[0].package.?);
+        try std.testing.expectEqualStrings("9.7-3", rm_entry.allowed[0].version.?);
+        try std.testing.expectEqualStrings("/usr/bin/rm", rm_entry.allowed[0].member.?);
+
+        const gconv_entry = self.entries.items[1];
+        try std.testing.expectEqualStrings("/usr/lib/aarch64-linux-gnu/gconv/gconv-modules.d/gconv-modules-extra.conf", gconv_entry.path);
+        try std.testing.expectEqual(guest.Role.gconv, gconv_entry.role);
+        try std.testing.expectEqual(@as(usize, 1), gconv_entry.allowed.len);
+        try std.testing.expectEqualStrings("libc6", gconv_entry.allowed[0].package.?);
+        try std.testing.expectEqualStrings("2.41-12+deb13u4", gconv_entry.allowed[0].version.?);
+
+        const nss_entry = self.entries.items[2];
+        try std.testing.expectEqualStrings("/etc/nsswitch.conf", nss_entry.path);
+        try std.testing.expectEqual(@as(usize, 1), nss_entry.allowed.len);
+        try std.testing.expectEqualStrings("libc-bin", nss_entry.allowed[0].package.?);
+
+        // Missing coreutils /usr/bin/rm or missing libc6 gconv tree must still refuse.
+        try recorder.payloads.put("coreutils", try fixturePayload(a, "usr/bin/true", "noop\n"));
+        var bad_rm: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "aarch64-linux-gnu",
+            .interpreter = "/lib/ld-linux-aarch64.so.1",
+            .loader_path = "usr/lib/ld-linux-aarch64.so.1",
+            .visited = .init(a),
+        };
+        try std.testing.expectError(error.MissingGuestMember, bad_rm.rmHelper());
+
+        try recorder.payloads.put("libc6", try fixturePayload(a, "usr/lib/aarch64-linux-gnu/libc.so.6", "noop\n"));
+        var bad_gconv: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "aarch64-linux-gnu",
+            .interpreter = "/lib/ld-linux-aarch64.so.1",
+            .loader_path = "usr/lib/aarch64-linux-gnu",
+            .visited = .init(a),
+        };
+        try std.testing.expectError(error.MissingGuestMember, bad_gconv.gconvTree("usr/lib/aarch64-linux-gnu/gconv"));
+    }
+}
+
 test {
     _ = guest;
 }

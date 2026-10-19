@@ -102,12 +102,14 @@ const snapshot_debian_systemd_postinst_size = 4314;
 fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bool {
     const version_and_digest_match =
         (std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
+            std.mem.eql(u8, identity.architecture, "amd64") and
             std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_systemd_sha256)) or
         (std.mem.eql(u8, identity.version, "257.13-1~deb13u1") and
+            (std.mem.eql(u8, identity.architecture, "amd64") or
+                std.mem.eql(u8, identity.architecture, "arm64")) and
             std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_debian_systemd_sha256));
     return std.mem.eql(u8, identity.package, "systemd") and
         version_and_digest_match and
-        std.mem.eql(u8, identity.architecture, "amd64") and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/systemd.postinst") and
         arguments.len == 2 and
@@ -4717,6 +4719,15 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
     request.identity.version = "259.5-0ubuntu3.4";
     request.identity.architecture = "arm64";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.version = "257.13-1~deb13u1";
+    request.identity.script_sha256 = snapshot_debian_systemd_sha256;
+    try testing.expect(validate(request) == null);
+    request.identity.architecture = "amd64";
+    try testing.expect(validate(request) == null);
+    request.identity.architecture = "riscv64";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.version = "259.5-0ubuntu3.4";
+    request.identity.script_sha256 = snapshot_systemd_sha256;
     request.identity.architecture = "amd64";
     request.policy.descendants = .detach;
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);

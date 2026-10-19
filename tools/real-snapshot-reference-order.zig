@@ -237,6 +237,37 @@ pub const debian_base_cycle = [_]CyclePackagePin{
     },
 };
 
+pub const debian_arm64_base_cycle = [_]CyclePackagePin{
+    .{
+        .name = "libc6",
+        .version = "2.41-12+deb13u4",
+        .architecture = "arm64",
+        .size = 2483572,
+        .sha512 = "6bf6e36ace1a974c53c643d06a28546e75d857411b96df385d7f0860ab330624e5812a6603ce73cd758b7b46197a9326ee408cf375815bea8b576346ad98db20",
+        .depends = "libgcc-s1",
+        .status = "install ok unpacked",
+    },
+    .{
+        .name = "libgcc-s1",
+        .version = "14.2.0-19",
+        .architecture = "arm64",
+        .size = 54104,
+        .sha512 = "134d5404a297ccf303642328538fb4e46ec6d71d8e0cdf5ed16bce8c7b98d9a08237973170157f0cbfe37786b91ce9e03a83f0d4eea412829b1524ebcb641633",
+        .depends = "gcc-14-base (= 14.2.0-19), libc6 (>= 2.35)",
+        .status = "install ok unpacked",
+        .members = &.{ ".", "./control", "./md5sums", "./shlibs", "./symbols", "./triggers" },
+    },
+    .{
+        .name = "gcc-14-base",
+        .version = "14.2.0-19",
+        .architecture = "arm64",
+        .size = 49444,
+        .sha512 = "39bb505b163ec38b840530b6de11d7021ce553451e749fa6caaed2010b3c7d4c9f438fe5e89544bcbcb383d4dd3b817c60ed073d024950834d134751eec57471",
+        .depends = "",
+        .status = "install ok installed",
+    },
+};
+
 pub const arm64_base_cycle = [_]CyclePackagePin{
     .{
         .name = "libc6",
@@ -432,6 +463,56 @@ pub const debian_openssl_cycle = [_]CyclePackagePin{
     },
 };
 
+pub const debian_arm64_openssl_cycle = [_]CyclePackagePin{
+    .{
+        .name = "libssl3t64",
+        .version = "3.5.7-1~deb13u2",
+        .architecture = "arm64",
+        .size = 2766020,
+        .sha512 = "93b4877e8f43532ce54162057e041b28a8379018fe115555af41f0efb3b0466a7b447ae0e4ddcc71ade1d981d66db3642af90fef1a99a39b7c66715a10581bba",
+        .depends = "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy",
+        .status = "install ok unpacked",
+        .members = &.{ ".", "./control", "./md5sums", "./shlibs", "./symbols", "./triggers" },
+    },
+    .{
+        .name = "openssl-provider-legacy",
+        .version = "3.5.7-1~deb13u2",
+        .architecture = "arm64",
+        .size = 313492,
+        .sha512 = "2b77e3a5ba04d918f5c8b3772894c7af91f3098eecbd46cd828f5fbaa3daf3a07333d8baf1d8bdbb0dd5697b4a1354b082c4435e150110b275f2b7de60d77541",
+        .depends = "libc6 (>= 2.17), libssl3t64 (>= 3.0.3)",
+        .status = "install ok unpacked",
+        .members = &.{ ".", "./control", "./md5sums" },
+    },
+    .{
+        .name = "libc6",
+        .version = "2.41-12+deb13u4",
+        .architecture = "arm64",
+        .size = 2483572,
+        .sha512 = "6bf6e36ace1a974c53c643d06a28546e75d857411b96df385d7f0860ab330624e5812a6603ce73cd758b7b46197a9326ee408cf375815bea8b576346ad98db20",
+        .depends = "libgcc-s1",
+        .status = "install ok installed",
+    },
+    .{
+        .name = "libzstd1",
+        .version = "1.5.7+dfsg-1",
+        .architecture = "arm64",
+        .size = 266052,
+        .sha512 = "7d6f82d9c2294238f8f78083f67ae315e4bb2cb9a6e4e966f20064c4945b28ef6cd56379290b2c99e9595e27ab76bd124ff126680b270e684b78d15adea1a496",
+        .depends = "libc6 (>= 2.34)",
+        .status = "install ok installed",
+    },
+    .{
+        .name = "zlib1g",
+        .version = "1:1.3.dfsg+really1.3.1-1+b1",
+        .architecture = "arm64",
+        .size = 85116,
+        .sha512 = "17fae1070ab2d235dcb756e46fb62e3846176f271a660a5c13f5e6c70d590741658cf86a7c6a6303430d0bb51b2019dddba88fabc5d4e7afa3f82db96bb03961",
+        .depends = "libc6 (>= 2.17)",
+        .status = "install ok installed",
+    },
+};
+
 pub const kbd_triggers = "# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n";
 
 pub const kbd_cycle = [_]CyclePackagePin{
@@ -555,6 +636,21 @@ pub const debian_libc_bin_trigger_handler: TriggerHandlerPin = .{
     .architecture = "amd64",
     .size = 638452,
     .sha512 = "dd9704fa1935280a1a5418658c75cc45c8c646f9020229e72addde5bc9744ce75f46daeecc7a46c256cf2c4f08bc50bebbbd87e04848b55787f4ec304cfd41bc",
+    .profile = "none",
+    .pending = "ldconfig",
+    .members = &.{ ".", "./conffiles", "./control", "./md5sums", "./postinst", "./triggers" },
+    .postinst_size = 847,
+    .postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+    .triggers_size = 440,
+    .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
+};
+
+pub const debian_arm64_libc_bin_trigger_handler: TriggerHandlerPin = .{
+    .name = "libc-bin",
+    .version = "2.41-12+deb13u4",
+    .architecture = "arm64",
+    .size = 551956,
+    .sha512 = "ea983f61c25f7b7e555cea4a8ea020db47dfe1b9f68156ec37c02b6418ca8fb2d224769eb3ae48969d5bb7092762bc102bd6a691c11306bf3593de5165779cb4",
     .profile = "none",
     .pending = "ldconfig",
     .members = &.{ ".", "./conffiles", "./control", "./md5sums", "./postinst", "./triggers" },
@@ -741,6 +837,11 @@ fn findTriggerHandlerPinFor(name: []const u8, version: []const u8) ?TriggerHandl
 
 fn findTriggerHandlerPinForArch(name: []const u8, version: []const u8, architecture: []const u8) ?TriggerHandlerPin {
     if (std.mem.eql(u8, architecture, "arm64")) {
+        if (std.mem.eql(u8, name, debian_arm64_libc_bin_trigger_handler.name) and
+            std.mem.eql(u8, version, debian_arm64_libc_bin_trigger_handler.version))
+        {
+            return debian_arm64_libc_bin_trigger_handler;
+        }
         for (arm64_trigger_handlers) |pin| {
             if (std.mem.eql(u8, pin.name, name)) return pin;
         }
@@ -927,10 +1028,10 @@ pub fn dpkgCommand(
         {
             return error.OpensslCyclePackageIdentityMismatch;
         }
-        const pins: []const CyclePackagePin = if (std.mem.eql(u8, architecture, "arm64"))
+        const pins: []const CyclePackagePin = if (std.mem.eql(u8, packages[0].version, debian_openssl_cycle[0].version))
+            if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_openssl_cycle else &debian_openssl_cycle
+        else if (std.mem.eql(u8, architecture, "arm64"))
             &arm64_openssl_cycle
-        else if (std.mem.eql(u8, packages[0].version, debian_openssl_cycle[0].version))
-            &debian_openssl_cycle
         else
             &openssl_cycle;
         for (packages, pins[0..2]) |pkg, expected| {
@@ -956,10 +1057,10 @@ pub fn dpkgCommand(
         {
             return error.BaseCycleBreakPackageIdentityMismatch;
         }
-        const pins: []const CyclePackagePin = if (std.mem.eql(u8, architecture, "arm64"))
+        const pins: []const CyclePackagePin = if (std.mem.eql(u8, packages[0].version, debian_base_cycle[0].version))
+            if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_base_cycle else &debian_base_cycle
+        else if (std.mem.eql(u8, architecture, "arm64"))
             &arm64_base_cycle
-        else if (std.mem.eql(u8, packages[0].version, debian_base_cycle[0].version))
-            &debian_base_cycle
         else
             &base_cycle;
         for (packages, pins[0..2]) |pkg, expected| {
@@ -1383,7 +1484,6 @@ pub fn verifyBaseCycle(
 ) ![2]Package {
     if (!std.mem.eql(u8, architecture, "amd64") and !std.mem.eql(u8, architecture, "arm64")) return error.BaseCycleOrderRequiresAmd64;
     const is_debian = isDebianBaseCycleMap(all_packages, architecture);
-    if (is_debian and !std.mem.eql(u8, architecture, "amd64")) return error.BaseCycleOrderRequiresAmd64;
     var ubuntu_pkgs: [base_cycle.len]Package = undefined;
     var debian_pkgs: [debian_base_cycle.len]Package = undefined;
     const pkgs: []const Package = if (is_debian) blk: {
@@ -1394,7 +1494,7 @@ pub fn verifyBaseCycle(
         break :blk &ubuntu_pkgs;
     };
     const pins: []const CyclePackagePin = if (is_debian)
-        &debian_base_cycle
+        if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_base_cycle else &debian_base_cycle
     else if (std.mem.eql(u8, architecture, "arm64"))
         &arm64_base_cycle
     else
@@ -1528,10 +1628,10 @@ pub fn verifyOpensslCycle(
 ) ![2]Package {
     if (!std.mem.eql(u8, architecture, "amd64") and !std.mem.eql(u8, architecture, "arm64")) return error.OpensslCycleOrderRequiresAmd64;
     const pkgs = try opensslCyclePackages(all_packages, architecture);
-    const pins: []const CyclePackagePin = if (std.mem.eql(u8, architecture, "arm64"))
+    const pins: []const CyclePackagePin = if (std.mem.eql(u8, pkgs[0].version, debian_openssl_cycle[0].version))
+        if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_openssl_cycle else &debian_openssl_cycle
+    else if (std.mem.eql(u8, architecture, "arm64"))
         &arm64_openssl_cycle
-    else if (std.mem.eql(u8, pkgs[0].version, debian_openssl_cycle[0].version))
-        &debian_openssl_cycle
     else
         &openssl_cycle;
     for (pkgs, pins) |pkg, expected| {
@@ -1733,7 +1833,10 @@ pub fn triggerHandlerPackages(
         return error.MissingTriggerHandlerPackage;
     const handlers: []const TriggerHandlerPin = if (std.mem.eql(u8, libc_bin.version, debian_libc_bin_trigger_handler.version) and
         !all_packages.contains(.{ .name = "procps", .architecture = architecture }))
-        &.{debian_libc_bin_trigger_handler}
+        if (std.mem.eql(u8, architecture, "arm64"))
+            &.{debian_arm64_libc_bin_trigger_handler}
+        else
+            &.{debian_libc_bin_trigger_handler}
     else if (std.mem.eql(u8, architecture, "arm64"))
         &arm64_trigger_handlers
     else
@@ -2249,10 +2352,10 @@ pub fn launcherCommand(
         {
             return error.CycleIdentityChanged;
         }
-        const pins: []const CyclePackagePin = if (std.mem.eql(u8, architecture, "arm64"))
+        const pins: []const CyclePackagePin = if (std.mem.eql(u8, cycle[0].version, debian_openssl_cycle[0].version))
+            if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_openssl_cycle else &debian_openssl_cycle
+        else if (std.mem.eql(u8, architecture, "arm64"))
             &arm64_openssl_cycle
-        else if (std.mem.eql(u8, cycle[0].version, debian_openssl_cycle[0].version))
-            &debian_openssl_cycle
         else
             &openssl_cycle;
         for (cycle, pins) |pkg, pin| {
@@ -2282,17 +2385,16 @@ pub fn launcherCommand(
     if (std.mem.eql(u8, verb, "break_base_cycle")) {
         if ((!std.mem.eql(u8, architecture, "amd64") and !std.mem.eql(u8, architecture, "arm64")) or
             !std.mem.eql(u8, profile, base_cycle_profile) or
-            (cycle.len != base_cycle.len and
-                (!std.mem.eql(u8, architecture, "amd64") or cycle.len != debian_base_cycle.len)) or
+            (cycle.len != base_cycle.len and cycle.len != debian_base_cycle.len) or
             package == null or
             !PackageKey.eql(package.?.key(), cycle[1].key()))
         {
             return error.CycleIdentityChanged;
         }
-        const pins: []const CyclePackagePin = if (std.mem.eql(u8, architecture, "arm64"))
+        const pins: []const CyclePackagePin = if (cycle.len == debian_base_cycle.len)
+            if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_base_cycle else &debian_base_cycle
+        else if (std.mem.eql(u8, architecture, "arm64"))
             &arm64_base_cycle
-        else if (cycle.len == debian_base_cycle.len)
-            &debian_base_cycle
         else
             &base_cycle;
         for (cycle, pins) |pkg, pin| {
@@ -2368,13 +2470,7 @@ pub fn launcherCommand(
             (!std.mem.eql(u8, architecture, "amd64") and !std.mem.eql(u8, architecture, "arm64")) or
             !std.mem.eql(u8, pkg.name, profile) or
             !std.mem.eql(u8, pkg.architecture, architecture) or
-            (!profileVersionMatches(profile, pkg.version) and
-                !(std.mem.eql(u8, architecture, "arm64") and std.mem.eql(u8, pkg.version, profilePinnedVersion(profile).?))))
-        {
-            return error.RuntimeProfileVersionMismatch;
-        }
-        if (std.mem.eql(u8, architecture, "arm64") and
-            !std.mem.eql(u8, pkg.version, profilePinnedVersion(profile).?))
+            !profileVersionMatches(profile, pkg.version))
         {
             return error.RuntimeProfileVersionMismatch;
         }
@@ -3159,7 +3255,7 @@ fn execBreakBaseCycle(
         try out.writer.writeAll("{\"callbacks\":[],\"force\":[\"--force-depends\"],\"graph\":{");
         const order_indices: []const usize = if (is_debian) &.{ 2, 0, 1 } else &.{ 2, 3, 0, 1 };
         const bindings: []const CyclePackagePin = if (is_debian)
-            &debian_base_cycle
+            if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_base_cycle else &debian_base_cycle
         else if (std.mem.eql(u8, architecture, "arm64"))
             &arm64_base_cycle
         else
@@ -3235,7 +3331,7 @@ fn execConfigureOpensslCycle(
     const cycle = try opensslCyclePackages(all_packages, architecture);
     const is_debian = std.mem.eql(u8, cycle[0].version, debian_openssl_cycle[0].version);
     const active_openssl_cycle: []const CyclePackagePin = if (is_debian)
-        &debian_openssl_cycle
+        if (std.mem.eql(u8, architecture, "arm64")) &debian_arm64_openssl_cycle else &debian_openssl_cycle
     else if (std.mem.eql(u8, architecture, "arm64"))
         &arm64_openssl_cycle
     else
@@ -3532,7 +3628,10 @@ fn execProcessTriggers(
     const handlers = try verifyTriggerHandlers(allocator, root, all_packages, &statuses, architecture, fetchCtrlTarViaDpkgDeb);
     const active_handlers: []const TriggerHandlerPin = if (handlers.len == 1 and
         std.mem.eql(u8, handlers[0].version, debian_libc_bin_trigger_handler.version))
-        &.{debian_libc_bin_trigger_handler}
+        if (std.mem.eql(u8, architecture, "arm64"))
+            &.{debian_arm64_libc_bin_trigger_handler}
+        else
+            &.{debian_libc_bin_trigger_handler}
     else if (std.mem.eql(u8, architecture, "arm64"))
         &arm64_trigger_handlers
     else
@@ -5761,6 +5860,166 @@ test "debian stable amd64 base cycle, openssl cycle, trigger handler, and system
     };
     const sysd_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "amd64", "systemd", "configure", debian_systemd, &.{});
     try std.testing.expectEqual(@as(usize, 8), sysd_cmd.len);
+}
+
+test "debian stable arm64 base cycle, openssl cycle, trigger handler, and systemd profile bindings admit trixie arm64 closure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const NoopArchive = struct {
+        fn verify(_: Package) !void {}
+    };
+    test_verify_archive_hook = NoopArchive.verify;
+    defer test_verify_archive_hook = null;
+
+    var all_pkgs = std.HashMap(PackageKey, Package, PackageKeyContext, 80).init(allocator);
+    for (debian_arm64_base_cycle) |pin| {
+        const pkg: Package = .{
+            .name = pin.name,
+            .version = pin.version,
+            .architecture = pin.architecture,
+            .digest = pin.sha512,
+            .declared_size = pin.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{pin.name}),
+        };
+        try all_pkgs.put(pkg.key(), pkg);
+    }
+    for (debian_arm64_openssl_cycle) |pin| {
+        const pkg: Package = .{
+            .name = pin.name,
+            .version = pin.version,
+            .architecture = pin.architecture,
+            .digest = pin.sha512,
+            .declared_size = pin.size,
+            .archive = try std.fmt.allocPrint(allocator, "/cache/{s}.deb", .{pin.name}),
+        };
+        try all_pkgs.put(pkg.key(), pkg);
+    }
+    const debian_arm64_libc_bin: Package = .{
+        .name = debian_arm64_libc_bin_trigger_handler.name,
+        .version = debian_arm64_libc_bin_trigger_handler.version,
+        .architecture = debian_arm64_libc_bin_trigger_handler.architecture,
+        .digest = debian_arm64_libc_bin_trigger_handler.sha512,
+        .declared_size = debian_arm64_libc_bin_trigger_handler.size,
+        .archive = "/cache/libc-bin.deb",
+    };
+    try all_pkgs.put(debian_arm64_libc_bin.key(), debian_arm64_libc_bin);
+
+    const FetchDebianArm64Tar = struct {
+        fn fetch(alloc: std.mem.Allocator, archive: []const u8) ![]const u8 {
+            const base_name = std.fs.path.stem(archive);
+            for (debian_arm64_base_cycle) |pin| {
+                if (std.mem.eql(u8, pin.name, base_name)) {
+                    const ctrl = try std.fmt.allocPrint(
+                        alloc,
+                        "Package: {s}\nVersion: {s}\nArchitecture: {s}\nDepends: {s}\n",
+                        .{ pin.name, pin.version, pin.architecture, pin.depends },
+                    );
+                    if (std.mem.eql(u8, base_name, "libgcc-s1")) {
+                        var entries = std.ArrayList(TarFixtureMember).empty;
+                        for (pin.members) |m| {
+                            if (std.mem.eql(u8, m, ".")) {
+                                try entries.append(alloc, .{ .name = ".", .content = null });
+                            } else if (std.mem.eql(u8, m, "./control")) {
+                                try entries.append(alloc, .{ .name = "./control", .content = ctrl });
+                            } else if (std.mem.eql(u8, m, "./triggers")) {
+                                try entries.append(alloc, .{ .name = "./triggers", .content = debian_libgcc_triggers });
+                            } else {
+                                try entries.append(alloc, .{ .name = m, .content = "fixture\n" });
+                            }
+                        }
+                        return buildTestControlTar(alloc, entries.items);
+                    }
+                    return buildTestControlTar(alloc, &.{
+                        .{ .name = ".", .content = null },
+                        .{ .name = "./control", .content = ctrl },
+                    });
+                }
+            }
+            for (debian_arm64_openssl_cycle) |pin| {
+                if (std.mem.eql(u8, pin.name, base_name)) {
+                    const ctrl = try std.fmt.allocPrint(
+                        alloc,
+                        "Package: {s}\nVersion: {s}\nArchitecture: {s}\nDepends: {s}\n",
+                        .{ pin.name, pin.version, pin.architecture, pin.depends },
+                    );
+                    return buildTestControlTar(alloc, &.{
+                        .{ .name = ".", .content = null },
+                        .{ .name = "./control", .content = ctrl },
+                    });
+                }
+            }
+            return error.MissingControlTarFixture;
+        }
+    };
+
+    var base_statuses = DatabaseMap.init(allocator);
+    for (debian_arm64_base_cycle) |pin| {
+        try base_statuses.put(.{ .name = pin.name, .architecture = pin.architecture }, .{
+            .name = pin.name,
+            .architecture = pin.architecture,
+            .version = pin.version,
+            .status = pin.status,
+        });
+    }
+    const base_pair = try verifyBaseCycle(allocator, &all_pkgs, &base_statuses, "arm64", FetchDebianArm64Tar.fetch);
+    try std.testing.expectEqualStrings("libc6", base_pair[0].name);
+    try std.testing.expectEqualStrings("libgcc-s1", base_pair[1].name);
+    try std.testing.expectEqualStrings("arm64", base_pair[0].architecture);
+
+    var openssl_statuses = DatabaseMap.init(allocator);
+    for (debian_arm64_openssl_cycle) |pin| {
+        try openssl_statuses.put(.{ .name = pin.name, .architecture = pin.architecture }, .{
+            .name = pin.name,
+            .architecture = pin.architecture,
+            .version = pin.version,
+            .status = pin.status,
+        });
+    }
+    const openssl_pair = try verifyOpensslCycle(allocator, &all_pkgs, &openssl_statuses, "arm64", FetchDebianArm64Tar.fetch);
+    try std.testing.expectEqualStrings("libssl3t64", openssl_pair[0].name);
+    try std.testing.expectEqualStrings("openssl-provider-legacy", openssl_pair[1].name);
+    try std.testing.expectEqualStrings("arm64", openssl_pair[0].architecture);
+
+    var trig_statuses = DatabaseMap.init(allocator);
+    try trig_statuses.put(debian_arm64_libc_bin.key(), .{
+        .name = debian_arm64_libc_bin.name,
+        .architecture = debian_arm64_libc_bin.architecture,
+        .version = debian_arm64_libc_bin.version,
+        .status = "install ok triggers-pending",
+    });
+    const ready_handlers = try triggerHandlerPackages(allocator, &all_pkgs, &trig_statuses, "arm64");
+    try std.testing.expectEqual(@as(usize, 1), ready_handlers.len);
+    try std.testing.expectEqualStrings("libc-bin", ready_handlers[0].name);
+    try std.testing.expectEqualStrings("arm64", ready_handlers[0].architecture);
+
+    const launcher: Launcher = .{ .path = "/bin/launcher", .runtime = "/runtime" };
+    const deb_base_pkgs = try debianBaseCyclePackages(&all_pkgs, "arm64");
+    const base_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "arm64", base_cycle_profile, "break_base_cycle", deb_base_pkgs[1], &deb_base_pkgs);
+    try std.testing.expectEqual(@as(usize, 11), base_cmd.len);
+    try std.testing.expectEqualStrings("libgcc-s1:arm64", base_cmd[6]);
+
+    const deb_openssl_pkgs = try opensslCyclePackages(&all_pkgs, "arm64");
+    const openssl_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "arm64", openssl_cycle_profile, "configure_openssl_cycle", deb_openssl_pkgs[0], &deb_openssl_pkgs);
+    try std.testing.expectEqual(@as(usize, 13), openssl_cmd.len);
+    try std.testing.expectEqualStrings("libssl3t64:arm64", openssl_cmd[6]);
+
+    const trig_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "arm64", "none", "triggers_only", debian_arm64_libc_bin, &.{});
+    try std.testing.expectEqual(@as(usize, 9), trig_cmd.len);
+    try std.testing.expectEqualStrings("libc-bin:arm64", trig_cmd[6]);
+
+    const debian_systemd: Package = .{
+        .name = "systemd",
+        .version = debian_systemd_profile_version.version,
+        .architecture = "arm64",
+        .digest = debian_arm64_base_cycle[0].sha512,
+        .declared_size = 100,
+        .archive = "/cache/systemd.deb",
+    };
+    const sysd_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "arm64", "systemd", "configure", debian_systemd, &.{});
+    try std.testing.expectEqual(@as(usize, 8), sysd_cmd.len);
+    try std.testing.expectEqualStrings("systemd:arm64", sysd_cmd[6]);
 }
 
 test "ubuntu arm64 base cycle, openssl cycle, kbd cycle, trigger handlers, and profile bindings admit arm64 closure" {

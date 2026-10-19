@@ -469,5 +469,11 @@ for arm64):
 
 These are tracked in #271 (amd64) and #273 (arm64). The committed,
 bounded locks (at most 128 packages and 64 MiB each) and their CAS and
-inventory evidence are the baseline input for those runs. Nothing here
-satisfies their gate.
+inventory evidence are the baseline input for those runs. Native unpack and
+maintainer-script admissions (`systemd` `257.13-1~deb13u1`, `bash`
+`5.2.37-2+b10`, and `gawk` `1:5.2.1-2+b1` on `amd64` / `1:5.2.1-2+b2` on
+`arm64`), reference runtime/launcher/ordering bindings (base and OpenSSL
+cycles, `libc-bin` trigger processing, `dpkg`/`util-linux` deferral behind
+`systemd`, and `coreutils`/`libc6` provider bindings), and strict comparator
+normalizations now cover both `amd64` (#271) and `arm64` (#273) `trixie`
+closures.

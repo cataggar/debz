@@ -776,7 +776,10 @@ depends on it: `test/real-snapshot-policy.zig` uses fixed offline inputs.
     `trixie` to `frozen_release_with_witnesses`, with `trixie-updates` as the
     witness and the archive keys accepted. It can use PR B's tool through a
     `debian-trixie` profile. That removes the 2026-10-13 cliff in exchange
-    for weekly repins.
+    for weekly repins. #271 (`amd64`) and #273 (`arm64`) bind the signed
+    `trixie` `apt` and `systemd-sysv` closures into the native unpack/script
+    admissions, reference runtime/launcher/ordering, and differential
+    comparator.
 
 ## Open questions for review
 
