@@ -2,9 +2,9 @@
   "schema": "https://debz.dev/schema/legacy-compatibility-policy-v1",
   "version": 1,
   "issue": 86,
-  "current_release_mode": "legacy_capable",
+  "current_release_mode": "native_only",
   "legacy_capable_release_range": ">=0.3.0,<0.4.0",
-  "native_only_cutover_ready": false,
+  "native_only_cutover_ready": true,
   "invariants": {
     "legacy_is_never_native_authority": true,
     "active_legacy_requires_legacy_capable_recovery": true,
@@ -615,12 +615,5 @@
       "required_evidence": "backend-capability"
     }
   ],
-  "cutover_blockers": [
-    "active_legacy_root_operations_recovered_or_refused_with_version_guidance",
-    "legacy_journal_execution_deleted_but_historical_decoders_retained",
-    "legacy_product_repository_package_family_and_actions_selectors_deleted",
-    "system_profile_v1_execution_deleted_but_exact_byte_decoder_retained",
-    "legacy_lock_and_result_generation_deleted",
-    "release_and_actions_defaults_changed_only_in_cutover_increment"
-  ]
+  "cutover_blockers": []
 }

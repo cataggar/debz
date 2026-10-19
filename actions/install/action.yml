@@ -8,14 +8,14 @@ branding:
 
 inputs:
   transaction-backend:
-    description: Explicit transaction engine (legacy_dpkg or native); no format detection or fallback
+    description: Explicit transaction engine (native; legacy_dpkg is refused without fallback)
     required: false
-    default: legacy_dpkg
+    default: native
   package:
     description: One explicit debz install selector (name[:architecture][=version])
     required: true
   lock-input:
-    description: Reviewed canonical exact-lock document (v1 for legacy_dpkg, v3 for native)
+    description: Reviewed canonical exact-lock document (v3 for native)
     required: true
   architecture:
     description: Native Debian architecture (amd64 on Linux X64 or arm64 on Linux ARM64)

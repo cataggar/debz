@@ -270,9 +270,13 @@ pub fn main(init: std.process.Init) !void {
     defer first.deinit();
     if (first.exit_status != .success) {
         const failure_json = try first.canonicalJson(allocator);
-        std.debug.print("{s}\n", .{failure_json});
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout_file = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+        const stdout = &stdout_file.interface;
+        try stdout.print("{s}\n", .{failure_json});
+        try stdout.flush();
+        std.process.exit(@intFromEnum(first.exit_status));
     }
-    try expect(first.exit_status == .success);
     try expect(first.changed);
     try expect(first.installed);
     try expect(first.refreshed == !parsed.request.no_refresh);

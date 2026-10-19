@@ -260,7 +260,12 @@ jobs:
           zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
-            --architecture "$ARCHITECTURE" --sha256-only
+            --architecture "$ARCHITECTURE"
+          "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$workspace/root" --mode full
+          sudo mkdir -p "$RUNNER_TEMP/debz-install-cold-root" "$RUNNER_TEMP/debz-install-warm-root"
+          sudo chmod 0755 "$RUNNER_TEMP/debz-install-cold-root" "$RUNNER_TEMP/debz-install-warm-root"
+          sudo "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$RUNNER_TEMP/debz-install-cold-root" --mode full
+          sudo "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$RUNNER_TEMP/debz-install-warm-root" --mode full
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -349,11 +354,11 @@ jobs:
           WARM_COUNT: ${{ steps.install-warm.outputs.installed-count }}
         run: |
           test "$COLD_COUNT" -gt 0
-          test -f "$COLD_RESULT"
+          sudo test -f "$COLD_RESULT"
           test "$WARM_CACHE_HIT" = true
           test "$WARM_DOWNLOADED" -eq 0
           test "$WARM_COUNT" -eq "$COLD_COUNT"
-          test -f "$WARM_RESULT"
+          sudo test -f "$WARM_RESULT"
           test "$WARM_RESULT" != "$COLD_RESULT"
       - name: Audit published archive and install exact release with ghr
         env:

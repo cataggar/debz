@@ -2,6 +2,7 @@ import {
   access,
   lstat,
   mkdir,
+  open,
   realpath,
   stat,
 } from 'node:fs/promises';
@@ -67,10 +68,12 @@ export async function readInputs(
   const workspace = requiredEnvironmentPath(environment, 'GITHUB_WORKSPACE');
   const runnerTemp = requiredEnvironmentPath(environment, 'RUNNER_TEMP');
   const transactionBackend =
-    optionalScalar(environment, 'TRANSACTION_BACKEND') ?? 'legacy_dpkg';
-  if (transactionBackend !== 'legacy_dpkg' && transactionBackend !== 'native') {
+    optionalScalar(environment, 'TRANSACTION_BACKEND') ?? 'native';
+  if (transactionBackend !== 'native') {
     throw new DownloadActionError(
-      "transaction-backend must be 'legacy_dpkg' or 'native'",
+      transactionBackend === 'legacy_dpkg'
+        ? 'legacy_dpkg package-cache execution is retired. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.'
+        : "transaction-backend must be 'native'",
     );
   }
   const lockInput = await resolveRegularFile(
@@ -78,6 +81,7 @@ export async function readInputs(
     workspace,
     'lock-input',
   );
+  await validateLockInput(lockInput);
   const sources = await resolveFileList(
     multiline(environment, 'SOURCE'),
     workspace,
@@ -88,19 +92,11 @@ export async function readInputs(
     workspace,
     'config',
   );
-  if (transactionBackend === 'legacy_dpkg' && sources.length === 0 && configs.length === 0) {
-    throw new DownloadActionError(
-      "one or more explicit 'source' or 'config' paths are required",
-    );
-  }
   const keyrings = await resolveFileList(
-    multiline(environment, 'KEYRING', transactionBackend === 'legacy_dpkg'),
+    multiline(environment, 'KEYRING'),
     workspace,
     'keyring',
   );
-  if (transactionBackend === 'legacy_dpkg' && keyrings.length === 0) {
-    throw new DownloadActionError("one or more explicit 'keyring' paths are required");
-  }
 
   const architecture = scalar(environment, 'ARCHITECTURE', true);
   if (architecture !== 'amd64' && architecture !== 'arm64') {
@@ -477,6 +473,40 @@ async function resolveRegularFile(
     throw new DownloadActionError(`${name} must name a regular file`);
   }
   return resolved;
+}
+
+async function validateLockInput(filename: string): Promise<void> {
+  const handle = await open(
+    filename,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const details = await handle.stat();
+    if (!details.isFile() || details.size <= 0 || details.size > 64 * 1024 * 1024) {
+      throw new DownloadActionError('lock-input must be a bounded JSON document');
+    }
+    const text = await handle.readFile({ encoding: 'utf8' });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new DownloadActionError('lock-input is not valid JSON');
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      (parsed as { schema?: unknown }).schema !==
+        'https://debz.dev/schema/exact-closure-lock-v3' ||
+      (parsed as { version?: unknown }).version !== 3
+    ) {
+      throw new DownloadActionError(
+        'lock-input must use https://debz.dev/schema/exact-closure-lock-v3 (exact-closure-lock-v1 and legacy lock schemas are unsupported; recover with debz >=0.3.0,<0.4.0)',
+      );
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 async function resolveCacheRoot(value: string, runnerTemp: string): Promise<string> {

@@ -178,7 +178,11 @@ native_exact=$(run_json package-cache prepare \
 native_empty_lock="$workspace/empty.native.lock.json"
 native_mixed_lock="$workspace/mixed.native.lock.json"
 native_local_lock="$workspace/local.native.lock.json"
-"$repository_generator" --check-roots write-native-cache-fixtures "$native_lock" "$native_empty_lock" "$native_mixed_lock" "$native_local_lock"
+legacy_v1_lock="$workspace/legacy.lock.json"
+legacy_v1_archive="$workspace/legacy-package-cache.dbzcache"
+"$repository_generator" --check-roots write-native-cache-fixtures \
+  "$native_lock" "$native_empty_lock" "$native_mixed_lock" "$native_local_lock" \
+  "$legacy_v1_lock" "$legacy_v1_archive"
 native_empty_fingerprint=$(run_json package-cache fingerprint \
   --transaction-backend native --lock-input "$native_empty_lock" \
   --cache-path "$workspace/native-package-cache-empty" --architecture "$architecture" --json)
@@ -213,44 +217,38 @@ test "$missing_local_status" -eq 6
 test ! -s "$stderr_file"
 printf '%s' "$missing_local" | grep -q '"id":"local_artifact_acquisition_required"'
 
-sha256_resolved_lock="$workspace/base-dep.sha256.lock.json"
-run_json plan $sha256_common --source "$sha256_source" \
-  --lock-output "$sha256_resolved_lock" base-dep | grep -q '"exit_status":0'
-run_json package-cache prepare --lock-input "$sha256_resolved_lock" \
-  --cache-path "$workspace/legacy-archive-cache" --architecture "$architecture" \
-  --source "$sha256_source" --keyring "$sha256_keyring" \
-  --archive-output "$workspace/legacy-package-cache.dbzcache" --json >/dev/null
-for backend in native legacy_dpkg; do
-  if [ "$backend" = native ]; then
-    selected_lock="$native_lock"
-    selected_source="$source_file"
-    selected_keyring="$keyring"
-    wrong_archive="$workspace/legacy-package-cache.dbzcache"
-    object_directory=packages-v2
-  else
-    selected_lock="$sha256_resolved_lock"
-    selected_source="$sha256_source"
-    selected_keyring="$sha256_keyring"
-    wrong_archive="$native_package_archive"
-    object_directory=packages-v2
-  fi
-  refused_cache="$workspace/native-cache-version-refusal-$backend"
-  set +e
-  refused=$("$debz" package-cache prepare --transaction-backend "$backend" \
-    --lock-input "$selected_lock" --cache-path "$refused_cache" \
-    --architecture "$architecture" --source "$selected_source" --keyring "$selected_keyring" \
-    --archive-input "$wrong_archive" --restored-cache exact --json 2>"$stderr_file")
-  refused_status=$?
-  set -e
-  test "$refused_status" -eq 6
-  test ! -s "$stderr_file"
-  printf '%s' "$refused" | grep -q '"id":"corrupt_cache_archive"'
-  test ! -d "$refused_cache/$object_directory/objects" ||
-    test -z "$(find "$refused_cache/$object_directory/objects" -mindepth 1 -print -quit)"
-done
+refused_cache="$workspace/native-cache-version-refusal-native"
+set +e
+refused=$("$debz" package-cache prepare --transaction-backend native \
+  --lock-input "$native_lock" --cache-path "$refused_cache" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
+  --archive-input "$legacy_v1_archive" --restored-cache exact --json 2>"$stderr_file")
+refused_status=$?
+set -e
+test "$refused_status" -eq 6
+test ! -s "$stderr_file"
+printf '%s' "$refused" | grep -q '"id":"corrupt_cache_archive"'
+test ! -d "$refused_cache/packages-v2/objects" ||
+  test -z "$(find "$refused_cache/packages-v2/objects" -mindepth 1 -print -quit)"
+
+refused_legacy_cache="$workspace/native-cache-version-refusal-legacy_dpkg"
+set +e
+refused_legacy=$("$debz" package-cache prepare --transaction-backend legacy_dpkg \
+  --lock-input "$legacy_v1_lock" --cache-path "$refused_legacy_cache" \
+  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --archive-input "$native_package_archive" --restored-cache exact --json 2>"$stderr_file")
+refused_legacy_status=$?
+set -e
+test "$refused_legacy_status" -eq 8
+test ! -s "$stderr_file"
+printf '%s' "$refused_legacy" | grep -q '"id":"legacy_recovery_release_required"'
+printf '%s' "$refused_legacy" | grep -Fq '>=0.3.0,<0.4.0'
+test ! -d "$refused_legacy_cache/packages-v2/objects" ||
+  test -z "$(find "$refused_legacy_cache/packages-v2/objects" -mindepth 1 -print -quit)"
+
 set +e
 native_cache_wrong_lock=$("$debz" package-cache fingerprint \
-  --transaction-backend native --lock-input "$resolved_lock" \
+  --transaction-backend native --lock-input "$legacy_v1_lock" \
   --cache-path "$native_package_cache" --architecture "$architecture" --json 2>"$stderr_file")
 native_cache_wrong_lock_status=$?
 set -e
@@ -261,7 +259,7 @@ test ! -s "$root/var/lib/dpkg/status"
 test ! -e "$root/var/lib/debz/root-operation-v1.json"
 
 set +e
-native_wrong_version=$("$debz" plan $native_common --lock-input "$resolved_lock" base-dep 2>"$stderr_file")
+native_wrong_version=$("$debz" plan $native_common --lock-input "$legacy_v1_lock" base-dep 2>"$stderr_file")
 native_wrong_version_status=$?
 set -e
 test "$native_wrong_version_status" -eq 5
@@ -303,15 +301,22 @@ test "$sha256_unbound_status" -eq 5
 test ! -s "$stderr_file"
 printf '%s' "$sha256_unbound" | grep -q 'SHA-512 archive identity'
 test ! -e "$sha256_unbound_lock"
-run_json plan $sha256_common --source "$sha256_source" \
-  --lock-output "$workspace/sha256.legacy.lock.json" scenario-main | grep -q '"exit_status":0'
+set +e
+sha256_legacy=$("$debz" plan $sha256_common --source "$sha256_source" --transaction-backend legacy_dpkg \
+  --lock-output "$workspace/sha256.legacy.lock.json" scenario-main 2>"$stderr_file")
+sha256_legacy_status=$?
+set -e
+test "$sha256_legacy_status" -eq 8
+test ! -s "$stderr_file"
+printf '%s' "$sha256_legacy" | grep -q '"id":"legacy_recovery_release_required"'
+test ! -e "$workspace/sha256.legacy.lock.json"
 sha256_bound_lock="$workspace/sha256-bound.native.lock.json"
 run_json plan $sha256_common --config "$sha256_config" --transaction-backend native \
   --lock-output "$sha256_bound_lock" scenario-main | grep -q '"exit_status":0'
 run_json download $sha256_common --config "$sha256_config" --transaction-backend native \
   --lock-input "$sha256_bound_lock" --cache-only scenario-main | grep -q '"exit_status":0'
 sha256_forged_lock="$workspace/sha256-forged.native.lock.json"
-sha256_tampered=$("$repository_generator" --check-roots sha256-bound-lock "$sha256_bound_lock" "$sha256_cache" "$workspace/sha256.legacy.lock.json" "$sha256_forged_lock")
+sha256_tampered=$("$repository_generator" --check-roots sha256-bound-lock "$sha256_bound_lock" "$sha256_cache" "$native_scenario_lock" "$sha256_forged_lock")
 set +e
 sha256_forged=$("$debz" plan $sha256_common --config "$sha256_config" --transaction-backend native \
   --lock-input "$sha256_forged_lock" scenario-main 2>"$stderr_file")
@@ -395,15 +400,15 @@ fi
 package_cache_root="$workspace/package-cache"
 package_cache_archives="$workspace/package-cache-archives"
 mkdir -p "$package_cache_archives"
-package_cache_common="--lock-input $sha256_resolved_lock --cache-path $package_cache_root --architecture $architecture"
+package_cache_common="--lock-input $resolved_lock --cache-path $package_cache_root --architecture $architecture"
 fingerprint=$(run_json package-cache fingerprint $package_cache_common --json)
-printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v3"'
-printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v3"'
+printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v5"'
+printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v5"'
 printf '%s' "$fingerprint" | grep -q '"cas_layout":"packages-v2"'
 
 set +e
 unsupported=$("$debz" package-cache fingerprint \
-  --lock-input "$native_lock" \
+  --lock-input "$legacy_v1_lock" \
   --cache-path "$package_cache_root" --architecture "$architecture" --json \
   2>"$stderr_file")
 unsupported_status=$?
@@ -414,7 +419,7 @@ printf '%s' "$unsupported" | grep -q '"id":"unsupported_lock_schema"'
 
 set +e
 wrong_architecture=$("$debz" package-cache fingerprint \
-  --lock-input "$sha256_resolved_lock" --cache-path "$package_cache_root" \
+  --lock-input "$resolved_lock" --cache-path "$package_cache_root" \
   --architecture other-architecture --json 2>"$stderr_file")
 wrong_architecture_status=$?
 set -e
@@ -423,16 +428,16 @@ test ! -s "$stderr_file"
 printf '%s' "$wrong_architecture" | grep -q '"id":"invalid_request"'
 
 cold=$(run_json package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" \
+  --source "$source_file" --keyring "$keyring" \
   --archive-output "$package_cache_archives/base.dbzcache" --json)
-printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v3"'
+printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v5"'
 "$repository_generator" --check-roots cache-result cold "$cold"
 
 retry_cache="$workspace/package-cache-retry"
-"$repository_generator" --check-roots write-abandoned-staging "$sha256_resolved_lock" "$retry_cache"
+"$repository_generator" --check-roots write-abandoned-staging "$resolved_lock" "$retry_cache"
 retried=$(run_json package-cache prepare \
-  --lock-input "$sha256_resolved_lock" --cache-path "$retry_cache" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --lock-input "$resolved_lock" --cache-path "$retry_cache" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --archive-input "$package_cache_archives/base.dbzcache" \
   --restored-cache exact --json)
 "$repository_generator" --check-roots cache-result retried "$retried"
@@ -444,8 +449,8 @@ printf partial >"$limited_cache/packages-v2/staging/one"
 printf partial >"$limited_cache/packages-v2/staging/two"
 set +e
 cleanup_limited=$("$debz" package-cache prepare \
-  --lock-input "$sha256_resolved_lock" --cache-path "$limited_cache" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --lock-input "$resolved_lock" --cache-path "$limited_cache" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --archive-input "$package_cache_archives/base.dbzcache" \
   --restored-cache exact --maximum-staging-entries 1 --json 2>"$stderr_file")
 cleanup_limited_status=$?
@@ -456,14 +461,14 @@ printf '%s' "$cleanup_limited" | grep -q '"id":"staging_cleanup_incomplete"'
 test -z "$(find "$limited_cache/packages-v2/objects" -mindepth 1 -type f -print -quit)"
 
 exact=$(run_json package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" --offline --json)
+  --source "$source_file" --keyring "$keyring" --offline --json)
 "$repository_generator" --check-roots cache-result exact "$exact"
 
 scenario_lock="$workspace/scenario-main.lock.json"
-run_json plan $sha256_common --source "$sha256_source" --lock-output "$scenario_lock" scenario-main | grep -q '"exit_status":0'
+run_json plan $common --lock-output "$scenario_lock" scenario-main | grep -q '"exit_status":0'
 archive_partial=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-relocated" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --archive-input "$package_cache_archives/base.dbzcache" \
   --archive-output "$package_cache_archives/scenario.dbzcache" \
   --restored-cache partial --json)
@@ -471,7 +476,7 @@ archive_partial=$(run_json package-cache prepare \
 
 archive_exact=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-relocated-exact" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --archive-input "$package_cache_archives/scenario.dbzcache" \
   --restored-cache exact --json)
 "$repository_generator" --check-roots cache-result exact "$archive_exact"
@@ -481,7 +486,7 @@ printf 'corrupt' >>"$package_cache_archives/corrupt.dbzcache"
 set +e
 corrupt_archive=$("$debz" package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$workspace/package-cache-corrupt-archive" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --archive-input "$package_cache_archives/corrupt.dbzcache" \
   --restored-cache partial --json 2>"$stderr_file")
 corrupt_archive_status=$?
@@ -492,11 +497,11 @@ printf '%s' "$corrupt_archive" | grep -q '"id":"corrupt_cache_archive"'
 
 partial=$(run_json package-cache prepare \
   --lock-input "$scenario_lock" --cache-path "$package_cache_root" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" --json)
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" --json)
 "$repository_generator" --check-roots cache-result partial "$partial"
 
 pruned=$(run_json package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" --offline --json)
+  --source "$source_file" --keyring "$keyring" --offline --json)
 "$repository_generator" --check-roots cache-result pruned "$pruned"
 
 first_cache_object=$(find "$package_cache_root/packages-v2/objects" -type f | head -n 1 || true)
@@ -505,7 +510,7 @@ cp "$first_cache_object" "$workspace/package-cache-object.backup"
 printf 'corrupt' >"$first_cache_object"
 set +e
 corrupt=$("$debz" package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" --offline --json 2>"$stderr_file")
+  --source "$source_file" --keyring "$keyring" --offline --json 2>"$stderr_file")
 corrupt_status=$?
 set -e
 test "$corrupt_status" -eq 6
@@ -513,7 +518,7 @@ test ! -s "$stderr_file"
 printf '%s' "$corrupt" | grep -q '"id":"corrupt_cache_object"'
 
 repaired=$(run_json package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" --repair-corrupt-cache --json)
+  --source "$source_file" --keyring "$keyring" --repair-corrupt-cache --json)
 "$repository_generator" --check-roots cache-result repaired "$repaired"
 rm -f "$workspace/package-cache-object.backup"
 
@@ -522,8 +527,8 @@ mkdir -p "$offline_objects_only/packages-v2"
 cp -R "$package_cache_root/packages-v2/objects" "$offline_objects_only/packages-v2/objects"
 set +e
 offline_without_metadata=$("$debz" package-cache prepare \
-  --lock-input "$sha256_resolved_lock" --cache-path "$offline_objects_only" \
-  --architecture "$architecture" --source "$sha256_source" --keyring "$sha256_keyring" \
+  --lock-input "$resolved_lock" --cache-path "$offline_objects_only" \
+  --architecture "$architecture" --source "$source_file" --keyring "$keyring" \
   --offline --json 2>"$stderr_file")
 offline_without_metadata_status=$?
 set -e
@@ -531,17 +536,17 @@ test "$offline_without_metadata_status" -eq 6
 test ! -s "$stderr_file"
 printf '%s' "$offline_without_metadata" | grep -q '"id":"offline_cache_miss"'
 
-printf 'tamper' >>"$sha256_repo/dists/$suite/InRelease"
+cp "$repo/dists/$suite/InRelease" "$workspace/InRelease.backup"
+printf 'tamper' >>"$repo/dists/$suite/InRelease"
 set +e
 moving_repository=$("$debz" package-cache prepare $package_cache_common \
-  --source "$sha256_source" --keyring "$sha256_keyring" --json 2>"$stderr_file")
+  --source "$source_file" --keyring "$keyring" --json 2>"$stderr_file")
 moving_repository_status=$?
 set -e
 test "$moving_repository_status" -eq 4
 test ! -s "$stderr_file"
 printf '%s' "$moving_repository" | grep -q '"id":"repository_authentication_failed"'
-"$repository_generator" \
-  --output "$sha256_repo" --suite "$suite" --architecture "$architecture" --sha256-only
+mv "$workspace/InRelease.backup" "$repo/dists/$suite/InRelease"
 
 find "$package_cache_root/packages-v2/objects" -mindepth 1 -maxdepth 1 -type f |
   while IFS= read -r object; do
@@ -614,6 +619,10 @@ EOF
   printf 'CAPABILITY dpkg-root-transactions: %s\n' "$(dpkg --version | head -n 1)"
   mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
   dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
+  $privileged dpkg --force-architecture --root="$root" --install \
+    "$repo/pool/main/native-helper-target_1.0-1_$architecture.deb" \
+    >"$workspace/root-seed.log" 2>&1
+  $privileged "$runtime" "$root" /bin/sh /bin/sh
   run_mutating_json install $mutating base-dep | grep -q '"exit_status":0'
   echo "ASSERT dpkg-install: passed"
   run_mutating_json reinstall $mutating base-dep | grep -q '"exit_status":0'

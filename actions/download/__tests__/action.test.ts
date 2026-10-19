@@ -16,7 +16,10 @@ test.beforeEach(async () => {
   await rm(testRoot, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
   await mkdir(runnerTemp, { recursive: true });
-  await writeFile(path.join(workspace, 'lock.json'), '{}\n');
+  await writeFile(
+    path.join(workspace, 'lock.json'),
+    '{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3}\n',
+  );
   await writeFile(path.join(workspace, 'repo.sources'), 'Types: deb\n');
   await writeFile(path.join(workspace, 'keyring.gpg'), 'keyring');
 });
@@ -25,7 +28,10 @@ test.after(async () => {
   await rm(testRoot, { recursive: true, force: true });
 });
 
-async function fakeDebz(values: ReturnType<typeof environment>): Promise<{
+async function fakeDebz(
+  values: ReturnType<typeof environment>,
+  backendOverride?: 'legacy_dpkg' | 'native',
+): Promise<{
   bin: string;
   executable: string;
   log: string;
@@ -33,8 +39,9 @@ async function fakeDebz(values: ReturnType<typeof environment>): Promise<{
   prepared: ReturnType<typeof preparation>;
 }> {
   const inputs = await readInputs(values);
-  const expected = fingerprint(inputs);
-  const prepared = preparation(inputs, expected);
+  const selected = backendOverride === undefined ? inputs : { ...inputs, transactionBackend: backendOverride };
+  const expected = fingerprint(selected);
+  const prepared = preparation(selected, expected);
   const bin = path.join(testRoot, 'bin');
   await mkdir(bin);
   const executable = path.join(bin, 'debz');
@@ -80,7 +87,7 @@ function restoreEnvironment(previous: NodeJS.ProcessEnv): void {
   process.exitCode = undefined;
 }
 
-for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
+for (const transactionBackend of ['native'] as const) {
   test(`restores, prepares, saves a partial cache, and publishes outputs last (${transactionBackend})`, async () => {
     const values = environment(workspace, runnerTemp);
     values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = transactionBackend;
@@ -131,21 +138,12 @@ for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
       await assert.rejects(lstat(savedPath));
       const output = await readFile(outputPath, 'utf8');
       assert.match(output, /cache-hit<<[^\n]+\nfalse\n/);
-      assert.match(
-        output,
-        new RegExp(`cache-matched-key<<[^\\n]+\\ndebz-package-cas-v${transactionBackend === 'native' ? 5 : 3}-`),
-      );
+      assert.match(output, /cache-matched-key<<[^\n]+\ndebz-package-cas-v5-/);
       assert.match(output, /downloaded-count<<[^\n]+\n1\n/);
       assert.match(output, /reused-count<<[^\n]+\n2\n/);
       assert.match(
         output,
-        new RegExp(
-          `backend-capability<<[^\\n]+\\n${
-            transactionBackend === 'legacy_dpkg'
-              ? 'legacy-dpkg-execution-deprecated-v1'
-              : 'native-transaction-execution-v1'
-          }\\n`,
-        ),
+        /backend-capability<<[^\n]+\nnative-transaction-execution-v1\n/,
       );
     } finally {
       restoreEnvironment(previous);
@@ -189,7 +187,7 @@ for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
 
 test('native selection rejects a legacy CLI response before cache access or success outputs', async () => {
   const values = environment(workspace, runnerTemp);
-  const { bin, log } = await fakeDebz(values);
+  const { bin, log } = await fakeDebz(values, 'legacy_dpkg');
   values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND = 'native';
   const outputPath = path.join(testRoot, 'github-output');
   await writeFile(outputPath, '');

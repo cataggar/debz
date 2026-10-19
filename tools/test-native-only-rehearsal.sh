@@ -84,7 +84,11 @@ grep -Fq 'native verification does not use --state-path' "$scratch/stderr"
 unchanged
 
 status=0
-"$debz" apt install --json demo >"$scratch/output" 2>"$scratch/stderr" || status=$?
-test "$status" -eq 2
-grep -Fq 'native-only rehearsal does not cover this selector (#280/#284)' "$scratch/stderr"
+output=$("$debz" package-cache fingerprint --json --transaction-backend legacy_dpkg \
+    --lock-input "$PWD/$scratch/no-lock" --cache-path "$PWD/$scratch/cache" \
+    --architecture amd64 2>"$scratch/stderr") || status=$?
+test "$status" -eq 8
+test ! -s "$scratch/stderr"
+printf '%s' "$output" | grep -Fq '"id":"legacy_recovery_release_required"'
+printf '%s' "$output" | grep -Fq '>=0.3.0,<0.4.0'
 unchanged

@@ -16,7 +16,7 @@ import {
 } from '../src/runner.js';
 
 const inputs: Inputs = {
-  transactionBackend: 'legacy_dpkg',
+  transactionBackend: 'native',
   runnerTemp: '/runner',
   lockInput: '/workspace/lock.json',
   architecture: 'amd64',
@@ -45,6 +45,8 @@ const inputs: Inputs = {
   offline: false,
   repairCorruptCache: false,
 };
+
+const legacyInputs: Inputs = { ...inputs, transactionBackend: 'legacy_dpkg' };
 
 test('requires the maintained Node 24 runtime', () => {
   assert.doesNotThrow(() => requireNode24('24.20.0'));
@@ -91,8 +93,8 @@ test('invokes debz without a shell and strictly validates both result schemas', 
   assert.equal(calls[1][0], 'package-cache');
   assert.equal(calls[1][1], 'fingerprint');
   assert.equal(calls[2][1], 'prepare');
-  assert.ok(!calls[1].includes('--transaction-backend'));
-  assert.ok(!calls[2].includes('--transaction-backend'));
+  assert.ok(calls[1].includes('--transaction-backend'));
+  assert.ok(calls[2].includes('--transaction-backend'));
   assert.ok(calls[2].includes('/workspace/keyring.gpg'));
   const restoreIndex = calls[2].indexOf('--restored-cache');
   assert.equal(calls[2][restoreIndex + 1], 'partial');
@@ -129,24 +131,27 @@ test('native selection binds both commands and accepts only consistent v5 contra
   assert.deepEqual(restoredCacheState(partial, nativeInputs, expected), {
     cacheHit: false, matchedKey: partial, kind: 'partial',
   });
-  assert.throws(() => restoredCacheState(fingerprint(inputs).primary_key, nativeInputs, expected), /outside/);
-  assert.throws(() => restoredCacheState(expected.primary_key, inputs, fingerprint(inputs)), /outside/);
+  assert.throws(() => restoredCacheState(fingerprint(legacyInputs).primary_key, nativeInputs, expected), /outside/);
+  assert.throws(() => restoredCacheState(expected.primary_key, legacyInputs, fingerprint(legacyInputs)), /legacy_dpkg/);
 });
 
 test('native and legacy schemas cannot be mixed or silently autodetected', async () => {
   const nativeInputs: Inputs = { ...inputs, transactionBackend: 'native' };
   const native = fingerprint(nativeInputs);
-  const legacy = fingerprint(inputs);
-  for (const [selected, foreign] of [[nativeInputs, legacy], [inputs, native]] as const) {
-    let calls = 0;
-    await assert.rejects(fingerprintCache('/runner/debz', '0.3.0', selected, {
-      async run() {
-        calls += 1;
-        return `${JSON.stringify(foreign)}\n`;
-      },
-    }), /unexpected value/);
-    assert.equal(calls, 1);
-  }
+  const legacy = fingerprint(legacyInputs);
+  let calls = 0;
+  await assert.rejects(fingerprintCache('/runner/debz', '0.3.0', nativeInputs, {
+    async run() {
+      calls += 1;
+      return `${JSON.stringify(legacy)}\n`;
+    },
+  }), /unexpected value/);
+  assert.equal(calls, 1);
+  await assert.rejects(fingerprintCache('/runner/debz', '0.3.0', legacyInputs, {
+    async run() {
+      assert.fail('legacy_dpkg must fail before invoking debz');
+    },
+  }), /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u);
   for (const field of [
     'schema', 'api_version', 'capability', 'lock_schema', 'lock_schema_version',
     'archive_format', 'origin_mode', 'primary_key', 'restore_prefix',
@@ -157,7 +162,7 @@ test('native and legacy schemas cannot be mixed or silently autodetected', async
     );
   }
   const result = preparation(nativeInputs, native);
-  const legacyResult = preparation(inputs, legacy);
+  const legacyResult = preparation(legacyInputs, legacy);
   for (const field of ['schema', 'api_version', 'capability'] as const) {
     assert.throws(
       () => validatePrepare({ ...result, [field]: legacyResult[field] }, nativeInputs, native),
@@ -175,29 +180,27 @@ test('native and legacy schemas cannot be mixed or silently autodetected', async
 });
 
 test('zero verified objects are native-only and all counts remain consistent and bounded', () => {
-  for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
-    const selected: Inputs = { ...inputs, transactionBackend };
-    const expected = fingerprint(selected);
-    const empty = {
-      ...preparation(selected, expected),
-      downloaded_count: 0,
-      reused_count: 0,
-      verified_count: 0,
-    };
-    if (transactionBackend === 'native') {
-      assert.deepEqual(validatePrepare(empty, selected, expected), empty);
-    } else {
-      assert.throws(() => validatePrepare(empty, selected, expected), /inconsistent counts/);
-    }
-    assert.throws(
-      () => validatePrepare({ ...empty, reused_count: 1 }, selected, expected),
-      /inconsistent counts/,
-    );
-    assert.throws(
-      () => validatePrepare({ ...empty, reused_count: 11, verified_count: 11 }, selected, expected),
-      /inconsistent counts/,
-    );
-  }
+  const selected: Inputs = { ...inputs, transactionBackend: 'native' };
+  const expected = fingerprint(selected);
+  const empty = {
+    ...preparation(selected, expected),
+    downloaded_count: 0,
+    reused_count: 0,
+    verified_count: 0,
+  };
+  assert.deepEqual(validatePrepare(empty, selected, expected), empty);
+  assert.throws(
+    () => validatePrepare({ ...empty, reused_count: 1 }, selected, expected),
+    /inconsistent counts/,
+  );
+  assert.throws(
+    () => validatePrepare({ ...empty, reused_count: 11, verified_count: 11 }, selected, expected),
+    /inconsistent counts/,
+  );
+  assert.throws(
+    () => validatePrepare(empty, legacyInputs, fingerprint(legacyInputs)),
+    /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u,
+  );
 });
 
 test('builds only typed arguments and excludes secrets from fingerprint material', () => {
@@ -313,6 +316,6 @@ test('rejects malformed version, multiline JSON, and inconsistent counts', async
         throw new Error('unknown command');
       },
     }),
-    /required package-cache-v3 fingerprint contract/,
+    /required package-cache-v5 fingerprint contract/,
   );
 });

@@ -231,64 +231,41 @@ fn actionCandidate(
     const inputs_path = try std.fmt.allocPrint(allocator, "{s}src/inputs.ts", .{prefix});
     const bundle_path = try std.fmt.allocPrint(allocator, "{s}dist/index.js", .{prefix});
     const child_path = try std.fmt.allocPrint(allocator, "{s}src/subprocess.ts", .{prefix});
-    var metadata = try f.replace(try f.source(metadata_path), "default: legacy_dpkg", "default: native");
-    const original_inputs = try f.source(inputs_path);
-    var inputs = try f.replace(original_inputs, "'legacy_dpkg';", "'native';");
-    inputs = try f.replace(inputs, "transactionBackend !== 'legacy_dpkg' && transactionBackend !== 'native'", "transactionBackend !== 'native'");
-    inputs = try f.replace(inputs, "transaction-backend must be 'legacy_dpkg' or 'native'", "transaction-backend refuses legacy_dpkg: Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.");
-    const default_expression = if (std.mem.eql(u8, action, "download"))
-        "optionalScalar(e,\"TRANSACTION_BACKEND\")??\"native\""
-    else
-        "exactScalar(e,\"TRANSACTION_BACKEND\")||\"native\"";
-    var bundle: []const u8 = try std.fmt.allocPrint(
-        allocator,
-        "const s={s};if(s!==\"native\"){{throw Error(\"legacy refusal\")}};setOutput(\"backend-capability\",\"native-transaction-execution-v1\");",
-        .{default_expression},
-    );
-    var overrides: std.json.ObjectMap = .empty;
-    if (mutation == .metadata) metadata = try f.replace(metadata, "default: native", "default: legacy_dpkg");
-    if (mutation == .input) inputs = if (std.mem.eql(u8, action, "download"))
-        try f.replace(inputs, "?? 'native';", "?? 'legacy_dpkg';")
-    else
-        try f.replace(inputs, "|| 'native';", "|| 'legacy_dpkg';");
-    if (mutation == .capability) metadata = try f.replace(metadata, "  backend-capability:", "  missing-capability:");
-    if (mutation == .bundle_capability) bundle = try f.replace(bundle, "\"backend-capability\"", "\"missing-capability\"");
-    try overrides.put(allocator, metadata_path, .{ .string = metadata });
-    try overrides.put(allocator, inputs_path, .{ .string = inputs });
-    if (mutation != .bundle) try overrides.put(allocator, bundle_path, .{ .string = bundle });
     const action_path = try std.fmt.allocPrint(allocator, "{s}src/action.ts", .{prefix});
-    const original_action = try f.source(action_path);
-    const marker = if (std.mem.eql(u8, action, "download"))
-        "  const inputs = await readInputs();"
-    else
-        "  const protectedFiles = await Promise.all(";
-    const guarded = if (std.mem.eql(u8, action, "download"))
-        try std.fmt.allocPrint(
-            allocator,
-            "{s}\n  if (inputs.transactionBackend !== 'native') throw new Error('legacy refusal');",
-            .{marker},
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "  if (inputs.transactionBackend !== 'native') throw new Error('legacy refusal');\n{s}",
-            .{marker},
-        );
-    var action_source = try f.replace(original_action, marker, guarded);
-    if (mutation == .action_capability) action_source = try f.replace(action_source, "'backend-capability'", "'missing-capability'");
-    if (mutation == .action_guard) action_source = original_action;
-    try overrides.put(allocator, action_path, .{ .string = action_source });
-    if (std.mem.eql(u8, action, "install")) {
-        const original_child = try f.source(child_path);
-        const old = "const expectedBackendCapability =\n    inputs.transactionBackend === 'legacy_dpkg'\n      ? 'legacy-dpkg-execution-deprecated-v1'\n      : 'native-transaction-execution-v1';";
-        var child = try f.replace(original_child, old, "const expectedBackendCapability = 'native-transaction-execution-v1';");
-        if (mutation == .handoff) child = try f.replace(child, "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: this.inputs.transactionBackend", "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg'");
-        try overrides.put(allocator, child_path, .{ .string = child });
-    } else if (mutation == .handoff) {
-        const runner_path = try std.fmt.allocPrint(allocator, "{s}src/runner.ts", .{prefix});
-        const runner = try f.source(runner_path);
-        const wrong = try std.mem.replaceOwned(u8, allocator, runner, "package-cache-v5", "package-cache-v3");
-        try overrides.put(allocator, runner_path, .{ .string = wrong });
+    var overrides: std.json.ObjectMap = .empty;
+    switch (mutation) {
+        .none => {},
+        .metadata => try overrides.put(allocator, metadata_path, .{ .string = try f.replace(try f.source(metadata_path), "default: native", "default: legacy_dpkg") }),
+        .input => try overrides.put(allocator, inputs_path, .{ .string = if (std.mem.eql(u8, action, "download"))
+            try f.replace(try f.source(inputs_path), "?? 'native';", "?? 'legacy_dpkg';")
+        else
+            try f.replace(try f.source(inputs_path), "|| 'native';", "|| 'legacy_dpkg';") }),
+        .capability => try overrides.put(allocator, metadata_path, .{ .string = try f.replace(try f.source(metadata_path), "  backend-capability:", "  missing-capability:") }),
+        .bundle_capability => {
+            const default_expression = if (std.mem.eql(u8, action, "download"))
+                "optionalScalar(e,\"TRANSACTION_BACKEND\")??\"native\""
+            else
+                "exactScalar(e,\"TRANSACTION_BACKEND\")||\"native\"";
+            const bundle = try std.fmt.allocPrint(
+                allocator,
+                "const s={s};if(s!==\"native\"){{throw Error(\"legacy refusal\")}};setOutput(\"missing-capability\",\"native-transaction-execution-v1\");",
+                .{default_expression},
+            );
+            try overrides.put(allocator, bundle_path, .{ .string = bundle });
+        },
+        .bundle => try overrides.put(allocator, bundle_path, .{ .string = "legacy-dpkg-execution-deprecated-v1" }),
+        .action_capability => try overrides.put(allocator, action_path, .{ .string = try f.replace(try f.source(action_path), "'backend-capability'", "'missing-capability'") }),
+        .action_guard => try overrides.put(allocator, action_path, .{ .string = try f.replace(try f.source(action_path), "if (inputs.transactionBackend !== 'native')", "if (false)") }),
+        .handoff => {
+            if (std.mem.eql(u8, action, "install")) {
+                try overrides.put(allocator, child_path, .{ .string = try f.replace(try f.source(child_path), "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: this.inputs.transactionBackend", "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg'") });
+            } else {
+                const runner_path = try std.fmt.allocPrint(allocator, "{s}src/runner.ts", .{prefix});
+                const runner = try f.source(runner_path);
+                const wrong = try std.mem.replaceOwned(u8, allocator, runner, "package-cache-v5", "package-cache-v3");
+                try overrides.put(allocator, runner_path, .{ .string = wrong });
+            }
+        },
     }
     return std.json.Stringify.valueAlloc(allocator, .{ .action = action, .overrides = std.json.Value{ .object = overrides } }, .{});
 }
@@ -303,9 +280,7 @@ test "security: both Actions rehearse native-only contracts without changing the
             .{},
         ));
         defer baseline.deinit();
-        try baseline.failsWith("action.yml: candidate transaction-backend default must be native");
-        try baseline.failsWith("inputs.ts: candidate omitted backend must select native");
-        try baseline.failsWith("dist/index.js: checked-in bundle is stale or accepts legacy");
+        try baseline.ok();
         const future = try f.check("actions-native-only", try actionCandidate(&f, action, .none));
         defer future.deinit();
         try future.ok();
@@ -354,42 +329,15 @@ test "security: native-only production candidate refuses shipped routes and exac
 
     const baseline = try productionCandidate(&f, null, null);
     defer baseline.deinit();
-    for ([_][]const u8{
-        "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
-        "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
-        "build.zig: candidate cutover task: change CLI shipped native-only mode",
-        "download dist/index.js: checked-in bundle is stale or accepts legacy",
-        "install dist/index.js: checked-in bundle is stale or accepts legacy",
-    }) |message| try baseline.failsWith(message);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: candidate cutover task: remove legacy dpkg/dpkg-deb executor (#281)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_executor.zig: active legacy journal recovery still launches dpkg") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/exact_lock.zig: candidate cutover task: stop creating exact-lock v1; retain decode/verify (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_provenance.zig: candidate cutover task: stop creating legacy result v1; retain verification (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_provenance_v2.zig: candidate cutover task: stop creating repository legacy result v2; retain verification (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/package_cache_workflow.zig: candidate cutover task: stop creating legacy cache v1 contracts; retain historical verification (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/transaction_result_summary.zig: candidate cutover task: stop creating legacy result summary v1; retain historical verification (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/system_profile.zig: candidate cutover task: stop executing profile v1/default; retain exact-byte decoder (#282)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/production_backend.zig: candidate cutover task: remove product legacy route/default (#284)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/repository_backend.zig: candidate cutover task: remove repository legacy route/default (#280)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/repository_cli.zig: candidate cutover task: remove repository CLI legacy default (#280/#283)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/apt_system_orchestrator.zig: candidate cutover task: remove apt/root legacy profile execution (#280)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "src/target_apt_config.zig: candidate cutover task: replace host-root dpkg architecture probe (#280)") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.zig:") == null);
-    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "test/native_differential_cli.zig:") == null);
+    try baseline.ok();
 
     for ([_]struct { path: []const u8, from: []const u8, to: []const u8, message: []const u8 }{
-        .{ .path = "src/main.zig", .from = "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;", .to = "var transaction_backend: debz.transaction_engine.Kind = .native;", .message = "src/main.zig: stale reviewed inventory fingerprint" },
-        .{ .path = "src/cli_backend_policy.zig", .from = ".legacy_capable => debz.transaction_engine.Kind.legacy_dpkg,", .to = ".legacy_capable => debz.transaction_engine.Kind.native,", .message = "src/cli_backend_policy.zig: stale reviewed inventory fingerprint" },
-        .{ .path = "build.zig", .from = "release_cli_options.addOption(bool, \"native_only\", false);", .to = "release_cli_options.addOption(bool, \"native_only\", true);", .message = "build.zig: stale reviewed inventory fingerprint" },
-        .{ .path = "actions/download/src/inputs.ts", .from = "?? 'legacy_dpkg';", .to = "?? 'native';", .message = "download inputs.ts: candidate must refuse legacy before reading lock" },
-        .{ .path = "actions/install/src/inputs.ts", .from = "|| 'legacy_dpkg';", .to = "|| 'native';", .message = "install inputs.ts: candidate must refuse legacy before reading lock" },
-        .{ .path = "actions/download/dist/index.js", .from = "legacy-dpkg-execution-deprecated-v1", .to = "forged-legacy-capability", .message = "actions/download/dist/index.js: stale reviewed inventory fingerprint" },
+        .{ .path = "src/main.zig", .from = "var transaction_backend: debz.transaction_engine.Kind = .native;", .to = "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;", .message = "src/main.zig: candidate cutover task: remove CLI legacy selection/default and rehearsal-only runtime mode (#283)" },
+        .{ .path = "src/cli_backend_policy.zig", .from = "const backend = requested orelse debz.transaction_engine.Kind.native;", .to = "const backend = requested orelse switch (runtime) { .legacy_capable => debz.transaction_engine.Kind.legacy_dpkg, .native_only => debz.transaction_engine.Kind.native };", .message = "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback; retain completed historical verification (#283)" },
+        .{ .path = "build.zig", .from = "release_cli_options.addOption(bool, \"native_only\", true);", .to = "release_cli_options.addOption(bool, \"native_only\", false);", .message = "build.zig: candidate cutover task: change CLI shipped native-only mode, not only rehearsal (#283)" },
+        .{ .path = "actions/download/src/inputs.ts", .from = "?? 'native';", .to = "?? 'legacy_dpkg';", .message = "actions/download/src/inputs.ts: candidate cutover task: remove download Action legacy input/default (#283)" },
+        .{ .path = "actions/install/src/inputs.ts", .from = "|| 'native';", .to = "|| 'legacy_dpkg';", .message = "actions/install/src/inputs.ts: candidate cutover task: remove install Action legacy input/default (#283)" },
+        .{ .path = "actions/download/dist/index.js", .from = "native-transaction-execution-v1", .to = "forged-legacy-capability", .message = "actions/download/dist/index.js: stale reviewed inventory fingerprint" },
         .{ .path = "src/transaction_recovery.zig", .from = "pub fn requireCompletedHistorical(journal: Journal) !void {", .to = "pub fn requireCompletedHistorical(journal: Journal) !void { // stale", .message = "src/transaction_recovery.zig: stale reviewed inventory fingerprint" },
         .{ .path = "src/transaction_executor.zig", .from = "return error.LegacyTransactionExecutionRetired;", .to = "return error.LegacyTransactionExecutionRetired; // stale", .message = "src/transaction_executor.zig: stale reviewed inventory fingerprint" },
         .{ .path = "src/root_operation.zig", .from = "legacy_execution_capable: bool = false,", .to = "legacy_execution_capable: bool = true,", .message = "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default; retain historical decoder and typed refusal (#279/#285)" },

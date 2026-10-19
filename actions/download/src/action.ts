@@ -16,7 +16,6 @@ import {
   verifyExecutableIdentity,
 } from './runner.js';
 
-export const LEGACY_BACKEND_CAPABILITY = 'legacy-dpkg-execution-deprecated-v1';
 export const NATIVE_BACKEND_CAPABILITY = 'native-transaction-execution-v1';
 
 export async function runMain(cache: CacheAdapter = defaultCache): Promise<void> {
@@ -39,6 +38,11 @@ export function requireNode24(version: string): void {
 
 export async function runAction(cache: CacheAdapter = defaultCache): Promise<void> {
   const inputs = await readInputs();
+  if (inputs.transactionBackend !== 'native') {
+    throw new DownloadActionError(
+      'legacy_dpkg package-cache execution is retired. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
+    );
+  }
   delete process.env.DEBZ_DOWNLOAD_PROXY;
   delete process.env['INPUT_PROXY'];
   delete process.env.DEBZ_DOWNLOAD_CREDENTIAL_REFERENCE;
@@ -119,15 +123,5 @@ export async function runAction(cache: CacheAdapter = defaultCache): Promise<voi
   core.setOutput('lock-digest', outputs.lockDigest);
   core.setOutput('downloaded-count', String(outputs.downloadedCount));
   core.setOutput('reused-count', String(outputs.reusedCount));
-  core.setOutput(
-    'backend-capability',
-    inputs.transactionBackend === 'legacy_dpkg'
-      ? LEGACY_BACKEND_CAPABILITY
-      : NATIVE_BACKEND_CAPABILITY,
-  );
-  if (inputs.transactionBackend === 'legacy_dpkg') {
-    core.warning(
-      'debz legacy_dpkg execution is deprecated. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
-    );
-  }
+  core.setOutput('backend-capability', NATIVE_BACKEND_CAPABILITY);
 }

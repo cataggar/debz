@@ -53,14 +53,13 @@ older runners are rejected rather than given a shell/Python fallback.
 Pinning the download action selects its orchestration code; pinning
 `debz-version` in the setup step separately selects the CLI and fingerprint
 implementation. The download action never upgrades or substitutes that CLI.
-The default `transaction-backend: legacy_dpkg` requires `package-cache-v3`
-(introduced in `debz` 0.3.0). Explicit `transaction-backend: native` requires a
-CLI build/release implementing `package-cache-v5`, with native v3 lock,
-fingerprint, preparation, and archive support. An older or incompatible CLI
-fails before cache restore; neither backend is automatically substituted.
-Legacy execution remains available for this compatibility increment, but is
-deprecated. The action emits one bounded warning and publishes an exact
-`backend-capability` value for the selected backend.
+The default `transaction-backend: native` requires a CLI build/release
+implementing `package-cache-v5`, with native v3 lock, fingerprint, preparation,
+and archive support. An older or incompatible CLI fails before cache restore;
+explicit `legacy_dpkg` is refused before reading locks or preparing cache with
+versioned recovery guidance (`debz >=0.3.0,<0.4.0`). The action publishes the
+exact `backend-capability` (`native-transaction-execution-v1`) for the
+native backend.
 `contents: read` is sufficient for checkout and public repository files;
 `attestations: read` is needed by the default setup-action provenance path.
 The download action itself calls no GitHub content or attestation API; the
@@ -87,7 +86,7 @@ Common optional inputs:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `transaction-backend` | `legacy_dpkg` | Explicit `legacy_dpkg` or `native`; binds both CLI phases, schema validation, and restore-key version. |
+| `transaction-backend` | `native` | `native` (default); explicit `legacy_dpkg` is refused before lock/cache work with `>=0.3.0,<0.4.0` recovery guidance. |
 | `foreign-architecture` | empty | Newline-delimited allowed foreign architectures. |
 | `default-release` | empty | Explicit release-selection policy. |
 | `repository-policy` | `strict-priority` | `strict-priority` or `best-version`; it must match the lock's solver policy. |
@@ -150,7 +149,7 @@ receipt-backed completion integration.
 | `lock-digest` | Canonical exact-lock digest verified and reported by `debz`. |
 | `downloaded-count` | Current-lock objects acquired from package transport. |
 | `reused-count` | Current-lock objects reopened, size/SHA-256 checked, and payload-validated from the CAS. |
-| `backend-capability` | `legacy-dpkg-execution-deprecated-v1` or `native-transaction-execution-v1`, matching the selected backend. |
+| `backend-capability` | `native-transaction-execution-v1`, matching the native backend. |
 
 Outputs are emitted only after authenticated repository matching, complete
 closure preparation, staging cleanup, and retained-closure garbage collection

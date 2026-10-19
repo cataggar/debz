@@ -310,6 +310,11 @@ pub fn productionPart(relative: []const u8, text: []const u8) []const u8 {
             pos = nl + 1;
         } else break;
     }
+    if (std.mem.eql(u8, relative, "src/maintainer_script.zig")) {
+        if (std.mem.indexOf(u8, text, "\ntest \"maintainer_script.test.")) |suite_start| {
+            return text[0..suite_start];
+        }
+    }
     if (std.mem.eql(u8, relative, "src/native_unpack.zig")) {
         if (std.mem.indexOf(u8, text, "\nfn testFreshDatabaseInstall(")) |helper| {
             if (test_start == null or helper < test_start.?) {
@@ -487,7 +492,11 @@ pub fn launchSites(
         if (matched) |m| {
             const line_start = if (std.mem.lastIndexOfScalar(u8, prod[0..i], '\n')) |nl| nl + 1 else 0;
             const prefix = std.mem.trimStart(u8, prod[line_start..i], " \t\r\n");
-            if (!std.mem.startsWith(u8, prefix, "//") and
+            const is_test_boundary_probe = std.mem.eql(u8, relative, "src/maintainer_script.zig") and
+                std.mem.eql(u8, m.kind, "syscall.execveat") and
+                std.mem.startsWith(u8, std.mem.trimStart(u8, prod[m.end..], " \t\r\n"), "@bitCast(@as(isize, probe.executable)),");
+            if (!is_test_boundary_probe and
+                !std.mem.startsWith(u8, prefix, "//") and
                 !std.mem.startsWith(u8, prefix, "*") and
                 !std.mem.startsWith(u8, prefix, "\\\\"))
             {
@@ -1574,7 +1583,41 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
     var overrides = std.StringHashMap(?[]const u8).init(alloc);
     var failures = Failures.init(alloc);
     try candidateFailures(alloc, testing.io, root_dir, &overrides, &failures);
+    try testing.expectEqual(@as(usize, 0), failures.items().len);
 
+    var regression_overrides = std.StringHashMap(?[]const u8).init(alloc);
+    const main_src = try root_dir.readFileAlloc(testing.io, "src/main.zig", alloc, .limited(maximum_source_bytes));
+    const regress_main = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        main_src,
+        "var transaction_backend: debz.transaction_engine.Kind = .native;",
+        "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;",
+    );
+    try regression_overrides.put("src/main.zig", regress_main);
+    const policy_src = try root_dir.readFileAlloc(testing.io, "src/cli_backend_policy.zig", alloc, .limited(maximum_source_bytes));
+    const regress_policy = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        policy_src,
+        "const backend = requested orelse debz.transaction_engine.Kind.native;",
+        "const backend = requested orelse switch (runtime) { .legacy_capable => debz.transaction_engine.Kind.legacy_dpkg, .native_only => debz.transaction_engine.Kind.native };",
+    );
+    try regression_overrides.put("src/cli_backend_policy.zig", regress_policy);
+    const build_src = try root_dir.readFileAlloc(testing.io, "build.zig", alloc, .limited(maximum_source_bytes));
+    const regress_build = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        build_src,
+        "release_cli_options.addOption(bool, \"native_only\", true);",
+        "release_cli_options.addOption(bool, \"native_only\", false);",
+    );
+    try regression_overrides.put("build.zig", regress_build);
+    try regression_overrides.put("actions/download/dist/index.js", "legacy-dpkg-execution-deprecated-v1");
+    try regression_overrides.put("actions/install/dist/index.js", "legacy-dpkg-execution-deprecated-v1");
+
+    var regression_failures = Failures.init(alloc);
+    try candidateFailures(alloc, testing.io, root_dir, &regression_overrides, &regression_failures);
     for ([_][]const u8{
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
@@ -1582,84 +1625,8 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |expected| {
-        try testing.expect(hasFailureContaining(&failures, expected));
+        try testing.expect(hasFailureContaining(&regression_failures, expected));
     }
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_executor.zig: candidate cutover task: remove legacy dpkg/dpkg-deb executor (#281)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_executor.zig: active legacy journal recovery still launches dpkg (#285)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode (#285)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default; retain historical decoder and typed refusal (#279/#285)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/exact_lock.zig: candidate cutover task: stop creating exact-lock v1; retain decode/verify (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_provenance.zig: candidate cutover task: stop creating legacy result v1; retain verification (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_provenance_v2.zig: candidate cutover task: stop creating repository legacy result v2; retain verification (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/package_cache_workflow.zig: candidate cutover task: stop creating legacy cache v1 contracts; retain historical verification (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/transaction_result_summary.zig: candidate cutover task: stop creating legacy result summary v1; retain historical verification (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/system_profile.zig: candidate cutover task: stop executing profile v1/default; retain exact-byte decoder (#282)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/production_backend.zig: candidate cutover task: remove product legacy route/default (#284)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/package_family_backend.zig: candidate cutover task: remove package-family legacy route/default (#284)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/repository_backend.zig: candidate cutover task: remove repository legacy route/default (#280)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/repository_cli.zig: candidate cutover task: remove repository CLI legacy default (#280/#283)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/apt_system_orchestrator.zig: candidate cutover task: remove apt/root legacy profile execution (#280)",
-    ));
-    try testing.expect(!hasFailureContaining(
-        &failures,
-        "src/target_apt_config.zig: candidate cutover task: replace host-root dpkg architecture probe (#280)",
-    ));
 
     const options = @import("native_only_candidate_options");
     var env = std.process.Environ.Map.init(alloc);
@@ -1670,8 +1637,9 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     });
-    try testing.expect(res.term == .exited and res.term.exited == 1);
-    try testing.expect(std.mem.indexOf(u8, res.stderr, "security-audit: src/main.zig: candidate cutover task:") != null);
+    try testing.expect(res.term == .exited and res.term.exited == 0);
+    try testing.expect(std.mem.indexOf(u8, res.stdout, "security-audit: native-only candidate passed") != null);
+    try testing.expectEqual(@as(usize, 0), res.stderr.len);
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1682,7 +1650,7 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
     const actions_input_path = try std.fmt.allocPrint(alloc, "{s}/actions-input.json", .{tmp_root});
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "actions-input.json",
-        .data = "{\"action\":\"download\",\"overrides\":{}}",
+        .data = "{\"action\":\"download\",\"overrides\":{\"actions/download/action.yml\":\"name: debz/download\\ninputs:\\n  transaction-backend:\\n    default: legacy_dpkg\\n\"}}",
     });
     const actions_res = try std.process.run(alloc, testing.io, .{
         .argv = &.{ options.executable, "check", "actions-native-only", actions_input_path },

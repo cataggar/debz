@@ -133,7 +133,7 @@ fi
 
 in_release_before=$(grep -c '/repository/dists/debian-stable/InRelease' "$request_log")
 no_refresh_root="$workspace/no-refresh-root"
-no_refresh_output=$(run_harness "$no_refresh_root" --no-refresh)
+no_refresh_output=$(run_harness "$no_refresh_root" --no-refresh --transaction-backend legacy_dpkg)
 printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed_phase":"skipped"'
 printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed":false'
 test -s "$no_refresh_root/var/lib/debz/repository/active-config-v1.json"
@@ -179,11 +179,12 @@ mismatch_root="$workspace/mismatch-root"
 mkdir -p "$mismatch_root/var/lib/dpkg"
 : >"$mismatch_root/var/lib/dpkg/status"
 set +e
-mismatch=$("$debz" repo add \
+mismatch=$("$harness" "$source_file" "$keyring" \
   --url "$descriptor_url" \
   --root "$mismatch_root" \
   --sha256 0000000000000000000000000000000000000000000000000000000000000000 \
   --architecture amd64 \
+  --transaction-backend legacy_dpkg \
   --json 2>"$harness_stderr")
 mismatch_status=$?
 set -e
@@ -194,6 +195,21 @@ printf '%s' "$mismatch" | grep -q '"installed":false'
 printf '%s' "$mismatch" | grep -vq 'fixture-query-secret'
 test ! -e "$mismatch_root/etc/apt/sources.list.d/microsoft-prod.list"
 test ! -e "$mismatch_root/var/lib/debz/repository/active-config-v1.json"
+
+set +e
+legacy_refused=$("$debz" repo add \
+  --url "$descriptor_url" \
+  --root "$mismatch_root" \
+  --sha256 "$descriptor_sha256" \
+  --architecture amd64 \
+  --transaction-backend legacy_dpkg \
+  --json 2>"$harness_stderr")
+legacy_refused_status=$?
+set -e
+test "$legacy_refused_status" -eq 8
+test ! -s "$harness_stderr"
+printf '%s' "$legacy_refused" | grep -q '"id":"legacy_recovery_release_required"'
+printf '%s' "$legacy_refused" | grep -Fq '>=0.3.0,<0.4.0'
 
 test ! -s "$server_stderr"
 printf 'repository-add integration passed\n'

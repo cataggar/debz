@@ -317,17 +317,22 @@ fn checkNativeLock(io: std.Io, allocator: std.mem.Allocator, args: []const []con
     if (!std.mem.eql(u8, try getString(native.object, "request_sha256"), try getString(legacy.object, "request_sha256")))
         return error.RequestDigestMismatch;
 
-    const legacy_policy_hex = try getString(legacy.object, "policy_sha256");
-    var legacy_policy_bytes: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&legacy_policy_bytes, legacy_policy_hex);
-    var policy_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    policy_hasher.update("debz.product-native-solver-policy-v1\x00");
-    policy_hasher.update(&legacy_policy_bytes);
-    var policy_digest: [32]u8 = undefined;
-    policy_hasher.final(&policy_digest);
-    const expected_policy = std.fmt.bytesToHex(policy_digest, .lower);
-    if (!std.mem.eql(u8, try getString(native.object, "policy_sha256"), &expected_policy))
-        return error.PolicyDigestMismatch;
+    const legacy_version = try getInt(legacy.object, "version");
+    if (legacy_version == 3) {
+        if (!equalValue(legacy, native)) return error.DefaultNativeLockMismatch;
+    } else {
+        const legacy_policy_hex = try getString(legacy.object, "policy_sha256");
+        var legacy_policy_bytes: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&legacy_policy_bytes, legacy_policy_hex);
+        var policy_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        policy_hasher.update("debz.product-native-solver-policy-v1\x00");
+        policy_hasher.update(&legacy_policy_bytes);
+        var policy_digest: [32]u8 = undefined;
+        policy_hasher.final(&policy_digest);
+        const expected_policy = std.fmt.bytesToHex(policy_digest, .lower);
+        if (!std.mem.eql(u8, try getString(native.object, "policy_sha256"), &expected_policy))
+            return error.PolicyDigestMismatch;
+    }
 
     const native_repos = try getArray(native.object, "repositories");
     const legacy_repos = try getArray(legacy.object, "repositories");
@@ -346,7 +351,9 @@ fn checkNativeLock(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         if (!std.mem.eql(u8, try getString(index_identity, "primary"), "sha256")) return error.InvalidIndexPrimary;
         const index_digests = try getArray(index_identity, "digests");
         if (index_digests.len != 1 or index_digests[0] != .object) return error.InvalidIndexDigests;
-        if (!std.mem.eql(u8, try getString(index_digests[0].object, "algorithm"), "sha256") or
+        if (!std.mem.eql(u8, try getString(index_digests[0].object, "algorithm"), "sha256"))
+            return error.IndexDigestMismatch;
+        if (legacy_version != 3 and
             !std.mem.eql(u8, try getString(index_digests[0].object, "digest"), try getString(prev, "index_sha256")))
             return error.IndexDigestMismatch;
     }
@@ -364,9 +371,11 @@ fn checkNativeLock(io: std.Io, allocator: std.mem.Allocator, args: []const []con
         const origin = try getObject(pkg, "origin");
         if (!std.mem.eql(u8, try getString(origin, "type"), "authenticated_repository"))
             return error.UnexpectedOriginType;
-        for ([_][]const u8{ "repository_id", "repository_snapshot_sha256" }) |field| {
-            if (!std.mem.eql(u8, try getString(origin, field), try getString(prev, field)))
-                return error.OriginFieldMismatch;
+        if (legacy_version != 3) {
+            for ([_][]const u8{ "repository_id", "repository_snapshot_sha256" }) |field| {
+                if (!std.mem.eql(u8, try getString(origin, field), try getString(prev, field)))
+                    return error.OriginFieldMismatch;
+            }
         }
         for ([_][]const u8{ "name", "version", "architecture", "declared_size", "retention", "dpkg_selection_hold" }) |field| {
             const left = pkg.get(field) orelse return error.MissingPackageField;
@@ -386,7 +395,7 @@ fn checkNativeLock(io: std.Io, allocator: std.mem.Allocator, args: []const []con
             const val = try getString(d.object, "digest");
             if (std.mem.eql(u8, alg, "sha256")) sha256_digest = val else if (std.mem.eql(u8, alg, "sha512")) sha512_digest = val else return error.UnexpectedDigestAlgorithm;
         }
-        if (sha256_digest == null or !std.mem.eql(u8, sha256_digest.?, try getString(prev, "sha256")))
+        if (sha256_digest == null or (legacy_version != 3 and !std.mem.eql(u8, sha256_digest.?, try getString(prev, "sha256"))))
             return error.PackageSha256Mismatch;
         if (sha512_digest == null or sha512_digest.?.len != 128)
             return error.PackageSha512Mismatch;
@@ -485,8 +494,34 @@ fn writeCacheFixture(io: std.Io, allocator: std.mem.Allocator, value: *std.json.
     try writeFileAll(io, path, final_bytes);
 }
 
+fn writeSyntheticLegacyV1Lock(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_lock_path: []const u8,
+    legacy_lock_path: []const u8,
+) !void {
+    const lock_bytes = try readFileAlloc(io, allocator, source_lock_path);
+    var legacy = try parseJsonSlice(allocator, lock_bytes);
+    try legacy.object.put(allocator, "schema", .{ .string = "https://debz.dev/schema/exact-closure-lock-v1" });
+    try legacy.object.put(allocator, "version", .{ .integer = 1 });
+    _ = legacy.object.orderedRemove("local_artifacts");
+    try legacy.object.put(allocator, "repositories", .{ .array = std.json.Array.init(allocator) });
+    try legacy.object.put(allocator, "packages", .{ .array = std.json.Array.init(allocator) });
+    try writeCacheFixture(io, allocator, &legacy, legacy_lock_path, "legacy-v1-lock");
+}
+
+fn writeSyntheticLegacyV1Archive(io: std.Io, path: []const u8) !void {
+    const body = "debz-package-cache-archive-v1\n\x00\x00\x00\x00";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    var buf: [body.len + 32]u8 = undefined;
+    @memcpy(buf[0..body.len], body);
+    @memcpy(buf[body.len..], &digest);
+    try writeFileAll(io, path, &buf);
+}
+
 fn writeNativeCacheFixtures(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
-    if (args.len != 4) return error.InvalidCheckArguments;
+    if (args.len != 4 and args.len != 6) return error.InvalidCheckArguments;
     const lock_bytes = try readFileAlloc(io, allocator, args[0]);
 
     var empty = try parseJsonSlice(allocator, lock_bytes);
@@ -552,6 +587,10 @@ fn writeNativeCacheFixtures(io: std.Io, allocator: std.mem.Allocator, args: []co
     try single_pkg.append(local.object.get("packages").?.array.items[pkg_idx]);
     try local.object.put(allocator, "packages", .{ .array = single_pkg });
     try writeCacheFixture(io, allocator, &local, args[3], "native-cache-local");
+    if (args.len == 6) {
+        try writeSyntheticLegacyV1Lock(io, allocator, args[0], args[4]);
+        try writeSyntheticLegacyV1Archive(io, args[5]);
+    }
 }
 
 fn checkNativeCacheEmpty(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -637,7 +676,9 @@ fn checkSha256BoundLock(io: std.Io, allocator: std.mem.Allocator, args: []const 
         if (digests.len != 1 or !std.mem.eql(u8, try getString(digests[0].object, "algorithm"), primary))
             return error.InvalidArchiveDigests;
         const signed = try getString(digests[0].object, "digest");
-        if (!std.mem.eql(u8, signed, try getString(prev, "sha256"))) return error.PackageSha256Mismatch;
+        if (prev.get("sha256")) |prev_sha256| {
+            if (!std.mem.eql(u8, signed, prev_sha256.string)) return error.PackageSha256Mismatch;
+        }
         const derived = try getObject(pkg, "derived_archive_identity");
         if (!std.mem.eql(u8, try getString(derived, "provenance"), "derived_from_signed_sha256") or
             !std.mem.eql(u8, try getString(derived, "algorithm"), "sha512"))
@@ -813,7 +854,13 @@ fn writeAbandonedStaging(io: std.Io, allocator: std.mem.Allocator, args: []const
     const retry_cache = args[1];
     const packages = try getArray(lock.object, "packages");
     if (packages.len == 0) return error.EmptyLockPackages;
-    const digest = try getString(packages[0].object, "sha256");
+    const digest = if (packages[0].object.get("sha256")) |val|
+        val.string
+    else blk: {
+        const identity = try getObject(packages[0].object, "archive_identity");
+        const digests = try getArray(identity, "digests");
+        break :blk try getString(digests[0].object, "digest");
+    };
     if (digest.len < 8) return error.InvalidPackageDigest;
 
     var name_buf: [96]u8 = @splat('_');
@@ -973,7 +1020,6 @@ fn bootstrapInstallAction(io: std.Io, allocator: std.mem.Allocator, args: []cons
     for ([_]PlanSpec{
         .{ .selector = "scenario-main", .filename = "lock.json", .backend = "native" },
         .{ .selector = "fail-script", .filename = "fail.lock.json", .backend = "native" },
-        .{ .selector = "scenario-main", .filename = "legacy.lock.json", .backend = "legacy_dpkg" },
     }) |spec| {
         const lock_out = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace, spec.filename });
         const plan_res = try std.process.run(allocator, io, .{
@@ -1005,6 +1051,10 @@ fn bootstrapInstallAction(io: std.Io, allocator: std.mem.Allocator, args: []cons
         if (plan_res.term != .exited or plan_res.term.exited != 0) return error.LockPlanFailed;
         try chownFile(lock_out, uid, gid);
     }
+    const native_lock_out = try std.fmt.allocPrint(allocator, "{s}/lock.json", .{workspace});
+    const legacy_lock_out = try std.fmt.allocPrint(allocator, "{s}/legacy.lock.json", .{workspace});
+    try writeSyntheticLegacyV1Lock(io, allocator, native_lock_out, legacy_lock_out);
+    try chownFile(legacy_lock_out, uid, gid);
 }
 
 fn checkInstallActionResults(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {

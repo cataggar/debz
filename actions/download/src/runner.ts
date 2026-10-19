@@ -11,24 +11,6 @@ import { validateDebzVersion } from './inputs.js';
 const execFile = promisify(execFileCallback);
 const hex64 = /^[0-9a-f]{64}$/;
 const contracts = {
-  legacy_dpkg: {
-    fingerprint: {
-      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v3',
-      api_version: 3,
-      capability: 'package-cache-v3',
-      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
-      lock_schema_version: 1,
-      archive_format: 'debz-package-cache-archive-v1',
-      origin_mode: 'exact-lock-v1-authenticated-repository',
-    },
-    prepare: {
-      schema: 'io.github.cataggar.debz.package-cache-result.v3',
-      api_version: 3,
-      capability: 'package-cache-v3',
-    },
-    cacheKey: /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
-    restorePrefix: /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
-  },
   native: {
     fingerprint: {
       schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
@@ -49,7 +31,16 @@ const contracts = {
   },
 } as const;
 
-type CacheContract = (typeof contracts)[Inputs['transactionBackend']];
+type CacheContract = (typeof contracts)['native'];
+
+function requireNativeContract(inputs: Inputs): CacheContract {
+  if (inputs.transactionBackend !== 'native') {
+    throw new DownloadActionError(
+      'legacy_dpkg package-cache execution is retired. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
+    );
+  }
+  return contracts.native;
+}
 
 export interface CommandRunner {
   run(executable: string, arguments_: string[], timeoutMs: number): Promise<string>;
@@ -181,6 +172,7 @@ export async function fingerprintCache(
   inputs: Inputs,
   runner: CommandRunner = systemRunner,
 ): Promise<FingerprintDocument> {
+  const contract = requireNativeContract(inputs);
   let output: string;
   try {
     output = await runner.run(
@@ -191,7 +183,7 @@ export async function fingerprintCache(
   } catch (error) {
     if (error instanceof CliDiagnosticError) throw error;
     throw new DownloadActionError(
-      `installed debz does not provide the required ${contracts[inputs.transactionBackend].fingerprint.capability} fingerprint contract`,
+      `installed debz does not provide the required ${contract.fingerprint.capability} fingerprint contract`,
       { cause: error },
     );
   }
@@ -323,6 +315,7 @@ export async function verifyExecutableIdentity(
 }
 
 export function fingerprintArguments(inputs: Inputs): string[] {
+  requireNativeContract(inputs);
   const arguments_ = [
     '--lock-input',
     inputs.lockInput,
@@ -338,10 +331,9 @@ export function fingerprintArguments(inputs: Inputs): string[] {
     String(inputs.limits.maximumTotalPackageBytes),
     '--maximum-lock-packages',
     String(inputs.limits.maximumLockPackages),
+    '--transaction-backend',
+    'native',
   ];
-  if (inputs.transactionBackend === 'native') {
-    arguments_.push('--transaction-backend', 'native');
-  }
   for (const value of inputs.foreignArchitectures) {
     arguments_.push('--foreign-architecture', value);
   }
@@ -356,7 +348,7 @@ export function validateFingerprint(
   inputs: Inputs,
   version: string,
 ): FingerprintDocument {
-  const contract = contracts[inputs.transactionBackend];
+  const contract = requireNativeContract(inputs);
   const document = record(value, 'fingerprint');
   exactKeys(document, [
     'schema',
@@ -431,7 +423,7 @@ export function validatePrepare(
   expected: FingerprintDocument,
 ): PrepareDocument {
   validateFingerprint(expected, inputs, expected.debz_version);
-  const contract = contracts[inputs.transactionBackend];
+  const contract = requireNativeContract(inputs);
   const document = record(value, 'prepare result');
   exactKeys(document, [
     'schema',
@@ -463,7 +455,6 @@ export function validatePrepare(
   const verified = count(document.verified_count, 'verified_count');
   if (
     verified !== downloaded + reused ||
-    (inputs.transactionBackend === 'legacy_dpkg' && verified === 0) ||
     verified > inputs.limits.maximumLockPackages
   ) {
     throw new DownloadActionError('debz prepare result contains inconsistent counts');
@@ -492,7 +483,7 @@ export function restoredCacheState(
   fingerprint: FingerprintDocument,
 ): RestoredCacheState {
   validateFingerprint(fingerprint, inputs, fingerprint.debz_version);
-  const contract = contracts[inputs.transactionBackend];
+  const contract = requireNativeContract(inputs);
   if (!inputs.cacheEnabled) {
     return { cacheHit: false, matchedKey: '', kind: 'none' };
   }

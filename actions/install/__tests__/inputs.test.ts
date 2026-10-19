@@ -15,7 +15,7 @@ test('validates all typed inputs before creating mutable directories', async () 
   fixture.environment.DEBZ_INSTALL_FORCE = 'depends\noverwrite_dir';
   fixture.environment.DEBZ_INSTALL_STATE_PATH = '';
   const inputs = await readInputs(fixture.environment);
-  assert.equal(inputs.transactionBackend, 'legacy_dpkg');
+  assert.equal(inputs.transactionBackend, 'native');
   assert.deepEqual(inputs.forces, ['depends', 'overwrite_dir']);
   assert.match(inputs.statePath, /debz-install-state\/[0-9a-f]{32}$/u);
   await assert.rejects(lstat(inputs.installRoot), /ENOENT/u);
@@ -25,12 +25,16 @@ test('validates all typed inputs before creating mutable directories', async () 
   assert.equal((await lstat(inputs.cacheRoot)).isDirectory(), true);
 });
 
-test('selects native explicitly from standard input and refuses unknown backends', async () => {
+test('selects native by default or explicitly and refuses legacy_dpkg and unknown backends', async () => {
   const fixture = await createInputEnvironment('native-backend');
+  assert.equal((await readInputs(fixture.environment)).transactionBackend, 'native');
   fixture.environment['INPUT_TRANSACTION-BACKEND'] = 'native';
   assert.equal((await readInputs(fixture.environment)).transactionBackend, 'native');
   fixture.environment.DEBZ_INSTALL_TRANSACTION_BACKEND = 'legacy_dpkg';
-  assert.equal((await readInputs(fixture.environment)).transactionBackend, 'legacy_dpkg');
+  await assert.rejects(
+    readInputs(fixture.environment),
+    /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u,
+  );
   for (const invalid of ['auto', 'NATIVE', ' native ', 'native\n']) {
     fixture.environment.DEBZ_INSTALL_TRANSACTION_BACKEND = invalid;
     await assert.rejects(readInputs(fixture.environment), /transaction-backend/u);

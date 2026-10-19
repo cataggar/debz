@@ -12,23 +12,18 @@ from `PATH`, asks that CLI to produce the deterministic cache fingerprint,
 downloads one opaque cache blob into a private `RUNNER_TEMP` staging directory,
 imports only verified package objects through debz, authenticates the explicit
 repository configuration and keyrings, and prepares every package in the lock.
-It defaults to the legacy lock/archive contract with packages-v2 cache
-envelopes. Explicit `transaction-backend: native` selects native v3 locks,
+It defaults to `transaction-backend: native`, selecting native v3 locks,
 v5 fingerprints/preparation results, and tagged archive-v3 keys,
-with no version autodetection or fallback. Native empty and local-only
+with no version autodetection or fallback. Explicit `legacy_dpkg` is refused
+before lock or cache work with `>=0.3.0,<0.4.0` recovery guidance. Native empty and local-only
 closures may omit repository inputs; local bytes must already be acquired or
 imported, never fetched from redacted provenance URLs.
 Native v3 locks must carry a SHA-512 archive identity: a signed SHA512 or, for a
 repository whose `--config` opts in with
 `"archive_binding":"signed_sha256_derived_sha512"`, a derived SHA512 bound to
-its signed SHA256 ([exact locks](exact-locks-and-provenance.md)). The legacy
-package cache currently requires repositories that publish only SHA256
-archive digests, so the hermetic legacy action fixtures use `--sha256-only`.
-Legacy remains the default for this increment but is explicitly deprecated.
+its signed SHA256 ([exact locks](exact-locks-and-provenance.md)).
 Successful download and install invocations publish `backend-capability` as
-`legacy-dpkg-execution-deprecated-v1` or
-`native-transaction-execution-v1`; legacy selection also emits one bounded
-notice. Generated bundle bytes are checked by the
+`native-transaction-execution-v1`. Generated bundle bytes are checked by the
 [cutover policy](legacy-compatibility.md).
 
 [`actions/install`](../actions/install/README.md) composes those exact
@@ -37,9 +32,10 @@ setup or cache activity, hands the exact setup executable directly to the
 download runtime, and always invokes one normal `debz install --cache-only`
 transaction with the same lock, repository/keyring inputs, architecture,
 solver policy, cache root, and explicit alternate root.
-The install action defaults to legacy. Explicit `transaction-backend: native`
-selects v5/v3 download contracts and receipt-bound native installation, with a
-dedicated CLI capability probe before preparation or mutation. Changed installs
+The install action defaults to `transaction-backend: native` and selects
+v5/v3 download contracts and receipt-bound native installation, with a
+dedicated CLI capability probe before preparation or mutation. Explicit
+`legacy_dpkg` is refused before any work. Changed installs
 must match the completing caller's typed receipt/completion identities to a
 read-only native verification summary. Verified unchanged native closures emit
 `changed: false` and no transaction/provenance path; an old receipt is not
@@ -82,21 +78,18 @@ explicit `sudo -n`, conffile/force policy, recovery-state preservation,
 fail-closed offline behavior, legacy canonical transaction-result validation,
 and native receipt versus unchanged-closure evidence before success outputs.
 
-## Native-only cutover rehearsal (#275)
+## Native-only cutover (#275 / #283 / #274)
 
-The shipped defaults, checked-in bundles and documentation above remain
-legacy-capable. The opt-in `actions-native-only` security-policy check
+The shipped defaults, checked-in bundles and documentation above are now
+native-only (`transaction-backend: native`). The `actions-native-only`
+security-policy check
 (`zig-out/bin/debz-security-audit check actions-native-only <fixture.json>`)
 evaluates **each** Action's metadata, TypeScript selector, checked-in bundle,
 backend-capability output and native handoff. A fixture is a JSON object with
 `"action": "download"` or `"install"` and `"overrides": {}`; missing override
-paths are read from the checkout. Against this release, **both** checks must
-fail: the default and bundle still select legacy. `zig build security-audit`
-tests candidate fixtures and exact negative mutations for both Actions without
-enabling the candidate on the shipped release. Set
-`DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE=1` for either Action's `npm test` only while
-working on the final cutover; those additional early-refusal tests intentionally
-fail on this release. Ordinary tests must continue to pass.
+paths are read from the checkout. Against this native-only release, **both**
+checks pass with zero findings, and `zig build security-audit` tests negative
+mutations against both Actions to prevent legacy regressions.
 
 In the *single* post-parity #283/#274 cutover, change together:
 

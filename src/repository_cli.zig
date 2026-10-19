@@ -251,7 +251,7 @@ test "repo add parser applies host defaults and explicit overrides" {
     try std.testing.expect(defaults.request.state.path == null);
     try std.testing.expect(!defaults.request.no_refresh);
     try std.testing.expectEqual(OutputFormat.human, defaults.output);
-    try std.testing.expectEqual(debz.transaction_engine.Kind.legacy_dpkg, defaults.transaction_backend);
+    try std.testing.expectEqual(debz.transaction_engine.Kind.native, defaults.transaction_backend);
 
     const overridden = try parseAdd(&.{
         "--url",
@@ -410,5 +410,5 @@ test "repo add parser rehearses native-only omitted and explicit backend refusal
         .native_only,
     );
     try std.testing.expectEqual(debz.transaction_engine.Kind.native, explicit.transaction_backend);
-    try std.testing.expectEqual(debz.transaction_engine.Kind.legacy_dpkg, (try parseAdd(&url)).transaction_backend);
+    try std.testing.expectEqual(debz.transaction_engine.Kind.native, (try parseAdd(&url)).transaction_backend);
 }

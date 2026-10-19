@@ -37,7 +37,7 @@ interface Harness {
 
 function harness(
   cacheHit = true,
-  backend: Inputs['transactionBackend'] = 'legacy_dpkg',
+  backend: Inputs['transactionBackend'] = 'native',
   changed = true,
   nativeEvidenceVersion: 1 | 2 = 2,
 ): Harness {
@@ -182,11 +182,9 @@ function ioFor(value: Harness): ActionIO {
 test('an exact package-cache hit still executes and audits one install', async () => {
   const value = harness(true);
   await runAction(value.inputs, ioFor(value), value.services);
-  assert.equal(
-    value.calls.filter((call) => call.arguments[0] === 'install').length,
-    1,
-  );
-  assert.equal(value.calls[1].arguments.includes('--cache-only'), true);
+  const install = value.calls.find((call) => call.arguments[0] === 'install');
+  assert.ok(install);
+  assert.equal(install.arguments.includes('--cache-only'), true);
   assert.equal(value.outputs.get('package-cache-hit'), 'true');
   assert.equal(value.outputs.get('installed-count'), '4');
   assert.equal(
@@ -197,13 +195,22 @@ test('an exact package-cache hit still executes and audits one install', async (
   assert.equal(value.cleanup, true);
   assert.equal(
     value.outputs.get('backend-capability'),
-    'legacy-dpkg-execution-deprecated-v1',
+    'native-transaction-execution-v1',
   );
-  assert.equal(value.infos.length, 1);
-  assert.match(
-    value.infos[0] ?? '',
-    /Recover this operation with debz >=0\.3\.0,<0\.4\.0 before installing a native-only release\./u,
+  assert.equal(value.infos.length, 0);
+});
+
+test('refuses forged legacy_dpkg input before any setup or root preparation', async () => {
+  const value = harness(true, 'legacy_dpkg');
+  await assert.rejects(
+    runAction(value.inputs, ioFor(value), value.services),
+    /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u,
   );
+  assert.equal(value.calls.length, 0);
+  assert.equal(value.downloaded, false);
+  assert.equal(value.outputs.size, 0);
+  assert.equal(value.saved, false);
+  assert.equal(value.cleanup, false);
 });
 
 test('propagates the exact debz exit code and publishes no success outputs', async () => {
@@ -212,6 +219,7 @@ test('propagates the exact debz exit code and publishes no success outputs', asy
   value.services.runDebz = async () => {
     invocation += 1;
     if (invocation === 1) return { code: 0, stdout: '0.3.0\n', stderr: '' };
+    if (invocation === 2) return { code: 0, stdout: nativeCapability(), stderr: '' };
     return { code: 7, stdout: commandResult(7), stderr: '' };
   };
   await assert.rejects(
