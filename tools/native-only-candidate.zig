@@ -1582,7 +1582,6 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
         "build.zig: candidate cutover task: change CLI shipped native-only mode",
         "src/target_apt_config.zig: legacy production dpkg/dpkg-deb command adapter remains",
-        "src/transaction_executor.zig: active legacy journal recovery still launches dpkg",
         "download dist/index.js: checked-in bundle is stale or accepts legacy",
         "install dist/index.js: checked-in bundle is stale or accepts legacy",
     }) |expected| {
@@ -1599,6 +1598,18 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
     try testing.expect(!hasFailureContaining(
         &failures,
         "src/transaction_engine.zig: candidate cutover task: remove legacy executor selection (#281)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_executor.zig: active legacy journal recovery still launches dpkg (#285)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode (#285)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default; retain historical decoder and typed refusal (#279/#285)",
     ));
 
     const options = @import("native_only_candidate_options");

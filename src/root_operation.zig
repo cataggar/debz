@@ -3096,9 +3096,9 @@ pub const Coordinator = struct {
     identity: Identity,
     locks: LockBackend,
     now_unix: ?i64 = null,
-    /// Set false by native-only releases. Active legacy ownership is then
-    /// refused before deferred cleanup, reclamation, or publication.
-    legacy_execution_capable: bool = true,
+    /// Native-only production default: active legacy ownership is refused
+    /// before deferred cleanup, reclamation, or publication.
+    legacy_execution_capable: bool = false,
     /// Borrowed from the current private-root callback; never persisted.
     root_projection: ?*const live_root.Projection = null,
 
@@ -4286,6 +4286,14 @@ test "root_operation.test.native pre-intent and pending-ack bindings cannot be r
         }
         const original = attempt.record().digest_sha256;
         attempt.release();
+        try testing.expect(!coordinator.legacy_execution_capable);
+        {
+            var legacy_replacement = request;
+            legacy_replacement.backend = .legacy_dpkg;
+            legacy_replacement.existing = .reclaim_resolved;
+            try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, legacy_replacement));
+        }
+        coordinator.legacy_execution_capable = true;
         for ([_]Backend{ .native, .legacy_dpkg }) |backend| {
             var replacement = request;
             replacement.backend = backend;
@@ -4380,7 +4388,10 @@ test "root_operation.test.orphan native intent blocks new attempts and legacy re
     var locks: TestLockBackend = .{ .allocator = testing.allocator };
     defer locks.deinit();
     var coordinator = try Coordinator.open(testing.io, root, "/target", locks.interface());
+    try testing.expect(!coordinator.legacy_execution_capable);
     var request = testRequest(.{ .package_transaction = .install });
+    try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, request));
+    coordinator.legacy_execution_capable = true;
     for ([_]Backend{ .native, .legacy_dpkg }) |backend| {
         request.backend = backend;
         try testing.expectError(error.RecoveryRequired, coordinator.acquire(testing.allocator, request));
@@ -4440,6 +4451,7 @@ fn openTestCoordinator(
         locks,
     );
     coordinator.now_unix = 1_700_000_000;
+    coordinator.legacy_execution_capable = true;
     return coordinator;
 }
 
@@ -5740,6 +5752,7 @@ test "root_operation.test.the same root reached through two spellings serializes
         locks.interface(),
     );
     alias_coordinator.now_unix = 1_700_000_000;
+    alias_coordinator.legacy_execution_capable = true;
     try testing.expectEqual(first_coordinator.identity.inode, alias_coordinator.identity.inode);
 
     var attempt = try first_coordinator.acquire(testing.allocator, packageRequest());
@@ -5839,8 +5852,13 @@ test "root_operation.test.legacy compatibility native-only coordinator refuses a
     defer tmp.cleanup();
     var locks: TestLockBackend = .{ .allocator = testing.allocator };
     defer locks.deinit();
-    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
-    coordinator.legacy_execution_capable = false;
+    var coordinator = try Coordinator.open(
+        testing.io,
+        .init(testing.io, tmp.dir),
+        test_root,
+        locks.interface(),
+    );
+    try testing.expect(!coordinator.legacy_execution_capable);
 
     try testing.expectError(
         error.LegacyCapabilityRequired,
@@ -5854,8 +5872,13 @@ test "root_operation.test.native-only rehearsal refuses before lock acquisition 
     defer tmp.cleanup();
     var locks: TestLockBackend = .{ .allocator = testing.allocator };
     defer locks.deinit();
-    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
-    coordinator.legacy_execution_capable = false;
+    var coordinator = try Coordinator.open(
+        testing.io,
+        .init(testing.io, tmp.dir),
+        test_root,
+        locks.interface(),
+    );
+    try testing.expect(!coordinator.legacy_execution_capable);
 
     for ([_]Request{ packageRequest(), repositoryRequest() }) |request| {
         try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, request));
@@ -5890,7 +5913,14 @@ test "root_operation.test.native-only rehearsal preserves legacy root bytes thro
         defer tmp.cleanup();
         var locks: TestLockBackend = .{ .allocator = testing.allocator };
         defer locks.deinit();
-        var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+        var coordinator = try Coordinator.open(
+            testing.io,
+            .init(testing.io, tmp.dir),
+            test_root,
+            locks.interface(),
+        );
+        coordinator.now_unix = 1_700_000_000;
+        try testing.expect(!coordinator.legacy_execution_capable);
         var input = testInput();
         input.state = case.state;
         input.phase = case.phase;
@@ -5908,11 +5938,12 @@ test "root_operation.test.native-only rehearsal preserves legacy root bytes thro
         if (case.deferred)
             try tmp.dir.writeFile(testing.io, .{ .sub_path = deferred_ack_path, .data = "unacknowledged legacy owner\n" });
 
-        coordinator.legacy_execution_capable = false;
         var native = repositoryRequest();
         native.backend = .native;
+        var legacy_recovery = packageRequest();
+        legacy_recovery.intent = .recovery;
         const before_acquisitions = locks.acquisitions;
-        for ([_]Request{ native, packageRequest(), native }) |request| {
+        for ([_]Request{ native, packageRequest(), legacy_recovery, native }) |request| {
             try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, request));
             try testing.expectEqual(before_acquisitions, locks.acquisitions);
             const after = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
@@ -5929,19 +5960,67 @@ test "root_operation.test.native-only rehearsal preserves legacy root bytes thro
         try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, lock_path, .{}));
         try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, native_intent_path, .{}));
     }
+
+    {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var locks: TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try Coordinator.open(
+            testing.io,
+            .init(testing.io, tmp.dir),
+            test_root,
+            locks.interface(),
+        );
+        coordinator.now_unix = 1_700_000_000;
+        try testing.expect(!coordinator.legacy_execution_capable);
+
+        const native_request: Request = .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .install },
+            .request_sha256 = @splat(0x51),
+            .policy_sha256 = @splat(0x52),
+            .evidence = .{ .program_sha256 = @splat(0x53) },
+            .target_architecture = "amd64",
+            .attempt_id = @splat(0x54),
+        };
+        var active = try coordinator.acquire(testing.allocator, native_request);
+        try active.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+        try active.markMutationStarted(testing.allocator, .mutation);
+        active.release();
+
+        var native_recovery = native_request;
+        native_recovery.intent = .recovery;
+        var recovered = try coordinator.acquire(testing.allocator, native_recovery);
+        defer recovered.release();
+        try testing.expect(recovered.adopted);
+        try recovered.beginRecovery(testing.allocator, .mutation);
+        try recovered.complete(testing.allocator, .succeeded);
+        try recovered.publishProvenance(testing.allocator, @splat(0x55));
+        var settled_native = (try coordinator.store().read(testing.allocator)).?;
+        defer settled_native.deinit();
+        try testing.expectEqual(Backend.native, settled_native.record.backend);
+        try testing.expect(settled_native.record.clearable());
+    }
 }
 
 test "root_operation.test.native-only rehearsal leaves the system lock absent for active legacy ownership" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var locks: SystemLockBackend = .{ .allocator = testing.allocator, .io = testing.io };
-    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+    var coordinator = try Coordinator.open(
+        testing.io,
+        .init(testing.io, tmp.dir),
+        test_root,
+        locks.interface(),
+    );
+    coordinator.now_unix = 1_700_000_000;
+    try testing.expect(!coordinator.legacy_execution_capable);
     var legacy = try create(testing.allocator, testInput());
     defer legacy.deinit();
     try coordinator.store().writeAtomic(testing.allocator, legacy.record);
     const before = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
     defer testing.allocator.free(before);
-    coordinator.legacy_execution_capable = false;
     var native = repositoryRequest();
     native.backend = .native;
     try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, native));
@@ -6410,6 +6489,7 @@ test "root_operation.test.a settled record is reclaimed as a new attempt, never 
         locks.interface(),
     );
     other_coordinator.now_unix = 1_700_000_000;
+    other_coordinator.legacy_execution_capable = true;
     try testing.expectError(
         error.LockTimeout,
         other_coordinator.acquire(testing.allocator, packageRequest()),
