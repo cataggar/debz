@@ -1178,7 +1178,7 @@ fn triggerStatusMatches(status: []const u8, target: TriggerBinding) bool {
                 (std.mem.eql(u8, target.package, "libc-bin") and std.mem.eql(u8, binding.package, "procps"));
             if (expect_pending) {
                 if (!std.mem.eql(u8, state.?, "install ok triggers-pending") or
-                    config_version == null or !std.mem.eql(u8, config_version.?, binding.version) or
+                    (config_version != null and !std.mem.eql(u8, config_version.?, binding.version)) or
                     triggers_pending == null or !singleTriggerMatches(triggers_pending.?, binding.pending_triggers))
                     return false;
             } else {
@@ -3173,6 +3173,18 @@ test "reference single-handler trigger bindings validate options and status tran
     try std.testing.expect(!triggerStatusMatches(step2_status, trigger_bindings[0]));
     try std.testing.expect(triggerStatusMatches(step2_status, trigger_bindings[1]));
 
+    const dpkg_omitted_config_version_status =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: ldconfig\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(triggerStatusMatches(dpkg_omitted_config_version_status, trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(dpkg_omitted_config_version_status, trigger_bindings[1]));
+
     try std.testing.expect(!triggerStatusMatches(step1_status ++
         "Package: extra-pending\nVersion: 1\nArchitecture: amd64\n" ++
         "Status: install ok triggers-pending\nConfig-Version: 1\n" ++
@@ -3418,5 +3430,28 @@ test "reference launcher binds Ubuntu arm64 profiles, cycles, and trigger handle
         "Triggers-Pending: /usr/lib/sysctl.d\n\n";
     try std.testing.expect(triggerStatusMatches(arm64_step1_triggers, arm64_trigger_bindings[0]));
     try std.testing.expect(!triggerStatusMatches(arm64_step1_triggers, arm64_trigger_bindings[1]));
+
+    const arm64_omitted_config_version_triggers =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: arm64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: ldconfig\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(triggerStatusMatches(arm64_omitted_config_version_triggers, arm64_trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(arm64_omitted_config_version_triggers, arm64_trigger_bindings[1]));
+
+    const arm64_step2_omitted_config_version_triggers =
+        "Package: base-files\nVersion: 14ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.43-2ubuntu2.4\nArchitecture: arm64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: procps\nVersion: 2:4.0.4-9ubuntu1\nArchitecture: arm64\n" ++
+        "Status: install ok triggers-pending\n" ++
+        "Triggers-Pending: /usr/lib/sysctl.d\n\n";
+    try std.testing.expect(!triggerStatusMatches(arm64_step2_omitted_config_version_triggers, arm64_trigger_bindings[0]));
+    try std.testing.expect(triggerStatusMatches(arm64_step2_omitted_config_version_triggers, arm64_trigger_bindings[1]));
 }
 

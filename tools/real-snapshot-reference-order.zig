@@ -3582,8 +3582,10 @@ fn execProcessTriggers(
 
     for (handlers, active_handlers) |pkg, binding| {
         const rec = findRecord(current_records, pkg.key()) orelse return error.TriggerHandlerStatusNotReady;
-        if (!std.mem.eql(u8, rec.fields.get("config-version") orelse "", pkg.version)) {
-            return error.TriggerHandlerStatusNotReady;
+        if (rec.fields.get("config-version")) |cv| {
+            if (!std.mem.eql(u8, cv, pkg.version)) {
+                return error.TriggerHandlerStatusNotReady;
+            }
         }
         const postinst_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/{s}.postinst", .{ std.mem.trimEnd(u8, root, "/"), pkg.name });
         const triggers_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/{s}.triggers", .{ std.mem.trimEnd(u8, root, "/"), pkg.name });
@@ -4329,10 +4331,10 @@ fn install(
 
             const sel = try pkg.selector(allocator);
             const prestate_opt = targets.get(sel);
-            if (prestate_opt != null and std.mem.eql(u8, sel, "sudo:amd64")) {
+            if (prestate_opt != null and std.mem.eql(u8, pkg.name, "sudo")) {
                 const comp_key: PackageKey = .{
                     .name = sudo_prestate_companion.name,
-                    .architecture = sudo_prestate_companion.architecture,
+                    .architecture = architecture,
                 };
                 var statuses = try currentStatuses(allocator, root);
                 defer statuses.deinit();
@@ -4346,6 +4348,18 @@ fn install(
                     {
                         return error.MissingSudoPrestateCompanion;
                     }
+                    try deferred.append(allocator, sel);
+                    continue;
+                }
+            }
+            if (prestates.len == 0 and
+                (std.mem.eql(u8, pkg.name, "dhcpcd-base") or
+                    std.mem.eql(u8, pkg.name, "udev") or
+                    std.mem.eql(u8, pkg.name, "sudo")))
+            {
+                var statuses = try currentStatuses(allocator, root);
+                defer statuses.deinit();
+                if (try shouldDeferFullRootConfigure(pkg, architecture, prestates.len, &statuses, &configured)) {
                     try deferred.append(allocator, sel);
                     continue;
                 }
@@ -5998,6 +6012,92 @@ test "ubuntu arm64 base cycle, openssl cycle, kbd cycle, trigger handlers, and p
         const prof_cmd = try launcherCommand(allocator, launcher, "/usr/bin/dpkg", "/root", "arm64", pin.name, "configure", prof_pkg, &.{});
         try std.testing.expectEqual(@as(usize, 8), prof_cmd.len);
     }
+
+    for ([_][]const u8{ "amd64", "arm64" }) |arch| {
+        var defer_statuses = DatabaseMap.init(allocator);
+        var defer_configured = std.HashMap(PackageKey, void, PackageKeyContext, 80).init(allocator);
+        const dhcpcd_pkg: Package = .{
+            .name = "dhcpcd-base",
+            .version = "1:10.1.0-7ubuntu1",
+            .architecture = arch,
+            .digest = arm64_base_cycle[0].sha512,
+            .declared_size = 100,
+            .archive = "/cache/dhcpcd-base.deb",
+        };
+        const udev_pkg: Package = .{
+            .name = "udev",
+            .version = profile_versions[1].version,
+            .architecture = arch,
+            .digest = arm64_base_cycle[0].sha512,
+            .declared_size = 100,
+            .archive = "/cache/udev.deb",
+        };
+        const sudo_pkg: Package = .{
+            .name = "sudo",
+            .version = profile_versions[2].version,
+            .architecture = arch,
+            .digest = arm64_base_cycle[0].sha512,
+            .declared_size = 100,
+            .archive = "/cache/sudo.deb",
+        };
+        try std.testing.expect(try shouldDeferFullRootConfigure(dhcpcd_pkg, arch, 0, &defer_statuses, &defer_configured));
+        try std.testing.expect(try shouldDeferFullRootConfigure(udev_pkg, arch, 0, &defer_statuses, &defer_configured));
+        try std.testing.expect(try shouldDeferFullRootConfigure(sudo_pkg, arch, 0, &defer_statuses, &defer_configured));
+        try std.testing.expect(!try shouldDeferFullRootConfigure(dhcpcd_pkg, arch, 1, &defer_statuses, &defer_configured));
+
+        try defer_statuses.put(.{ .name = "chrony", .architecture = arch }, .{
+            .name = "chrony",
+            .architecture = arch,
+            .version = "4.6.1-2ubuntu2",
+            .status = "install ok installed",
+        });
+        try std.testing.expect(!try shouldDeferFullRootConfigure(dhcpcd_pkg, arch, 0, &defer_statuses, &defer_configured));
+        try std.testing.expect(!try shouldDeferFullRootConfigure(udev_pkg, arch, 0, &defer_statuses, &defer_configured));
+
+        try defer_statuses.put(.{ .name = sudo_prestate_companion.name, .architecture = arch }, .{
+            .name = sudo_prestate_companion.name,
+            .architecture = arch,
+            .version = sudo_prestate_companion.version,
+            .status = "install ok installed",
+        });
+        try std.testing.expect(!try shouldDeferFullRootConfigure(sudo_pkg, arch, 0, &defer_statuses, &defer_configured));
+    }
 }
+
+fn shouldDeferFullRootConfigure(
+    pkg: Package,
+    architecture: []const u8,
+    prestates_len: usize,
+    statuses: *const DatabaseMap,
+    configured: *const std.HashMap(PackageKey, void, PackageKeyContext, 80),
+) !bool {
+    if (prestates_len != 0) return false;
+    if (std.mem.eql(u8, pkg.name, "dhcpcd-base") or std.mem.eql(u8, pkg.name, "udev")) {
+        const chrony_key: PackageKey = .{ .name = "chrony", .architecture = architecture };
+        const chrony_state = statuses.get(chrony_key);
+        if (chrony_state == null or !std.mem.eql(u8, chrony_state.?.status, "install ok installed")) {
+            return true;
+        }
+    } else if (std.mem.eql(u8, pkg.name, "sudo")) {
+        const comp_key: PackageKey = .{
+            .name = sudo_prestate_companion.name,
+            .architecture = architecture,
+        };
+        const comp_state = statuses.get(comp_key);
+        if (comp_state == null or
+            !std.mem.eql(u8, comp_state.?.status, "install ok installed") or
+            !std.mem.eql(u8, comp_state.?.version, sudo_prestate_companion.version))
+        {
+            if (configured.contains(comp_key) or
+                (comp_state != null and !std.mem.eql(u8, comp_state.?.version, sudo_prestate_companion.version)))
+            {
+                return error.MissingSudoPrestateCompanion;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 
 
