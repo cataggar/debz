@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "reviewed_on": "2026-08-20",
-  "review_expires": "2026-11-18",
+  "reviewed_on": "2026-10-19",
+  "review_expires": "2027-01-17",
   "production_dependencies": [
     {
       "name": "libsolv",
@@ -16,7 +16,7 @@
         "https://osv.dev/list?q=libsolv"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-20",
+        "reviewed_on": "2026-10-19",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
@@ -35,7 +35,7 @@
         "https://osv.dev/list?q=xz-utils"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-20",
+        "reviewed_on": "2026-10-19",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
@@ -55,7 +55,7 @@
         "https://osv.dev/list?q=zstd"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-20",
+        "reviewed_on": "2026-10-19",
         "result": "no_known_unresolved_advisories"
       },
       "reviewed_exceptions": []
@@ -82,7 +82,7 @@
         "https://osv.dev/list?q=musl"
       ],
       "vulnerability_review": {
-        "reviewed_on": "2026-08-20",
+        "reviewed_on": "2026-10-19",
         "result": "reviewed_exceptions"
       },
       "reviewed_exceptions": [

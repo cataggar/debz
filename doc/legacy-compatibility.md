@@ -76,22 +76,24 @@ backend. Historical verification never grants mutation authority.
 `zig build test-native-only-rehearsal` builds an uninstalled test-only CLI and
 exercises typed `native_only` selection
 for product and repository CLI backends and transaction-result verification,
-plus root-operation/product/repository pre-mutation refusal. An omitted
-backend selects native **in the test policy only**; the released CLI, dpkg
-executor, and both Actions still default to `legacy_dpkg`. Explicit new legacy
-requests refuse with `LegacyCapabilityRequired` and the versioned guidance
-above, before creating locks, results, sidecars, or root mutation records.
+plus root-operation/product/repository pre-mutation refusal. In the current
+`native_only` release line (`current_release_mode: "native_only"`), released CLI
+commands, `ProductBackend`, `AptSystemBackend`, `PackageFamilyBackend`,
+`RepositoryBackend`, `actions/download`, and `actions/install` all default to
+`native_zig` (`native`). `legacy_dpkg` (`legacy`) is accepted only at the outer
+parser boundary so it can be deterministically refused with `UnsupportedBackend`
+(`LegacyCapabilityRequired`) and the versioned `debz >=0.3.0,<0.4.0` guidance
+above before any network, lock, result, sidecar, or root mutation side effect.
 Native v3 inputs remain backend/profile/capability-bound; completed legacy
 results remain independently read-only through exact version-specific
 verification. An active legacy root, including a pre-mutation or terminal
 unacknowledged record, is not cleared to make room for a second mutation on
 either product or repository surfaces.
 
-This is not the native-only release gate: package-family, apt/system, cache,
-refresh/clean, and other unexercised selectors remain explicit #284/#280 and
-final #283/#274 work. The rehearsal binary rejects those unexercised selectors
-instead of advertising success-shaped defaults. No readiness policy or release
-default changes here.
+Following the completed #280–#285 and #274 cutover work, `native_only` is now
+the shipped production mode across all surfaces; the standalone rehearsal
+target remains a focused regression gate for the CLI and root-operation
+boundary.
 
 ## Digest compatibility inventory
 
@@ -130,14 +132,22 @@ assumptions cannot authorize current content.
    history requires them.
 5. Recover every active legacy root before installing a native-only release.
 
-The first-party download and install Actions retain their legacy default in
-this release, but publish `backend-capability` as either
-`legacy-dpkg-execution-deprecated-v1` or
-`native-transaction-execution-v1`. Generated bundles are audited against their
-TypeScript sources. This commit regenerates only the current checked-in bundle;
-released tag, attestation, and bundle bytes remain immutable historical
-artifacts. The cutover increment will remove the legacy input value and change
-defaults; this increment deliberately does neither.
+### Post-Cutover Default (`native_only` Today)
+
+- Released CLI commands, `actions/download`, and `actions/install` default
+  `transaction-backend` to `native` (`native_zig`) and publish
+  `backend-capability` as `native-transaction-execution-v1`.
+- Explicit `legacy_dpkg` (`legacy`) requests are refused before any network,
+  lock, or root mutation side effect (`UnsupportedBackend` /
+  `LegacyCapabilityRequired`).
+- When an older `legacy_dpkg` active-operation record or command-executor
+  bridge witness is encountered on a target root, `native_only` surfaces refuse
+  to abandon, clear, or relabel the record and direct the operator to finish or
+  recover that operation with a pre-cutover `debz >=0.3.0,<0.4.0` release
+  before mutating the root under `native_only`.
+- Generated Action bundles are audited against their TypeScript sources, while
+  completed historical artifacts and released tag, attestation, and bundle
+  bytes remain immutable read-only historical evidence.
 
 ## Cutover deletion boundary
 
@@ -178,12 +188,12 @@ paths under `tools/` are reference-only and may not migrate into production.
 Journals v1–v4 remain distinct read-only historical decode formats; active
 legacy journal publication/replay is a separate cutover blocker.
 
-The #279 CLI/root rehearsal is opt-in, not a changed release mode. The
-candidate also pins `build.zig`'s shipped CLI mode, the exact
-`src/cli_backend_policy.zig` selector, and the CLI/root operation wiring. The
-native-only cutover must remove the legacy new-execution fallback without
-removing completed historical verification or enabling the rehearsal as a
-success-shaped substitute for changing the shipped default.
+The #279 CLI/root rehearsal target remains a separate test binary alongside the
+shipped `native_only` CLI mode. The candidate pins `build.zig`'s shipped CLI
+mode, the exact `src/cli_backend_policy.zig` selector, and the CLI/root
+operation wiring, ensuring that the native-only cutover removes the legacy
+new-execution fallback while preserving completed historical verification and
+without treating the rehearsal binary as a substitute for the shipped default.
 
 After integrating #274, update fingerprints and allowances only with a review
 of the changed paths, run this candidate, both Actions' candidate contracts
