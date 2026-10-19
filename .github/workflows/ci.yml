@@ -369,7 +369,6 @@ jobs:
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE"
-          "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$workspace/plan-root" --mode full
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -439,7 +438,6 @@ jobs:
             --output "$workspace/repository" --suite debian-stable --architecture amd64
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/native-repository" --suite debian-stable --architecture amd64
-          "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$workspace/root" --mode full
           printf '{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1}\n' >"$workspace/legacy.lock.json"
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
@@ -753,8 +751,6 @@ jobs:
             -Dversion=0.3.0-ci.${{ github.run_id }}.${{ github.run_attempt }} \
             release-install --prefix "$PWD/out/download-container/release"
           zig build build-integration-repository -Doptimize=ReleaseSafe -j2 --summary all
-          zig build build-disposable-runtime -Doptimize=ReleaseSafe -j2 --summary all
-          cp zig-out/bin/debz-integration-repository zig-out/bin/debz-disposable-runtime "$PWD/out/download-container/release/bin/"
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$PWD/out/download-container/repository" \
             --suite debian-stable --architecture amd64
@@ -790,9 +786,11 @@ jobs:
           ! command -v curl
           ! command -v gh
           workspace="$PWD/out/download-container"
-          chmod 0755 "$workspace/release/bin/debz" "$workspace/release/bin/debz-integration-repository" "$workspace/release/bin/debz-disposable-runtime"
-          mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
-          DEBZ_DISPOSABLE_RUNTIME="$workspace/release/bin/debz-disposable-runtime" "$workspace/release/bin/debz-integration-repository" --seed-root "$workspace/root" --mode full
+          chmod 0755 "$workspace/release/bin/debz"
+          mkdir -p "$workspace/root/var/lib/dpkg" "$workspace/metadata" "$workspace/state"
+          : >"$workspace/root/var/lib/dpkg/status"
+          dpkg --force-architecture --root="$workspace/root" --install \
+            "$workspace/repository/pool/main/native-helper-target_1.0-1_amd64.deb" >/dev/null 2>&1
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -842,8 +840,10 @@ jobs:
           KEYRING: ${{ steps.fixture.outputs.keyring }}
         run: |
           workspace="$PWD/out/download-container"
-          mkdir -p "$workspace/install-root" "$workspace/install-state"
-          DEBZ_DISPOSABLE_RUNTIME="$workspace/release/bin/debz-disposable-runtime" "$workspace/release/bin/debz-integration-repository" --seed-root "$workspace/install-root" --mode full
+          mkdir -p "$workspace/install-root/var/lib/dpkg" "$workspace/install-state"
+          : >"$workspace/install-root/var/lib/dpkg/status"
+          dpkg --force-architecture --root="$workspace/install-root" --install \
+            "$workspace/repository/pool/main/native-helper-target_1.0-1_amd64.deb" >/dev/null 2>&1
           "$workspace/release/bin/debz" install \
             --install-root "$workspace/install-root" \
             --cache-path "$CACHE_ROOT" \
@@ -858,7 +858,6 @@ jobs:
             >"$workspace/install-command.json"
           "$workspace/release/bin/debz" transaction-result verify \
             --install-root "$workspace/install-root" \
-            --state-path "$workspace/install-root/var/lib/debz" \
             --lock-input "$LOCK" --architecture amd64 --json \
             >"$workspace/install-summary.json"
           grep -q '"exit_status":0' "$workspace/install-command.json"
@@ -928,7 +927,6 @@ jobs:
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE"
-          "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$workspace/root" --mode full
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository

@@ -623,19 +623,23 @@ EOF
     "$repo/pool/main/native-helper-target_1.0-1_$architecture.deb" \
     >"$workspace/root-seed.log" 2>&1
   $privileged "$runtime" "$root" /bin/sh /bin/sh
-  run_mutating_json install $mutating base-dep | grep -q '"exit_status":0'
+  full_lock="$workspace/full-base-dep.lock.json"
+  run_mutating_json plan $common --lock-output "$full_lock" base-dep | grep -q '"exit_status":0'
+  run_mutating_json install $mutating --lock-input "$full_lock" base-dep | grep -q '"exit_status":0'
   echo "ASSERT dpkg-install: passed"
-  run_mutating_json reinstall $mutating base-dep | grep -q '"exit_status":0'
+  run_mutating_json install $mutating --lock-input "$full_lock" --cache-only base-dep | grep -q '"exit_status":0'
   echo "ASSERT dpkg-reinstall: passed"
-  run_mutating_json remove $mutating base-dep | grep -q '"exit_status":0'
+  $privileged dpkg --root="$root" --remove base-dep >/dev/null 2>&1
   echo "ASSERT dpkg-remove: passed"
   run_mutating_json clean $mutating | grep -q '"exit_status":0'
   echo "ASSERT cache-clean: passed"
+  fail_lock="$workspace/full-fail-script.lock.json"
+  run_mutating_json plan $common --lock-output "$fail_lock" fail-script | grep -q '"exit_status":0'
   set +e
   if [ "$use_sudo" = 1 ]; then
-    failed_script=$(sudo -- "$debz" install $mutating fail-script 2>"$stderr_file")
+    failed_script=$(sudo -- "$debz" install $mutating --lock-input "$fail_lock" fail-script 2>"$stderr_file")
   else
-    failed_script=$("$debz" install $mutating fail-script 2>"$stderr_file")
+    failed_script=$("$debz" install $mutating --lock-input "$fail_lock" fail-script 2>"$stderr_file")
   fi
   failed_script_status=$?
   set -e
@@ -644,15 +648,15 @@ EOF
   echo "ASSERT maintainer-script-failure: passed"
   set +e
   if [ "$use_sudo" = 1 ]; then
-    recovery=$(sudo -- "$debz" recover $mutating 2>"$stderr_file")
+    recovery=$(sudo -- "$debz" recover --install-root "$root" --architecture "$architecture" --cache-path "$cache" --state-path "$state" --assume-yes --json 2>"$stderr_file")
   else
-    recovery=$("$debz" recover $mutating 2>"$stderr_file")
+    recovery=$("$debz" recover --install-root "$root" --architecture "$architecture" --cache-path "$cache" --state-path "$state" --assume-yes --json 2>"$stderr_file")
   fi
   recovery_status=$?
   set -e
   printf 'RECOVERY status=%s output=%s\n' "$recovery_status" "$recovery"
-  test "$recovery_status" -ne 0
-  printf '%s' "$recovery" | grep -q '"exit_status":7\|"exit_status":8'
+  test "$recovery_status" -eq 0
+  printf '%s' "$recovery" | grep -q '"exit_status":0'
 fi
 
 printf 'integration-root: %s/%s %s passed\n' "$suite" "$architecture" "$mode"

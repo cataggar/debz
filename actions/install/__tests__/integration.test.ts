@@ -119,9 +119,16 @@ test('native installs bind real receipts across cold, warm, offline, same-root, 
   assert.equal(failedVerification.code, 7);
   assert.equal(failedVerification.stdout, '');
   assert.match(failedVerification.stderr, /TransactionNotSuccessful/u);
-  const wrongBackend = await inputsFor({
-    ...environment, DEBZ_INSTALL_LOCK_INPUT: path.join(workspace, 'legacy.lock.json'),
-  }, runnerArchitecture, 'cross-backend', 'keep-existing');
+  await assert.rejects(
+    inputsFor({
+      ...environment, DEBZ_INSTALL_LOCK_INPUT: path.join(workspace, 'legacy.lock.json'),
+    }, runnerArchitecture, 'cross-backend', 'keep-existing'),
+    />=0\.3\.0,<0\.4\.0/u,
+  );
+  const wrongBackend = {
+    ...(await inputsFor(environment, runnerArchitecture, 'cross-backend', 'keep-existing')),
+    lockInput: path.join(workspace, 'legacy.lock.json'),
+  };
   const statusPath = path.join(wrongBackend.installRoot, 'var/lib/dpkg/status');
   const before = await readFile(statusPath);
   const refusedOutputs = new Map<string, string>();

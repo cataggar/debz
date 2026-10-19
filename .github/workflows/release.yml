@@ -261,11 +261,14 @@ jobs:
           "$PWD/zig-out/bin/debz-integration-repository" \
             --output "$workspace/repository" --suite debian-stable \
             --architecture "$ARCHITECTURE"
-          "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$workspace/root" --mode full
-          sudo mkdir -p "$RUNNER_TEMP/debz-install-cold-root" "$RUNNER_TEMP/debz-install-warm-root"
-          sudo chmod 0755 "$RUNNER_TEMP/debz-install-cold-root" "$RUNNER_TEMP/debz-install-warm-root"
-          sudo "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$RUNNER_TEMP/debz-install-cold-root" --mode full
-          sudo "$PWD/zig-out/bin/debz-integration-repository" --seed-root "$RUNNER_TEMP/debz-install-warm-root" --mode full
+          for target_root in "$workspace/root" "$RUNNER_TEMP/debz-install-cold-root" "$RUNNER_TEMP/debz-install-warm-root"; do
+            sudo mkdir -p "$target_root/var/lib/dpkg"
+            sudo chmod 0755 "$target_root"
+            sudo sh -c ': >"$1/var/lib/dpkg/status"' sh "$target_root"
+            sudo dpkg --force-architecture --root="$target_root" --install \
+              "$workspace/repository/pool/main/native-helper-target_1.0-1_$ARCHITECTURE.deb" >/dev/null 2>&1
+          done
+          sudo chown -R "$USER:$USER" "$workspace/root"
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository

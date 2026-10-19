@@ -206,7 +206,7 @@ legacy_refused=$("$debz" repo add \
   --json 2>"$harness_stderr")
 legacy_refused_status=$?
 set -e
-test "$legacy_refused_status" -eq 8
+test "$legacy_refused_status" -eq 9
 test ! -s "$harness_stderr"
 printf '%s' "$legacy_refused" | grep -q '"id":"legacy_recovery_release_required"'
 printf '%s' "$legacy_refused" | grep -Fq '>=0.3.0,<0.4.0'
