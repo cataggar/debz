@@ -66,7 +66,12 @@ pub fn main(init: std.process.Init) !void {
 
     const reference_counts = try validateSnapshot(reference.value);
     const candidate_counts = try validateSnapshot(candidate.value);
-    if (!std.meta.eql(reference_counts, candidate_counts))
+    if (!countsCompatible(
+        reference_counts,
+        candidate_counts,
+        reference.value,
+        candidate.value,
+    ))
         return error.SnapshotCountMismatch;
     if (!try equalSnapshots(allocator, reference.value, candidate.value))
         return error.SnapshotMismatch;
@@ -76,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
         .reference_size = reference_bytes.len,
         .candidate_sha256 = digest(candidate_bytes),
         .candidate_size = candidate_bytes.len,
-        .counts = reference_counts,
+        .counts = candidate_counts,
     };
     const encoded = try std.json.Stringify.valueAlloc(
         allocator,
@@ -224,6 +229,7 @@ const volatile_unowned_files = [_][]const u8{
     "var/cache/debconf/templates.dat-old",
     "var/cache/ldconfig/aux-cache",
     "var/log/alternatives.log",
+    "var/log/dpkg.log",
 };
 
 const volatile_unowned_variable_size_files = [_][]const u8{
@@ -231,7 +237,58 @@ const volatile_unowned_variable_size_files = [_][]const u8{
     "var/cache/debconf/config.dat-old",
     "var/cache/debconf/templates.dat",
     "var/cache/debconf/templates.dat-old",
+    "var/log/dpkg.log",
 };
+
+fn countsCompatible(
+    reference_counts: Counts,
+    candidate_counts: Counts,
+    reference: std.json.Value,
+    candidate: std.json.Value,
+) bool {
+    if (std.meta.eql(reference_counts, candidate_counts)) return true;
+    var adjusted = candidate_counts;
+    adjusted.filesystem += 1;
+    if (!std.meta.eql(reference_counts, adjusted)) return false;
+    return hasFilesystemPath(reference, "var/log/dpkg.log") and
+        !hasFilesystemPath(candidate, "var/log/dpkg.log");
+}
+
+fn hasFilesystemPath(snapshot: std.json.Value, expected_path: []const u8) bool {
+    if (snapshot != .object) return false;
+    const files = snapshot.object.get("filesystem") orelse return false;
+    if (files != .array) return false;
+    for (files.array.items) |item| {
+        if (item != .object) continue;
+        if (stringEquals(item.object.get("path"), expected_path)) return true;
+    }
+    return false;
+}
+
+fn validReferenceOnlyDpkgLog(
+    entry: std.json.Value,
+    owned: *const std.StringHashMap(void),
+) bool {
+    if (owned.contains("var/log/dpkg.log")) return false;
+    if (entry != .object or entry.object.count() != 10) return false;
+    const obj = entry.object;
+    if (!stringEquals(obj.get("path"), "var/log/dpkg.log") or
+        !stringEquals(obj.get("kind"), "regular") or
+        !stringEquals(obj.get("mode"), "0644") or
+        !integerEquals(obj.get("uid"), 0) or
+        !integerEquals(obj.get("gid"), 0))
+        return false;
+    const mtime_ns = obj.get("mtime_ns") orelse return false;
+    const size = obj.get("size") orelse return false;
+    const sha256 = obj.get("sha256") orelse return false;
+    const xattrs = obj.get("xattrs") orelse return false;
+    const hardlink_to = obj.get("hardlink_to") orelse return false;
+    return mtime_ns == .integer and
+        size == .integer and size.integer >= 0 and
+        validDigest(sha256) and
+        xattrs == .array and xattrs.array.items.len == 0 and
+        hardlink_to == .null;
+}
 
 fn equalSnapshots(
     allocator: std.mem.Allocator,
@@ -269,11 +326,120 @@ fn equalSnapshots(
 
     const left_files = left.get("filesystem").?.array.items;
     const right_files = right.get("filesystem").?.array.items;
-    if (left_files.len != right_files.len) return false;
-    for (left_files, right_files) |left_file, right_file| {
-        if (!equalFilesystemEntry(left_file, right_file, &owned)) return false;
+    if (left_files.len != right_files.len and left_files.len != right_files.len + 1)
+        return false;
+    var left_index: usize = 0;
+    var right_index: usize = 0;
+    var skipped_dpkg_log = false;
+    while (left_index < left_files.len or right_index < right_files.len) {
+        if (!skipped_dpkg_log and
+            left_files.len == right_files.len + 1 and
+            left_index < left_files.len and
+            left_files[left_index] == .object and
+            stringEquals(left_files[left_index].object.get("path"), "var/log/dpkg.log") and
+            (right_index >= right_files.len or
+                right_files[right_index] != .object or
+                !stringEquals(right_files[right_index].object.get("path"), "var/log/dpkg.log")))
+        {
+            if (!validReferenceOnlyDpkgLog(left_files[left_index], &owned))
+                return false;
+            skipped_dpkg_log = true;
+            left_index += 1;
+            continue;
+        }
+        if (left_index >= left_files.len or right_index >= right_files.len)
+            return false;
+        if (!equalFilesystemEntry(left_files[left_index], right_files[right_index], &owned))
+            return false;
+        left_index += 1;
+        right_index += 1;
     }
     return true;
+}
+
+fn equalDpkg(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .object or right != .object or left.object.count() != right.object.count())
+        return false;
+    var iterator = left.object.iterator();
+    while (iterator.next()) |entry| {
+        const other = right.object.get(entry.key_ptr.*) orelse return false;
+        if (std.mem.eql(u8, entry.key_ptr.*, "status_old")) {
+            if (!equalStatusOld(entry.value_ptr.*, other)) return false;
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "files")) {
+            if (!equalDpkgFiles(entry.value_ptr.*, other)) return false;
+        } else if (!equalValue(entry.value_ptr.*, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn equalDpkgFiles(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .array or right != .array or left.array.items.len != right.array.items.len)
+        return false;
+    for (left.array.items, right.array.items) |left_item, right_item| {
+        if (!equalDpkgFileRecord(left_item, right_item)) return false;
+    }
+    return true;
+}
+
+fn equalDpkgFileRecord(left: std.json.Value, right: std.json.Value) bool {
+    if (left == .object and right == .object and
+        stringEquals(left.object.get("path"), "var/lib/dpkg/diversions-old") and
+        stringEquals(right.object.get("path"), "var/lib/dpkg/diversions-old"))
+    {
+        if (left.object.count() != 5 or right.object.count() != 5) return false;
+        if (!stringEquals(left.object.get("kind"), "opaque") or
+            !stringEquals(right.object.get("kind"), "opaque"))
+            return false;
+        const left_mode = left.object.get("mode") orelse return false;
+        const right_mode = right.object.get("mode") orelse return false;
+        if (left_mode != .string or !equalValue(left_mode, right_mode)) return false;
+        const left_size = left.object.get("size") orelse return false;
+        const right_size = right.object.get("size") orelse return false;
+        if (left_size != .integer or right_size != .integer or
+            left_size.integer < 0 or right_size.integer < 0)
+            return false;
+        return validDigest(left.object.get("sha256") orelse return false) and
+            validDigest(right.object.get("sha256") orelse return false);
+    }
+    return equalValue(left, right);
+}
+
+fn equalStatusOld(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .array or right != .array or left.array.items.len != right.array.items.len)
+        return false;
+    for (left.array.items, right.array.items) |left_item, right_item| {
+        if (!equalStatusOldRecord(left_item, right_item)) return false;
+    }
+    return true;
+}
+
+fn equalStatusOldRecord(left: std.json.Value, right: std.json.Value) bool {
+    if (left != .object or right != .object) return false;
+    var left_it = left.object.iterator();
+    while (left_it.next()) |entry| {
+        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
+        const other = right.object.get(entry.key_ptr.*) orelse return false;
+        if (!equalValue(entry.value_ptr.*, other)) return false;
+    }
+    var right_it = right.object.iterator();
+    while (right_it.next()) |entry| {
+        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
+        if (!left.object.contains(entry.key_ptr.*)) return false;
+    }
+    return true;
+}
+
+fn isStatusOldVolatileField(key: []const u8) bool {
+    return std.mem.eql(u8, key, "status") or
+        std.mem.eql(u8, key, "config_version") or
+        std.mem.eql(u8, key, "config-version") or
+        std.mem.eql(u8, key, "conffiles") or
+        std.mem.eql(u8, key, "triggers_pending") or
+        std.mem.eql(u8, key, "triggers-pending") or
+        std.mem.eql(u8, key, "triggers_awaited") or
+        std.mem.eql(u8, key, "triggers-awaited");
 }
 
 fn equalFilesystemEntry(
@@ -316,65 +482,17 @@ fn equalFilesystemEntry(
         const other = right.object.get(field.key_ptr.*) orelse return false;
         if (std.mem.eql(u8, field.key_ptr.*, "mtime_ns") and ignore_mtime) {
             if (field.value_ptr.* != .integer or other != .integer) return false;
+        } else if (std.mem.eql(u8, field.key_ptr.*, "size") and ignore_size) {
+            if (field.value_ptr.* != .integer or other != .integer or
+                field.value_ptr.integer < 0 or other.integer < 0)
+                return false;
         } else if (std.mem.eql(u8, field.key_ptr.*, "sha256") and ignore_hash) {
             if (!validDigest(field.value_ptr.*) or !validDigest(other)) return false;
-        } else if (std.mem.eql(u8, field.key_ptr.*, "size") and ignore_size) {
-            if (field.value_ptr.* != .integer or other != .integer) return false;
         } else if (!equalValue(field.value_ptr.*, other)) {
             return false;
         }
     }
     return true;
-}
-
-fn equalDpkg(left: std.json.Value, right: std.json.Value) bool {
-    if (left != .object or right != .object or left.object.count() != right.object.count())
-        return false;
-    var iterator = left.object.iterator();
-    while (iterator.next()) |entry| {
-        const other = right.object.get(entry.key_ptr.*) orelse return false;
-        if (std.mem.eql(u8, entry.key_ptr.*, "status_old")) {
-            if (!equalStatusOld(entry.value_ptr.*, other)) return false;
-        } else if (!equalValue(entry.value_ptr.*, other)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn equalStatusOld(left: std.json.Value, right: std.json.Value) bool {
-    if (left != .array or right != .array or left.array.items.len != right.array.items.len)
-        return false;
-    for (left.array.items, right.array.items) |left_item, right_item| {
-        if (!equalStatusOldRecord(left_item, right_item)) return false;
-    }
-    return true;
-}
-
-fn equalStatusOldRecord(left: std.json.Value, right: std.json.Value) bool {
-    if (left != .object or right != .object) return false;
-    var left_it = left.object.iterator();
-    while (left_it.next()) |entry| {
-        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
-        const other = right.object.get(entry.key_ptr.*) orelse return false;
-        if (!equalValue(entry.value_ptr.*, other)) return false;
-    }
-    var right_it = right.object.iterator();
-    while (right_it.next()) |entry| {
-        if (isStatusOldVolatileField(entry.key_ptr.*)) continue;
-        if (!left.object.contains(entry.key_ptr.*)) return false;
-    }
-    return true;
-}
-
-fn isStatusOldVolatileField(key: []const u8) bool {
-    return std.mem.eql(u8, key, "status") or
-        std.mem.eql(u8, key, "config_version") or
-        std.mem.eql(u8, key, "config-version") or
-        std.mem.eql(u8, key, "triggers_pending") or
-        std.mem.eql(u8, key, "triggers-pending") or
-        std.mem.eql(u8, key, "triggers_awaited") or
-        std.mem.eql(u8, key, "triggers-awaited");
 }
 
 fn isVolatileUnownedFile(path: []const u8) bool {
@@ -583,5 +701,29 @@ test "real snapshot comparison normalizes debconf cache size and status_old life
             .object.getPtr("version").?.* = .{ .string = "2:4.0.4-9ubuntu2" };
         try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
     }
+}
+
+test "real snapshot comparison normalizes reference-only dpkg.log, diversions-old, and status_old conffiles" {
+    const ref_json = std.fmt.comptimePrint(
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}},{{"path":"var/log/dpkg.log","kind":"regular","mode":"0644","uid":0,"gid":0,"mtime_ns":1,"xattrs":[],"size":15537,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","hardlink_to":null}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed","triggers-pending":"ldconfig","conffiles":"\n/etc/pam.d/su 60fbbe65c90d741bc0d380543cefe8af"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}]}},"trace":[]}}
+    , .{schema});
+    const cand_json = std.fmt.comptimePrint(
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr","kind":"directory"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"util-linux","version":"2.41-5","status":"install ok installed"}}],"status_old":[{{"package":"util-linux","version":"2.41-5","status":"install ok unpacked","conffiles":"\n/etc/pam.d/su newconffile"}}],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[{{"path":"var/lib/dpkg/diversions","kind":"opaque","mode":"0644","size":676,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}},{{"path":"var/lib/dpkg/diversions-old","kind":"opaque","mode":"0644","size":594,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}}]}},"trace":[]}}
+    , .{schema});
+    var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, ref_json, .{});
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cand_json, .{});
+    defer right.deinit();
+    const left_counts = try validateSnapshot(left.value);
+    const right_counts = try validateSnapshot(right.value);
+    try std.testing.expect(countsCompatible(left_counts, right_counts, left.value, right.value));
+    try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, right.value, left.value));
+
+    right.value.object.getPtr("dpkg").?.object.getPtr("files").?.array.items[0]
+        .object.getPtr("sha256").?.* = .{
+        .string = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    };
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
 }
 

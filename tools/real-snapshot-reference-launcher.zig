@@ -343,7 +343,7 @@ fn debianOpensslGraphField(index: usize, key: []const u8) []const u8 {
 
 fn debianBaseCycleArchive(name: []const u8) CycleBinding {
     if (std.mem.eql(u8, name, "libgcc-s1")) return debian_base_cycle[1];
-    if (std.mem.eql(u8, name, "gcc-16-base")) return debian_base_cycle[2];
+    if (std.mem.eql(u8, name, "gcc-14-base") or std.mem.eql(u8, name, "gcc-16-base")) return debian_base_cycle[2];
     return debian_base_cycle[0];
 }
 
@@ -2317,7 +2317,7 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
             binding.size,
             binding.size,
         ) catch |err| blk: {
-            if (options.profile == .systemd and err == error.InvalidInstalledBinding) {
+            if (options.profile == .systemd and (err == error.InvalidSourceFile or err == error.SourceChanged)) {
                 break :blk try openVerified(
                     script_path,
                     std.crypto.hash.sha2.Sha256,

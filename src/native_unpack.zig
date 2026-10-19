@@ -19250,6 +19250,8 @@ fn lifecycleInvocationPolicy(
 
 const snapshot_systemd_postinst_sha256 =
     "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d";
+const snapshot_debian_systemd_postinst_sha256 =
+    "7a95419baad7f5e6cfa7a422ae8965e67a5b25f9c74fa6cb6596090c1c236793";
 
 fn snapshotSystemdProcIsBound(
     architecture: []const u8,
@@ -19260,13 +19262,17 @@ fn snapshotSystemdProcIsBound(
     script_sha256: native_program.Digest,
     arguments: []const []const u8,
 ) bool {
+    const version_and_digest_match =
+        (std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
+            std.mem.eql(u8, &script_sha256, snapshot_systemd_postinst_sha256)) or
+        (std.mem.eql(u8, package.version, "257.13-1~deb13u1") and
+            std.mem.eql(u8, &script_sha256, snapshot_debian_systemd_postinst_sha256));
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "systemd") and
-        std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
+        version_and_digest_match and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
-        std.mem.eql(u8, &script_sha256, snapshot_systemd_postinst_sha256) and
         arguments.len == 2 and
         std.mem.eql(u8, arguments[0], "configure") and
         arguments[1].len == 0;
@@ -22728,6 +22734,48 @@ fn snapshotBashPostinstIsBound(
     if ((!amd64 and !arm64) or
         !std.mem.eql(u8, package.name, "bash") or
         !std.mem.eql(u8, package.version, "5.3-2ubuntu1") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+fn snapshotDebianBashPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotDebianBashPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "bash") or
+        !std.mem.eql(u8, package.version, "5.2.37-2+b10") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+fn snapshotDebianGawkPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotDebianGawkPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "gawk") or
+        !std.mem.eql(u8, package.version, "1:5.2.1-2+b1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -27327,6 +27375,22 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const snapshot_debian_bash_postinst = try snapshotDebianBashPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
+    const snapshot_debian_gawk_postinst = try snapshotDebianGawkPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const snapshot_sudo_rs_postinst = try snapshotSudoRsPostinstIsBound(
         script_bytes,
         architecture,
@@ -27424,6 +27488,12 @@ fn prepareAlternativesScriptBoundary(
             architecture,
             tool_digest,
         )) return error.InvalidAlternativesTool;
+    if (snapshot_debian_bash_postinst or snapshot_debian_gawk_postinst) {
+        const expected_tool = native_alternatives.pinnedTool(architecture) orelse
+            return error.InvalidAlternativesTool;
+        if (!std.crypto.timing_safe.eql([32]u8, expected_tool.sha256, tool_digest))
+            return error.InvalidAlternativesTool;
+    }
     if (snapshot_sudo_rs_postinst)
         try verifySudoRsStructuralOwner(allocator, root, program);
     if (python3_inert)

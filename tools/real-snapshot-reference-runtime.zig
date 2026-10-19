@@ -800,15 +800,25 @@ const GuestRecorder = struct {
     }
 
     /// /etc/nsswitch.conf may only hold a signed provider copy of the bound lock:
-    /// libc-bin's is always required; systemd's factory copy is bound exactly
-    /// when the lock carries systemd (the protected runtime lock does not). A
-    /// locked provider whose member is missing still refuses.
+    /// libc-bin's is always required; systemd's factory copy is bound when the
+    /// lock carries a systemd release that ships it (Debian trixie 257.13-1~deb13u1
+    /// does not ship usr/share/factory/etc/nsswitch.conf). A locked provider whose
+    /// expected member is missing still refuses.
     fn nssConfig(self: *GuestRecorder) !void {
         for ([_]struct { package: []const u8, path: []const u8, required: bool }{
             .{ .package = "libc-bin", .path = "usr/share/libc-bin/nsswitch.conf", .required = true },
             .{ .package = "systemd", .path = "usr/share/factory/etc/nsswitch.conf", .required = false },
         }) |source| {
-            if (!source.required and self.base.lockPackage(source.package) == null) continue;
+            const pkg = self.base.lockPackage(source.package) orelse {
+                if (!source.required) continue;
+                return error.MissingRuntimePackage;
+            };
+            if (!source.required and std.mem.eql(u8, source.package, "systemd") and
+                std.mem.eql(u8, pkg.version, "257.13-1~deb13u1"))
+            {
+                const data = try self.base.payload(source.package);
+                if (payloadEntry(data, source.path) == null) continue;
+            }
             const found = try self.member(source.package, source.path);
             try self.put("/etc/nsswitch.conf", .nss_config, false, found.identity);
         }

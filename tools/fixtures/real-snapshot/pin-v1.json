@@ -63,6 +63,18 @@
     {
       "digest": "sha256:5223cb19af6f686faa591eb6575b6d585a830473d98550df52ef958fd152f9f2",
       "reason": "SHA-256 of the sorted reference-archives TSV that tools/real-snapshot-signed-proc-prestates.sh rebuilds from the locked amd64 closure; a derived digest over the closure already bound by snapshot.closures.amd64.digest, not snapshot bytes"
+    },
+    {
+      "digest": "sha256:6d1b5aafa381703582cefe6ba5e4b7b0cfa7f10b0b0a9b299361c4afd5172a21",
+      "reason": "bash 5.2.37-2+b10 postinst from the frozen Debian trixie amd64 closure; bound by tools/fixtures/debian-stable-closure-v1/amd64-inventory.json, not the resolute snapshot pin"
+    },
+    {
+      "digest": "sha256:7a95419baad7f5e6cfa7a422ae8965e67a5b25f9c74fa6cb6596090c1c236793",
+      "reason": "systemd 257.13-1~deb13u1 postinst from the frozen Debian trixie amd64 closure; bound by tools/fixtures/debian-stable-closure-v1/amd64-inventory.json, not the resolute snapshot pin"
+    },
+    {
+      "digest": "sha256:95e1e850c9df6ac5534ec74e67f94b3f1e579216d54ce7e83a06860dc6c40439",
+      "reason": "gawk 1:5.2.1-2+b1 postinst from the frozen Debian trixie amd64 closure; bound by tools/fixtures/debian-stable-closure-v1/amd64-inventory.json, not the resolute snapshot pin"
     }
   ],
   "identities": [

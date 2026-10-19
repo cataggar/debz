@@ -91,13 +91,25 @@ const snapshot_systemd_sha256 = [32]u8{
 };
 const snapshot_systemd_postinst_size = 5037;
 
+const snapshot_debian_systemd_sha256 = [32]u8{
+    0x7a, 0x95, 0x41, 0x9b, 0xaa, 0xd7, 0xf5, 0xe6,
+    0xcf, 0xa7, 0xa4, 0x22, 0xae, 0x89, 0x65, 0xe6,
+    0x7a, 0x5b, 0x25, 0xf9, 0xc7, 0x4f, 0xa6, 0xcb,
+    0x65, 0x96, 0x09, 0x0c, 0x1c, 0x23, 0x67, 0x93,
+};
+const snapshot_debian_systemd_postinst_size = 4314;
+
 fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bool {
+    const version_and_digest_match =
+        (std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
+            std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_systemd_sha256)) or
+        (std.mem.eql(u8, identity.version, "257.13-1~deb13u1") and
+            std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_debian_systemd_sha256));
     return std.mem.eql(u8, identity.package, "systemd") and
-        std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
+        version_and_digest_match and
         std.mem.eql(u8, identity.architecture, "amd64") and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/systemd.postinst") and
-        std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_systemd_sha256) and
         arguments.len == 2 and
         std.mem.eql(u8, arguments[0], "configure") and
         arguments[1].len == 0;
@@ -314,14 +326,15 @@ pub const SnapshotSystemdProc = struct {
         const observed = try self.script.observeAlloc(allocator, 8192);
         defer allocator.free(observed.bytes);
         if (observed.entry.uid != 0 or observed.entry.gid != 0 or
-            observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
-            observed.entry.size != snapshot_systemd_postinst_size)
+            observed.entry.mode != 0o755 or observed.entry.link_count != 1)
             return error.InvalidSnapshotSystemdScript;
-        if (!std.crypto.timing_safe.eql(
-            [32]u8,
-            hashBytes(observed.bytes),
-            snapshot_systemd_sha256,
-        )) return error.InvalidSnapshotSystemdScript;
+        const observed_hash = hashBytes(observed.bytes);
+        const matches_ubuntu = observed.entry.size == snapshot_systemd_postinst_size and
+            std.crypto.timing_safe.eql([32]u8, observed_hash, snapshot_systemd_sha256);
+        const matches_debian = observed.entry.size == snapshot_debian_systemd_postinst_size and
+            std.crypto.timing_safe.eql([32]u8, observed_hash, snapshot_debian_systemd_sha256);
+        if (!matches_ubuntu and !matches_debian)
+            return error.InvalidSnapshotSystemdScript;
         if (!std.mem.eql(u8, &self.boot_id, &(try readKernelBootId())))
             return error.SnapshotBootIdChanged;
     }
