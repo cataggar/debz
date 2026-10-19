@@ -60,6 +60,7 @@ pub const ci_ghr_zig_jobs = [_][]const u8{
     "fuzz",
     "integration-required",
     "integration-full",
+    "system-install-live",
 };
 
 pub const release_ghr_zig_jobs = [_][]const u8{
@@ -1299,7 +1300,7 @@ const TestFixture = struct {
 test "reviewed jobs have one exact verified install each" {
     var fx = try TestFixture.init();
     defer fx.deinit();
-    try testing.expectEqual(@as(usize, 23), ci_ghr_zig_jobs.len);
+    try testing.expectEqual(@as(usize, 24), ci_ghr_zig_jobs.len);
 
     var failures = Failures.init(fx.arena.allocator());
     try auditZigInstallation(&failures, fx.ci, fx.release);
@@ -1316,7 +1317,7 @@ test "balanced move between new jobs still fails" {
     const step1 = try fx.replaceFirst(fx.ci, repository, repo_without);
     const changed = try fx.replaceFirst(step1, helper, helper_with);
 
-    try testing.expectEqual(@as(usize, 23), countSubstr(changed, ghr_zig_install));
+    try testing.expectEqual(@as(usize, 24), countSubstr(changed, ghr_zig_install));
     var failures = Failures.init(fx.arena.allocator());
     try auditZigInstallation(&failures, changed, fx.release);
     try testing.expect(TestFixture.hasFailureContaining(&failures, "reviewed CI job inventory"));
@@ -1332,7 +1333,7 @@ test "balanced move out of diversion shard still fails" {
     const step1 = try fx.replaceFirst(fx.ci, diversions, div_without);
     const changed = try fx.replaceFirst(step1, helper, helper_with);
 
-    try testing.expectEqual(@as(usize, 23), countSubstr(changed, ghr_zig_install));
+    try testing.expectEqual(@as(usize, 24), countSubstr(changed, ghr_zig_install));
     var failures = Failures.init(fx.arena.allocator());
     try auditZigInstallation(&failures, changed, fx.release);
     try testing.expect(TestFixture.hasFailureContaining(&failures, "reviewed CI job inventory"));
@@ -1357,7 +1358,7 @@ test "balanced move between workload jobs still fails" {
         const step1 = try fx.replaceFirst(fx.ci, moved_from, from_without);
         const changed = try fx.replaceFirst(step1, moved_to, to_with);
 
-        try testing.expectEqual(@as(usize, 23), countSubstr(changed, ghr_zig_install));
+        try testing.expectEqual(@as(usize, 24), countSubstr(changed, ghr_zig_install));
         var failures = Failures.init(fx.arena.allocator());
         try auditZigInstallation(&failures, changed, fx.release);
         try testing.expect(TestFixture.hasFailureContaining(&failures, "reviewed CI job inventory"));
@@ -1374,7 +1375,7 @@ test "balanced move out of native oracle evidence job still fails" {
     const step1 = try fx.replaceFirst(fx.ci, oracle, oracle_without);
     const changed = try fx.replaceFirst(step1, helper, helper_with);
 
-    try testing.expectEqual(@as(usize, 23), countSubstr(changed, ghr_zig_install));
+    try testing.expectEqual(@as(usize, 24), countSubstr(changed, ghr_zig_install));
     var failures = Failures.init(fx.arena.allocator());
     try auditZigInstallation(&failures, changed, fx.release);
     try testing.expect(TestFixture.hasFailureContaining(&failures, "reviewed CI job inventory"));

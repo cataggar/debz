@@ -192,7 +192,11 @@ fn importMatching(
     const limits: target.Limits = .{};
     for (manifest.sources, policies) |record, *policy| {
         try verifyRecordedFile(allocator, root, record.logical_path, record.sha256, limits.max_source_material_bytes);
-        policy.* = .{ .logical_path = record.logical_path, .freshness = record.freshness };
+        policy.* = .{
+            .logical_path = record.logical_path,
+            .freshness = record.freshness,
+            .archive_binding = record.archive_binding,
+        };
     }
     for (manifest.keyrings) |record|
         try verifyRecordedFile(allocator, root, record.logical_path, record.sha256, limits.max_keyring_material_bytes);

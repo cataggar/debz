@@ -3442,6 +3442,13 @@ pub fn auditProductionSources(ctx: *AuditContext) !void {
                     {
                         continue;
                     }
+                    if (std.mem.eql(u8, relative, "src/production_backend.zig") and
+                        std.mem.eql(u8, val, "/etc/apt/") and
+                        std.mem.indexOf(u8, lt, ".logical_path = \"/etc/apt/sources.list.d/vendor.list\",") != null and
+                        first_test != null and idx > first_test.?)
+                    {
+                        continue;
+                    }
                     if (std.mem.eql(u8, relative, "src/target_apt_config.zig") and
                         (sliceContainsStr(&target_apt_paths, lt_stripped) or (first_test != null and idx > first_test.?)))
                     {
@@ -6826,11 +6833,12 @@ pub fn nativeDatabasePairCiFailures(allocator: std.mem.Allocator, ci: []const u8
             job = sec.body;
         }
     }
-    const last_three_ok = sections.len >= 3 and
-        std.mem.eql(u8, sections[sections.len - 3].name, "ubuntu-real-snapshot") and
-        std.mem.eql(u8, sections[sections.len - 2].name, "native-database-pair") and
+    const last_four_ok = sections.len >= 4 and
+        std.mem.eql(u8, sections[sections.len - 4].name, "ubuntu-real-snapshot") and
+        std.mem.eql(u8, sections[sections.len - 3].name, "native-database-pair") and
+        std.mem.eql(u8, sections[sections.len - 2].name, "system-install-live") and
         std.mem.eql(u8, sections[sections.len - 1].name, "protected-reference");
-    if (ndp_cnt != 1 or !last_three_ok) {
+    if (ndp_cnt != 1 or !last_four_ok) {
         try failures.append(
             allocator,
             try allocator.dupe(u8, "ci.yml: the native database pair job must sit between the native snapshot and protected reference jobs"),
@@ -6880,6 +6888,320 @@ pub fn nativeDatabasePairCiFailures(allocator: std.mem.Allocator, ci: []const u8
     }
     if (!driver_ok) {
         try failures.append(allocator, try allocator.dupe(u8, "ci.yml: the native database pair driver and inputs must be used only by the matched-pair job"));
+    }
+    return failures.toOwnedSlice(allocator);
+}
+
+const SYSTEM_INSTALL_LIVE_PATHS = [_][]const u8{
+    ".github/workflows/ci.yml",
+    "tools/system-install-live-proof.sh",
+    "tools/system-install-live-proof.zig",
+};
+
+const SYSTEM_INSTALL_LIVE_INPUT =
+    \\      run_system_install_live:
+    \\        description: "Run the live short system-profile install proof on disposable hosted amd64 and arm64 runners"
+    \\        required: true
+    \\        type: boolean
+    \\        default: false
+    \\
+;
+
+const SYSTEM_INSTALL_LIVE_JOB =
+    \\  system-install-live:
+    \\    if: github.event_name == 'workflow_dispatch' && inputs.run_system_install_live
+    \\    name: Live system install proof (${{ matrix.architecture }})
+    \\    # Disposable GitHub-hosted runners only: the proof rewrites the runner's
+    \\    # APT sources and adds the reviewed Microsoft repository to the real root.
+    \\    runs-on: ${{ matrix.runner }}
+    \\    # Toolchain 5, static ReleaseSafe build 30, the proof 25 and evidence
+    \\    # upload 5.
+    \\    timeout-minutes: 65
+    \\    permissions:
+    \\      contents: read
+    \\      attestations: read
+    \\    strategy:
+    \\      fail-fast: false
+    \\      matrix:
+    \\        include:
+    \\          - architecture: amd64
+    \\            runner: ubuntu-24.04
+    \\            target: x86_64-linux-musl
+    \\          - architecture: arm64
+    \\            runner: ubuntu-24.04-arm
+    \\            target: aarch64-linux-musl
+    \\    steps:
+    \\      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    \\        with:
+    \\          persist-credentials: false
+    \\      - name: Install Zig via ghr
+    \\        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+    \\        env:
+    \\          GH_TOKEN: ${{ github.token }}
+    \\        with:
+    \\          ghr-version: v0.8.1
+    \\          tools: >-
+    \\            cataggar/zig@v0.17.0
+    \\            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+    \\      - name: Validate Zig version
+    \\        run: test "$(zig version)" = 0.17.0
+    \\      - name: Build the static ReleaseSafe CLI
+    \\        timeout-minutes: 30
+    \\        env:
+    \\          TARGET: ${{ matrix.target }}
+    \\        run: zig build install build-system-install-live-proof -Dtarget="$TARGET" -Doptimize=ReleaseSafe --summary all
+    \\      - name: Prove the short system profile against the live Microsoft feed
+    \\        timeout-minutes: 25
+    \\        env:
+    \\          ARCHITECTURE: ${{ matrix.architecture }}
+    \\        run: tools/system-install-live-proof.sh "$ARCHITECTURE"
+    \\      - name: Upload live system install evidence
+    \\        if: always()
+    \\        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+    \\        with:
+    \\          name: system-install-live-${{ matrix.architecture }}
+    \\          path: .system-install-live/${{ matrix.architecture }}/
+    \\          if-no-files-found: error
+    \\          retention-days: 14
+    \\
+;
+
+const SYSTEM_INSTALL_LIVE_SCRIPT_TOKENS = [_][]const u8{
+    "set -euo pipefail\n",
+    "if [ \"${GITHUB_ACTIONS:-}\" != true ]; then die \"refusing to run outside GitHub Actions\"; fi\n",
+    "if [ \"${RUNNER_ENVIRONMENT:-}\" != github-hosted ]; then die \"refusing to run outside a disposable GitHub-hosted runner\"; fi\n",
+    "if ! grep -qx 'ID=ubuntu' /etc/os-release; then die \"refusing to run outside Ubuntu\"; fi\n",
+    "if ! grep -qx 'VERSION_ID=\"24.04\"' /etc/os-release; then die \"refusing to run outside Ubuntu 24.04\"; fi\n",
+    "if [ \"$(dpkg --print-architecture)\" != \"$arch\" ]; then die \"the runner is not $arch\"; fi\n",
+    "as_root() { sudo -n env -i PATH=\"$path\" LC_ALL=C \"$@\"; }\n",
+    "check() { as_root \"$checker\" \"$@\"; }\n",
+    "trap finish EXIT\n",
+    "check prestate \"$arch\" >\"$out/prestate-initial.json\" ||\n",
+    "  --transaction-backend legacy_dpkg --json\n",
+    "    die \"the Microsoft feed is older than the reviewed 1209600 s (14-day) bound; debz refused it (ReleaseExpired); no proof is possible from this feed state\"\n",
+    "check repo-add \"$out\" \"$descriptor\" \"$arch\" >\"$out/apt-config-snapshot.json\" ||\n",
+    "check snapshot >\"$work/baseline.txt\" || die \"could not snapshot /var/lib/dpkg\"\n",
+    "cat >\"$out/runs/index\" <<'RUNS'\n" ++
+        "native-symcrypt root json native symcrypt\n" ++
+        "native-symcrypt-openssl root json native symcrypt-openssl\n" ++
+        "legacy-symcrypt root json legacy_dpkg symcrypt\n" ++
+        "legacy-symcrypt-openssl root json legacy_dpkg symcrypt-openssl\n" ++
+        "native-symcrypt-again root json native symcrypt\n" ++
+        "native-symcrypt-human root human native symcrypt\n" ++
+        "default-symcrypt-human root human default symcrypt\n" ++
+        "unprivileged-native-symcrypt user json native symcrypt\n" ++
+        "native-absent root json native debz-live-proof-absent\n" ++
+        "RUNS\n",
+    "  check snapshot >\"$work/after.txt\" || die \"could not snapshot /var/lib/dpkg after $name\"\n",
+    "  if ! cmp -s \"$work/baseline.txt\" \"$work/after.txt\"; then\n",
+    "    die \"$name changed /var/lib/dpkg; see runs/$name.dpkg.diff\"\n",
+    "check verify \"$out\" \"$arch\" >\"$out/verified.json\" || die \"the install evidence does not meet the pass criteria\"\n",
+};
+
+const SYSTEM_INSTALL_LIVE_CHECKER_TOKENS = [_][]const u8{
+    "const BOUND = 1209600;\n",
+    "const DERIVED = \"signed_sha256_derived_sha512\";\n",
+    "const SIGNER = \"BC528686B50D79E339D3721CEB3E94ADBE1229CF\";\n",
+    "const ABSENT = \"package has no available candidate; nothing was changed\";\n",
+    "try require(!containsAsciiCaseInsensitive(stdout, \"upstream\") and !containsAsciiCaseInsensitive(stderr, \"upstream\"), \"output mentions an upstream digest\");\n",
+    "std.mem.eql(u8, provenance_str, \"derived_from_signed_sha256\") and\n",
+    "const found = try self.cache.matches(self.allocator, self.io, declared_size, signed);\n",
+    "try require(allEqualSlice(found, derived_val), \"the derived SHA-512 is not over the signed SHA-256 bytes\");\n",
+    "try require(std.mem.eql(u8, auth_str, \"signed_sha256_only\") and !archive_obj.contains(\"derived_sha512\"), \"the legacy plan claims a SHA-512\");\n",
+    "try require(!try self.pathExists(EVIDENCE ++ \"/active-v1.json\"), \"an owned attempt was left unsettled\");\n",
+    "try require(stringSlicesEqual(published, self.locks.items), \"the locks directory holds install locks no planned run reported\");\n",
+};
+
+pub fn systemInstallLiveFailures(
+    allocator: std.mem.Allocator,
+    texts: std.StringArrayHashMapUnmanaged([]const u8),
+) ![][]const u8 {
+    var failures: std.ArrayList([]const u8) = .empty;
+    for (SYSTEM_INSTALL_LIVE_PATHS) |path| {
+        const val = texts.get(path) orelse "";
+        if (val.len == 0) {
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "live system install proof: missing proof file: {s}", .{path}));
+        }
+    }
+    if (failures.items.len > 0) return failures.toOwnedSlice(allocator);
+
+    const ci = texts.get(".github/workflows/ci.yml").?;
+    const dispatch = extractDispatchInputsBlock(ci);
+    const rsil = countTrimmedKeyLines(ci, "      run_system_install_live:", "run_system_install_live:");
+    if (dispatch == null or
+        !dispatchInputExact(dispatch.?, SYSTEM_INSTALL_LIVE_INPUT) or
+        rsil.total_key_lines != 1 or
+        rsil.exact_matches != 1 or
+        countSubstring(ci, "inputs.run_system_install_live") != 1)
+    {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "ci.yml: the live system install proof must stay a manual default-off workflow_dispatch input"),
+        );
+    }
+
+    const sections = try parseCiJobSections(allocator, ci);
+    var sil_cnt: usize = 0;
+    var job: []const u8 = "";
+    for (sections) |sec| {
+        if (std.mem.eql(u8, sec.name, "system-install-live")) {
+            sil_cnt += 1;
+            job = sec.body;
+        }
+    }
+    const last_three_ok = sections.len >= 3 and
+        std.mem.eql(u8, sections[sections.len - 3].name, "native-database-pair") and
+        std.mem.eql(u8, sections[sections.len - 2].name, "system-install-live") and
+        std.mem.eql(u8, sections[sections.len - 1].name, "protected-reference");
+    if (sil_cnt != 1 or !last_three_ok) {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "ci.yml: the live system install proof job must sit between the native database pair and protected reference jobs"),
+        );
+    }
+
+    const trimmed_job = std.mem.trimEnd(u8, job, "\n");
+    const full_job = try std.fmt.allocPrint(allocator, "  system-install-live:\n{s}\n", .{trimmed_job});
+    if (!std.mem.eql(u8, full_job, SYSTEM_INSTALL_LIVE_JOB)) {
+        try failures.append(allocator, try allocator.dupe(u8, "ci.yml: the live system install proof job must keep its exact hosted read-only wiring"));
+    }
+
+    var ro_cnt: usize = 0;
+    var ro_ok = false;
+    {
+        var it = std.mem.splitScalar(u8, job, '\n');
+        while (it.next()) |line| {
+            if (std.mem.startsWith(u8, line, "    runs-on:")) {
+                ro_cnt += 1;
+                if (std.mem.eql(u8, line, "    runs-on: ${{ matrix.runner }}")) {
+                    ro_ok = true;
+                }
+            }
+        }
+    }
+    if (std.mem.indexOf(u8, job, "self-hosted") != null or
+        std.mem.indexOf(u8, job, "continue-on-error") != null or
+        std.mem.indexOf(u8, job, "chown") != null or
+        countWordOccurrences(job, "sudo") != 0 or
+        ro_cnt != 1 or !ro_ok or
+        countSubstring(ci, "tools/system-install-live-proof.sh") != 1)
+    {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "ci.yml: the live system install proof job must stay GitHub-hosted and read-only"),
+        );
+    }
+
+    const script = texts.get("tools/system-install-live-proof.sh").?;
+    var script_tokens_ok = true;
+    for (SYSTEM_INSTALL_LIVE_SCRIPT_TOKENS) |tok| {
+        if (countSubstring(script, tok) != 1) script_tokens_ok = false;
+    }
+    if (!script_tokens_ok) {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "tools/system-install-live-proof.sh: the live system install proof script lost a required check"),
+        );
+    }
+
+    var script_dpkg_ok = std.mem.indexOf(u8, script, "debz apt") == null and
+        countSubstring(script, "sudo -n dpkg --purge packages-microsoft-prod ") == 1;
+    var dpkg_purge_count: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, script, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trimStart(u8, line, " \t");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            if (hasUnflaggedSudo(line) or
+                std.mem.indexOf(u8, trimmed, "|| true") != null or
+                std.mem.eql(u8, trimmed, "exit 0") or
+                std.mem.indexOf(u8, trimmed, "--force") != null or
+                std.mem.indexOf(u8, trimmed, "--skip") != null or
+                countWordOccurrences(line, "curl") > 0 or
+                countWordOccurrences(line, "wget") > 0)
+            {
+                script_dpkg_ok = false;
+            }
+            if (std.mem.indexOf(u8, line, "dpkg --purge") != null) {
+                dpkg_purge_count += 1;
+            }
+            for ([_][]const u8{
+                "apt install",        "apt remove",        "apt purge",        "apt upgrade",
+                "apt dist-upgrade",   "apt full-upgrade",  "apt autoremove",   "apt-get install",
+                "apt-get remove",     "apt-get purge",     "apt-get upgrade",  "apt-get dist-upgrade",
+                "apt-get full-upgrade", "apt-get autoremove", "dpkg -i",       "dpkg --install",
+                "dpkg -r",            "dpkg --remove",     "dpkg -P",          "dpkg --configure",
+                "dpkg --unpack",      "dpkg --set-selections",
+            }) |forbidden| {
+                if (std.mem.indexOf(u8, line, forbidden) != null) script_dpkg_ok = false;
+            }
+        }
+    }
+    if (dpkg_purge_count != 1) script_dpkg_ok = false;
+    if (!script_dpkg_ok) {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "tools/system-install-live-proof.sh: the live system install proof must not invoke APT or dpkg install commands"),
+        );
+    }
+
+    const checker = texts.get("tools/system-install-live-proof.zig").?;
+    var checker_tokens_ok = true;
+    for (SYSTEM_INSTALL_LIVE_CHECKER_TOKENS) |tok| {
+        if (countSubstring(checker, tok) != 1) checker_tokens_ok = false;
+    }
+    if (!checker_tokens_ok) {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "tools/system-install-live-proof.zig: the live system install verifier lost a required check"),
+        );
+    }
+
+    var checker_readonly_ok = countSubstring(checker, ".openFile(") >= 1;
+    {
+        var it = std.mem.splitScalar(u8, checker, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, ".openFile(") != null and
+                std.mem.indexOf(u8, line, ".mode = .read_only") == null)
+            {
+                checker_readonly_ok = false;
+            }
+        }
+    }
+    for ([_][]const u8{
+        "createFile",
+        "writeFile",
+        "makeDir",
+        "makePath",
+        "deleteFile",
+        "deleteDir",
+        "deleteTree",
+        "rename",
+        "symLink",
+        "hardLink",
+        "chmod",
+        "chown",
+        "fchmod",
+        "fchown",
+        "unlink",
+        "rmdir",
+        "mkdir",
+        "std.process.run",
+        "std.process.Child",
+        ".spawn(",
+        "execve",
+        "fork(",
+        "publishFile",
+        ".read_write",
+        ".write_only",
+    }) |forbidden_tok| {
+        if (std.mem.indexOf(u8, checker, forbidden_tok) != null) checker_readonly_ok = false;
+    }
+    if (!checker_readonly_ok) {
+        try failures.append(
+            allocator,
+            try allocator.dupe(u8, "tools/system-install-live-proof.zig: the live system install verifier must stay read-only and childless"),
+        );
     }
     return failures.toOwnedSlice(allocator);
 }
@@ -11204,11 +11526,14 @@ pub fn auditCiPins(ctx: *AuditContext) !void {
             for (try protectedReferenceCiFailures(ctx.allocator, try loadExistingTextMap(ctx, &PROTECTED_REFERENCE_PATHS))) |msg| {
                 try ctx.fail(msg);
             }
+            for (try systemInstallLiveFailures(ctx.allocator, try loadExistingTextMap(ctx, &SYSTEM_INSTALL_LIVE_PATHS))) |msg| {
+                try ctx.fail(msg);
+            }
             for (try signedProcCiFailures(ctx.allocator, text)) |msg| {
                 try ctx.fail(msg);
             }
         }
-        const expected_ghr: ?usize = if (std.mem.eql(u8, name, "ci.yml")) 23 else if (std.mem.eql(u8, name, "release.yml")) 3 else null;
+        const expected_ghr: ?usize = if (std.mem.eql(u8, name, "ci.yml")) 24 else if (std.mem.eql(u8, name, "release.yml")) 3 else null;
         if (expected_ghr) |exp| {
             for (try ghrZigWorkflowFailures(ctx.allocator, text, relative, exp)) |msg| {
                 try ctx.fail(msg);
@@ -12475,7 +12800,7 @@ pub fn checkPolicyInput(
             else => 1,
         };
     } else if (std.mem.eql(u8, kind, "ghr-ci")) {
-        failures = try ghrZigWorkflowFailures(ctx.allocator, text, "ci.yml", 23);
+        failures = try ghrZigWorkflowFailures(ctx.allocator, text, "ci.yml", 24);
     } else if (std.mem.eql(u8, kind, "ghr-release")) {
         failures = try ghrZigWorkflowFailures(ctx.allocator, text, "release.yml", 3);
     } else if (std.mem.eql(u8, kind, "workflow-failure")) {
@@ -12771,6 +13096,7 @@ fn getNativeSourcesForKind(kind: []const u8) ?[]const []const u8 {
     };
     if (std.mem.eql(u8, kind, "reference-root")) return &REFERENCE_ROOT_PATHS;
     if (std.mem.eql(u8, kind, "protected-reference")) return &PROTECTED_REFERENCE_PATHS;
+    if (std.mem.eql(u8, kind, "native-system-install-live")) return &SYSTEM_INSTALL_LIVE_PATHS;
     if (std.mem.eql(u8, kind, "native-cli-smoke")) return &CLI_SMOKE_PATHS;
     if (std.mem.eql(u8, kind, "native-action-empty-lock")) return &ACTION_EMPTY_LOCK_PATHS;
     if (std.mem.eql(u8, kind, "native-debian-readiness")) return &DEBIAN_READINESS_PATHS;
@@ -12876,6 +13202,7 @@ fn dispatchNativeKindFailures(
         );
     }
     if (std.mem.eql(u8, kind, "protected-reference")) return protectedReferenceCiFailures(allocator, texts);
+    if (std.mem.eql(u8, kind, "native-system-install-live")) return systemInstallLiveFailures(allocator, texts);
     if (std.mem.eql(u8, kind, "native-cli-smoke")) return nativeCliSmokeFailures(allocator, texts);
     if (std.mem.eql(u8, kind, "native-action-empty-lock")) return nativeActionEmptyLockFailures(allocator, texts);
     if (std.mem.eql(u8, kind, "native-debian-readiness")) return nativeDebianReadinessFailures(allocator, texts);

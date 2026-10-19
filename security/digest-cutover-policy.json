@@ -270,6 +270,7 @@
       "paths": [
         "schema/apt-config-snapshot-v1.json",
         "schema/apt-config-snapshot-v2.json",
+        "schema/apt-config-snapshot-v3.json",
         "schema/apt-system-execution-completion-v1.json",
         "schema/apt-system-operation-state-v1.json",
         "schema/apt-system-result-v1.json",
@@ -336,6 +337,7 @@
         "actions/setup/src/hash.ts",
         "schema/apt-config-snapshot-v1.json",
         "schema/apt-config-snapshot-v2.json",
+        "schema/apt-config-snapshot-v3.json",
         "schema/apt-system-execution-completion-v1.json",
         "schema/apt-system-operation-state-v1.json",
         "schema/apt-system-result-v1.json",

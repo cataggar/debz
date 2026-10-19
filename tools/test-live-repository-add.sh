@@ -66,6 +66,11 @@ jq -e --arg sha256 "$sha256" '
 target_manifest=$(jq -er '.paths.target_manifest' "$evidence/repo-add-result.json")
 sudo -n cat "$root$target_manifest" >"$evidence/apt-config-snapshot.json"
 jq -e '
+  .schema == "https://debz.dev/schema/apt-config-snapshot-v3" and
+  .version == 3 and
+  ([.sources[].archive_binding, .repository_policies[].archive_binding]) as $bindings |
+  ($bindings | length >= 2) and
+  ($bindings | all(. == "signed_sha256_derived_sha512")) and
   ([.sources[].freshness, .repository_policies[].freshness]) as $freshness |
   ($freshness | length >= 2) and
   ($freshness | all(. == {

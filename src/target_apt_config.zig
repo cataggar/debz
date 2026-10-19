@@ -11,11 +11,16 @@ pub const schema_id = "https://debz.dev/schema/apt-config-snapshot-v1";
 pub const schema_version: u32 = 1;
 pub const freshness_schema_id = "https://debz.dev/schema/apt-config-snapshot-v2";
 pub const freshness_schema_version: u32 = 2;
+/// Records a reviewed per-source archive binding that the source bytes do not
+/// declare themselves; see `SourcePolicy.archive_binding`.
+pub const archive_binding_schema_id = "https://debz.dev/schema/apt-config-snapshot-v3";
+pub const archive_binding_schema_version: u32 = 3;
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
 
 pub const ArtifactVersion = enum {
     v1,
     v2,
+    v3,
 };
 
 const sources_list_path = "/etc/apt/sources.list";
@@ -162,6 +167,11 @@ pub const Request = struct {
 pub const SourcePolicy = struct {
     logical_path: []const u8,
     freshness: repository_refresh.ExpiryPolicy,
+    /// Document-policy archive binding applied to every declaration in the
+    /// source. A declaration's own binding may agree with it but never
+    /// contradict it. A non-default value is recorded only by
+    /// apt-config-snapshot-v3.
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 };
 
 pub const SourceRecord = struct {
@@ -169,11 +179,15 @@ pub const SourceRecord = struct {
     sha256: [32]u8,
     format: source.Format,
     freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 };
 
 pub const RepositoryPolicyRecord = struct {
     repository_id: [64]u8,
     freshness: repository_refresh.ExpiryPolicy,
+    /// The repository's effective binding; recorded only by v3, where it
+    /// includes bindings a declaration states itself.
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 };
 
 pub const KeyringUse = enum {
@@ -235,6 +249,8 @@ fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
             !targetExpiryPolicy(record.freshness))
             return error.InvalidPath;
     }
+    if (!validArchiveBindingVersion(manifest.artifact_version, manifest.sources, manifest.repository_policies))
+        return error.InvalidIdentity;
     if (!validLowerHex(&manifest.configuration_id)) return error.InvalidIdentity;
     for (manifest.repository_ids) |id| {
         if (!validLowerHex(&id)) return error.InvalidIdentity;
@@ -511,14 +527,17 @@ pub fn snapshot(
 
     const documents = try allocator.alloc(repository_policy.SourceDocument, source_materials.len);
     defer allocator.free(documents);
-    for (source_materials, 0..) |material, index| documents[index] = .{
-        .bytes = material.bytes,
-        .format = material.format,
-        .policy = .{ .freshness = sourceFreshness(
-            request.source_policies,
-            material.logical_path,
-        ) },
-    };
+    for (source_materials, 0..) |material, index| {
+        const policy = sourcePolicy(request.source_policies, material.logical_path);
+        documents[index] = .{
+            .bytes = material.bytes,
+            .format = material.format,
+            .policy = .{
+                .freshness = policy.freshness,
+                .archive_binding = policy.archive_binding,
+            },
+        };
+    }
     for (request.source_policies) |policy| {
         var found = false;
         for (source_materials) |material| {
@@ -661,12 +680,18 @@ pub fn snapshot(
 
     const source_records = try allocator.alloc(SourceRecord, source_materials.len);
     defer allocator.free(source_records);
-    for (source_materials, 0..) |material, index| source_records[index] = .{
-        .logical_path = material.logical_path,
-        .sha256 = material.sha256,
-        .format = material.format,
-        .freshness = documents[index].policy.freshness,
-    };
+    var binding_recorded = false;
+    for (source_materials, 0..) |material, index| {
+        source_records[index] = .{
+            .logical_path = material.logical_path,
+            .sha256 = material.sha256,
+            .format = material.format,
+            .freshness = documents[index].policy.freshness,
+            .archive_binding = documents[index].policy.archive_binding,
+        };
+        if (documents[index].policy.archive_binding != .published_digests)
+            binding_recorded = true;
+    }
     const repository_ids = try allocator.alloc([64]u8, configuration.repositories.len);
     defer allocator.free(repository_ids);
     for (configuration.repositories, 0..) |repository, index|
@@ -680,6 +705,12 @@ pub fn snapshot(
         repository_policies[index] = .{
             .repository_id = repository.id.bytes,
             .freshness = repository.freshness,
+            // Before v3, a declaration's own binding is carried only by its
+            // recorded source bytes and its repository identity.
+            .archive_binding = if (binding_recorded)
+                repository.archive_binding
+            else
+                .published_digests,
         };
     }
     const keyring_records = try allocator.alloc(KeyringRecord, keyring_materials.items.len);
@@ -798,15 +829,34 @@ fn targetExpiryPolicy(policy: repository_refresh.ExpiryPolicy) bool {
         repository_refresh.validExpiryPolicy(policy);
 }
 
-fn sourceFreshness(
+fn sourcePolicy(
     policies: []const SourcePolicy,
     logical_path: []const u8,
-) repository_refresh.ExpiryPolicy {
+) SourcePolicy {
     for (policies) |policy| {
         if (std.mem.eql(u8, policy.logical_path, logical_path))
-            return policy.freshness;
+            return policy;
     }
-    return .require_valid_until;
+    return .{ .logical_path = logical_path, .freshness = .require_valid_until };
+}
+
+/// v3 is used exactly when a source carries a non-default document binding,
+/// so a recorded binding is never dropped and each artifact has one version.
+fn validArchiveBindingVersion(
+    artifact_version: ArtifactVersion,
+    sources: []const SourceRecord,
+    repository_policies: []const RepositoryPolicyRecord,
+) bool {
+    var bound_source = false;
+    for (sources) |record| {
+        if (record.archive_binding != .published_digests) bound_source = true;
+    }
+    if (artifact_version == .v3) return bound_source;
+    if (bound_source) return false;
+    for (repository_policies) |policy| {
+        if (policy.archive_binding != .published_digests) return false;
+    }
+    return true;
 }
 
 fn appendSourceIfPresent(
@@ -1128,6 +1178,9 @@ pub fn createManifest(
 
 fn manifestVersion(input: ManifestInput) ArtifactVersion {
     for (input.sources) |record| {
+        if (record.archive_binding != .published_digests) return .v3;
+    }
+    for (input.sources) |record| {
         if (record.freshness != .require_valid_until) return .v2;
     }
     for (input.repository_policies) |policy| {
@@ -1214,6 +1267,8 @@ fn createManifestVersion(
                 return error.InvalidIdentity;
         }
     }
+    if (!validArchiveBindingVersion(artifact_version, sources, repository_policies))
+        return error.InvalidIdentity;
 
     const keyrings = try owned.alloc(KeyringRecord, input.keyrings.len);
     for (input.keyrings, 0..) |record, index| {
@@ -1303,6 +1358,20 @@ const WireRepositoryPolicy = struct {
     freshness: WireFreshness,
 };
 
+const WireSourceV3 = struct {
+    logical_path: []const u8,
+    sha256: []const u8,
+    format: source.Format,
+    freshness: WireFreshness,
+    archive_binding: exact_lock_v3.ArchiveBinding,
+};
+
+const WireRepositoryPolicyV3 = struct {
+    repository_id: []const u8,
+    freshness: WireFreshness,
+    archive_binding: exact_lock_v3.ArchiveBinding,
+};
+
 const WireKeyring = struct {
     logical_path: []const u8,
     sha256: []const u8,
@@ -1344,6 +1413,21 @@ const WireManifestV2 = struct {
     digest_sha256: []const u8,
 };
 
+const WireManifestV3 = struct {
+    schema: []const u8,
+    version: u32,
+    native_architecture: []const u8,
+    foreign_architectures: []const []const u8,
+    sources: []const WireSourceV3,
+    configuration_id: []const u8,
+    repository_ids: []const []const u8,
+    repository_policies: []const WireRepositoryPolicyV3,
+    keyrings: []const WireKeyring,
+    global_trust_compatibility: bool,
+    exclusions: []const WireExclusion,
+    digest_sha256: []const u8,
+};
+
 pub fn decodeManifest(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -1361,7 +1445,10 @@ pub fn decodeManifest(
         return decodeManifestV1(allocator, bytes);
     if (std.mem.eql(u8, header.value.schema, freshness_schema_id) and
         header.value.version == freshness_schema_version)
-        return decodeManifestV2(allocator, bytes);
+        return decodeManifestWithPolicies(WireManifestV2, .v2, allocator, bytes);
+    if (std.mem.eql(u8, header.value.schema, archive_binding_schema_id) and
+        header.value.version == archive_binding_schema_version)
+        return decodeManifestWithPolicies(WireManifestV3, .v3, allocator, bytes);
     return error.UnsupportedSchema;
 }
 
@@ -1389,8 +1476,13 @@ fn decodeManifestV1(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManif
     );
 }
 
-fn decodeManifestV2(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManifest {
-    var parsed = try std.json.parseFromSlice(WireManifestV2, allocator, bytes, .{
+fn decodeManifestWithPolicies(
+    comptime Wire: type,
+    comptime artifact_version: ArtifactVersion,
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) !OwnedManifest {
+    var parsed = try std.json.parseFromSlice(Wire, allocator, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     });
@@ -1402,6 +1494,7 @@ fn decodeManifestV2(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManif
         .sha256 = try parseHex(32, record.sha256),
         .format = record.format,
         .freshness = try parseFreshness(record.freshness),
+        .archive_binding = if (artifact_version == .v3) record.archive_binding else .published_digests,
     };
     const repository_policies = try allocator.alloc(
         RepositoryPolicyRecord,
@@ -1412,6 +1505,7 @@ fn decodeManifestV2(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManif
         repository_policies[index] = .{
             .repository_id = try parseId(policy.repository_id),
             .freshness = try parseFreshness(policy.freshness),
+            .archive_binding = if (artifact_version == .v3) policy.archive_binding else .published_digests,
         };
     }
     return finishDecodedManifest(
@@ -1420,7 +1514,7 @@ fn decodeManifestV2(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManif
         parsed.value,
         sources,
         repository_policies,
-        .v2,
+        artifact_version,
     );
 }
 
@@ -1833,10 +1927,12 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
     try writeJsonString(writer, switch (manifest.artifact_version) {
         .v1 => schema_id,
         .v2 => freshness_schema_id,
+        .v3 => archive_binding_schema_id,
     });
     try writer.print(",\"version\":{},\"native_architecture\":", .{switch (manifest.artifact_version) {
         .v1 => schema_version,
         .v2 => freshness_schema_version,
+        .v3 => archive_binding_schema_version,
     }});
     try writeJsonString(writer, manifest.native_architecture);
     try writer.writeAll(",\"foreign_architectures\":[");
@@ -1853,9 +1949,13 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         try writeHexString(writer, &record.sha256);
         try writer.writeAll(",\"format\":");
         try writeJsonString(writer, @tagName(record.format));
-        if (manifest.artifact_version == .v2) {
+        if (manifest.artifact_version != .v1) {
             try writer.writeAll(",\"freshness\":");
             try writeFreshness(writer, record.freshness);
+        }
+        if (manifest.artifact_version == .v3) {
+            try writer.writeAll(",\"archive_binding\":");
+            try writeJsonString(writer, @tagName(record.archive_binding));
         }
         try writer.writeByte('}');
     }
@@ -1866,7 +1966,7 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         if (index != 0) try writer.writeByte(',');
         try writeJsonString(writer, &id);
     }
-    if (manifest.artifact_version == .v2) {
+    if (manifest.artifact_version != .v1) {
         try writer.writeAll("],\"repository_policies\":[");
         for (manifest.repository_policies, 0..) |policy, index| {
             if (index != 0) try writer.writeByte(',');
@@ -1874,6 +1974,10 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
             try writeJsonString(writer, &policy.repository_id);
             try writer.writeAll(",\"freshness\":");
             try writeFreshness(writer, policy.freshness);
+            if (manifest.artifact_version == .v3) {
+                try writer.writeAll(",\"archive_binding\":");
+                try writeJsonString(writer, @tagName(policy.archive_binding));
+            }
             try writer.writeByte('}');
         }
     }
@@ -2462,6 +2566,164 @@ test "target_apt_config carries per-repository archive binding declarations" {
     try std.testing.expectError(error.MalformedSource, snapshot(std.testing.allocator, .{
         .root_path = root_path,
         .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    }));
+}
+
+test "target_apt_config records a reviewed source archive binding only in v3" {
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share/keyrings");
+    const reviewed_path = "/etc/apt/sources.list.d/reviewed.list";
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root" ++ reviewed_path,
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://reviewed.example stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/vendor.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://vendor.example stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/keyrings/vendor.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(allocator, directory.dir);
+    defer allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    const bounded: repository_refresh.ExpiryPolicy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 14 * 24 * 60 * 60,
+    };
+    var imported = try snapshot(allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .source_policies = &.{.{
+            .logical_path = reviewed_path,
+            .freshness = bounded,
+            .archive_binding = .signed_sha256_derived_sha512,
+        }},
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+    var freshness_only = try snapshot(allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .source_policies = &.{.{ .logical_path = reviewed_path, .freshness = bounded }},
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer freshness_only.deinit();
+    const manifest = imported.manifest.manifest;
+    try std.testing.expectEqual(ArtifactVersion.v3, manifest.artifact_version);
+    try std.testing.expectEqual(ArtifactVersion.v2, freshness_only.manifest.manifest.artifact_version);
+
+    // The binding is repository identity, so only the reviewed source's
+    // repository changes id, and only it is bound.
+    try std.testing.expectEqual(@as(usize, 2), imported.configuration.repositories.len);
+    for (imported.configuration.repositories) |repository| {
+        const bound = std.mem.indexOf(u8, repository.uri, "reviewed.example") != null;
+        try std.testing.expectEqual(
+            if (bound) exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512 else .published_digests,
+            repository.archive_binding,
+        );
+        const control = for (freshness_only.configuration.repositories) |candidate| {
+            if (std.mem.eql(u8, candidate.uri, repository.uri)) break candidate;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(bound, !std.mem.eql(u8, &control.id.bytes, &repository.id.bytes));
+        const policy = for (manifest.repository_policies) |candidate| {
+            if (std.mem.eql(u8, &candidate.repository_id, &repository.id.bytes)) break candidate;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(repository.archive_binding, policy.archive_binding);
+    }
+    for (manifest.sources) |record| try std.testing.expectEqual(
+        if (std.mem.eql(u8, record.logical_path, reviewed_path))
+            exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512
+        else
+            .published_digests,
+        record.archive_binding,
+    );
+
+    const canonical = try manifest.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, archive_binding_schema_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"archive_binding\":\"published_digests\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"archive_binding\":\"signed_sha256_derived_sha512\"") != null);
+    var decoded = try decodeManifest(allocator, canonical, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(ArtifactVersion.v3, decoded.manifest.artifact_version);
+    try std.testing.expectEqualSlices(u8, &manifest.digest_sha256, &decoded.manifest.digest_sha256);
+    const round_trip = try decoded.manifest.canonicalJson(allocator);
+    defer allocator.free(round_trip);
+    try std.testing.expectEqualStrings(canonical, round_trip);
+
+    // A v3 document that no longer binds any source is not a v3 artifact,
+    // and an unknown binding is not decoded.
+    const unbound = try std.mem.replaceOwned(u8, allocator, canonical, "signed_sha256_derived_sha512", "published_digests");
+    defer allocator.free(unbound);
+    try std.testing.expectError(error.InvalidIdentity, decodeManifest(allocator, unbound, maximum_document_bytes));
+    const unknown = try std.mem.replaceOwned(u8, allocator, canonical, "signed_sha256_derived_sha512", "sha512");
+    defer allocator.free(unknown);
+    if (decodeManifest(allocator, unknown, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    // Earlier versions cannot carry a reviewed binding, and v3 requires one.
+    const record_input: ManifestInput = .{
+        .native_architecture = manifest.native_architecture,
+        .foreign_architectures = manifest.foreign_architectures,
+        .sources = manifest.sources,
+        .configuration_id = manifest.configuration_id,
+        .repository_ids = manifest.repository_ids,
+        .repository_policies = manifest.repository_policies,
+        .keyrings = manifest.keyrings,
+        .global_trust_compatibility = manifest.global_trust_compatibility,
+        .exclusions = manifest.exclusions,
+    };
+    try std.testing.expectError(error.InvalidIdentity, createManifestVersion(allocator, record_input, .v2));
+    const default_freshness_sources = [_]SourceRecord{.{
+        .logical_path = "/etc/apt/sources.list",
+        .sha256 = @splat(1),
+        .format = .legacy,
+        .archive_binding = .signed_sha256_derived_sha512,
+    }};
+    const default_freshness_repositories = [_][64]u8{@splat('a')};
+    const default_freshness_input: ManifestInput = .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &default_freshness_sources,
+        .configuration_id = @splat('b'),
+        .repository_ids = &default_freshness_repositories,
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    };
+    try std.testing.expectError(error.InvalidIdentity, createManifestVersion(allocator, default_freshness_input, .v1));
+    var automatic = try createManifest(allocator, default_freshness_input);
+    defer automatic.deinit();
+    try std.testing.expectEqual(ArtifactVersion.v3, automatic.manifest.artifact_version);
+    var unbound_input = record_input;
+    unbound_input.sources = freshness_only.manifest.manifest.sources;
+    try std.testing.expectError(error.InvalidIdentity, createManifestVersion(allocator, unbound_input, .v2));
+    unbound_input.repository_policies = &.{};
+    try std.testing.expectError(error.InvalidIdentity, createManifestVersion(allocator, unbound_input, .v3));
+
+    // A declaration may agree with the reviewed binding but never contradict it.
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root" ++ reviewed_path,
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg debz-archive-binding=published_digests] " ++
+            "https://reviewed.example stable main\n",
+    });
+    try std.testing.expectError(error.MalformedSource, snapshot(allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .source_policies = &.{.{
+            .logical_path = reviewed_path,
+            .freshness = bounded,
+            .archive_binding = .signed_sha256_derived_sha512,
+        }},
         .dependencies = .{ .filesystem = files.interface() },
     }));
 }

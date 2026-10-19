@@ -1543,6 +1543,8 @@ fn loadHistoricalActiveConfiguration(
             if (!std.mem.eql(u8, &record.sha256, &file.sha256)) return error.ImportedDigestMismatch;
             if (!repository_refresh.expiryPoliciesEqual(record.freshness, active_record.freshness))
                 return error.ImportedFreshnessMismatch;
+            if (record.archive_binding != active_record.archive_binding)
+                return error.ImportedArchiveBindingMismatch;
         } else {
             const record = for (historical.keyrings) |candidate| {
                 if (std.mem.eql(u8, file.logical_path, candidate.logical_path)) break candidate;
@@ -5765,13 +5767,17 @@ fn reviewedSourcePolicies(
         .primary_fingerprints = material.primary_fingerprints,
     };
     for (snapshot.source_materials) |material| {
-        const freshness = try reviewed_repository_profile.sourceFreshness(allocator, profiles, .{
+        const policy = try reviewed_repository_profile.sourcePolicy(allocator, profiles, .{
             .logical_path = material.logical_path,
             .bytes = material.bytes,
             .format = material.format,
         }, keyrings, snapshot.manifest.manifest.native_architecture);
-        if (freshness == .require_valid_until) continue;
-        try policies.append(allocator, .{ .logical_path = material.logical_path, .freshness = freshness });
+        if (policy.profile == null) continue;
+        try policies.append(allocator, .{
+            .logical_path = material.logical_path,
+            .freshness = policy.freshness,
+            .archive_binding = policy.archive_binding,
+        });
     }
     return policies.toOwnedSlice(allocator);
 }
@@ -5819,6 +5825,7 @@ const MaterialFile = struct {
     kind: enum { source, keyring },
     /// Set only by an exact reviewed-profile match for this source file.
     freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
+    archive_binding: exact_lock_v2.ArchiveBinding = .published_digests,
 };
 
 const DescriptorMaterial = struct {
@@ -6004,13 +6011,16 @@ fn inspectDescriptorMaterial(
     // against the payload keyring that refresh will authenticate with.
     var reviewed = false;
     for (files.items[0..documents.len], documents) |*file, *document| {
-        file.freshness = try reviewed_repository_profile.sourceFreshness(allocator, profiles, .{
+        const policy = try reviewed_repository_profile.sourcePolicy(allocator, profiles, .{
             .logical_path = file.logical_path,
             .bytes = file.bytes,
             .format = document.format,
         }, keyring_fingerprints.items, architecture);
+        file.freshness = policy.freshness;
+        file.archive_binding = policy.archive_binding;
         document.policy.freshness = file.freshness;
-        if (file.freshness != .require_valid_until) reviewed = true;
+        document.policy.archive_binding = file.archive_binding;
+        if (policy.profile != null) reviewed = true;
     }
     if (reviewed) {
         const replacement = try normalizeDescriptorDocuments(allocator, documents, architecture, resources);
@@ -6046,6 +6056,7 @@ fn descriptorSourceDocument(file: MaterialFile, network: api.NetworkPolicy) repo
             .legacy,
         .policy = .{
             .freshness = file.freshness,
+            .archive_binding = file.archive_binding,
             .proxy = if (network.proxy_url != null)
                 .{ .declared = .{ .id = "repository-api-proxy" } }
             else
@@ -6669,7 +6680,8 @@ fn completePlanOrigin(action: solver.PlanAction) !solver.PlanOriginV2 {
 /// Repository ids of a fresh operation lock whose imported target
 /// configuration opts into `signed_sha256_derived_sha512` (#261), through a
 /// declaration's `X-Debz-Archive-Binding` field or `debz-archive-binding`
-/// option. Every lock repository must still be configured.
+/// option, or through an exact reviewed repository profile match. Every lock
+/// repository must still be configured.
 fn configuredArchiveBindings(
     allocator: std.mem.Allocator,
     lock: exact_lock_v2.Lock,
@@ -7328,8 +7340,9 @@ fn verifyImportedMaterial(
         return error.ImportedDigestMismatch;
 }
 
-/// The imported manifest must carry exactly the reviewed freshness that the
-/// descriptor payload earned, so refresh evidence and target state agree.
+/// The imported manifest must carry exactly the reviewed freshness and archive
+/// binding that the descriptor payload earned, so refresh evidence and target
+/// state agree.
 fn verifyImportedFreshness(
     snapshot: target_apt_config.Snapshot,
     material: *const DescriptorMaterial,
@@ -7341,6 +7354,8 @@ fn verifyImportedFreshness(
         } else return error.ImportedDigestMismatch;
         if (!repository_refresh.expiryPoliciesEqual(record.freshness, file.freshness))
             return error.ImportedFreshnessMismatch;
+        if (record.archive_binding != file.archive_binding)
+            return error.ImportedArchiveBindingMismatch;
     }
 }
 
@@ -12657,6 +12672,10 @@ test "repository backend admits the reviewed upstream Microsoft Noble descriptor
                 @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
                 repository_refresh.expiryPolicyMaxAge(repository.freshness),
             );
+            try std.testing.expectEqual(
+                exact_lock_v2.ArchiveBinding.signed_sha256_derived_sha512,
+                repository.archive_binding,
+            );
         }
         try std.testing.expectEqual(managed.len, material.evidence.len);
         for (managed, material.evidence) |expected, actual| {
@@ -12668,15 +12687,26 @@ test "repository backend admits the reviewed upstream Microsoft Noble descriptor
             @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
             repository_refresh.expiryPolicyMaxAge(listed.freshness),
         );
+        try std.testing.expectEqual(
+            exact_lock_v2.ArchiveBinding.signed_sha256_derived_sha512,
+            listed.archive_binding,
+        );
     }
-    // Admitting the descriptor shape does not relax freshness on its own.
+    // Admitting the descriptor shape does not relax freshness or bind
+    // archives on its own.
     var unreviewed = try inspectDescriptorMaterial(std.testing.allocator, &validation, "amd64", .{}, .{}, &.{});
     defer unreviewed.deinit();
-    for (unreviewed.configuration.repositories) |repository|
+    for (unreviewed.configuration.repositories) |repository| {
         try std.testing.expectEqual(@as(?u64, null), repository_refresh.expiryPolicyMaxAge(repository.freshness));
+        try std.testing.expectEqual(exact_lock_v2.ArchiveBinding.published_digests, repository.archive_binding);
+    }
     try std.testing.expectEqual(
         repository_refresh.ExpiryPolicy.require_valid_until,
         (unreviewed.find(managed[0].path) orelse return error.TestUnexpectedResult).freshness,
+    );
+    try std.testing.expectEqual(
+        exact_lock_v2.ArchiveBinding.published_digests,
+        (unreviewed.find(managed[0].path) orelse return error.TestUnexpectedResult).archive_binding,
     );
 
     // A single changed byte in either upstream documentation copy is dynamic.
@@ -16841,7 +16871,9 @@ test "repository add applies the reviewed 14-day policy to the verified Microsof
         target_apt_config.maximum_document_bytes,
     );
     defer manifest.deinit();
-    try std.testing.expectEqual(target_apt_config.ArtifactVersion.v2, manifest.manifest.artifact_version);
+    // The reviewed profile's derived SHA-512 binding is not declared by the
+    // source bytes, so only apt-config-snapshot-v3 can record it.
+    try std.testing.expectEqual(target_apt_config.ArtifactVersion.v3, manifest.manifest.artifact_version);
     try std.testing.expectEqual(@as(usize, 1), manifest.manifest.sources.len);
     try std.testing.expectEqualStrings(
         reviewed_repository_profile.microsoft_ubuntu_noble_prod.source_path,
@@ -16851,11 +16883,26 @@ test "repository add applies the reviewed 14-day policy to the verified Microsof
         @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
         repository_refresh.expiryPolicyMaxAge(manifest.manifest.sources[0].freshness),
     );
-    try std.testing.expectEqual(@as(usize, 3), manifest.manifest.repository_policies.len);
-    for (manifest.manifest.repository_policies) |policy| try std.testing.expectEqual(
-        @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
-        repository_refresh.expiryPolicyMaxAge(policy.freshness),
+    try std.testing.expectEqual(
+        exact_lock_v2.ArchiveBinding.signed_sha256_derived_sha512,
+        manifest.manifest.sources[0].archive_binding,
     );
+    try std.testing.expectEqual(@as(usize, 3), manifest.manifest.repository_policies.len);
+    for (manifest.manifest.repository_policies) |policy| {
+        try std.testing.expectEqual(
+            @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
+            repository_refresh.expiryPolicyMaxAge(policy.freshness),
+        );
+        try std.testing.expectEqual(
+            exact_lock_v2.ArchiveBinding.signed_sha256_derived_sha512,
+            policy.archive_binding,
+        );
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest_bytes,
+        "\"archive_binding\":\"signed_sha256_derived_sha512\"",
+    ) != null);
 
     var replay = try runReviewedRepositoryAdd(
         directory.dir,

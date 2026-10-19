@@ -138,6 +138,28 @@ fn nativeMutationsIn(
     }
 }
 
+fn nativeReplacementsIn(
+    f: *Fixture,
+    kind: []const u8,
+    path: []const u8,
+    start: []const u8,
+    end: []const u8,
+    replacements: []const [2][]const u8,
+) !void {
+    const source = try f.source(path);
+    const first = std.mem.indexOf(u8, source, start) orelse return error.MissingMutationScope;
+    const last = std.mem.indexOfPos(u8, source, first + start.len, end) orelse return error.MissingMutationScope;
+    const body = source[first..last];
+    for (replacements) |replacement| {
+        const changed = try f.replace(source, body, try f.replace(body, replacement[0], replacement[1]));
+        const refused = try nativeCheck(f, kind, path, changed);
+        defer refused.deinit();
+        if (refused.code == 0) std.debug.print("unchecked {s} replacement in {s}: {s}\n", .{ kind, path, replacement[0] });
+        try testing.expectEqual(@as(u8, 1), refused.code);
+        try refused.failsWith("security-audit:");
+    }
+}
+
 test "security: commit-pinned composite actions reject floating refs" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1896,6 +1918,59 @@ test "security: disposable runtime consumers require native copying without a Py
     const restored = try nativeCheck(&f, "native-disposable-runtime", "tools/disposable_root_runtime.py", "#!/usr/bin/env python3\n");
     defer restored.deinit();
     try restored.failsWith("retired Python disposable runtime implementation was restored");
+}
+
+test "security: live system install proof stays dispatch-only, hosted-only, read-only and fail-closed" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const kind = "native-system-install-live";
+    const workflow = ".github/workflows/ci.yml";
+    const proof_script = "tools/system-install-live-proof.sh";
+    const checker = "tools/system-install-live-proof.zig";
+    try nativeMutations(&f, kind, workflow, &.{
+        "      run_system_install_live:\n",
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_system_install_live\n",
+        "        run: tools/system-install-live-proof.sh \"$ARCHITECTURE\"\n",
+    });
+    try nativeReplacementsIn(&f, kind, workflow, "      run_system_install_live:\n", "  schedule:\n", &.{
+        .{ "        default: false\n", "        default: true\n" },
+    });
+    try nativeReplacementsIn(&f, kind, workflow, "  system-install-live:\n", "\n  protected-reference:\n", &.{
+        .{ "            runner: ubuntu-24.04-arm\n", "            runner: self-hosted\n" },
+        .{ "    runs-on: ${{ matrix.runner }}\n", "    runs-on: [self-hosted, linux]\n" },
+        .{ "      contents: read\n", "      contents: write\n" },
+        .{ "      attestations: read\n", "      attestations: read\n      id-token: write\n" },
+        .{ "          ARCHITECTURE: ${{ matrix.architecture }}\n", "          ARCHITECTURE: ${{ matrix.architecture }}\n          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n" },
+        .{ "        timeout-minutes: 25\n", "        timeout-minutes: 25\n        continue-on-error: true\n" },
+        .{ "          if-no-files-found: error\n", "          if-no-files-found: ignore\n" },
+        .{ "    if: github.event_name == 'workflow_dispatch' && inputs.run_system_install_live\n", "    if: always()\n" },
+    });
+    try nativeMutations(&f, kind, proof_script, &.{
+        "if [ \"${RUNNER_ENVIRONMENT:-}\" != github-hosted ]; then die \"refusing to run outside a disposable GitHub-hosted runner\"; fi\n",
+        "if ! grep -qx 'VERSION_ID=\"24.04\"' /etc/os-release; then die \"refusing to run outside Ubuntu 24.04\"; fi\n",
+        "trap finish EXIT\n",
+        "unprivileged-native-symcrypt user json native symcrypt\n",
+        "native-absent root json native debz-live-proof-absent\n",
+        "  if ! cmp -s \"$work/baseline.txt\" \"$work/after.txt\"; then\n",
+        "check verify \"$out\" \"$arch\" >\"$out/verified.json\" || die \"the install evidence does not meet the pass criteria\"\n",
+    });
+    try nativeReplacementsIn(&f, kind, proof_script, "set -euo pipefail\n", "\ncheck verify ", &.{
+        .{ "set -euo pipefail\n", "set -uo pipefail\n" },
+        .{ "as_root() { sudo -n env -i", "as_root() { sudo env -i" },
+        .{ "check snapshot >\"$work/baseline.txt\" || die \"could not snapshot /var/lib/dpkg\"\n", "check snapshot >\"$work/baseline.txt\" || true\n" },
+        .{ "trap finish EXIT\n", "trap finish EXIT\nsudo -n apt-get install -y symcrypt\n" },
+    });
+    try nativeMutations(&f, kind, checker, &.{
+        "const BOUND = 1209600;\n",
+        "try require(!containsAsciiCaseInsensitive(stdout, \"upstream\") and !containsAsciiCaseInsensitive(stderr, \"upstream\"), \"output mentions an upstream digest\");\n",
+        "std.mem.eql(u8, provenance_str, \"derived_from_signed_sha256\") and\n",
+        "try require(allEqualSlice(found, derived_val), \"the derived SHA-512 is not over the signed SHA-256 bytes\");\n",
+        "try require(stringSlicesEqual(published, self.locks.items), \"the locks directory holds install locks no planned run reported\");\n",
+    });
+    try nativeReplacementsIn(&f, kind, checker, "const std = @import(\"std\");\n", "\npub fn main(", &.{
+        .{ "const builtin = @import(\"builtin\");\n", "const builtin = @import(\"builtin\");\n// std.process.run\n" },
+        .{ ".mode = .read_only", ".mode = .read_write" },
+    });
 }
 
 test "security: actual release core consumes native tags plans ELF mappings and original GNU tar" {

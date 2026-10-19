@@ -312,6 +312,21 @@ pub fn build(b: *std.Build) void {
     b.step("test-exec-audit", "Test native exec-trace lineage, shape and root-identity auditing").dependOn(&run_exec_audit_tests.step);
     workload_native.dependOn(&run_exec_audit_tests.step);
 
+    const system_install_live_proof_module = b.createModule(.{
+        .root_source_file = b.path("tools/system-install-live-proof.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = !native_helper_debug_info,
+    });
+    const system_install_live_proof = b.addExecutable(.{
+        .name = "debz-system-install-live-proof",
+        .root_module = system_install_live_proof_module,
+    });
+    const install_system_install_live_proof = b.addInstallArtifact(system_install_live_proof, .{});
+    b.step("build-system-install-live-proof", "Build the read-only live system install proof verifier").dependOn(&install_system_install_live_proof.step);
+    const run_system_install_live_proof_tests = b.addRunArtifact(b.addTest(.{ .root_module = system_install_live_proof_module }));
+    b.step("test-system-install-live-proof", "Test the read-only live system install proof verifier").dependOn(&run_system_install_live_proof_tests.step);
+
     const native_action_empty_lock_module = b.createModule(.{
         .root_source_file = b.path("tools/native-action-empty-lock.zig"),
         .target = target,
@@ -3638,6 +3653,7 @@ fn installReleaseFiles(
         "active-repository-config-v1.json",
         "apt-config-snapshot-v1.json",
         "apt-config-snapshot-v2.json",
+        "apt-config-snapshot-v3.json",
         "apt-system-cli-diagnostic-v1.json",
         "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",
