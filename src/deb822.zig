@@ -159,6 +159,7 @@ pub fn parseBorrowed(
     var line_number: usize = 1;
     var paragraph_start: ?Position = null;
     var last_end = Position{ .offset = 0, .line = 1, .column = 1 };
+    var current_field_value_bytes: usize = 0;
 
     while (offset < input.len) {
         const line_result = nextLine(input, offset, line_number);
@@ -182,6 +183,7 @@ pub fn parseBorrowed(
                     allocator,
                     &paragraphs,
                     &fields,
+                    &current_values,
                     paragraph_start.?,
                     line.start,
                     options.limits.max_paragraphs,
@@ -193,6 +195,7 @@ pub fn parseBorrowed(
                     paragraph_start.?,
                 );
                 paragraph_start = null;
+                current_field_value_bytes = 0;
             }
             continue;
         }
@@ -216,7 +219,8 @@ pub fn parseBorrowed(
             };
             const text = line.text[1..];
             const field = fields.items[fields.items.len - 1];
-            const new_size = field.name.len + field.valueByteCount() + 1 + text.len;
+            const new_value_bytes = current_field_value_bytes + 1 + text.len;
+            const new_size = field.name.len + new_value_bytes;
             if (new_size > options.limits.max_field_bytes) {
                 return failureWithCleanup(
                     allocator,
@@ -226,16 +230,11 @@ pub fn parseBorrowed(
                     value_start,
                 );
             }
-            const old_lines = fields.items[fields.items.len - 1].value_lines;
-            current_values.clearRetainingCapacity();
-            try current_values.appendSlice(allocator, old_lines);
             try current_values.append(allocator, .{
                 .text = text,
                 .span = .{ .start = value_start, .end = line.end },
             });
-            const replacement = try current_values.toOwnedSlice(allocator);
-            allocator.free(old_lines);
-            fields.items[fields.items.len - 1].value_lines = replacement;
+            current_field_value_bytes = new_value_bytes;
             fields.items[fields.items.len - 1].span.end = line.end;
             continue;
         }
@@ -297,6 +296,7 @@ pub fn parseBorrowed(
                 line.start,
             );
         }
+        try finishCurrentField(allocator, &fields, &current_values);
         const name_end = Position{
             .offset = line.start.offset + colon,
             .line = line.start.line,
@@ -307,20 +307,17 @@ pub fn parseBorrowed(
             .line = line.start.line,
             .column = value_index + 1,
         };
-        const values = try allocator.alloc(ValueLine, 1);
-        values[0] = .{
+        try current_values.append(allocator, .{
             .text = value,
             .span = .{ .start = value_start, .end = line.end },
-        };
-        fields.append(allocator, .{
+        });
+        try fields.append(allocator, .{
             .name = name,
             .name_span = .{ .start = line.start, .end = name_end },
-            .value_lines = values,
+            .value_lines = &.{},
             .span = .{ .start = line.start, .end = line.end },
-        }) catch |err| {
-            allocator.free(values);
-            return err;
-        };
+        });
+        current_field_value_bytes = value.len;
         if (paragraph_start == null) paragraph_start = line.start;
     }
 
@@ -329,6 +326,7 @@ pub fn parseBorrowed(
             allocator,
             &paragraphs,
             &fields,
+            &current_values,
             paragraph_start.?,
             last_end,
             options.limits.max_paragraphs,
@@ -414,15 +412,26 @@ fn nextLine(input: []const u8, offset: usize, line_number: usize) NextLine {
     } };
 }
 
+fn finishCurrentField(
+    allocator: std.mem.Allocator,
+    fields: *std.ArrayList(Field),
+    current_values: *std.ArrayList(ValueLine),
+) std.mem.Allocator.Error!void {
+    if (fields.items.len == 0) return;
+    fields.items[fields.items.len - 1].value_lines = try current_values.toOwnedSlice(allocator);
+}
+
 fn finishParagraph(
     allocator: std.mem.Allocator,
     paragraphs: *std.ArrayList(Paragraph),
     fields: *std.ArrayList(Field),
+    current_values: *std.ArrayList(ValueLine),
     start: Position,
     end: Position,
     limit: usize,
 ) std.mem.Allocator.Error!?void {
     if (paragraphs.items.len >= limit) return null;
+    try finishCurrentField(allocator, fields, current_values);
     const owned_fields = try fields.toOwnedSlice(allocator);
     errdefer {
         for (owned_fields) |field| allocator.free(field.value_lines);
@@ -442,9 +451,9 @@ fn failureWithCleanup(
     kind: ErrorKind,
     position: Position,
 ) BorrowedOutcome {
-    _ = current_values;
     for (fields.items) |field| allocator.free(field.value_lines);
     fields.clearRetainingCapacity();
+    current_values.clearRetainingCapacity();
     return .{ .failure = .{ .kind = kind, .position = position } };
 }
 
@@ -605,3 +614,53 @@ test "comment lines are opt-in and do not split paragraphs" {
     try std.testing.expectEqual(1, document.paragraphs.len);
     try std.testing.expectEqual(2, document.paragraphs[0].fields.len);
 }
+
+test "deep multiline field tracks incremental byte limit and cleans up on failure" {
+    const continuation_count: usize = 256;
+    var input_builder: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input_builder.deinit();
+
+    try input_builder.writer.writeAll("Package: debz\nDescription: summary line\n");
+    var expected_value_bytes: usize = "summary line".len;
+    var last_continuation_value_offset: usize = 0;
+    for (0..continuation_count) |index| {
+        if (index + 1 == continuation_count) {
+            last_continuation_value_offset = input_builder.written().len + 1;
+        }
+        try input_builder.writer.print(" continuation-{d:0>3}\n", .{index});
+        expected_value_bytes += 1 + "continuation-000".len;
+    }
+    try input_builder.writer.writeAll("Architecture: amd64\n");
+
+    const input = input_builder.written();
+    const exact_field_limit = "Description".len + expected_value_bytes;
+
+    const accepted = try parseBorrowed(std.testing.allocator, input, .{
+        .limits = .{ .max_field_bytes = exact_field_limit },
+    });
+    var document = switch (accepted) {
+        .document => |value| value,
+        .failure => return error.UnexpectedParseFailure,
+    };
+    defer document.deinit();
+
+    const description = document.paragraphs[0].get("Description").?;
+    try std.testing.expectEqual(continuation_count + 1, description.value_lines.len);
+    try std.testing.expectEqual(expected_value_bytes, description.valueByteCount());
+    try std.testing.expectEqualStrings("summary line", description.value_lines[0].text);
+    try std.testing.expectEqualStrings("continuation-000", description.value_lines[1].text);
+    try std.testing.expectEqualStrings("continuation-255", description.value_lines[continuation_count].text);
+    try std.testing.expectEqual(@as(usize, 2), description.span.start.line);
+    try std.testing.expectEqual(@as(usize, 2 + continuation_count), description.span.end.line);
+    try std.testing.expectEqualStrings("amd64", document.paragraphs[0].get("Architecture").?.value_lines[0].text);
+
+    try expectFailure(
+        input,
+        .{ .limits = .{ .max_field_bytes = exact_field_limit - 1 } },
+        .field_size_limit,
+        last_continuation_value_offset,
+        2 + continuation_count,
+        2,
+    );
+}
+
