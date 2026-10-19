@@ -2148,6 +2148,10 @@ pub fn preflight(
 fn build(builder: *Builder, request: PreflightRequest) BuildError!void {
     if (request.intents.len > request.limits.max_steps or request.intents.len > maximum_steps)
         return builder.fail(.preflight, .step_limit, "");
+    try builder.steps.ensureTotalCapacity(builder.allocator, request.intents.len);
+    try builder.contents.ensureTotalCapacity(builder.allocator, request.intents.len);
+    try builder.models.ensureTotalCapacity(builder.allocator, request.intents.len);
+    try builder.index.ensureTotalCapacity(builder.allocator, @intCast(request.intents.len));
     const workspace = builder.root.deviceOfDirectory(
         root_fs.Path.init(workspace_path) catch unreachable,
     ) catch return builder.fail(.workspace, .io_failed, workspace_path);
@@ -2215,10 +2219,11 @@ fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
         allow_retired_alias,
     );
 
+    const owned_path = builder.models.items[model_index].path;
     const expected = builder.models.items[model_index].state;
-    const step = try buildStep(builder, intent, path, expected, index, &requires);
-    try builder.steps.append(builder.allocator, step);
-    try builder.contents.append(builder.allocator, switch (intent) {
+    const step = try buildStep(builder, intent, path, owned_path, expected, index, &requires);
+    builder.steps.appendAssumeCapacity(step);
+    builder.contents.appendAssumeCapacity(switch (intent) {
         .file => |value| value.bytes,
         else => &.{},
     });
@@ -2466,16 +2471,16 @@ fn buildStep(
     builder: *Builder,
     intent: Intent,
     path: root_fs.Path,
+    owned_path: []const u8,
     expected: Expectation,
     index: u32,
     requires: *Requirements,
 ) BuildError!Step {
-    var staging_buffer: [8]u8 = undefined;
-    var backup_buffer: [8]u8 = undefined;
-    const staging_entry = try builder.arena.dupe(u8, workspaceName(&staging_buffer, index));
-    const backup_entry = try builder.arena.dupe(u8, workspaceName(&backup_buffer, index));
-    const owned_path = try builder.arena.dupe(u8, path.text);
-    const owned_requires = try builder.arena.dupe(u32, requires.slice());
+    const required = requires.slice();
+    const owned_requires: []const u32 = if (required.len == 0)
+        &.{}
+    else
+        try builder.arena.dupe(u32, required);
 
     var step: Step = .{
         .index = index,
@@ -2516,7 +2521,6 @@ fn buildStep(
                 .size = value.bytes.len,
                 .content_sha256 = digest,
             } };
-            step.staging_entry = staging_entry;
         },
         .copy => |value| {
             step.kind = .copy_file;
@@ -2554,7 +2558,6 @@ fn buildStep(
                 .size = present.size,
                 .content_sha256 = source_digest,
             } };
-            step.staging_entry = staging_entry;
         },
         .symlink => |value| {
             step.kind = .publish_symlink;
@@ -2586,7 +2589,6 @@ fn buildStep(
                     .link_target = try builder.arena.dupe(u8, value.target),
                 },
             };
-            step.staging_entry = staging_entry;
         },
         .fifo => |value| {
             step.kind = .publish_fifo;
@@ -2605,7 +2607,6 @@ fn buildStep(
                     ),
                 },
             } };
-            step.staging_entry = staging_entry;
         },
         .hard_link => |value| {
             step.kind = .publish_hard_link;
@@ -2629,7 +2630,6 @@ fn buildStep(
             desired.inode = 0;
             desired.link_count = 0;
             step.desired = .{ .present = desired };
-            step.staging_entry = staging_entry;
         },
         .directory => |value| {
             step.kind = .create_directory;
@@ -2759,10 +2759,34 @@ fn buildStep(
         },
     }
 
-    step.backup_entry = if (step.needsBackup()) backup_entry else null;
-    if (step.satisfied()) {
-        step.staging_entry = null;
-        step.backup_entry = null;
+    if (!step.satisfied()) {
+        switch (step.kind) {
+            .publish_file,
+            .copy_file,
+            .publish_symlink,
+            .publish_fifo,
+            .publish_hard_link,
+            => {
+                var staging_buffer: [8]u8 = undefined;
+                step.staging_entry = try builder.arena.dupe(
+                    u8,
+                    workspaceName(&staging_buffer, index),
+                );
+            },
+            .create_directory,
+            .set_metadata,
+            .assert_case_sensitive,
+            .remove_path,
+            .remove_directory,
+            => {},
+        }
+        if (step.needsBackup()) {
+            var backup_buffer: [8]u8 = undefined;
+            step.backup_entry = try builder.arena.dupe(
+                u8,
+                workspaceName(&backup_buffer, index),
+            );
+        }
     }
     // Replacing a directory means the directory has to disappear first, so it
     // must be empty exactly like an explicit removal.
@@ -11148,6 +11172,66 @@ test "root_mutation.test.a crash during the repair of a torn tail is itself safe
     try testing.expectEqual(@as(u64, 0), try progressSize(root) % progress_record_bytes);
     try clear(&engine);
 }
+
+test "root_mutation.test.multi-intent preflight preserves step dependencies staging and backup entries" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedRoot(root);
+
+    const intents = [_]Intent{
+        directoryIntent("opt"),
+        fileIntent("opt/new", "created\n"),
+        .{ .metadata = .{ .path = "opt/new", .mode = 0o755 } },
+        fileIntent("etc/keep", "replaced\n"),
+        .{ .metadata = .{ .path = "etc/meta", .mode = 0o600 } },
+        .{ .remove = .{ .path = "etc/doomed" } },
+        .{ .remove = .{ .path = "etc/absent", .removal = .allow_absent } },
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    try testing.expectEqual(intents.len, plan.steps.len);
+
+    // Step 0 (`opt` directory): independent, never stages or backs up.
+    try testing.expectEqual(@as(usize, 0), plan.steps[0].requires.len);
+    try testing.expect(plan.steps[0].staging_entry == null);
+    try testing.expect(plan.steps[0].backup_entry == null);
+
+    // Step 1 (`opt/new` file): depends on parent directory step 0, stages new content, no backup.
+    try testing.expectEqualSlices(u32, &.{0}, plan.steps[1].requires);
+    try testing.expectEqualStrings("00000001", plan.steps[1].staging_entry.?);
+    try testing.expect(plan.steps[1].backup_entry == null);
+
+    // Step 2 (`opt/new` metadata): depends on step 1 (same path) and step 0 (ancestor), no staging/backup.
+    try testing.expectEqualSlices(u32, &.{ 1, 0 }, plan.steps[2].requires);
+    try testing.expect(plan.steps[2].staging_entry == null);
+    try testing.expect(plan.steps[2].backup_entry == null);
+    try testing.expectEqual(plan.steps[1].path.ptr, plan.steps[2].path.ptr);
+
+    // Step 3 (`etc/keep` replacement): independent, stages new content and backs up replaced regular file.
+    try testing.expectEqual(@as(usize, 0), plan.steps[3].requires.len);
+    try testing.expectEqualStrings("00000003", plan.steps[3].staging_entry.?);
+    try testing.expectEqualStrings("00000003", plan.steps[3].backup_entry.?);
+
+    // Step 4 (`etc/meta` metadata): independent, neither stages nor backs up.
+    try testing.expectEqual(@as(usize, 0), plan.steps[4].requires.len);
+    try testing.expect(plan.steps[4].staging_entry == null);
+    try testing.expect(plan.steps[4].backup_entry == null);
+
+    // Step 5 (`etc/doomed` removal): backs up existing regular file, does not stage.
+    try testing.expectEqual(@as(usize, 0), plan.steps[5].requires.len);
+    try testing.expect(plan.steps[5].staging_entry == null);
+    try testing.expectEqualStrings("00000005", plan.steps[5].backup_entry.?);
+
+    // Step 6 (`etc/absent` allow_absent removal): already satisfied, allocates neither staging nor backup.
+    try testing.expect(plan.steps[6].satisfied());
+    try testing.expectEqual(@as(usize, 0), plan.steps[6].requires.len);
+    try testing.expect(plan.steps[6].staging_entry == null);
+    try testing.expect(plan.steps[6].backup_entry == null);
+}
+
 
 test "root_mutation.test.a symbolic link re-created while restoring is finished, not refused" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
