@@ -470,10 +470,11 @@ test "fuzz.native alternatives records" {
 
 fn fuzzAlternatives(_: void, smith: *std.testing.Smith) !void {
     var storage: [max_input]u8 = undefined;
-    debz.native_alternatives.fuzzOne(
-        std.testing.allocator,
-        input(smith, &storage),
-    );
+    try exerciseAlternatives(input(smith, &storage));
+}
+
+fn exerciseAlternatives(bytes: []const u8) !void {
+    debz.native_alternatives.fuzzOne(std.testing.allocator, bytes);
 }
 
 test "fuzz.lock provenance and transaction journals" {
@@ -562,6 +563,63 @@ fn exerciseState(bytes: []const u8) !void {
         var document = value;
         document.deinit();
     } else |_| {}
+    if (bytes.len <= 16 * 1024) {
+        const allocator = std.testing.allocator;
+        if (debz.exact_lock_v4.decode(allocator, bytes)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+            const encoded = try decoded.canonicalJson(allocator);
+            defer allocator.free(encoded);
+            std.debug.assert(std.mem.eql(u8, encoded, bytes));
+        } else |_| {}
+        if (debz.exact_lock_v5.decode(allocator, bytes)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+            const encoded = try decoded.canonicalJson(allocator);
+            defer allocator.free(encoded);
+            std.debug.assert(std.mem.eql(u8, encoded, bytes));
+        } else |_| {}
+        if (debz.system_install.decodeResult(allocator, bytes)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+            const encoded = try decoded.canonicalJson(allocator);
+            defer allocator.free(encoded);
+            std.debug.assert(std.mem.eql(u8, encoded, bytes));
+        } else |_| {}
+        if (debz.apt_system_state.decode(allocator, bytes, 16 * 1024)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+            const encoded = try decoded.state.canonicalJson(allocator);
+            defer allocator.free(encoded);
+            std.debug.assert(std.mem.eql(u8, encoded, bytes));
+        } else |_| {}
+        if (debz.native_diversion_cache.decode(allocator, bytes, @splat('0'))) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+        } else |_| {}
+        if (debz.native_unpack_diversion.decode(allocator, bytes, @splat('0'), 0)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+        } else |_| {}
+        if (debz.native_unpack_route_settlement.decode(allocator, bytes, @splat('0'), 0, @splat('0'))) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+        } else |_| {}
+        if (debz.native_unpack_route_settlement.decodeEvidence(allocator, bytes, @splat('0'), 0)) |value| {
+            var decoded = value;
+            defer decoded.deinit();
+        } else |_| {}
+        {
+            var statoverride_arena: std.heap.ArenaAllocator = .init(allocator);
+            defer statoverride_arena.deinit();
+            _ = debz.native_unpack_statoverride.decode(
+                statoverride_arena.allocator(),
+                bytes,
+                @splat('0'),
+                0,
+            ) catch {};
+        }
+    }
     // The mutation journal and its write-ahead log are the durable inputs the
     // recovery path parses, and both are reachable on a compromised root.
     debz.root_mutation.fuzzOne(std.testing.allocator, bytes);
@@ -648,6 +706,7 @@ test "fuzz.deterministic bounded mutation smoke" {
     try smokeCorpus(archive_corpus, exerciseArchive);
     try smokeCorpus(state_corpus, exerciseState);
     try smokeCorpus(ownership_corpus, exerciseOwnership);
+    try smokeCorpus(alternatives_corpus, exerciseAlternatives);
 }
 
 fn smokeCorpus(
@@ -1381,4 +1440,86 @@ test "fuzz.new native state corpus decodes and keeps exact SHA256" {
             .sha256 = "6b39b19168b95ed22c9745c0e5c192e4e4b36e47cd5b69765c43724488f32ec6",
         },
     }) |seed| try expectSeedSha256(seed.bytes, seed.sha256);
+}
+
+test "fuzz.post-v0.3 decoders and alternatives handle valid and truncated inputs" {
+    const allocator = std.testing.allocator;
+    inline for (alternatives_corpus) |seed| {
+        try exerciseAlternatives(seed);
+        if (seed.len > 1) {
+            try exerciseAlternatives(seed[0 .. seed.len / 2]);
+            try exerciseAlternatives(seed[0 .. seed.len - 1]);
+        }
+    }
+    try exerciseAlternatives("");
+    try exerciseAlternatives("auto\n/usr/bin/editor\n\x00");
+
+    var install_refusal = try debz.system_install.refusal(
+        allocator,
+        "demo",
+        .usage,
+        .invalid_request,
+        "refused",
+    );
+    defer install_refusal.deinit();
+    const install_bytes = try install_refusal.canonicalJson(allocator);
+    defer allocator.free(install_bytes);
+
+    var empty_cache = try debz.native_diversion.CachedRecords.init(
+        allocator,
+        null,
+        null,
+    );
+    defer empty_cache.deinit();
+
+    const diversion_bytes = try debz.native_diversion_cache.encode(
+        allocator,
+        empty_cache,
+        @splat('0'),
+    );
+    defer allocator.free(diversion_bytes);
+
+    const unpack_diversion_bytes = try debz.native_unpack_diversion.encode(
+        allocator,
+        empty_cache,
+        @splat('0'),
+        0,
+    );
+    defer allocator.free(unpack_diversion_bytes);
+
+    const statoverride_bytes = try debz.native_unpack_statoverride.encode(
+        allocator,
+        .{},
+        @splat('0'),
+        0,
+    );
+    defer allocator.free(statoverride_bytes);
+
+    for ([_][]const u8{
+        install_bytes,
+        diversion_bytes,
+        unpack_diversion_bytes,
+        statoverride_bytes,
+    }) |valid| {
+        try exerciseState(valid);
+        try exerciseState(valid[0 .. valid.len - 1]);
+        try exerciseState(valid[0 .. valid.len / 2]);
+        const mutated = try allocator.dupe(u8, valid);
+        defer allocator.free(mutated);
+        mutated[mutated.len / 2] ^= 0x01;
+        try exerciseState(mutated);
+    }
+
+    for ([_][]const u8{
+        "",
+        "{",
+        "{}",
+        "{\"payload\":{}}",
+        "{\"payload\":{\"version\":4}}",
+        "{\"payload\":{\"version\":5}}",
+        "{\"version\":1,\"operation\":\"install\"}",
+        "{\"version\":1,\"entries\":[{\"path\":\"../bad\",\"mode\":0,\"uid\":0,\"gid\":0}]}",
+    }) |malformed| {
+        try exerciseState(malformed);
+    }
 }
