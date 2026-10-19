@@ -86,6 +86,12 @@ const script_bindings = [_]ScriptBinding{
     .{ .name = "udev", .version = "259.5-0ubuntu3.4", .size = 2578, .digest = "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606" },
     .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .size = 1747, .digest = "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383" },
 };
+const debian_systemd_script_binding: ScriptBinding = .{
+    .name = "systemd",
+    .version = "257.13-1~deb13u1",
+    .size = 4314,
+    .digest = "7a95419baad7f5e6cfa7a422ae8965e67a5b25f9c74fa6cb6596090c1c236793",
+};
 const TriggerBinding = struct {
     package: []const u8,
     version: []const u8,
@@ -122,6 +128,17 @@ const trigger_bindings = [_]TriggerBinding{
         .triggers_size = 35,
         .triggers_sha256 = "f07479758daa6be9525681d6bd884cb935bbacc9b6b0e3669b33bb7e83b8ca79",
     },
+};
+const debian_libc_bin_trigger_binding: TriggerBinding = .{
+    .package = "libc-bin",
+    .version = "2.41-12+deb13u4",
+    .pending_triggers = "ldconfig",
+    .archive_size = 638452,
+    .archive_sha512 = "dd9704fa1935280a1a5418658c75cc45c8c646f9020229e72addde5bc9744ce75f46daeecc7a46c256cf2c4f08bc50bebbbd87e04848b55787f4ec304cfd41bc",
+    .postinst_size = 847,
+    .postinst_sha256 = "3daa7e3ffd429c1d77287f0fc840a490a607697906d2303452f70578647ce0d4",
+    .triggers_size = 440,
+    .triggers_sha256 = "c3d6b5df131336e54c31dc5687929467de7abea5c5798e3d6a6b2a64ef971fd4",
 };
 fn triggerBindingFor(selector: []const u8) ?TriggerBinding {
     const colon = std.mem.indexOfScalar(u8, selector, ':') orelse return null;
@@ -166,6 +183,21 @@ const kbd_cycle = [_]CycleBinding{
     base_cycle[0],
 };
 const kbd_triggers = "# Triggers added by dh_installinitramfs/13.24.2ubuntu1\nactivate-noawait update-initramfs\n";
+const debian_base_cycle = [_]CycleBinding{
+    .{ .name = "libc6", .version = "2.41-12+deb13u4", .depends = "libgcc-s1", .archive_size = 2846580, .archive_sha512 = "0ab52592ed75cd5731f9b065ff4ea9109d58ce4f80cfc044d3209219e88a79c904baacc8f48d49cb440376b172ef82e5875ae15d7de7336e9d93e7c3bc2f61e5" },
+    .{ .name = "libgcc-s1", .version = "14.2.0-19", .depends = "gcc-14-base (= 14.2.0-19), libc6 (>= 2.35)", .archive_size = 72772, .archive_sha512 = "a772ead03f938d76c09b3efba8c77652262be015cf44a8cb881183769c5ab19138afb95125d4b9563ec682d15163df1d3d9317563cd7ac3633178f5ae81185e9" },
+    .{ .name = "gcc-14-base", .version = "14.2.0-19", .depends = "", .archive_size = 49432, .archive_sha512 = "372defee254080b998da134bfe02ca1b8122ac28247776f7d2f3c36f1c18b2739232b6363c74d17217558e5c4326887ac2270fd642240a14eb391fd67ec532fe" },
+};
+const debian_openssl_cycle = [_]CycleBinding{
+    .{ .name = "libssl3t64", .version = "3.5.7-1~deb13u2", .depends = "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy", .archive_size = 2453872, .archive_sha512 = "b9451913054c60ebc1273439b944c95d441930a71aefb385033764541f70bb8238d637e595019793c759c923693675741267863b8f7a5d934a8e1b8a77780b26" },
+    .{ .name = "openssl-provider-legacy", .version = "3.5.7-1~deb13u2", .depends = "libc6 (>= 2.14), libssl3t64 (>= 3.0.3)", .archive_size = 316132, .archive_sha512 = "808addd039e469876a893944288c3e7dfd39005943f2a1b955e40f558a97a268e901c724dd39774d9acc030880996c0d11932867a19f4d73defd0b0d1126ab68" },
+    debian_base_cycle[0],
+    .{ .name = "libzstd1", .version = "1.5.7+dfsg-1", .depends = "libc6 (>= 2.34)", .archive_size = 303836, .archive_sha512 = "1f211445c1aa3a8e9dad19369bfcc3959a50720e386f53b49104a8fe9ff3aaa3a7ee44cce84f426178819f009e368ff0dff44fd79ef7f645a88449c8400a0d88" },
+    .{ .name = "zlib1g", .version = "1:1.3.dfsg+really1.3.1-1+b1", .depends = "libc6 (>= 2.14)", .archive_size = 88892, .archive_sha512 = "99707ae371d970a774a7e0fffcceb48ad7ae611ff8513488f8fab809a4eb69a3d9df734d1a211f7b6e9104ada25a75f9a86fcf137000001006ce64bf0d38057d" },
+};
+const debian_libc6_breaks = "base-files (<< 13.3~), chrony (<< 4.2-3~), dhcpcd (<< 1:10.1.0-7~), fakechroot (<< 2.19-3.5), firefox (<< 91~), firefox-esr (<< 91~), gnumach-image-1.8-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-486-dbg (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486-dbg (<< 2:1.8+git20210923~), hurd (<< 1:0.9.git20220301-2), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3+b1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.41), locales-all (<< 2.41), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.41), pd-scaf (<< 1:0.14.1+darcs20180201-6+b4), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-iptables (<< 1.0.0-2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), tinydns (<< 1:1.05-14), uwsgi-plugin-pypy3 (<< 0.0.2+b1), valgrind (<< 1:3.19.0-1~)";
+const debian_base_triggers = "# Triggers added by dh_makeshlibs/13.24.1\nactivate-noawait ldconfig\n";
+const debian_openssl_triggers = "# Triggers added by dh_makeshlibs/13.24.2\nactivate-noawait ldconfig\n";
 const CycleKind = enum { base, openssl, kbd };
 const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
 const cycle_graph_keys = [_][]const u8{
@@ -215,6 +247,61 @@ fn opensslGraphField(index: usize, key: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(key, "Conflicts")) return if (index == 4) "zlib1 (<= 1:1.0.4-7)" else "";
     if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index == 1) "foreign" else "same";
     return "";
+}
+
+fn debianCycleGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return debian_base_cycle[index].depends;
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => debian_libc6_breaks,
+        2 => "gnat (<< 7)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libc6-amd64",
+        1 => "libgcc1 (<< 1:10)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return if (index == 1) "libgcc1 (= 1:14.2.0-19)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return "same";
+    if (std.ascii.eqlIgnoreCase(key, "Protected")) return if (index == 1) "yes" else "";
+    return "";
+}
+
+fn debianOpensslGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return debian_openssl_cycle[index].depends;
+    if (index == 2) return debianCycleGraphField(0, key);
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => "freeradius (<< 3.2.7+dfsg-1+deb13u1), libssl3 (<< 3.5.7-1~deb13u2), openssh-client (<< 1:9.4p1), openssh-server (<< 1:9.4p1), python3-m2crypto (<< 0.38.0-4)",
+        1 => "libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)",
+        4 => "libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2023.20230311.66589-8)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libssl3",
+        1 => "libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return switch (index) {
+        0 => "libssl3 (= 3.5.7-1~deb13u2)",
+        4 => "libz1",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Conflicts")) return if (index == 4) "zlib1 (<= 1:1.0.4-7)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index == 1) "foreign" else "same";
+    return "";
+}
+
+fn debianBaseCycleArchive(name: []const u8) CycleBinding {
+    if (std.mem.eql(u8, name, "libgcc-s1")) return debian_base_cycle[1];
+    if (std.mem.eql(u8, name, "gcc-16-base")) return debian_base_cycle[2];
+    return debian_base_cycle[0];
+}
+
+fn debianOpensslCycleArchive(name: []const u8) CycleBinding {
+    for (debian_openssl_cycle) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return binding;
+    }
+    unreachable;
 }
 
 fn kbdGraphField(index: usize, key: []const u8) []const u8 {
@@ -295,9 +382,13 @@ pub fn main(init: std.process.Init) !void {
     var trigger_archive: ?[:0]const u8 = null;
     if (verb == .break_base_cycle) {
         var paths: [base_cycle.len][:0]const u8 = undefined;
-        for (&paths) |*path| {
-            path.* = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
+        for (0..debian_base_cycle.len) |index| {
+            paths[index] = try init.arena.allocator().dupeSentinel(u8, args.next() orelse return error.InvalidArguments, 0);
         }
+        paths[debian_base_cycle.len] = if (args.next()) |fourth|
+            try init.arena.allocator().dupeSentinel(u8, fourth, 0)
+        else
+            paths[0];
         cycle_archives = paths;
     }
     if (verb == .configure_openssl_cycle) {
@@ -679,20 +770,26 @@ fn readInstalledStatus() ![]u8 {
 fn verifyInstalledBinding(binding: ScriptBinding, verb: Verb) !void {
     const bytes = try readInstalledStatus();
     defer std.heap.page_allocator.free(bytes);
-    if (!bindingStatusMatchesFor(bytes, binding, verb)) return error.InvalidInstalledBinding;
+    const active = if (bindingStatusMatchesFor(bytes, binding, verb))
+        binding
+    else if (std.mem.eql(u8, binding.name, debian_systemd_script_binding.name) and
+        bindingStatusMatchesFor(bytes, debian_systemd_script_binding, verb))
+        debian_systemd_script_binding
+    else
+        return error.InvalidInstalledBinding;
     const script_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.postinst",
-        .{binding.name},
+        .{active.name},
         0,
     );
     defer std.heap.page_allocator.free(script_path);
     const script = try openVerified(
         script_path,
         std.crypto.hash.sha2.Sha256,
-        binding.digest,
-        binding.size,
-        binding.size,
+        active.digest,
+        active.size,
+        active.size,
     );
     _ = linux.close(script.fd);
 }
@@ -702,16 +799,21 @@ fn cycleStatusMatches(status: []const u8) bool {
 }
 
 fn cycleStatusMatchesFor(status: []const u8, comptime kind: CycleKind) bool {
-    const bindings = switch (kind) {
-        .base => base_cycle,
-        .openssl => openssl_cycle,
-        .kbd => kbd_cycle,
+    return switch (kind) {
+        .base => cycleStatusMatchesBindings(status, .base, base_cycle, cycleGraphField) or
+            cycleStatusMatchesBindings(status, .base, debian_base_cycle, debianCycleGraphField),
+        .openssl => cycleStatusMatchesBindings(status, .openssl, openssl_cycle, opensslGraphField) or
+            cycleStatusMatchesBindings(status, .openssl, debian_openssl_cycle, debianOpensslGraphField),
+        .kbd => cycleStatusMatchesBindings(status, .kbd, kbd_cycle, kbdGraphField),
     };
-    const graphField = switch (kind) {
-        .base => cycleGraphField,
-        .openssl => opensslGraphField,
-        .kbd => kbdGraphField,
-    };
+}
+
+fn cycleStatusMatchesBindings(
+    status: []const u8,
+    comptime kind: CycleKind,
+    comptime bindings: anytype,
+    comptime graphField: fn (usize, []const u8) []const u8,
+) bool {
     var matched: [bindings.len]bool = @splat(false);
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
@@ -802,7 +904,18 @@ fn verifyCycle(comptime kind: CycleKind) !void {
         "/var/lib/dpkg/info/" ++ activation_name ++ ":amd64.triggers";
     const triggers = readInstalledFile(activation_path, 1024) catch return error.CycleCallbackChanged;
     defer std.heap.page_allocator.free(triggers);
-    if (!std.mem.eql(u8, triggers, if (kind == .kbd) kbd_triggers else "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"))
+    const expected_triggers = switch (kind) {
+        .kbd => kbd_triggers,
+        .base => if (cycleStatusMatchesBindings(bytes, .base, debian_base_cycle, debianCycleGraphField))
+            debian_base_triggers
+        else
+            "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n",
+        .openssl => if (cycleStatusMatchesBindings(bytes, .openssl, debian_openssl_cycle, debianOpensslGraphField))
+            debian_openssl_triggers
+        else
+            "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n",
+    };
+    if (!std.mem.eql(u8, triggers, expected_triggers))
         return error.CycleCallbackChanged;
     const other_path = if (kind == .kbd)
         "/var/lib/dpkg/info/kbd:amd64.triggers"
@@ -857,7 +970,12 @@ fn fileContainsLine(bytes: []const u8, expected: []const u8) bool {
 }
 
 fn triggerStatusMatches(status: []const u8, target: TriggerBinding) bool {
-    var matched: [trigger_bindings.len]bool = @splat(false);
+    const is_debian = std.mem.eql(u8, target.version, debian_libc_bin_trigger_binding.version);
+    const handlers: []const TriggerBinding = if (is_debian)
+        &.{debian_libc_bin_trigger_binding}
+    else
+        &trigger_bindings;
+    var matched: [trigger_bindings.len]bool = .{ false, is_debian };
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
         if (paragraph.len == 0) continue;
@@ -918,7 +1036,7 @@ fn triggerStatusMatches(status: []const u8, target: TriggerBinding) bool {
             state == null or triggers_awaited != null)
             return false;
         var is_handler = false;
-        for (trigger_bindings, 0..) |binding, index| {
+        for (handlers, 0..) |binding, index| {
             if (!std.mem.eql(u8, name.?, binding.package)) continue;
             if (matched[index]) return false;
             matched[index] = true;
@@ -952,7 +1070,13 @@ fn verifyTriggerHandler(selector: []const u8) !void {
     const binding = triggerBindingFor(selector) orelse return error.InvalidTriggerHandler;
     const bytes = try readInstalledStatus();
     defer std.heap.page_allocator.free(bytes);
-    if (!triggerStatusMatches(bytes, binding)) return error.TriggerStateChanged;
+    const active = if (triggerStatusMatches(bytes, binding))
+        binding
+    else if (std.mem.eql(u8, selector, "libc-bin:amd64") and
+        triggerStatusMatches(bytes, debian_libc_bin_trigger_binding))
+        debian_libc_bin_trigger_binding
+    else
+        return error.TriggerStateChanged;
     protectedAncestors("/var/lib/dpkg/updates/.trigger-check") catch return error.TriggerStateChanged;
     emptyDirectory("/var/lib/dpkg/updates") catch return error.TriggerStateChanged;
     const unincorp_path: [:0]const u8 = "/var/lib/dpkg/triggers/Unincorp";
@@ -966,46 +1090,48 @@ fn verifyTriggerHandler(selector: []const u8) !void {
     const ldconfig = readInstalledFile("/var/lib/dpkg/triggers/ldconfig", 1024) catch return error.TriggerStateChanged;
     defer std.heap.page_allocator.free(ldconfig);
     if (!std.mem.eql(u8, ldconfig, "libc-bin\n")) return error.TriggerStateChanged;
-    const file_triggers = readInstalledFile("/var/lib/dpkg/triggers/File", 64 * 1024) catch return error.TriggerStateChanged;
-    defer std.heap.page_allocator.free(file_triggers);
-    if (!fileContainsLine(file_triggers, "/usr/lib/sysctl.d procps/noawait"))
-        return error.TriggerStateChanged;
+    if (!std.mem.eql(u8, active.version, debian_libc_bin_trigger_binding.version)) {
+        const file_triggers = readInstalledFile("/var/lib/dpkg/triggers/File", 64 * 1024) catch return error.TriggerStateChanged;
+        defer std.heap.page_allocator.free(file_triggers);
+        if (!fileContainsLine(file_triggers, "/usr/lib/sysctl.d procps/noawait"))
+            return error.TriggerStateChanged;
+    }
     const postinst_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.postinst",
-        .{binding.package},
+        .{active.package},
         0,
     );
     defer std.heap.page_allocator.free(postinst_path);
     const postinst = openVerified(
         postinst_path,
         std.crypto.hash.sha2.Sha256,
-        binding.postinst_sha256,
-        binding.postinst_size,
-        binding.postinst_size,
+        active.postinst_sha256,
+        active.postinst_size,
+        active.postinst_size,
     ) catch return error.TriggerCallbackChanged;
     defer _ = linux.close(postinst.fd);
     if ((postinst.metadata.mode & 0o7777) != 0o755) return error.TriggerCallbackChanged;
     const triggers_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.triggers",
-        .{binding.package},
+        .{active.package},
         0,
     );
     defer std.heap.page_allocator.free(triggers_path);
     const triggers = openVerified(
         triggers_path,
         std.crypto.hash.sha2.Sha256,
-        binding.triggers_sha256,
-        binding.triggers_size,
-        binding.triggers_size,
+        active.triggers_sha256,
+        active.triggers_size,
+        active.triggers_size,
     ) catch return error.TriggerCallbackChanged;
     defer _ = linux.close(triggers.fd);
     if ((triggers.metadata.mode & 0o7777) != 0o644) return error.TriggerCallbackChanged;
     const qualified_postinst = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}:amd64.postinst",
-        .{binding.package},
+        .{active.package},
         0,
     );
     defer std.heap.page_allocator.free(qualified_postinst);
@@ -1013,7 +1139,7 @@ fn verifyTriggerHandler(selector: []const u8) !void {
     const qualified_triggers = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}:amd64.triggers",
-        .{binding.package},
+        .{active.package},
         0,
     );
     defer std.heap.page_allocator.free(qualified_triggers);
@@ -1854,26 +1980,78 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         if (archive) |value| _ = linux.close(value.fd);
     }
     if (options.cycle_archives) |paths| {
+        var debian_cycle: ?bool = null;
         for (paths, base_cycle) |path, binding| {
-            const source = openVerified(
-                path,
-                std.crypto.hash.sha2.Sha512,
-                binding.archive_sha512,
-                binding.archive_size,
-                binding.archive_size,
-            ) catch return error.CycleIdentityChanged;
+            const debian_binding = debianBaseCycleArchive(binding.name);
+            const source = if (debian_cycle == null) blk: {
+                if (openVerified(
+                    path,
+                    std.crypto.hash.sha2.Sha512,
+                    binding.archive_sha512,
+                    binding.archive_size,
+                    binding.archive_size,
+                )) |verified| {
+                    debian_cycle = false;
+                    break :blk verified;
+                } else |_| {
+                    const verified = openVerified(
+                        path,
+                        std.crypto.hash.sha2.Sha512,
+                        debian_binding.archive_sha512,
+                        debian_binding.archive_size,
+                        debian_binding.archive_size,
+                    ) catch return error.CycleIdentityChanged;
+                    debian_cycle = true;
+                    break :blk verified;
+                }
+            } else blk: {
+                const expected = if (debian_cycle.?) debian_binding else binding;
+                break :blk openVerified(
+                    path,
+                    std.crypto.hash.sha2.Sha512,
+                    expected.archive_sha512,
+                    expected.archive_size,
+                    expected.archive_size,
+                ) catch return error.CycleIdentityChanged;
+            };
             _ = linux.close(source.fd);
         }
     }
     if (options.openssl_archives) |paths| {
+        var debian_cycle: ?bool = null;
         for (paths, openssl_cycle) |path, binding| {
-            const source = openVerified(
-                path,
-                std.crypto.hash.sha2.Sha512,
-                binding.archive_sha512,
-                binding.archive_size,
-                binding.archive_size,
-            ) catch return error.CycleIdentityChanged;
+            const debian_binding = debianOpensslCycleArchive(binding.name);
+            const source = if (debian_cycle == null) blk: {
+                if (openVerified(
+                    path,
+                    std.crypto.hash.sha2.Sha512,
+                    binding.archive_sha512,
+                    binding.archive_size,
+                    binding.archive_size,
+                )) |verified| {
+                    debian_cycle = false;
+                    break :blk verified;
+                } else |_| {
+                    const verified = openVerified(
+                        path,
+                        std.crypto.hash.sha2.Sha512,
+                        debian_binding.archive_sha512,
+                        debian_binding.archive_size,
+                        debian_binding.archive_size,
+                    ) catch return error.CycleIdentityChanged;
+                    debian_cycle = true;
+                    break :blk verified;
+                }
+            } else blk: {
+                const expected = if (debian_cycle.?) debian_binding else binding;
+                break :blk openVerified(
+                    path,
+                    std.crypto.hash.sha2.Sha512,
+                    expected.archive_sha512,
+                    expected.archive_size,
+                    expected.archive_size,
+                ) catch return error.CycleIdentityChanged;
+            };
             _ = linux.close(source.fd);
         }
     }
@@ -1890,15 +2068,28 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         }
     }
     if (options.trigger_archive) |path| {
-        const binding = triggerBindingFor(options.selector.?) orelse return error.InvalidTriggerHandler;
-        const source = openVerified(
+        const default_binding = triggerBindingFor(options.selector.?) orelse return error.InvalidTriggerHandler;
+        const binding = if (openVerified(
             path,
             std.crypto.hash.sha2.Sha512,
-            binding.archive_sha512,
-            binding.archive_size,
-            binding.archive_size,
-        ) catch return error.TriggerIdentityChanged;
-        _ = linux.close(source.fd);
+            default_binding.archive_sha512,
+            default_binding.archive_size,
+            default_binding.archive_size,
+        )) |source| blk: {
+            _ = linux.close(source.fd);
+            break :blk default_binding;
+        } else |_| blk: {
+            if (!std.mem.eql(u8, options.selector.?, "libc-bin:amd64")) return error.TriggerIdentityChanged;
+            const source = openVerified(
+                path,
+                std.crypto.hash.sha2.Sha512,
+                debian_libc_bin_trigger_binding.archive_sha512,
+                debian_libc_bin_trigger_binding.archive_size,
+                debian_libc_bin_trigger_binding.archive_size,
+            ) catch return error.TriggerIdentityChanged;
+            _ = linux.close(source.fd);
+            break :blk debian_libc_bin_trigger_binding;
+        };
         const postinst_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/var/lib/dpkg/info/{s}.postinst",
@@ -1952,13 +2143,24 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
             .{ options.root, binding.name },
             0,
         );
-        const script = try openVerified(
+        const script = openVerified(
             script_path,
             std.crypto.hash.sha2.Sha256,
             binding.digest,
             binding.size,
             binding.size,
-        );
+        ) catch |err| blk: {
+            if (options.profile == .systemd and err == error.InvalidInstalledBinding) {
+                break :blk try openVerified(
+                    script_path,
+                    std.crypto.hash.sha2.Sha256,
+                    debian_systemd_script_binding.digest,
+                    debian_systemd_script_binding.size,
+                    debian_systemd_script_binding.size,
+                );
+            }
+            return err;
+        };
         _ = linux.close(script.fd);
     }
     const boot_id = if (options.profile == .systemd) try readBootId() else null;
@@ -2829,5 +3031,87 @@ test "reference single-handler trigger bindings validate options and status tran
             "Triggers-Pending: /usr/lib/sysctl.d\n\n",
         trigger_bindings[0],
     ));
+
+    const debian_trigger_status =
+        "Package: base-files\nVersion: 13.8+deb13u4\nArchitecture: amd64\n" ++
+        "Status: install ok installed\n\n" ++
+        "Package: libc-bin\nVersion: 2.41-12+deb13u4\nArchitecture: amd64\n" ++
+        "Status: install ok triggers-pending\nConfig-Version: 2.41-12+deb13u4\n" ++
+        "Triggers-Pending: ldconfig\n\n";
+    try std.testing.expect(triggerStatusMatches(debian_trigger_status, debian_libc_bin_trigger_binding));
+    try std.testing.expect(!triggerStatusMatches(debian_trigger_status, trigger_bindings[0]));
+    try std.testing.expect(!triggerStatusMatches(
+        "Package: libc-bin\nVersion: 2.41-12+deb13u4\nArchitecture: amd64\n" ++
+            "Status: install ok triggers-pending\nConfig-Version: 2.41-12+deb13u4\n" ++
+            "Triggers-Pending: /usr/lib/sysctl.d\n\n",
+        debian_libc_bin_trigger_binding,
+    ));
+}
+
+test "reference launcher binds Debian stable amd64 systemd script and cycle status graphs" {
+    try std.testing.expect(bindingStatusMatches(
+        "Package: systemd\nVersion: 257.13-1~deb13u1\nArchitecture: amd64\n" ++
+            "Status: install ok unpacked\n\n",
+        debian_systemd_script_binding,
+    ));
+    try std.testing.expect(bindingStatusMatchesFor(
+        "Package: systemd\nVersion: 257.13-1~deb13u1\nArchitecture: amd64\n" ++
+            "Status: install ok half-configured\n\n",
+        debian_systemd_script_binding,
+        .continue_prestate,
+    ));
+    try std.testing.expect(!bindingStatusMatches(
+        "Package: systemd\nVersion: 257.13-1~deb13u2\nArchitecture: amd64\n" ++
+            "Status: install ok unpacked\n\n",
+        debian_systemd_script_binding,
+    ));
+
+    const debian_base_status =
+        "Package: gcc-14-base\nArchitecture: amd64\nVersion: 14.2.0-19\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nBreaks: gnat (<< 7)\n\n" ++
+        "Package: libc6\nArchitecture: amd64\nVersion: 2.41-12+deb13u4\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\nDepends: libgcc-s1\n" ++
+        "Breaks: " ++ debian_libc6_breaks ++ "\nReplaces: libc6-amd64\n\n" ++
+        "Package: libgcc-s1\nArchitecture: amd64\nVersion: 14.2.0-19\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\nProtected: yes\n" ++
+        "Depends: gcc-14-base (= 14.2.0-19), libc6 (>= 2.35)\n" ++
+        "Provides: libgcc1 (= 1:14.2.0-19)\nReplaces: libgcc1 (<< 1:10)\n\n";
+    try std.testing.expect(cycleStatusMatchesFor(debian_base_status, .base));
+    try std.testing.expect(!cycleStatusMatchesFor(debian_base_status, .openssl));
+    try std.testing.expect(!cycleStatusMatchesFor(
+        "Package: gcc-14-base\nArchitecture: amd64\nVersion: 14.2.0-19\n" ++
+            "Status: install ok installed\nMulti-Arch: same\nBreaks: gnat (<< 7)\n\n" ++
+            "Package: libc6\nArchitecture: amd64\nVersion: 2.43-2ubuntu2.4\n" ++
+            "Status: install ok unpacked\nMulti-Arch: same\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\n" ++
+            "Breaks: " ++ libc6_breaks ++ "\nReplaces: libc6-amd64\n\n" ++
+            "Package: libgcc-s1\nArchitecture: amd64\nVersion: 14.2.0-19\n" ++
+            "Status: install ok unpacked\nMulti-Arch: same\nProtected: yes\n" ++
+            "Depends: gcc-14-base (= 14.2.0-19), libc6 (>= 2.35)\n" ++
+            "Provides: libgcc1 (= 1:14.2.0-19)\nReplaces: libgcc1 (<< 1:10)\n\n",
+        .base,
+    ));
+
+    const debian_openssl_status =
+        "Package: libc6\nArchitecture: amd64\nVersion: 2.41-12+deb13u4\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libgcc-s1\n" ++
+        "Breaks: " ++ debian_libc6_breaks ++ "\nReplaces: libc6-amd64\n\n" ++
+        "Package: libzstd1\nArchitecture: amd64\nVersion: 1.5.7+dfsg-1\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libc6 (>= 2.34)\n\n" ++
+        "Package: zlib1g\nArchitecture: amd64\nVersion: 1:1.3.dfsg+really1.3.1-1+b1\n" ++
+        "Status: install ok installed\nMulti-Arch: same\nDepends: libc6 (>= 2.14)\n" ++
+        "Breaks: libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2023.20230311.66589-8)\n" ++
+        "Conflicts: zlib1 (<= 1:1.0.4-7)\nProvides: libz1\n\n" ++
+        "Package: libssl3t64\nArchitecture: amd64\nVersion: 3.5.7-1~deb13u2\n" ++
+        "Status: install ok unpacked\nMulti-Arch: same\n" ++
+        "Depends: libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy\n" ++
+        "Breaks: freeradius (<< 3.2.7+dfsg-1+deb13u1), libssl3 (<< 3.5.7-1~deb13u2), openssh-client (<< 1:9.4p1), openssh-server (<< 1:9.4p1), python3-m2crypto (<< 0.38.0-4)\n" ++
+        "Provides: libssl3 (= 3.5.7-1~deb13u2)\nReplaces: libssl3\n\n" ++
+        "Package: openssl-provider-legacy\nArchitecture: amd64\nVersion: 3.5.7-1~deb13u2\n" ++
+        "Status: install ok unpacked\nMulti-Arch: foreign\n" ++
+        "Depends: libc6 (>= 2.14), libssl3t64 (>= 3.0.3)\n" ++
+        "Breaks: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\n" ++
+        "Replaces: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\n\n";
+    try std.testing.expect(cycleStatusMatchesFor(debian_openssl_status, .openssl));
+    try std.testing.expect(!cycleStatusMatchesFor(debian_openssl_status, .base));
 }
 

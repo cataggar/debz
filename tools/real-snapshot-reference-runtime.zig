@@ -431,10 +431,18 @@ const Recorder = struct {
         };
         const archive_hash = package.archive_identity.digests.sha512 orelse
             package.derived_sha512 orelse return error.UnboundRuntimeArchive;
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/packages-v2/objects/sha512-{s}", .{
+        const sha512_path = try std.fmt.allocPrint(self.allocator, "{s}/packages-v2/objects/sha512-{s}", .{
             self.cache, std.fmt.bytesToHex(archive_hash, .lower),
         });
-        const bytes = try readProtected(self.allocator, path, 32 * 1024 * 1024);
+        const bytes = readProtected(self.allocator, sha512_path, 32 * 1024 * 1024) catch |err| blk: {
+            var key_buf: [135]u8 = undefined;
+            const key = package.archive_identity.cacheKey(&key_buf);
+            if (err != error.RuntimeInputRefused or std.mem.startsWith(u8, key, "sha512-")) return err;
+            const fallback_path = try std.fmt.allocPrint(self.allocator, "{s}/packages-v2/objects/{s}", .{
+                self.cache, key,
+            });
+            break :blk try readProtected(self.allocator, fallback_path, 32 * 1024 * 1024);
+        };
         try package.verifyArchive(bytes);
         const validation = switch (debz.deb_payload.validate(self.allocator, bytes, .{
             .repository = &origin.repository_id,
@@ -699,7 +707,7 @@ const GuestRecorder = struct {
                 const data = try self.base.payload(package_name);
                 if (payloadEntry(data, path) != null) break try self.member(package_name, path);
             } else {
-                std.log.err("reference guest member /{s} is missing", .{path});
+                if (!builtin.is_test) std.log.err("reference guest member /{s} is missing", .{path});
                 return error.MissingGuestMember;
             };
             const absolute = try std.fmt.allocPrint(allocator, "/{s}", .{path});
@@ -749,14 +757,45 @@ const GuestRecorder = struct {
         const allocator = self.base.allocator;
         for (packages) |package_name| {
             const data = try self.base.payload(package_name);
+            var matched = false;
             for (data.data.entries) |entry| {
                 const path = std.mem.trimEnd(u8, entry.path, "/");
                 if (!std.mem.eql(u8, path, directory) and !(std.mem.startsWith(u8, path, directory) and
                     path.len > directory.len and path[directory.len] == '/'))
                     continue;
+                matched = true;
                 const found = try self.member(package_name, path);
                 try self.put(try std.fmt.allocPrint(allocator, "/{s}", .{path}), role, false, found.identity);
             }
+            if (!matched) return error.MissingGuestMember;
+        }
+    }
+
+    /// dpkg removes control extraction directories with rm: the coreutils-from-gnu
+    /// alias in Ubuntu reference roots (or the GNU rm bytes staged in proof templates),
+    /// or the direct coreutils /usr/bin/rm binary in Debian stable locks that do
+    /// not split gnu-coreutils/coreutils-from-gnu.
+    fn rmHelper(self: *GuestRecorder) !void {
+        if (self.base.lockPackage("gnu-coreutils") != null or
+            self.base.lockPackage("coreutils-from-gnu") != null)
+        {
+            const gnurm = try self.member("gnu-coreutils", "usr/bin/gnurm");
+            try self.put("/usr/bin/rm", .helper, true, gnurm.identity);
+            try self.closure(gnurm.bytes.?, true);
+            try self.put("/usr/bin/rm", .helper, true, (try self.member("coreutils-from-gnu", "usr/bin/rm")).identity);
+            try self.chain(&.{"gnu-coreutils"}, "usr/bin/gnurm", .helper, false);
+            return;
+        }
+        try self.chain(&.{"coreutils"}, "usr/bin/rm", .helper, true);
+    }
+
+    /// Late gconv modules, configuration and cache, all from signed members:
+    /// libc6 is always required, and libc-gconv-modules-extra is bound when
+    /// present in the signed lock.
+    fn gconvTree(self: *GuestRecorder, gconv: []const u8) !void {
+        try self.tree(&.{"libc6"}, gconv, .gconv);
+        if (self.base.lockPackage("libc-gconv-modules-extra") != null) {
+            try self.tree(&.{"libc-gconv-modules-extra"}, gconv, .gconv);
         }
     }
 
@@ -816,13 +855,7 @@ fn recordGuest(recorder: *Recorder, dpkg_path: []const u8, lock_sha256: []const 
     for (guest_executables) |executable| {
         try self.chain(&.{executable.package}, executable.path, executable.role, executable.required);
     }
-    // dpkg removes control extraction directories with rm: the coreutils-from-gnu
-    // alias in reference roots, or the GNU rm bytes staged in proof templates.
-    const gnurm = try self.member("gnu-coreutils", "usr/bin/gnurm");
-    try self.put("/usr/bin/rm", .helper, true, gnurm.identity);
-    try self.closure(gnurm.bytes.?, true);
-    try self.put("/usr/bin/rm", .helper, true, (try self.member("coreutils-from-gnu", "usr/bin/rm")).identity);
-    try self.chain(&.{"gnu-coreutils"}, "usr/bin/gnurm", .helper, false);
+    try self.rmHelper();
     for ((try recorder.payload("dpkg")).data.entries) |entry| {
         const path = std.mem.trimEnd(u8, entry.path, "/");
         if (entry.kind == .directory or !(std.mem.startsWith(u8, path, "usr/bin/") or std.mem.startsWith(u8, path, "usr/sbin/")) or
@@ -845,7 +878,7 @@ fn recordGuest(recorder: *Recorder, dpkg_path: []const u8, lock_sha256: []const 
     }
     // Late gconv modules, configuration and cache, all from signed members.
     const gconv = try std.fmt.allocPrint(allocator, "{s}/gconv", .{library_directory});
-    try self.tree(&.{ "libc6", "libc-gconv-modules-extra" }, gconv, .gconv);
+    try self.gconvTree(gconv);
     // dpkg and loader configuration.
     for ([_][3][]const u8{
         .{ "dpkg", "etc/dpkg/dpkg.cfg", "dpkg_config" },
@@ -1587,6 +1620,96 @@ test "reference runtime binds exactly the nsswitch.conf providers of the hosted 
                 try std.testing.expectEqual(@as(u64, provider.bytes.len), identity.size);
             }
         }
+    }
+}
+
+test "reference runtime binds Debian stable amd64 coreutils rm, libc6 gconv, and nsswitch providers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const apt_lock_bytes = @embedFile("fixtures/debian-stable-closure-v1/amd64-apt.lock.json");
+    const sysv_lock_bytes = @embedFile("fixtures/debian-stable-closure-v1/amd64-systemd-sysv.lock.json");
+
+    for ([_]struct { bytes: []const u8, has_systemd: bool }{
+        .{ .bytes = apt_lock_bytes, .has_systemd = false },
+        .{ .bytes = sysv_lock_bytes, .has_systemd = true },
+    }) |lock_case| {
+        const decoded = try Recorder.debz.exact_lock_v3.decode(a, lock_case.bytes, 16 * 1024 * 1024);
+        const lock = decoded.lock;
+        try std.testing.expectEqualStrings("amd64", lock.target_architecture);
+        try std.testing.expect(lock.findIdentity("gnu-coreutils", "amd64") == null);
+        try std.testing.expect(lock.findIdentity("coreutils-from-gnu", "all") == null);
+        try std.testing.expect(lock.findIdentity("libc-gconv-modules-extra", "amd64") == null);
+
+        var recorder: Recorder = .{
+            .allocator = a,
+            .architecture = "amd64",
+            .lock = lock,
+            .cache = "/nonexistent-reference-runtime-cache",
+            .payloads = .init(a),
+        };
+        try recorder.payloads.put("coreutils", try fixturePayload(a, "usr/bin/rm", "debian-coreutils-rm\n"));
+        try recorder.payloads.put(
+            "libc6",
+            try fixturePayload(a, "usr/lib/x86_64-linux-gnu/gconv/gconv-modules.d/gconv-modules-extra.conf", "module\n"),
+        );
+        try recorder.payloads.put("libc-bin", try fixturePayload(a, "usr/share/libc-bin/nsswitch.conf", "passwd: files\n"));
+        if (lock_case.has_systemd) {
+            try recorder.payloads.put("systemd", try fixturePayload(a, "usr/share/factory/etc/nsswitch.conf", "passwd: files systemd\n"));
+        }
+
+        var self: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "x86_64-linux-gnu",
+            .interpreter = "",
+            .loader_path = "",
+            .visited = .init(a),
+        };
+        try self.rmHelper();
+        try self.gconvTree("usr/lib/x86_64-linux-gnu/gconv");
+        try self.nssConfig();
+
+        try std.testing.expectEqual(@as(usize, 3), self.entries.items.len);
+        const rm_entry = self.entries.items[0];
+        try std.testing.expectEqualStrings("/usr/bin/rm", rm_entry.path);
+        try std.testing.expectEqual(guest.Role.helper, rm_entry.role);
+        try std.testing.expect(rm_entry.required);
+        try std.testing.expectEqual(@as(usize, 1), rm_entry.allowed.len);
+        try std.testing.expectEqualStrings("coreutils", rm_entry.allowed[0].package.?);
+        try std.testing.expectEqualStrings("9.7-3", rm_entry.allowed[0].version.?);
+        try std.testing.expectEqualStrings("/usr/bin/rm", rm_entry.allowed[0].member.?);
+
+        const gconv_entry = self.entries.items[1];
+        try std.testing.expectEqualStrings("/usr/lib/x86_64-linux-gnu/gconv/gconv-modules.d/gconv-modules-extra.conf", gconv_entry.path);
+        try std.testing.expectEqual(guest.Role.gconv, gconv_entry.role);
+        try std.testing.expectEqual(@as(usize, 1), gconv_entry.allowed.len);
+        try std.testing.expectEqualStrings("libc6", gconv_entry.allowed[0].package.?);
+        try std.testing.expectEqualStrings("2.41-12+deb13u4", gconv_entry.allowed[0].version.?);
+
+        const nss_entry = self.entries.items[2];
+        try std.testing.expectEqualStrings("/etc/nsswitch.conf", nss_entry.path);
+        try std.testing.expectEqual(@as(usize, if (lock_case.has_systemd) 2 else 1), nss_entry.allowed.len);
+
+        // Missing coreutils /usr/bin/rm or missing libc6 gconv tree must still refuse.
+        try recorder.payloads.put("coreutils", try fixturePayload(a, "usr/bin/true", "noop\n"));
+        var bad_rm: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "x86_64-linux-gnu",
+            .interpreter = "",
+            .loader_path = "",
+            .visited = .init(a),
+        };
+        try std.testing.expectError(error.MissingGuestMember, bad_rm.rmHelper());
+
+        try recorder.payloads.put("libc6", try fixturePayload(a, "usr/lib/x86_64-linux-gnu/libc.so.6", "noop\n"));
+        var bad_gconv: GuestRecorder = .{
+            .base = &recorder,
+            .triplet = "x86_64-linux-gnu",
+            .interpreter = "",
+            .loader_path = "",
+            .visited = .init(a),
+        };
+        try std.testing.expectError(error.MissingGuestMember, bad_gconv.gconvTree("usr/lib/x86_64-linux-gnu/gconv"));
     }
 }
 
