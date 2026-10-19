@@ -53,6 +53,7 @@ fn finalDatabase(allocator: std.mem.Allocator, root: debz.root_fs.Root, architec
         .status = (try file(allocator, root, "status")) orelse return error.MissingConsumerStatus,
         .status_old = try file(allocator, root, "status-old"),
         .arch = try file(allocator, root, "arch"),
+        .arch_native = try file(allocator, root, "arch-native"),
         .diversions = try file(allocator, root, "diversions"),
         .statoverride = try file(allocator, root, "statoverride"),
         .triggers_file = try file(allocator, root, "triggers/File"),

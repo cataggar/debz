@@ -1473,6 +1473,7 @@ fn refreshExecutionStatOverrides(
     var captured = try captureDatabaseSnapshot(temporary, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, native_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, native_architecture);
     if (statOverrideDatabaseMatches(
         execution.stat_override_database_bytes,
         captured.snapshot.statoverride,
@@ -1566,6 +1567,7 @@ fn readUnpackStatOverrides(
     var captured = try captureDatabaseSnapshot(temporary, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, native_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, native_architecture);
     var database = switch (try package_database.importSnapshot(temporary, .{
         .native_architecture = native_architecture,
         .snapshot = captured.snapshot,
@@ -9750,6 +9752,12 @@ fn captureDatabaseSnapshotInto(
         package_database.arch_path,
         limits.max_database_file_bytes,
     );
+    snapshot.arch_native = try captureDatabaseFile(
+        owned,
+        database_root,
+        package_database.arch_native_path,
+        limits.max_database_file_bytes,
+    );
     snapshot.diversions = try captureDatabaseFile(
         owned,
         database_root,
@@ -9957,6 +9965,36 @@ fn validateDatabaseNativeArchitecture(
     const name = if (std.mem.endsWith(u8, bytes, "\n")) bytes[0 .. bytes.len - 1] else bytes;
     if (!std.mem.eql(u8, name, target_architecture))
         return error.DatabaseNativeArchitectureMismatch;
+}
+
+fn validateCapturedNativeArchitecture(
+    snapshot: package_database.Snapshot,
+    target_architecture: []const u8,
+) !void {
+    const entry = snapshot.arch_native orelse return;
+    if (entry.kind != .regular or !package_database.safeFileMode(entry.mode) or
+        (entry.mode & 0o022) != 0)
+        return error.UnsafeDatabaseEntry;
+    const maximum = (package_database.Limits{}).max_architecture_bytes;
+    if (target_architecture.len == 0 or target_architecture.len > maximum or
+        !package_database.validArchitecture(target_architecture))
+        return error.DatabaseNativeArchitectureMismatch;
+    const bytes = entry.bytes;
+    const name = if (std.mem.endsWith(u8, bytes, "\n")) bytes[0 .. bytes.len - 1] else bytes;
+    if (!std.mem.eql(u8, name, target_architecture))
+        return error.DatabaseNativeArchitectureMismatch;
+}
+
+fn validateLiveDatabaseNativeArchitecture(
+    root: root_fs.Root,
+    target_architecture: []const u8,
+) !void {
+    const path = package_database.database_directory ++ "/" ++ native_architecture_entry;
+    const entry = (try root.entryIfExists(try root_fs.Path.init(path))) orelse return;
+    if (!entry.isRegularFile() or !package_database.safeFileMode(entry.mode) or
+        (entry.mode & 0o022) != 0)
+        return error.UnsafeDatabaseEntry;
+    try validateDatabaseNativeArchitecture(root, path, target_architecture);
 }
 
 fn validateImportedDatabaseLayout(root: root_fs.Root, target_architecture: []const u8) !void {
@@ -10298,6 +10336,274 @@ test "native_unpack.test.imported live database detects external same-byte mode 
     )) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(package_database.Code.external_generation_change, diagnostic.code);
 }
+
+test "native_unpack.test.lifecycle refuses mid-transaction arch-native rewrite and detects post-transaction drift" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    const arch_native_rel = "var/lib/dpkg/" ++ native_architecture_entry;
+    const arch_native_path = try root_fs.Path.init(arch_native_rel);
+
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo/file", .content = "payload\n" },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var root_buffer: [4096]u8 = undefined;
+    const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    const root_identity = bindFixtureProgramRoot(&program, install_root);
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+
+    // Preflight and unpack succeed while arch-native is absent.
+    const unpack_result = try materialize(testing.allocator, .{
+        .io = testing.io,
+        .root = root,
+        .install_root = install_root,
+        .planning = .{
+            .program = &program,
+            .snapshot = fixture.snapshot(),
+            .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+            .root = root,
+            .root_identity_sha256 = root_identity,
+            .interoperability = .isolated_root,
+        },
+        .locks = locks.interface(),
+        .operation = .install,
+    });
+    try testing.expectEqual(MaterializationOutcome.applied, unpack_result.outcome);
+
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .install,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .prior_version = null,
+        .artifact = .{
+            .sha256 = model.provenance().sha256,
+            .size = bytes.len,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = @splat('a'),
+                .repository_snapshot_sha256 = @splat(0x32),
+            } },
+        },
+    }};
+    const final_state = [_]native_authorization.FinalPackage{.{
+        .name = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .state = .installed,
+        .dpkg_selection_hold = false,
+    }};
+    var authorization = try native_authorization.create(testing.allocator, .{
+        .backend = .native,
+        .target_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .install_root = install_root,
+        .request_sha256 = @splat(0x11),
+        .solver_policy_sha256 = @splat(0x22),
+        .executor_policy_sha256 = @splat(0x33),
+        .plan_sha256 = @splat(0x44),
+        .exact_lock = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = @splat(0x55),
+        },
+        .policy = .{ .conffile = .keep_existing },
+        .actions = &actions,
+        .final_state = &final_state,
+        .trigger_authority = null,
+    });
+    defer authorization.deinit();
+
+    var coordinator = try root_operation.Coordinator.open(
+        testing.io,
+        root,
+        install_root,
+        locks.interface(),
+    );
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(0),
+        .policy_sha256 = @splat(0),
+        .evidence = try native_operation.evidence(program),
+        .target_architecture = "amd64",
+    });
+    defer attempt.release();
+    var execution: ExecutionState = .{};
+
+    // 1. Mid-transaction: a maintainer script (postinst) rewrites arch-native to
+    // a foreign architecture or unsafe mode after preflight. Both the post-script
+    // boundary and the next database recapture boundary refuse with a typed error.
+    try root.publishFile(arch_native_path, "arm64\n", .{ .overwrite = .replace });
+    try testing.expectError(
+        error.DatabaseNativeArchitectureMismatch,
+        validateLiveDatabaseNativeArchitecture(root, "amd64"),
+    );
+    try testing.expectError(
+        error.DatabaseNativeArchitectureMismatch,
+        lifecycleStateStep(
+            &execution,
+            testing.allocator,
+            root,
+            install_root,
+            &program,
+            &authorization.authorization,
+            locks.interface(),
+            &attempt,
+            .install,
+            .keep_existing,
+            .{
+                .package = .{ .name = "demo", .version = "1", .architecture = "amd64" },
+                .state = .installed,
+                .hold = false,
+                .remove_entry = false,
+            },
+            null,
+            null,
+        ),
+    );
+
+    try fixture.tmp.dir.setFilePermissions(testing.io, arch_native_rel, .fromMode(0o666), .{});
+    try testing.expectError(
+        error.UnsafeDatabaseEntry,
+        validateLiveDatabaseNativeArchitecture(root, "amd64"),
+    );
+    try testing.expectError(
+        error.UnsafeDatabaseEntry,
+        lifecycleStateStep(
+            &execution,
+            testing.allocator,
+            root,
+            install_root,
+            &program,
+            &authorization.authorization,
+            locks.interface(),
+            &attempt,
+            .install,
+            .keep_existing,
+            .{
+                .package = .{ .name = "demo", .version = "1", .architecture = "amd64" },
+                .state = .installed,
+                .hold = false,
+                .remove_entry = false,
+            },
+            null,
+            null,
+        ),
+    );
+
+    // Admitted dpkg-written arch-native ("amd64\n", 0o644) succeeds across the
+    // configure/state database boundary and binds into the completed generation.
+    try root.publishFile(arch_native_path, "amd64\n", .{ .overwrite = .replace });
+    try fixture.tmp.dir.setFilePermissions(testing.io, arch_native_rel, .fromMode(0o644), .{});
+    try validateLiveDatabaseNativeArchitecture(root, "amd64");
+    const state_result = try lifecycleStateStep(
+        &execution,
+        testing.allocator,
+        root,
+        install_root,
+        &program,
+        &authorization.authorization,
+        locks.interface(),
+        &attempt,
+        .install,
+        .keep_existing,
+        .{
+            .package = .{ .name = "demo", .version = "1", .architecture = "amd64" },
+            .state = .installed,
+            .hold = false,
+            .remove_entry = false,
+        },
+        null,
+        null,
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, state_result.outcome);
+
+    var completed = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer completed.deinit();
+    try validateCapturedNativeArchitecture(completed.snapshot, "amd64");
+    var completed_db = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = completed.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer completed_db.deinit();
+
+    var receipt: native_provenance.Document = undefined;
+    receipt.outcome = .succeeded;
+    receipt.final_database_generation_sha256 = native_provenance.hexDigest(completed_db.generation.sha256);
+    receipt.final_state_sha256 = native_provenance.hexDigest(nativeFinalClosureDigest(completed.snapshot));
+    try Runtime.verifyTerminalDatabase(
+        testing.allocator,
+        root,
+        authorization.authorization,
+        receipt,
+    );
+
+    // 2. Post-transaction external change to arch-native reports
+    // external_generation_change and fails terminal database verification.
+    try root.publishFile(arch_native_path, "amd64", .{ .overwrite = .replace });
+    var stripped_newline = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer stripped_newline.deinit();
+    const stripped_diag = (try package_database.verifyGeneration(
+        testing.allocator,
+        completed_db,
+        stripped_newline.snapshot,
+    )) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(package_database.Code.external_generation_change, stripped_diag.code);
+    try testing.expectError(
+        error.FinalStateMismatch,
+        Runtime.verifyTerminalDatabase(testing.allocator, root, authorization.authorization, receipt),
+    );
+
+    try root.publishFile(arch_native_path, "amd64\n", .{ .overwrite = .replace });
+    try fixture.tmp.dir.setFilePermissions(testing.io, arch_native_rel, .fromMode(0o600), .{});
+    var mode_changed = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer mode_changed.deinit();
+    const mode_diag = (try package_database.verifyGeneration(
+        testing.allocator,
+        completed_db,
+        mode_changed.snapshot,
+    )) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(package_database.Code.external_generation_change, mode_diag.code);
+    try testing.expectError(
+        error.FinalStateMismatch,
+        Runtime.verifyTerminalDatabase(testing.allocator, root, authorization.authorization, receipt),
+    );
+
+    try root.publishFile(arch_native_path, "arm64\n", .{ .overwrite = .replace });
+    try fixture.tmp.dir.setFilePermissions(testing.io, arch_native_rel, .fromMode(0o644), .{});
+    var foreign_changed = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer foreign_changed.deinit();
+    const foreign_diag = (try package_database.verifyGeneration(
+        testing.allocator,
+        completed_db,
+        foreign_changed.snapshot,
+    )) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(package_database.Code.external_generation_change, foreign_diag.code);
+    try testing.expectError(
+        error.DatabaseNativeArchitectureMismatch,
+        Runtime.verifyTerminalDatabase(testing.allocator, root, authorization.authorization, receipt),
+    );
+}
+
 
 test "native_unpack.test.absent database is distinct from partial foreign and healthy roots" {
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -10983,6 +11289,7 @@ fn verifyMaterializedDatabase(
     var captured = try captureDatabaseSnapshot(allocator, root, options);
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, architecture);
     var imported = switch (try package_database.importSnapshot(
         allocator,
         .{
@@ -11896,6 +12203,10 @@ fn materializePlanned(
     defer fresh_database.deinit();
     normalizeCapturedNativeArchitecture(
         &fresh_database.snapshot,
+        request.planning.program.target_architecture,
+    );
+    try validateCapturedNativeArchitecture(
+        fresh_database.snapshot,
         request.planning.program.target_architecture,
     );
     const fresh_generation = try package_database.generation(
@@ -17247,6 +17558,112 @@ fn publishRemovalRetry(
     });
 }
 
+fn lifecycleExactLockV2(
+    allocator: std.mem.Allocator,
+    target_architecture: []const u8,
+    request_sha256: [32]u8,
+    policy_sha256: [32]u8,
+    actions: []const native_authorization.Action,
+    final_state: []const native_authorization.FinalPackage,
+) !?exact_lock_v2.OwnedLock {
+    var local_artifacts: std.ArrayList(package_origin.LocalArtifactEvidence) = .empty;
+    defer local_artifacts.deinit(allocator);
+    var packages: std.ArrayList(exact_lock_v2.Package) = .empty;
+    defer packages.deinit(allocator);
+    const repository_id: [64]u8 = @splat('a');
+    const repository_snapshot: [32]u8 = @splat(0x22);
+    const signer: [20]u8 = @splat(0x11);
+    var used_repository = false;
+
+    for (final_state) |entry| {
+        switch (entry.state) {
+            .config_files => continue,
+            .triggers_pending, .triggers_awaited => return null,
+            .installed => {},
+        }
+        var matched_artifact: ?native_authorization.Artifact = null;
+        for (actions) |action| {
+            const artifact = action.artifact orelse continue;
+            if (std.mem.eql(u8, action.package, entry.name) and
+                std.mem.eql(u8, action.version, entry.version) and
+                std.mem.eql(u8, action.architecture, entry.architecture))
+            {
+                matched_artifact = artifact;
+            }
+        }
+        if (matched_artifact) |artifact| {
+            const origin = artifact.origin orelse return null;
+            switch (origin) {
+                .local_artifact => |local| {
+                    var seen = false;
+                    for (local_artifacts.items) |existing| {
+                        if (std.mem.eql(u8, &existing.artifact_id, &local.artifact_id)) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) try local_artifacts.append(allocator, local);
+                },
+                .authenticated_repository => return null,
+            }
+            try packages.append(allocator, .{
+                .name = entry.name,
+                .version = entry.version,
+                .architecture = entry.architecture,
+                .origin = origin,
+                .sha256 = artifact.sha256,
+                .declared_size = artifact.size,
+                .retention = .requested,
+                .dpkg_selection_hold = entry.dpkg_selection_hold,
+            });
+        } else {
+            used_repository = true;
+            var retained_hash = Sha256.init(.{});
+            retained_hash.update(digest_domain);
+            hashText(&retained_hash, "lifecycle-retained-package");
+            hashText(&retained_hash, entry.name);
+            hashText(&retained_hash, entry.version);
+            hashText(&retained_hash, entry.architecture);
+            try packages.append(allocator, .{
+                .name = entry.name,
+                .version = entry.version,
+                .architecture = entry.architecture,
+                .origin = .{
+                    .authenticated_repository = .{
+                        .repository_id = repository_id,
+                        .repository_snapshot_sha256 = repository_snapshot,
+                    },
+                },
+                .sha256 = retained_hash.finalResult(),
+                .declared_size = 1,
+                .retention = .retained,
+                .dpkg_selection_hold = entry.dpkg_selection_hold,
+            });
+        }
+    }
+
+    const repositories: []const exact_lock_v2.Repository = if (used_repository)
+        &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = repository_snapshot,
+            .release_sha256 = @splat(0x33),
+            .index_sha256 = @splat(0x44),
+            .signer_fingerprints = &.{signer},
+        }}
+    else
+        &.{};
+
+    return exact_lock_v2.create(allocator, .{
+        .target_architecture = target_architecture,
+        .request_sha256 = request_sha256,
+        .policy_sha256 = policy_sha256,
+        .repositories = repositories,
+        .local_artifacts = local_artifacts.items,
+        .packages = packages.items,
+        .verified_origins = true,
+    }) catch null;
+}
+
 fn compileLifecycleProgram(
     allocator: std.mem.Allocator,
     raw_request: []const u8,
@@ -17387,6 +17804,16 @@ fn compileLifecycleProgram(
     hashText(&binding_hash, &database.generation.sha256);
     for (archives) |archive| hashText(&binding_hash, &archive.sha256);
     const binding = binding_hash.finalResult();
+    var exact_lock = try lifecycleExactLockV2(
+        allocator,
+        external.architecture,
+        request_sha256,
+        binding,
+        actions.items,
+        final_state,
+    );
+    defer if (exact_lock) |*lock| lock.deinit();
+    const exact_lock_digest = if (exact_lock) |lock| lock.lock.digest_sha256 else binding;
     var authorization = try native_authorization.create(allocator, .{
         .backend = .native,
         .target_architecture = external.architecture,
@@ -17399,7 +17826,7 @@ fn compileLifecycleProgram(
         .exact_lock = .{
             .schema = exact_lock_v2.schema_id,
             .version = exact_lock_v2.schema_version,
-            .digest_sha256 = binding,
+            .digest_sha256 = exact_lock_digest,
         },
         .policy = .{
             .conffile = switch (external.policy) {
@@ -17546,6 +17973,7 @@ fn lifecycleDataStep(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var request = lifecyclePhaseRequest(
         execution,
         root,
@@ -17606,6 +18034,7 @@ fn lifecycleConfigurePackage(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     return materializeConfigure(allocator, lifecyclePhaseRequest(
         execution,
         root,
@@ -17640,6 +18069,7 @@ fn lifecycleRemovePackage(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     const selection = [_]ExternalPackageSelection{.{
         .name = package.name,
         .architecture = package.architecture,
@@ -17688,6 +18118,7 @@ fn lifecycleStateStep(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var current = switch (try package_database.importSnapshot(
         allocator,
         .{
@@ -17771,6 +18202,7 @@ fn lifecycleFreshFailure(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var request = lifecyclePhaseRequest(
         execution,
         root,
@@ -17814,6 +18246,7 @@ fn lifecycleDetailedState(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
@@ -17870,6 +18303,7 @@ fn lifecycleRestoredPackageState(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     return materializeRestoredPackageState(
         allocator,
         lifecyclePhaseRequest(
@@ -17913,6 +18347,7 @@ fn lifecycleTriggerDatabase(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     return materializeTriggerDatabase(
         allocator,
         lifecyclePhaseRequest(
@@ -17949,6 +18384,7 @@ fn lifecycleSyncTriggerRegistry(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{
@@ -18072,6 +18508,7 @@ fn lifecycleApplyTriggerEvents(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
@@ -18356,6 +18793,7 @@ fn lifecycleIncorporateTriggerQueue(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
@@ -18534,6 +18972,7 @@ fn nextPendingTriggerHandler(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{ .native_architecture = architecture, .snapshot = captured.snapshot },
@@ -18606,6 +19045,7 @@ fn lifecycleCompleteTriggerHandler(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
@@ -19187,6 +19627,7 @@ fn lifecycleAuxiliary(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
     return lifecycleAuxiliaryMutation(
         allocator,
         lifecyclePhaseRequest(
@@ -28084,6 +28525,7 @@ fn runLifecycleScript(
                 }
             }
             const disposition = nativeScriptDisposition(owned.outcome);
+            try validateLiveDatabaseNativeArchitecture(root, program.target_architecture);
             if (scriptRefreshesStatOverrides(disposition, kind))
                 _ = try refreshExecutionStatOverrides(
                     execution,
@@ -28428,6 +28870,10 @@ fn runLifecycleScript(
         },
         else => {},
     };
+    validateLiveDatabaseNativeArchitecture(root, program.target_architecture) catch |err| {
+        try attempt.requireRecovery(allocator, .script);
+        return err;
+    };
     var native_outcome: ?native_recovery.ScriptOutcome = null;
     var managed_checkpoint_sha256: ?native_recovery.Digest = null;
     if (execution.recovery) |runtime| {
@@ -28674,7 +29120,7 @@ const PostUnpackHook = struct {
     primary_failed: bool = false,
     unwind_succeeded: bool = false,
     failed_compensation: ?u32 = null,
-    diversion_failure: ?native_diversion.UpdateError = null,
+    diversion_failure: ?anyerror = null,
 };
 
 fn recoveredPostUnpackOutcome(
@@ -28781,11 +29227,13 @@ fn resumeRolledBackUnpack(
     return .{ .outcome = .rolled_back, .detail = "recovered_unpack_rollback" };
 }
 
-fn diversionUpdateFailure(err: anyerror) ?native_diversion.UpdateError {
+fn diversionUpdateFailure(err: anyerror) ?anyerror {
     return switch (err) {
         error.UnsupportedInPlaceDiversionUpdate => error.UnsupportedInPlaceDiversionUpdate,
         error.UnsupportedMidUnpackDiversionUpdate => error.UnsupportedMidUnpackDiversionUpdate,
         error.InvalidDiversionUpdate => error.InvalidDiversionUpdate,
+        error.DatabaseNativeArchitectureMismatch => error.DatabaseNativeArchitectureMismatch,
+        error.UnsafeDatabaseEntry => error.UnsafeDatabaseEntry,
         else => null,
     };
 }
@@ -29047,6 +29495,10 @@ fn finishLifecycleAttempt(
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(
         &captured.snapshot,
+        record.target_architecture,
+    );
+    try validateCapturedNativeArchitecture(
+        captured.snapshot,
         record.target_architecture,
     );
     const final_generation = try package_database.generation(
@@ -29437,6 +29889,7 @@ fn verifyLifecycleFinalClosure(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    try validateCapturedNativeArchitecture(captured.snapshot, architecture);
     var database = switch (try package_database.importSnapshot(
         allocator,
         .{
@@ -29758,6 +30211,7 @@ fn prepareNativeRecovery(
     const optional_files = .{
         .{ "status-old", package_database.status_old_path, initial_snapshot.status_old },
         .{ "arch", package_database.arch_path, initial_snapshot.arch },
+        .{ "arch-native", package_database.arch_native_path, initial_snapshot.arch_native },
         .{ "diversions", package_database.diversions_path, initial_snapshot.diversions },
         .{ "statoverride", package_database.statoverride_path, initial_snapshot.statoverride },
         .{ "triggers-file", package_database.triggers_file_path, initial_snapshot.triggers_file },
@@ -31188,6 +31642,7 @@ fn loadRecoveredLifecycleInputs(
     var status_seen = false;
     snapshot.status_old = null;
     snapshot.arch = null;
+    snapshot.arch_native = null;
     snapshot.diversions = null;
     snapshot.statoverride = null;
     snapshot.triggers_file = null;
@@ -31212,6 +31667,8 @@ fn loadRecoveredLifecycleInputs(
                     snapshot.status_old = recoveredFileEntry(blob, bytes);
                 } else if (std.mem.eql(u8, blob.key, "arch")) {
                     snapshot.arch = recoveredFileEntry(blob, bytes);
+                } else if (std.mem.eql(u8, blob.key, "arch-native")) {
+                    snapshot.arch_native = recoveredFileEntry(blob, bytes);
                 } else if (std.mem.eql(u8, blob.key, "diversions")) {
                     snapshot.diversions = recoveredFileEntry(blob, bytes);
                 } else if (std.mem.eql(u8, blob.key, "statoverride")) {
@@ -32850,6 +33307,7 @@ pub const Runtime = struct {
         var captured = try captureDatabaseSnapshot(allocator, root, .{});
         defer captured.deinit();
         normalizeCapturedNativeArchitecture(&captured.snapshot, authorization.target_architecture);
+        try validateCapturedNativeArchitecture(captured.snapshot, authorization.target_architecture);
         var database = switch (try package_database.importSnapshot(allocator, .{
             .native_architecture = authorization.target_architecture,
             .snapshot = captured.snapshot,
@@ -33372,6 +33830,7 @@ fn initializeNativeDatabase(
             var captured = try captureDatabaseSnapshot(allocator, root, .{});
             defer captured.deinit();
             normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+            try validateCapturedNativeArchitecture(captured.snapshot, program.target_architecture);
             var database = switch (try package_database.importSnapshot(
                 allocator,
                 .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
@@ -34572,8 +35031,13 @@ fn executeLifecycleProgramWithRequest(
             return err;
         };
     defer if (locked_capture) |*value| value.deinit();
-    if (locked_capture) |*value|
+    if (locked_capture) |*value| {
         normalizeCapturedNativeArchitecture(&value.snapshot, program.target_architecture);
+        validateCapturedNativeArchitecture(value.snapshot, program.target_architecture) catch |err| {
+            if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
+            return err;
+        };
+    }
     if (recovery_intent == null and
         locked_capture.?.absent != requiresDatabaseInitialization(program.*))
         return error.DatabasePresenceChanged;

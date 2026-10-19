@@ -38,6 +38,7 @@ pub const database_directory = "var/lib/dpkg";
 pub const status_path = "status";
 pub const status_old_path = "status-old";
 pub const arch_path = "arch";
+pub const arch_native_path = "arch-native";
 pub const diversions_path = "diversions";
 pub const statoverride_path = "statoverride";
 pub const info_directory = "info";
@@ -177,6 +178,7 @@ pub const Snapshot = struct {
     status: FileEntry,
     status_old: ?FileEntry = null,
     arch: ?FileEntry = null,
+    arch_native: ?FileEntry = null,
     diversions: ?FileEntry = null,
     statoverride: ?FileEntry = null,
     triggers_file: ?FileEntry = null,
@@ -2505,6 +2507,7 @@ pub fn generation(
         .{ .path = status_path, .entry = snapshot.status },
         .{ .path = status_old_path, .entry = snapshot.status_old },
         .{ .path = arch_path, .entry = snapshot.arch },
+        .{ .path = arch_native_path, .entry = snapshot.arch_native },
         .{ .path = diversions_path, .entry = snapshot.diversions },
         .{ .path = statoverride_path, .entry = snapshot.statoverride },
         .{ .path = triggers_file_path, .entry = snapshot.triggers_file },
@@ -5099,3 +5102,65 @@ test "package_database.test.long status fields import and republish unchanged" {
     try testing.expectEqualStrings(document, republished);
     try testing.expect(try verifySerializedStatus(allocator, republished, 1, .{}, .status) == null);
 }
+
+test "package_database.test.arch-native generation digest binds bytes mode and kind" {
+    const absent = test_fixtures.snapshot();
+    try testing.expect(absent.arch_native == null);
+    const absent_generation = try generation(testing.allocator, absent);
+
+    var explicit_absent = test_fixtures.snapshot();
+    explicit_absent.arch_native = null;
+    try testing.expectEqual(
+        absent_generation.sha256,
+        (try generation(testing.allocator, explicit_absent)).sha256,
+    );
+
+    var with_arch_native = absent;
+    with_arch_native.arch_native = regularFile("amd64\n");
+    const base_generation = try generation(testing.allocator, with_arch_native);
+    try testing.expect(!std.mem.eql(u8, &absent_generation.sha256, &base_generation.sha256));
+
+    var database = switch (try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = with_arch_native },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    try testing.expect((try verifyGeneration(testing.allocator, database, with_arch_native)) == null);
+
+    var bytes_changed = with_arch_native;
+    bytes_changed.arch_native = regularFile("arm64\n");
+    const bytes_generation = try generation(testing.allocator, bytes_changed);
+    try testing.expect(!std.mem.eql(u8, &base_generation.sha256, &bytes_generation.sha256));
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, bytes_changed)).?.code,
+    );
+
+    var mode_changed = with_arch_native;
+    mode_changed.arch_native = .{ .bytes = "amd64\n", .mode = 0o600 };
+    const mode_generation = try generation(testing.allocator, mode_changed);
+    try testing.expect(!std.mem.eql(u8, &base_generation.sha256, &mode_generation.sha256));
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, mode_changed)).?.code,
+    );
+
+    var kind_changed = with_arch_native;
+    kind_changed.arch_native = .{ .bytes = "amd64\n", .kind = .symlink, .mode = 0o644 };
+    const kind_generation = try generation(testing.allocator, kind_changed);
+    try testing.expect(!std.mem.eql(u8, &base_generation.sha256, &kind_generation.sha256));
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, kind_changed)).?.code,
+    );
+
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, absent)).?.code,
+    );
+}
+

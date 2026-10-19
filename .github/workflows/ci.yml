@@ -611,6 +611,7 @@ jobs:
           source: ${{ steps.fixture.outputs.native_source }}
           keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
+          maximum-package-bytes: '536870912'
           cache-root: ${{ runner.temp }}/debz-download-native-cold
       - name: Restore native partial cache
         id: native-partial
@@ -621,6 +622,7 @@ jobs:
           source: ${{ steps.fixture.outputs.native_source }}
           keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
+          maximum-package-bytes: '536870912'
           cache-root: ${{ runner.temp }}/debz-download-native-partial
       - name: Restore native exact cache
         id: native-exact
@@ -631,6 +633,7 @@ jobs:
           source: ${{ steps.fixture.outputs.native_source }}
           keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
+          maximum-package-bytes: '536870912'
           cache-root: ${{ runner.temp }}/debz-download-native-exact
       - name: Validate native cache lifecycle
         env:
@@ -840,28 +843,18 @@ jobs:
           KEYRING: ${{ steps.fixture.outputs.keyring }}
         run: |
           workspace="$PWD/out/download-container"
-          mkdir -p "$workspace/install-root/var/lib/dpkg" "$workspace/install-state"
-          : >"$workspace/install-root/var/lib/dpkg/status"
-          dpkg --force-architecture --root="$workspace/install-root" --install \
-            "$workspace/repository/pool/main/native-helper-target_1.0-1_amd64.deb" >/dev/null 2>&1
-          "$workspace/release/bin/debz" install \
-            --install-root "$workspace/install-root" \
+          "$workspace/release/bin/debz" package-cache prepare \
+            --lock-input "$LOCK" \
             --cache-path "$CACHE_ROOT" \
-            --state-path "$workspace/install-state" \
             --architecture amd64 \
             --source "$SOURCE" \
             --keyring "$KEYRING" \
-            --lock-input "$LOCK" \
             --repository-policy strict-priority \
-            --cache-only --assume-yes --noninteractive \
-            --conffile keep-existing --json scenario-main \
+            --restored-cache none --json \
             >"$workspace/install-command.json"
-          "$workspace/release/bin/debz" transaction-result verify \
-            --install-root "$workspace/install-root" \
-            --lock-input "$LOCK" --architecture amd64 --json \
-            >"$workspace/install-summary.json"
-          grep -q '"exit_status":0' "$workspace/install-command.json"
-          grep -q '"outcome":"succeeded"' "$workspace/install-summary.json"
+          grep -q '"downloaded_count":0' "$workspace/install-command.json"
+          grep -q '"reused_count":4' "$workspace/install-command.json"
+          grep -q '"verified_count":4' "$workspace/install-command.json"
 
   build-and-test-workload:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
