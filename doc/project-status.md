@@ -1,12 +1,14 @@
 # Project status and API overview
 
-`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It owns repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, diagnostics, and an install-root-aware `dpkg` execution boundary.
+`debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It owns repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, diagnostics, and an install-root-aware native transaction execution boundary.
 
-The current release remains legacy-capable and does not change backend
-defaults. Exact legacy/native identity, active-operation refusal, immutable
-historical verification, Actions capability evidence, and the remaining
-native-only deletion inventory are tracked in
-[Legacy compatibility](legacy-compatibility.md).
+Following the completed native-only production cutover (`#274` / `#86`), `debz`
+executes Debian package transactions through the native Zig transaction engine
+(`native_zig` / `native`) as the sole production backend (`current_release_mode:
+"native_only"`). `legacy_dpkg` is removed from production execution and retained
+only as a rejected compatibility spelling and in standalone reference/differential
+test harnesses, while historical legacy artifacts remain verifiable read-only;
+see [Legacy compatibility](legacy-compatibility.md).
 
 Required PR tests now exercise deterministic signed Debian stable and Ubuntu
 26.04 fixture repositories and disposable dpkg roots on native amd64 and arm64.
@@ -74,16 +76,15 @@ package disappearance, shared roots, and unsupported filesystem/database
 features still hand off in these private adapters. Their fixture apply, journal,
 recovery, and release entry points are not exported; the separate typed runtime
 described below never hands off to legacy execution.
-Native backend selection remains `BackendUnavailable` before mutation. The
-private adapter composes the existing lock, journal, and mutation engine;
+The private adapter composes the existing lock, journal, and mutation engine;
 `test-native-materialization` compares real install, upgrade, downgrade,
 reinstall, and repeated unpack results with dpkg on disposable roots. Native
 amd64/arm64 CI runs that gate and `test-native-conffiles` in Debug and ReleaseSafe.
 The latter compares each unpack/configure/remove/purge phase against dpkg,
 including preservation of local and co-owned contents. Zero timestamps on
 newly materialized directories are explicitly refused, not approximated.
-Production execution, recovery, and provenance integration remain later
-roadmap work. See
+Production execution, recovery, and provenance integration are shipped through
+the native runtime described below. See
 [Native unpack and file ownership](native-unpack.md) and
 [Native conffile and removal acceptance](native-conffiles.md).
 
@@ -199,19 +200,20 @@ capability before package mutation and persists the binding in a v2 request.
 Missing helper targets are refused without placeholders; package-owned target
 bytes remain unchanged. Interpreter recovery, action counters, and mutation
 callback state are now explicitly execution-local rather than thread-local.
-`debz.native_runtime` exposes experimental caller-owned execution, recovery,
+`debz.native_runtime` exposes caller-owned execution, recovery,
 terminal receipts, and acknowledgment with mandatory bundled helper binding.
 It accepts prepared programs and immutable archive bytes rather than fixture
 requests or command-shaped executor inputs, and refuses host or mismatched
-roots. The core CLI now supports explicit `--transaction-backend native` for
-genuine v3 lock planning/replay and verified download, with backend-bound solver
-policy and no v1 conversion. Experimental core native mutation now captures
-complete production evidence and executes prepared programs under the caller's
-root attempt. Persisted-input recovery and receipt-backed outer completion
-acknowledge native evidence before clearing the caller record, including known
-terminal failure. Native pre-intent and pending-ack records cannot be generically
-reclaimed. Orchestrated consumers and full parity remain pending; legacy remains
-default. See the
+roots. `native_zig` (`native`) is now the default and only production backend
+across `ProductBackend`, `AptSystemBackend`, `PackageFamilyBackend`,
+`RepositoryBackend`, the CLI, and GitHub Actions (`current_release_mode:
+"native_only"`), while `legacy_dpkg` requests fail closed with
+`UnsupportedBackend` / `LegacyCapabilityRequired` before mutation. Core native
+mutation captures complete production evidence and executes prepared programs
+under the caller's root attempt. Persisted-input recovery and receipt-backed
+outer completion acknowledge native evidence before clearing the caller record,
+including known terminal failure. Native pre-intent and pending-ack records
+cannot be generically reclaimed. See the
 [typed runtime contract](native-recovery.md#experimental-typed-runtime-api).
 Exact-lock v2 permits an empty installed closure for last-package removal/purge,
 without changing existing lock bytes or hashes. Native preparation still binds
