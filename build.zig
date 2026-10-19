@@ -858,6 +858,7 @@ pub fn build(b: *std.Build) void {
             .strip = !native_helper_debug_info,
         }),
     });
+    reference_runtime_tests.root_module.addImport("debz", debz_debug);
     const run_reference_runtime_tests = b.addRunArtifact(reference_runtime_tests);
     const reference_runtime_test_step = b.step(
         "test-real-snapshot-reference-runtime",

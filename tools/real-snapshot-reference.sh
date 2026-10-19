@@ -34,6 +34,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
   "$repository_root/tools/real-snapshot-reference.sh" \
   "$repository_root/tools/real-snapshot-reference-launcher.zig" \
   "$repository_root/tools/real-snapshot-reference-runtime.zig" \
+  "$repository_root/tools/real-snapshot-reference-guest.zig" \
   "$repository_root/src/private_network.zig" \
   "$repository_root/tools/real-snapshot-reference-order.zig" \
   "$repository_root/tools/real-snapshot-reference-paths.zig" \
@@ -170,6 +171,7 @@ runtime="$workspace/reference-runtime"
 "$workspace/runtime-tool/bin/debz-reference-runtime" record \
   "$architecture" "$lock" "$cache" "$reference_dpkg" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
 timeout --signal=TERM --kill-after=30s 40m \
   "$workspace/runtime-tool/bin/debz-reference-order" \
     --launcher "$launcher" --runtime "$runtime" --architecture "$architecture" \

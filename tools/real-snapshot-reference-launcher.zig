@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const private_network = @import("private_network");
 const reference_namespaces = linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET;
 const runtime = @import("real-snapshot-reference-runtime.zig");
+const guest = @import("real-snapshot-reference-guest.zig");
 
 const OpenHow = extern struct { flags: u64, mode: u64 = 0, resolve: u64 };
 const resolve_no_symlinks: u64 = 0x02 | 0x04;
@@ -1227,6 +1228,7 @@ const Child = struct {
     archive_mountpoint: Pinned,
     dpkg: Pinned,
     runtime: *const runtime.Bound,
+    guest: *const guest.Bound,
     runtime_mountpoints: RuntimeMountpoints,
     archive: ?Pinned,
     boot_id: ?[37]u8,
@@ -1649,6 +1651,10 @@ fn childMain(input: Child) noreturn {
         std.log.err("reference runtime before-chroot refusal: {s}", .{@errorName(err)});
         fail(status, 12, .STALE);
     };
+    child.guest.verify(child.options.root) catch |err| {
+        std.log.err("reference guest before-chroot refusal: {s}", .{@errorName(err)});
+        fail(status, 17, .STALE);
+    };
     if (child.options.archive) |path| {
         const reopened = openPinned(path, false) catch fail(status, 3, .STALE);
         if (!same(reopened.metadata, child.archive.?.metadata))
@@ -1665,6 +1671,10 @@ fn childMain(input: Child) noreturn {
     child.runtime.verify("") catch |err| {
         std.log.err("reference runtime before-exec refusal: {s}", .{@errorName(err)});
         fail(status, 12, .STALE);
+    };
+    child.guest.verify("") catch |err| {
+        std.log.err("reference guest before-exec refusal: {s}", .{@errorName(err)});
+        fail(status, 17, .STALE);
     };
     const allocator = std.heap.page_allocator;
     const loader = stageRuntime(child, allocator) catch |err| {
@@ -1952,6 +1962,17 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         _ = linux.close(script.fd);
     }
     const boot_id = if (options.profile == .systemd) try readBootId() else null;
+    // Pin guest helpers, interpreters, loader configs and late providers after
+    // RuntimeMountpoints.create restores /etc mtime so parent directory pins see
+    // the exact pre-exec metadata.
+    var guest_bound = try guest.Bound.init(
+        allocator,
+        bound.guest_source,
+        options.root,
+        options.architecture,
+        bound.manifest().lock_sha256,
+    );
+    defer guest_bound.deinit();
 
     var fds: [2]i32 = undefined;
     _ = try checked(linux.pipe2(&fds, .{ .CLOEXEC = true }));
@@ -1972,6 +1993,7 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         .archive_mountpoint = target,
         .dpkg = dpkg,
         .runtime = bound,
+        .guest = &guest_bound,
         .runtime_mountpoints = mountpoints,
         .archive = archive,
         .boot_id = boot_id,

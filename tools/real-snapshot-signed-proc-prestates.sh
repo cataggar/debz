@@ -97,6 +97,7 @@ require_protected_file "$repository_root/tools/real-snapshot-reference-order.zig
 require_protected_file "$repository_root/tools/real-snapshot-reference-paths.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/real-snapshot-reference-runtime.zig"
+require_protected_file "$repository_root/tools/real-snapshot-reference-guest.zig"
 require_protected_file "$repository_root/src/private_network.zig"
 require_protected_file "$repository_root/zig-out/bin/debz-native-dpkg-reference"
 # The staged toolchain lives outside the fixed PATH above, so the caller names
@@ -277,6 +278,7 @@ runtime=$tools/reference-runtime
 "$tools/runtime-tool/bin/debz-reference-runtime" record \
   amd64 "$lock" "$cache" "$pinned" "$runtime"
 cp -- "$runtime/binding.json" "$evidence/reference-runtime-binding.json"
+cp -- "$runtime/guest.json" "$evidence/reference-guest-binding.json"
 
 # This oracle has only the four reviewed packages registered. Its one possible
 # libc6 callback is denied before exec; --pending is never used on the closure.
