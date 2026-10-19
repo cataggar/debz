@@ -1,5 +1,6 @@
 const std = @import("std");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const package_origin = @import("package_origin.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const v1 = @import("transaction_provenance.zig");
@@ -70,163 +71,34 @@ pub const Result = struct {
         return output.toOwnedSlice();
     }
 
-    fn testExecutionMetadataBoundToExactLock() !void {
-        const digest: [32]u8 = @splat(0x31);
-        const artifact: package_origin.LocalArtifactEvidence = .{
-            .artifact_id = package_origin.artifactIdFromSha256(digest),
-            .sha256 = digest,
-            .size = 31,
-            .package = "demo",
-            .version = "1",
-            .architecture = "amd64",
-            .acquisition_url = "file:///demo.deb",
-            .trust_mode = .pinned_sha256,
+    pub fn legacyIdentity(_: Result) legacy_compat.Identity {
+        return .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
         };
-        const locked_package: exact_lock_v2.Package = .{
-            .name = artifact.package,
-            .version = artifact.version,
-            .architecture = artifact.architecture,
-            .origin = .{ .local_artifact = artifact },
-            .sha256 = artifact.sha256,
-            .declared_size = artifact.size,
-            .retention = .requested,
-            .dpkg_selection_hold = false,
-        };
-        var lock = try exact_lock_v2.create(std.testing.allocator, .{
-            .target_architecture = "amd64",
-            .request_sha256 = @splat(1),
-            .policy_sha256 = @splat(2),
-            .repositories = &.{},
-            .local_artifacts = &.{artifact},
-            .packages = &.{locked_package},
-            .verified_origins = true,
-        });
-        defer lock.deinit();
-        const package: PackageEvidence = .{
-            .name = artifact.package,
-            .version = artifact.version,
-            .architecture = artifact.architecture,
-            .origin = .{ .local_artifact = artifact },
-            .package_sha256 = artifact.sha256,
-            .cas_sha256 = artifact.sha256,
-            .declared_size = artifact.size,
-        };
-        const verification: FinalVerification = .{
-            .status = .exact_match,
-            .installed_state_sha256 = @splat(3),
-            .package_origins_sha256 = lock.lock.digest_sha256,
-            .detail = "verified",
-        };
-        const input: ExecutionInput = .{
-            .exact_lock = &lock.lock,
-            .target_architecture = lock.lock.target_architecture,
-            .request_sha256 = lock.lock.request_sha256,
-            .solver_policy_sha256 = lock.lock.policy_sha256,
-            .repositories = &.{},
-            .packages = &.{package},
-            .journal_steps = &.{},
-            .final_verification = verification,
-        };
-        const report: transaction_executor.Report = .{
-            .allocator = std.testing.allocator,
-            .arena = undefined,
-            .commands = &.{},
-            .plan_sha256 = @splat(4),
-            .transaction_state = .complete,
-            .root_identity = @splat(5),
-            .policy_sha256 = @splat(6),
-            .lock_sha256 = lock.lock.digest_sha256,
-            .failure = null,
-        };
-        const recovery_report: transaction_executor.RecoveryReport = .{
-            .allocator = std.testing.allocator,
-            .arena = undefined,
-            .state = .complete,
-            .commands = &.{},
-            .plan_sha256 = report.plan_sha256,
-            .root_identity = report.root_identity,
-            .policy_sha256 = report.policy_sha256,
-            .lock_sha256 = report.lock_sha256,
-            .failure = null,
-        };
-        var execution = try createFromExecution(std.testing.allocator, input, report);
-        defer execution.deinit();
-        var recovered = try createFromRecovery(
-            std.testing.allocator,
-            input,
-            recovery_report,
-        );
-        defer recovered.deinit();
-        try std.testing.expectEqualStrings(
-            lock.lock.target_architecture,
-            execution.result.target_architecture,
-        );
-        try std.testing.expectEqualSlices(
-            u8,
-            &lock.lock.request_sha256,
-            &recovered.result.request_sha256,
-        );
+    }
 
-        const Mismatch = enum { architecture, request, policy };
-        inline for ([_]Mismatch{ .architecture, .request, .policy }) |kind| {
-            var mismatch = input;
-            const expected: anyerror = switch (kind) {
-                .architecture => blk: {
-                    mismatch.target_architecture = "arm64";
-                    break :blk error.LockArchitectureMismatch;
-                },
-                .request => blk: {
-                    mismatch.request_sha256 = @splat(0xaa);
-                    break :blk error.LockRequestMismatch;
-                },
-                .policy => blk: {
-                    mismatch.solver_policy_sha256 = @splat(0xbb);
-                    break :blk error.LockPolicyMismatch;
-                },
-            };
-            try std.testing.expectError(
-                expected,
-                createFromExecution(std.testing.allocator, mismatch, report),
-            );
-            try std.testing.expectError(
-                expected,
-                createFromRecovery(std.testing.allocator, mismatch, recovery_report),
-            );
-        }
-        const VerificationMismatch = enum {
-            installed_state_null,
-            package_origins_null,
-            package_origins_mismatch,
-        };
-        inline for ([_]VerificationMismatch{
-            .installed_state_null,
-            .package_origins_null,
-            .package_origins_mismatch,
-        }) |kind| {
-            var mismatch = input;
-            const expected: anyerror = switch (kind) {
-                .installed_state_null => blk: {
-                    mismatch.final_verification.installed_state_sha256 = null;
-                    break :blk error.MissingFinalVerificationEvidence;
-                },
-                .package_origins_null => blk: {
-                    mismatch.final_verification.package_origins_sha256 = null;
-                    break :blk error.MissingFinalVerificationEvidence;
-                },
-                .package_origins_mismatch => blk: {
-                    mismatch.final_verification.package_origins_sha256 = @splat(0xcc);
-                    break :blk error.PackageOriginsDigestMismatch;
-                },
-            };
-            try std.testing.expectError(
-                expected,
-                createFromExecution(std.testing.allocator, mismatch, report),
-            );
-            try std.testing.expectError(
-                expected,
-                createFromRecovery(std.testing.allocator, mismatch, recovery_report),
-            );
-        }
+    pub fn verifyCompletedHistorical(
+        self: Result,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(self: Result) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
     }
 };
 
@@ -243,6 +115,7 @@ pub const OwnedResult = struct {
 };
 
 pub const Error = v1.Error || package_origin.ValidationError || error{
+    LegacyTransactionProvenanceV2Retired,
     UnusedRepository,
     InvalidPackageOrigin,
     PackageOriginMismatch,
@@ -269,86 +142,33 @@ pub const ExecutionInput = struct {
     final_verification: FinalVerification,
 };
 
-pub fn createFromExecution(
-    allocator: std.mem.Allocator,
-    input: ExecutionInput,
-    report: transaction_executor.Report,
-) !OwnedResult {
-    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
-    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
-        return error.LockDigestMismatch;
-    try validateExecutionLockMetadata(input);
-    try verifyLockEvidence(
-        allocator,
-        input.exact_lock.*,
-        input.repositories,
-        input.packages,
-        null,
-    );
-    var temporary = std.heap.ArenaAllocator.init(allocator);
-    defer temporary.deinit();
-    const arena = temporary.allocator();
-    const commands = try commandsFromReport(arena, report.commands);
-    return create(allocator, .{
-        .target_architecture = input.exact_lock.target_architecture,
-        .request_sha256 = input.exact_lock.request_sha256,
-        .solver_policy_sha256 = input.exact_lock.policy_sha256,
-        .executor_policy_sha256 = report.policy_sha256,
-        .plan_sha256 = report.plan_sha256,
-        .lock_sha256 = lock_sha256,
-        .repositories = input.repositories,
-        .packages = input.packages,
-        .commands = commands,
-        .journal_steps = input.journal_steps,
-        .recovery_steps = input.recovery_steps,
-        .final_verification = input.final_verification,
-        .outcome = if (report.succeeded()) .succeeded else switch (report.transaction_state) {
-            .interrupted => .interrupted,
-            .in_progress, .dpkg_failed, .verification_failed => .recovery_required,
-            else => .failed,
-        },
-        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
-    });
+pub fn legacyIdentity() legacy_compat.Identity {
+    return .{
+        .schema = schema_id,
+        .version = schema_version,
+        .backend = .legacy_dpkg,
+    };
 }
 
-pub fn createFromRecovery(
-    allocator: std.mem.Allocator,
-    input: ExecutionInput,
-    report: transaction_executor.RecoveryReport,
-) !OwnedResult {
-    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
-    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
-        return error.LockDigestMismatch;
-    try validateExecutionLockMetadata(input);
-    try verifyLockEvidence(
-        allocator,
-        input.exact_lock.*,
-        input.repositories,
-        input.packages,
-        null,
+pub fn verifyCompletedHistorical() legacy_compat.PolicyError!legacy_compat.Disposition {
+    const disposition = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .completed_historical_verification,
+        legacyIdentity(),
     );
-    var temporary = std.heap.ArenaAllocator.init(allocator);
-    defer temporary.deinit();
-    const commands = try commandsFromReport(temporary.allocator(), report.commands);
-    return create(allocator, .{
-        .target_architecture = input.exact_lock.target_architecture,
-        .request_sha256 = input.exact_lock.request_sha256,
-        .solver_policy_sha256 = input.exact_lock.policy_sha256,
-        .executor_policy_sha256 = report.policy_sha256,
-        .plan_sha256 = report.plan_sha256,
-        .lock_sha256 = lock_sha256,
-        .repositories = input.repositories,
-        .packages = input.packages,
-        .commands = commands,
-        .journal_steps = input.journal_steps,
-        .recovery_steps = input.recovery_steps,
-        .final_verification = input.final_verification,
-        .outcome = if (report.succeeded()) .succeeded else if (report.state == .interrupted)
-            .interrupted
-        else
-            .recovery_required,
-        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
-    });
+    std.debug.assert(disposition == .historical_read_only);
+    return disposition;
+}
+
+pub fn requireExecutionAuthority() Error!void {
+    _ = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .new_execution,
+        legacyIdentity(),
+    );
+    return error.LegacyTransactionProvenanceV2Retired;
 }
 
 fn validateExecutionLockMetadata(input: ExecutionInput) Error!void {
@@ -370,6 +190,7 @@ fn validateExecutionLockMetadata(input: ExecutionInput) Error!void {
 }
 
 pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceV2Retired;
     if (input.target_architecture.len == 0) return error.InvalidIdentity;
     if (input.outcome == .succeeded) {
         if (input.final_verification.status != .exact_match)
@@ -648,6 +469,7 @@ pub fn validateDocument(
     hash.update("}");
     const actual = hash.finalResult();
     if (!std.mem.eql(u8, &expected, &actual)) return error.DigestMismatch;
+    _ = try verifyCompletedHistorical();
     return .{
         .bytes = try allocator.dupe(u8, source),
         .digest_sha256 = expected,
@@ -680,6 +502,7 @@ pub const Store = struct {
     }
 
     pub fn writeAtomic(self: Store, allocator: std.mem.Allocator, result: Result) !void {
+        if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceV2Retired;
         const bytes = try result.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
@@ -1252,7 +1075,342 @@ test "transaction_provenance_v2.test.local artifact evidence has no repository s
 }
 
 test "transaction_provenance_v2.test.execution metadata is bound to exact lock" {
-    try Result.testExecutionMetadataBoundToExactLock();
+    try testExecutionMetadataBoundToExactLock();
+}
+
+pub fn createFromExecution(
+    allocator: std.mem.Allocator,
+    input: ExecutionInput,
+    report: transaction_executor.Report,
+) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceV2Retired;
+    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try validateExecutionLockMetadata(input);
+    try verifyLockEvidence(
+        allocator,
+        input.exact_lock.*,
+        input.repositories,
+        input.packages,
+        null,
+    );
+    var temporary = std.heap.ArenaAllocator.init(allocator);
+    defer temporary.deinit();
+    const arena = temporary.allocator();
+    const commands = try commandsFromReport(arena, report.commands);
+    return create(allocator, .{
+        .target_architecture = input.exact_lock.target_architecture,
+        .request_sha256 = input.exact_lock.request_sha256,
+        .solver_policy_sha256 = input.exact_lock.policy_sha256,
+        .executor_policy_sha256 = report.policy_sha256,
+        .plan_sha256 = report.plan_sha256,
+        .lock_sha256 = lock_sha256,
+        .repositories = input.repositories,
+        .packages = input.packages,
+        .commands = commands,
+        .journal_steps = input.journal_steps,
+        .recovery_steps = input.recovery_steps,
+        .final_verification = input.final_verification,
+        .outcome = if (report.succeeded()) .succeeded else switch (report.transaction_state) {
+            .interrupted => .interrupted,
+            .in_progress, .dpkg_failed, .verification_failed => .recovery_required,
+            else => .failed,
+        },
+        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
+    });
+}
+
+pub fn createFromRecovery(
+    allocator: std.mem.Allocator,
+    input: ExecutionInput,
+    report: transaction_executor.RecoveryReport,
+) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceV2Retired;
+    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try validateExecutionLockMetadata(input);
+    try verifyLockEvidence(
+        allocator,
+        input.exact_lock.*,
+        input.repositories,
+        input.packages,
+        null,
+    );
+    var temporary = std.heap.ArenaAllocator.init(allocator);
+    defer temporary.deinit();
+    const commands = try commandsFromReport(temporary.allocator(), report.commands);
+    return create(allocator, .{
+        .target_architecture = input.exact_lock.target_architecture,
+        .request_sha256 = input.exact_lock.request_sha256,
+        .solver_policy_sha256 = input.exact_lock.policy_sha256,
+        .executor_policy_sha256 = report.policy_sha256,
+        .plan_sha256 = report.plan_sha256,
+        .lock_sha256 = lock_sha256,
+        .repositories = input.repositories,
+        .packages = input.packages,
+        .commands = commands,
+        .journal_steps = input.journal_steps,
+        .recovery_steps = input.recovery_steps,
+        .final_verification = input.final_verification,
+        .outcome = if (report.succeeded()) .succeeded else if (report.state == .interrupted)
+            .interrupted
+        else
+            .recovery_required,
+        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
+    });
+}
+
+fn testExecutionMetadataBoundToExactLock() !void {
+    const digest: [32]u8 = @splat(0x31);
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = 31,
+        .package = "demo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "file:///demo.deb",
+        .trust_mode = .pinned_sha256,
+    };
+    const locked_package: exact_lock_v2.Package = .{
+        .name = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .origin = .{ .local_artifact = artifact },
+        .sha256 = artifact.sha256,
+        .declared_size = artifact.size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{artifact},
+        .packages = &.{locked_package},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const package: PackageEvidence = .{
+        .name = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .origin = .{ .local_artifact = artifact },
+        .package_sha256 = artifact.sha256,
+        .cas_sha256 = artifact.sha256,
+        .declared_size = artifact.size,
+    };
+    const verification: FinalVerification = .{
+        .status = .exact_match,
+        .installed_state_sha256 = @splat(3),
+        .package_origins_sha256 = lock.lock.digest_sha256,
+        .detail = "verified",
+    };
+    const input: ExecutionInput = .{
+        .exact_lock = &lock.lock,
+        .target_architecture = lock.lock.target_architecture,
+        .request_sha256 = lock.lock.request_sha256,
+        .solver_policy_sha256 = lock.lock.policy_sha256,
+        .repositories = &.{},
+        .packages = &.{package},
+        .journal_steps = &.{},
+        .final_verification = verification,
+    };
+    const report: transaction_executor.Report = .{
+        .allocator = std.testing.allocator,
+        .arena = undefined,
+        .commands = &.{},
+        .plan_sha256 = @splat(4),
+        .transaction_state = .complete,
+        .root_identity = @splat(5),
+        .policy_sha256 = @splat(6),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .failure = null,
+    };
+    const recovery_report: transaction_executor.RecoveryReport = .{
+        .allocator = std.testing.allocator,
+        .arena = undefined,
+        .state = .complete,
+        .commands = &.{},
+        .plan_sha256 = report.plan_sha256,
+        .root_identity = report.root_identity,
+        .policy_sha256 = report.policy_sha256,
+        .lock_sha256 = report.lock_sha256,
+        .failure = null,
+    };
+    var execution = try createFromExecution(std.testing.allocator, input, report);
+    defer execution.deinit();
+    var recovered = try createFromRecovery(
+        std.testing.allocator,
+        input,
+        recovery_report,
+    );
+    defer recovered.deinit();
+    try std.testing.expectEqualStrings(
+        lock.lock.target_architecture,
+        execution.result.target_architecture,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &lock.lock.request_sha256,
+        &recovered.result.request_sha256,
+    );
+
+    const Mismatch = enum { architecture, request, policy };
+    inline for ([_]Mismatch{ .architecture, .request, .policy }) |kind| {
+        var mismatch = input;
+        const expected: anyerror = switch (kind) {
+            .architecture => blk: {
+                mismatch.target_architecture = "arm64";
+                break :blk error.LockArchitectureMismatch;
+            },
+            .request => blk: {
+                mismatch.request_sha256 = @splat(0xaa);
+                break :blk error.LockRequestMismatch;
+            },
+            .policy => blk: {
+                mismatch.solver_policy_sha256 = @splat(0xbb);
+                break :blk error.LockPolicyMismatch;
+            },
+        };
+        try std.testing.expectError(
+            expected,
+            createFromExecution(std.testing.allocator, mismatch, report),
+        );
+        try std.testing.expectError(
+            expected,
+            createFromRecovery(std.testing.allocator, mismatch, recovery_report),
+        );
+    }
+    const VerificationMismatch = enum {
+        installed_state_null,
+        package_origins_null,
+        package_origins_mismatch,
+    };
+    inline for ([_]VerificationMismatch{
+        .installed_state_null,
+        .package_origins_null,
+        .package_origins_mismatch,
+    }) |kind| {
+        var mismatch = input;
+        const expected: anyerror = switch (kind) {
+            .installed_state_null => blk: {
+                mismatch.final_verification.installed_state_sha256 = null;
+                break :blk error.MissingFinalVerificationEvidence;
+            },
+            .package_origins_null => blk: {
+                mismatch.final_verification.package_origins_sha256 = null;
+                break :blk error.MissingFinalVerificationEvidence;
+            },
+            .package_origins_mismatch => blk: {
+                mismatch.final_verification.package_origins_sha256 = @splat(0xcc);
+                break :blk error.PackageOriginsDigestMismatch;
+            },
+        };
+        try std.testing.expectError(
+            expected,
+            createFromExecution(std.testing.allocator, mismatch, report),
+        );
+        try std.testing.expectError(
+            expected,
+            createFromRecovery(std.testing.allocator, mismatch, recovery_report),
+        );
+    }
+}
+
+test "transaction_provenance_v2.test.native_only_cutover_retires_v2_generation_and_retains_historical_verification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_name = "transaction-result.json";
+    const sidecar_name = "transaction-result.json.legacy-capability-evidence.json";
+
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, result_name, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    const digest: [32]u8 = @splat(0x44);
+    const artifact: package_origin.LocalArtifactEvidence = .{
+        .artifact_id = package_origin.artifactIdFromSha256(digest),
+        .sha256 = digest,
+        .size = 44,
+        .package = "vendor-repo",
+        .version = "1",
+        .architecture = "amd64",
+        .acquisition_url = "https://example.test/vendor.deb",
+        .trust_mode = .verified_https,
+    };
+    const package: PackageEvidence = .{
+        .name = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .origin = .{ .local_artifact = artifact },
+        .package_sha256 = artifact.sha256,
+        .cas_sha256 = artifact.sha256,
+        .declared_size = artifact.size,
+    };
+    var owned = try create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .solver_policy_sha256 = @splat(2),
+        .executor_policy_sha256 = @splat(3),
+        .plan_sha256 = @splat(4),
+        .lock_sha256 = @splat(5),
+        .repositories = &.{},
+        .packages = &.{package},
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(6),
+            .package_origins_sha256 = @splat(5),
+            .detail = "verified",
+        },
+        .outcome = .succeeded,
+    });
+    defer owned.deinit();
+    const json = try owned.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    var validated = try validateDocument(
+        std.testing.allocator,
+        json,
+        maximum_document_bytes,
+    );
+    defer validated.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &owned.result.digest_sha256,
+        &validated.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try owned.result.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        owned.result.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(
+            .native_only,
+            .native,
+            .completed_historical_verification,
+            legacyIdentity(),
+        ),
+    );
 }
 
 test "transaction_provenance_v2.test.large reversed evidence uses bounded sorted verification" {

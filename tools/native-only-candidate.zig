@@ -1611,6 +1611,30 @@ test "candidateFailures and CLI refuse shipped legacy routes without host interp
         &failures,
         "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default; retain historical decoder and typed refusal (#279/#285)",
     ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/exact_lock.zig: candidate cutover task: stop creating exact-lock v1; retain decode/verify (#282)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_provenance.zig: candidate cutover task: stop creating legacy result v1; retain verification (#282)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_provenance_v2.zig: candidate cutover task: stop creating repository legacy result v2; retain verification (#282)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/package_cache_workflow.zig: candidate cutover task: stop creating legacy cache v1 contracts; retain historical verification (#282)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/transaction_result_summary.zig: candidate cutover task: stop creating legacy result summary v1; retain historical verification (#282)",
+    ));
+    try testing.expect(!hasFailureContaining(
+        &failures,
+        "src/system_profile.zig: candidate cutover task: stop executing profile v1/default; retain exact-byte decoder (#282)",
+    ));
 
     const options = @import("native_only_candidate_options");
     var env = std.process.Environ.Map.init(alloc);

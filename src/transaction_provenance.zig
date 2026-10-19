@@ -1,5 +1,6 @@
 const std = @import("std");
 const exact_lock = @import("exact_lock.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const transaction_executor = @import("transaction_executor.zig");
 
 pub const schema_id = "https://debz.dev/schema/transaction-result-v1";
@@ -99,6 +100,36 @@ pub const Result = struct {
         try writeDocument(self, &output.writer);
         return output.toOwnedSlice();
     }
+
+    pub fn legacyIdentity(_: Result) legacy_compat.Identity {
+        return .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: Result,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(self: Result) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
+    }
 };
 
 pub const OwnedResult = struct {
@@ -114,6 +145,7 @@ pub const OwnedResult = struct {
 };
 
 pub const Error = error{
+    LegacyTransactionProvenanceRetired,
     UnsupportedSchema,
     DocumentTooLarge,
     DigestMismatch,
@@ -132,7 +164,7 @@ pub const Error = error{
     InvalidDigest,
     MissingLockDigest,
     LockDigestMismatch,
-};
+} || legacy_compat.PolicyError;
 
 pub const ExecutionInput = struct {
     exact_lock: *const exact_lock.Lock,
@@ -146,103 +178,18 @@ pub const ExecutionInput = struct {
     final_verification: FinalVerification,
 };
 
-/// Converts the executor's observed argv/environment, artifact digests,
-/// journal state, plan/policy/lock bindings, and failure into schema v1.
-pub fn createFromExecution(
-    allocator: std.mem.Allocator,
-    input: ExecutionInput,
-    report: transaction_executor.Report,
-) !OwnedResult {
-    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
-    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
-        return error.LockDigestMismatch;
-    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
-    var temporary = std.heap.ArenaAllocator.init(allocator);
-    defer temporary.deinit();
-    const arena = temporary.allocator();
-    const commands = try arena.alloc(CommandEvidence, report.commands.len);
-    for (report.commands, 0..) |command, index| {
-        const environment = try arena.alloc(EnvironmentEntry, command.environment.len);
-        for (command.environment, 0..) |entry, environment_index| environment[environment_index] = .{
-            .key = entry.key,
-            .value = entry.value,
-        };
-        commands[index] = .{
-            .phase = @tagName(command.phase),
-            .package = command.package,
-            .argv = command.argv,
-            .environment = environment,
-            .command_sha256 = command.command_sha256,
-            .artifact_sha256 = command.artifact_sha256,
-        };
-    }
-
-    return create(allocator, .{
-        .target_architecture = input.target_architecture,
-        .request_sha256 = input.request_sha256,
-        .solver_policy_sha256 = input.solver_policy_sha256,
-        .executor_policy_sha256 = report.policy_sha256,
-        .plan_sha256 = report.plan_sha256,
-        .lock_sha256 = lock_sha256,
-        .repositories = input.repositories,
-        .packages = input.packages,
-        .commands = commands,
-        .journal_steps = input.journal_steps,
-        .recovery_steps = input.recovery_steps,
-        .final_verification = input.final_verification,
-        .outcome = if (report.succeeded()) .succeeded else switch (report.transaction_state) {
-            .interrupted => .interrupted,
-            .in_progress, .dpkg_failed, .verification_failed => .recovery_required,
-            else => .failed,
+pub fn requireExecutionAuthority() Error!void {
+    _ = try legacy_compat.decide(
+        .native_only,
+        .legacy_dpkg,
+        .new_execution,
+        .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
         },
-        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
-    });
-}
-
-pub fn createFromRecovery(
-    allocator: std.mem.Allocator,
-    input: ExecutionInput,
-    report: transaction_executor.RecoveryReport,
-) !OwnedResult {
-    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
-    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
-        return error.LockDigestMismatch;
-    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
-    var temporary = std.heap.ArenaAllocator.init(allocator);
-    defer temporary.deinit();
-    const arena = temporary.allocator();
-    const commands = try arena.alloc(CommandEvidence, report.commands.len);
-    for (report.commands, 0..) |command, index| {
-        const environment = try arena.alloc(EnvironmentEntry, command.environment.len);
-        for (command.environment, 0..) |entry, environment_index| environment[environment_index] = .{
-            .key = entry.key,
-            .value = entry.value,
-        };
-        commands[index] = .{
-            .phase = @tagName(command.phase),
-            .package = command.package,
-            .argv = command.argv,
-            .environment = environment,
-            .command_sha256 = command.command_sha256,
-            .artifact_sha256 = command.artifact_sha256,
-        };
-    }
-    return create(allocator, .{
-        .target_architecture = input.target_architecture,
-        .request_sha256 = input.request_sha256,
-        .solver_policy_sha256 = input.solver_policy_sha256,
-        .executor_policy_sha256 = report.policy_sha256,
-        .plan_sha256 = report.plan_sha256,
-        .lock_sha256 = lock_sha256,
-        .repositories = input.repositories,
-        .packages = input.packages,
-        .commands = commands,
-        .journal_steps = input.journal_steps,
-        .recovery_steps = input.recovery_steps,
-        .final_verification = input.final_verification,
-        .outcome = if (report.succeeded()) .succeeded else if (report.state == .interrupted) .interrupted else .recovery_required,
-        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
-    });
+    );
+    return error.LegacyTransactionProvenanceRetired;
 }
 
 pub const ValidatedDocument = struct {
@@ -253,6 +200,38 @@ pub const ValidatedDocument = struct {
     pub fn deinit(self: *ValidatedDocument) void {
         self.allocator.free(self.bytes);
         self.* = undefined;
+    }
+
+    pub fn legacyIdentity(_: ValidatedDocument) legacy_compat.Identity {
+        return .{
+            .schema = schema_id,
+            .version = schema_version,
+            .backend = .legacy_dpkg,
+        };
+    }
+
+    pub fn verifyCompletedHistorical(
+        self: ValidatedDocument,
+    ) legacy_compat.PolicyError!legacy_compat.Disposition {
+        const disposition = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .completed_historical_verification,
+            self.legacyIdentity(),
+        );
+        std.debug.assert(disposition == .historical_read_only);
+        return disposition;
+    }
+
+    pub fn requireExecutionAuthority(
+        self: ValidatedDocument,
+    ) legacy_compat.PolicyError!void {
+        _ = try legacy_compat.decide(
+            .native_only,
+            .legacy_dpkg,
+            .new_execution,
+            self.legacyIdentity(),
+        );
     }
 };
 
@@ -290,11 +269,13 @@ pub fn validateDocument(
     hash.update("}");
     const actual = hash.finalResult();
     if (!std.mem.eql(u8, &expected, &actual)) return error.DigestMismatch;
-    return .{
+    const validated: ValidatedDocument = .{
         .bytes = try allocator.dupe(u8, source),
         .digest_sha256 = expected,
         .allocator = allocator,
     };
+    _ = try validated.verifyCompletedHistorical();
+    return validated;
 }
 
 /// The identity a published transaction result binds, read back from a
@@ -407,6 +388,7 @@ pub const Store = struct {
     }
 
     pub fn writeAtomic(self: Store, allocator: std.mem.Allocator, result: Result) !void {
+        if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceRetired;
         const bytes = try result.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
@@ -435,6 +417,7 @@ pub const Store = struct {
 };
 
 pub fn create(allocator: std.mem.Allocator, input: Input) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceRetired;
     if (input.target_architecture.len == 0) return error.InvalidIdentity;
     if (input.outcome == .succeeded and input.final_verification.status != .exact_match)
         return error.ContradictoryOutcome;
@@ -1306,3 +1289,185 @@ test "transaction_provenance.verifyLockEvidence names a changed repository diges
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "index digest changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "aaaaaaaaaaaa") != null);
 }
+
+pub fn createFromExecution(
+    allocator: std.mem.Allocator,
+    input: ExecutionInput,
+    report: transaction_executor.Report,
+) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceRetired;
+    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
+    var temporary = std.heap.ArenaAllocator.init(allocator);
+    defer temporary.deinit();
+    const arena = temporary.allocator();
+    const commands = try arena.alloc(CommandEvidence, report.commands.len);
+    for (report.commands, 0..) |command, index| {
+        const environment = try arena.alloc(EnvironmentEntry, command.environment.len);
+        for (command.environment, 0..) |entry, environment_index| environment[environment_index] = .{
+            .key = entry.key,
+            .value = entry.value,
+        };
+        commands[index] = .{
+            .phase = @tagName(command.phase),
+            .package = command.package,
+            .argv = command.argv,
+            .environment = environment,
+            .command_sha256 = command.command_sha256,
+            .artifact_sha256 = command.artifact_sha256,
+        };
+    }
+
+    return create(allocator, .{
+        .target_architecture = input.target_architecture,
+        .request_sha256 = input.request_sha256,
+        .solver_policy_sha256 = input.solver_policy_sha256,
+        .executor_policy_sha256 = report.policy_sha256,
+        .plan_sha256 = report.plan_sha256,
+        .lock_sha256 = lock_sha256,
+        .repositories = input.repositories,
+        .packages = input.packages,
+        .commands = commands,
+        .journal_steps = input.journal_steps,
+        .recovery_steps = input.recovery_steps,
+        .final_verification = input.final_verification,
+        .outcome = if (report.succeeded()) .succeeded else switch (report.transaction_state) {
+            .interrupted => .interrupted,
+            .in_progress, .dpkg_failed, .verification_failed => .recovery_required,
+            else => .failed,
+        },
+        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
+    });
+}
+
+pub fn createFromRecovery(
+    allocator: std.mem.Allocator,
+    input: ExecutionInput,
+    report: transaction_executor.RecoveryReport,
+) !OwnedResult {
+    if (!@import("builtin").is_test) return error.LegacyTransactionProvenanceRetired;
+    const lock_sha256 = report.lock_sha256 orelse return error.MissingLockDigest;
+    if (!std.mem.eql(u8, &lock_sha256, &input.exact_lock.digest_sha256))
+        return error.LockDigestMismatch;
+    try verifyLockEvidence(input.exact_lock.*, input.repositories, input.packages, null);
+    var temporary = std.heap.ArenaAllocator.init(allocator);
+    defer temporary.deinit();
+    const arena = temporary.allocator();
+    const commands = try arena.alloc(CommandEvidence, report.commands.len);
+    for (report.commands, 0..) |command, index| {
+        const environment = try arena.alloc(EnvironmentEntry, command.environment.len);
+        for (command.environment, 0..) |entry, environment_index| environment[environment_index] = .{
+            .key = entry.key,
+            .value = entry.value,
+        };
+        commands[index] = .{
+            .phase = @tagName(command.phase),
+            .package = command.package,
+            .argv = command.argv,
+            .environment = environment,
+            .command_sha256 = command.command_sha256,
+            .artifact_sha256 = command.artifact_sha256,
+        };
+    }
+    return create(allocator, .{
+        .target_architecture = input.target_architecture,
+        .request_sha256 = input.request_sha256,
+        .solver_policy_sha256 = input.solver_policy_sha256,
+        .executor_policy_sha256 = report.policy_sha256,
+        .plan_sha256 = report.plan_sha256,
+        .lock_sha256 = lock_sha256,
+        .repositories = input.repositories,
+        .packages = input.packages,
+        .commands = commands,
+        .journal_steps = input.journal_steps,
+        .recovery_steps = input.recovery_steps,
+        .final_verification = input.final_verification,
+        .outcome = if (report.succeeded()) .succeeded else if (report.state == .interrupted) .interrupted else .recovery_required,
+        .diagnostic = if (report.failure) |failure| failure.diagnostic else "",
+    });
+}
+
+test "transaction_provenance.test.native_only_cutover_retires_v1_generation_and_retains_historical_verification" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_name = "transaction-result.json";
+    const sidecar_name = "transaction-result.json.legacy-capability-evidence.json";
+
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, result_name, .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.openFile(std.testing.io, sidecar_name, .{}),
+    );
+
+    const repository_id: [64]u8 = @splat('b');
+    const repositories = [_]RepositoryEvidence{.{
+        .source_config_id = repository_id,
+        .snapshot_sha256 = @splat(1),
+        .release_sha256 = @splat(2),
+        .signature_sha256 = @splat(3),
+        .metadata_sha256 = @splat(4),
+        .signer_fingerprints = &.{@splat(5)},
+        .signature_verified = true,
+    }};
+    var owned = try create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(8),
+        .solver_policy_sha256 = @splat(9),
+        .executor_policy_sha256 = @splat(10),
+        .plan_sha256 = @splat(11),
+        .lock_sha256 = @splat(12),
+        .repositories = &repositories,
+        .packages = &.{},
+        .commands = &.{},
+        .journal_steps = &.{},
+        .final_verification = .{
+            .status = .exact_match,
+            .installed_state_sha256 = @splat(13),
+            .package_origins_sha256 = @splat(14),
+            .detail = "ok",
+        },
+        .outcome = .succeeded,
+    });
+    defer owned.deinit();
+    const json = try owned.result.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    var validated = try validateDocument(
+        std.testing.allocator,
+        json,
+        maximum_document_bytes,
+    );
+    defer validated.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &owned.result.digest_sha256,
+        &validated.digest_sha256,
+    );
+    try std.testing.expectEqual(
+        legacy_compat.Disposition.historical_read_only,
+        try validated.verifyCompletedHistorical(),
+    );
+    try std.testing.expectError(
+        error.LegacyCapabilityRequired,
+        validated.requireExecutionAuthority(),
+    );
+    try std.testing.expectError(
+        error.BackendMismatch,
+        legacy_compat.decide(
+            .native_only,
+            .native,
+            .completed_historical_verification,
+            validated.legacyIdentity(),
+        ),
+    );
+}
+
