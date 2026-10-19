@@ -60,6 +60,11 @@ awaited state rather than claim that every package is installed. Dynamic
 script activations are constrained by bound trigger-handler identity and
 script evidence; they are not a free-form script-execution capability.
 
+The reference launcher's guest binding (`guest.json`, see
+[integration roots](integration-roots.md)) covers the script interpreter,
+`ldconfig`, the loader, its libraries, and the late NSS/gconv/configuration
+search and absence inputs that reference trigger handlers use.
+
 ## Installed `triggers` files
 
 dpkg 1.22.22 renames each control member into `info/` unchanged

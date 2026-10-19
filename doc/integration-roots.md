@@ -747,6 +747,33 @@ the scan (processes, mountinfo entries, the empty regular archive mountpoint
 and empty `/proc`) in each case's JSON. It fails
 instead of passing or skipping when protected inputs are unavailable.
 
+Before any dpkg operation the launcher also binds the guest runtime that
+pinned dpkg executes from the root itself (#263). `debz-reference-runtime
+record` derives `guest.json` (`io.github.cataggar.debz.reference-guest.v1`)
+from the original signed lock archives and the hash-pinned Debian
+`dpkg-deb`/`dpkg-split` staged beside the pinned dpkg. It covers the `/bin`,
+`/sbin` and `/lib` aliases (plus `/lib64` on amd64) and the loader chain. It
+covers the recursive `dpkg-deb`, `dpkg-split`, `tar` and `rm` helpers with
+their ELF library closures, and the `sh`/`dash`/`bash`/`perl` interpreters.
+It covers `ldconfig`, the dpkg tools, `/etc/nsswitch.conf`, every libc6 NSS
+provider, the gconv tree, and the dpkg and loader configuration. It also
+records required absences: `/.dpkg.cfg`, `/usr/sbin` PATH shadows,
+`debsig-verify`, glibc-hwcaps directories and library search shadows.
+Bounded scopes refuse any unbound gconv module, NSS provider, `dpkg.cfg.d`
+fragment or `ld.so.conf.d` file. `/etc/ld.so.cache` may map a reviewed soname
+or a `libnss_` name only to a bound path. Nothing is mounted over these paths,
+because dpkg legitimately replaces the files it owns. The launcher binds them
+by descriptor, without following symlinks, in the parent. It re-verifies the
+bound identities before chroot and again before exec. Any changed, missing,
+swapped, shadowing or unbound input refuses with a typed `Guest*` error before
+dpkg or any script starts. Per architecture, the protected target proves 15
+such refusals and two post-binding drifts (`prove-guest-postbinding`,
+`GuestSourceChanged`), recorded in `guest-preflight-proof.json`. The signed
+proc-profile cases use a test-private prefix copy whose binding also admits
+the static escape probe as `/usr/bin/sh`; production prefixes bind only the
+signed `dash` alias. Keep #263 open until hosted protected and full-reference
+runs prove this binding on both architectures.
+
 The escape archive's `preinst` is the static
 `tools/real-snapshot-reference-escape-probe.zig`, run by pinned dpkg
 (namespace PID 1) on its own fresh root with an inherited host directory fd.

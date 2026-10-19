@@ -113,6 +113,8 @@ pub const PROFILE_VIEW_CHECKS = [_]ProfileViewEntry{
 };
 
 pub const PROFILE_SCRIPT_LIMIT: usize = 64 * 1024;
+pub const GUEST_MANIFEST = "guest.json";
+pub const GUEST_MANIFEST_LIMIT: usize = 2 * 1024 * 1024;
 
 pub const PINNED_DPKG_DIGESTS = [_]struct { architecture: []const u8, sha256: []const u8 }{
     .{ .architecture = "amd64", .sha256 = "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5" },
@@ -1415,6 +1417,395 @@ pub fn proveRuntimeWithHooks(
     try writeBeneath(args.workspace, "runtime-preflight-proof.json", proof_json, 0o600, false);
 }
 
+pub fn guestPrefix(
+    allocator: std.mem.Allocator,
+    args: ProofArgs,
+    name: []const u8,
+    probe: []const u8,
+    hooks: RuntimeProofHooks,
+) ![]u8 {
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/{s}-prefix", .{ args.workspace, name });
+    errdefer allocator.free(prefix);
+    try copyTemplateTreeRecursive(allocator, args.runtime, args.runtime, prefix, true);
+    const guest_bytes = try reference_paths.readRootFile(allocator, args.runtime, GUEST_MANIFEST, GUEST_MANIFEST_LIMIT);
+    defer allocator.free(guest_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, guest_bytes, .{});
+    if (parsed != .object) return error.InvalidGuestBinding;
+    const entries_val = parsed.object.getPtr("entries") orelse return error.InvalidGuestBinding;
+    if (entries_val.* != .array) return error.InvalidGuestBinding;
+    var sh_entry: ?*std.json.Value = null;
+    for (entries_val.array.items) |*entry| {
+        if (entry.* != .object) return error.InvalidGuestBinding;
+        const p = entry.object.get("path") orelse continue;
+        if (p == .string and std.mem.eql(u8, p.string, "/usr/bin/sh")) {
+            if (sh_entry != null) return error.InvalidGuestBinding;
+            sh_entry = entry;
+        }
+    }
+    const target_entry = sh_entry orelse return error.InvalidGuestBinding;
+    const allowed_val = target_entry.object.getPtr("allowed") orelse return error.InvalidGuestBinding;
+    if (allowed_val.* != .array) return error.InvalidGuestBinding;
+
+    var sha256_raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(probe, &sha256_raw, .{});
+    const sha256_hex = std.fmt.bytesToHex(sha256_raw, .lower);
+    var sha512_raw: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(probe, &sha512_raw, .{});
+    const sha512_hex = std.fmt.bytesToHex(sha512_raw, .lower);
+
+    var item_obj: std.json.ObjectMap = .empty;
+    try item_obj.put(a, "kind", .{ .string = "regular" });
+    try item_obj.put(a, "mode", .{ .integer = 0o755 });
+    try item_obj.put(a, "size", .{ .integer = @intCast(probe.len) });
+    try item_obj.put(a, "sha256", .{ .string = try a.dupe(u8, &sha256_hex) });
+    try item_obj.put(a, "target", .{ .string = "" });
+    try item_obj.put(a, "package", .{ .string = "debz-reference-escape-probe" });
+    try item_obj.put(a, "version", .{ .string = "1" });
+    try item_obj.put(a, "archive_sha512", .{ .string = try a.dupe(u8, &sha512_hex) });
+    try item_obj.put(a, "member", .{ .string = "/usr/bin/sh" });
+    try allowed_val.array.append(.{ .object = item_obj });
+
+    const serialized = try std.json.Stringify.valueAlloc(a, parsed, .{ .whitespace = .indent_2 });
+    const out_bytes = try std.fmt.allocPrint(a, "{s}\n", .{serialized});
+    const rel = try std.fmt.allocPrint(a, "{s}-prefix/{s}", .{ name, GUEST_MANIFEST });
+    try writeBeneath(args.workspace, rel, out_bytes, 0o500, true);
+    try hooks.protected_directory(prefix, false);
+    return prefix;
+}
+
+pub fn loaderCache(allocator: std.mem.Allocator, entries: []const [2][]const u8) ![]u8 {
+    var strings: std.ArrayList(u8) = .empty;
+    defer strings.deinit(allocator);
+    const base = 48 + entries.len * 24;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    try bytes.appendSlice(allocator, "glibc-ld.so.cache1.1");
+    var header: [28]u8 = @splat(0);
+    std.mem.writeInt(u32, header[0..4], @intCast(entries.len), .little);
+    header[8] = 2;
+    var offsets: std.ArrayList([2]u32) = .empty;
+    defer offsets.deinit(allocator);
+    for (entries) |pair| {
+        const key: u32 = @intCast(base + strings.items.len);
+        try strings.appendSlice(allocator, pair[0]);
+        try strings.append(allocator, 0);
+        const value: u32 = @intCast(base + strings.items.len);
+        try strings.appendSlice(allocator, pair[1]);
+        try strings.append(allocator, 0);
+        try offsets.append(allocator, .{ key, value });
+    }
+    std.mem.writeInt(u32, header[4..8], @intCast(strings.items.len), .little);
+    try bytes.appendSlice(allocator, &header);
+    for (offsets.items) |offset| {
+        var entry: [24]u8 = @splat(0);
+        std.mem.writeInt(i32, entry[0..4], 0x0303, .little);
+        std.mem.writeInt(u32, entry[4..8], offset[0], .little);
+        std.mem.writeInt(u32, entry[8..12], offset[1], .little);
+        try bytes.appendSlice(allocator, &entry);
+    }
+    try bytes.appendSlice(allocator, strings.items);
+    return bytes.toOwnedSlice(allocator);
+}
+
+pub const GuestMutation = struct {
+    case_name: []const u8,
+    relative: []const u8,
+    expected: []const u8,
+};
+
+pub fn freeGuestMutations(allocator: std.mem.Allocator, list: []GuestMutation) void {
+    for (list) |item| {
+        allocator.free(item.case_name);
+        allocator.free(item.relative);
+        allocator.free(item.expected);
+    }
+    allocator.free(list);
+}
+
+pub fn guestMutations(
+    allocator: std.mem.Allocator,
+    triplet: []const u8,
+    guest_bytes: []const u8,
+    runtime_bytes: []const u8,
+) ![]GuestMutation {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const runtime_parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, runtime_bytes, .{});
+    if (runtime_parsed != .object) return error.InvalidRuntimeBinding;
+    const objects_val = runtime_parsed.object.get("objects") orelse return error.InvalidRuntimeBinding;
+    if (objects_val != .array) return error.InvalidRuntimeBinding;
+
+    var runtime_paths = std.StringHashMap(void).init(a);
+    for (objects_val.array.items) |obj| {
+        if (obj != .object) continue;
+        const rp = obj.object.get("root_path") orelse continue;
+        if (rp == .string and rp.string.len > 0) {
+            try runtime_paths.put(rp.string, {});
+        }
+    }
+
+    const guest_parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, guest_bytes, .{});
+    if (guest_parsed != .object) return error.InvalidGuestBinding;
+    const entries_val = guest_parsed.object.get("entries") orelse return error.InvalidGuestBinding;
+    if (entries_val != .array) return error.InvalidGuestBinding;
+
+    var selected_lib: ?[]const u8 = null;
+    for (entries_val.array.items) |entry| {
+        if (entry != .object) continue;
+        const role = entry.object.get("role") orelse continue;
+        if (role != .string or !std.mem.eql(u8, role.string, "library")) continue;
+        const req = entry.object.get("required") orelse continue;
+        if (req != .bool or !req.bool) continue;
+        const path = entry.object.get("path") orelse continue;
+        if (path != .string or runtime_paths.contains(path.string)) continue;
+        const allowed = entry.object.get("allowed") orelse continue;
+        if (allowed != .array) continue;
+        var has_regular = false;
+        for (allowed.array.items) |item| {
+            if (item == .object) {
+                if (item.object.get("kind")) |k| {
+                    if (k == .string and std.mem.eql(u8, k.string, "regular")) {
+                        has_regular = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (has_regular) {
+            selected_lib = std.mem.trimStart(u8, path.string, "/");
+            break;
+        }
+    }
+    const lib_rel = selected_lib orelse return error.InvalidGuestBinding;
+    const hwcaps_rel = try std.fmt.allocPrint(a, "usr/lib/{s}/glibc-hwcaps", .{triplet});
+    const nss_rel = try std.fmt.allocPrint(a, "usr/lib/{s}/libnss_extra.so.2", .{triplet});
+    const gconv_rel = try std.fmt.allocPrint(a, "usr/lib/{s}/gconv/EXTRA.so", .{triplet});
+
+    const raw_cases = [_][3][]const u8{
+        .{ "helper-altered", "usr/bin/tar", "GuestDigestChanged" },
+        .{ "helper-missing", "usr/bin/dpkg-split", "MissingGuestBinding" },
+        .{ "helper-symlink", "usr/bin/dpkg-deb", "GuestFileTypeChanged" },
+        .{ "library-altered", lib_rel, "GuestDigestChanged" },
+        .{ "interpreter-altered", "usr/bin/dash", "GuestDigestChanged" },
+        .{ "interpreter-symlink", "usr/bin/sh", "GuestSymlinkChanged" },
+        .{ "alias-symlink", "bin", "GuestSymlinkChanged" },
+        .{ "path-shadow", "usr/sbin/tar", "PresentGuestForbiddenPath" },
+        .{ "dpkg-config", ".dpkg.cfg", "PresentGuestForbiddenPath" },
+        .{ "dpkg-config-dir", "etc/dpkg/dpkg.cfg.d/unbound", "UnboundGuestScopeEntry" },
+        .{ "loader-config", "etc/ld.so.conf.d/zz-unbound.conf", "UnboundGuestScopeEntry" },
+        .{ "loader-cache", "etc/ld.so.cache", "UnboundGuestCacheEntry" },
+        .{ "hwcaps-dir", hwcaps_rel, "PresentGuestForbiddenPath" },
+        .{ "nss-provider", nss_rel, "UnboundGuestScopeEntry" },
+        .{ "gconv-module", gconv_rel, "UnboundGuestScopeEntry" },
+    };
+
+    var out = try allocator.alloc(GuestMutation, raw_cases.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| {
+            allocator.free(item.case_name);
+            allocator.free(item.relative);
+            allocator.free(item.expected);
+        }
+        allocator.free(out);
+    }
+    for (raw_cases, 0..) |raw, idx| {
+        const cn = try allocator.dupe(u8, raw[0]);
+        errdefer allocator.free(cn);
+        const rl = try allocator.dupe(u8, raw[1]);
+        errdefer allocator.free(rl);
+        const ex = try allocator.dupe(u8, raw[2]);
+        out[idx] = .{ .case_name = cn, .relative = rl, .expected = ex };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn mkdirParents(root: []const u8, relative: []const u8) !void {
+    if (std.mem.lastIndexOfScalar(u8, relative, '/')) |slash| {
+        var idx: usize = 0;
+        while (idx <= slash) : (idx += 1) {
+            if (idx == slash or relative[idx] == '/') {
+                const sub = relative[0..idx];
+                if (sub.len > 0) {
+                    var sub_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    const full_sub = try std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ root, sub });
+                    mkdirPath(full_sub, 0o755) catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => return err,
+                    };
+                }
+            }
+        }
+    }
+}
+
+pub fn mutateGuest(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    case_name: []const u8,
+    relative: []const u8,
+) !void {
+    const target = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, relative });
+    defer allocator.free(target);
+    const anchor = std.fs.path.dirname(root) orelse return error.InvalidPath;
+    const root_name = std.fs.path.basename(root);
+    const root_relative = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_name, relative });
+    defer allocator.free(root_relative);
+
+    if (std.mem.endsWith(u8, case_name, "-altered")) {
+        const meta = try lstatPath(target);
+        const data = try readHostFile(allocator, target, 64 * 1024 * 1024);
+        defer allocator.free(data);
+        if (data.len == 0) return error.EmptyGuestInput;
+        data[0] ^= 1;
+        try writeBeneath(anchor, root_relative, data, meta.mode & 0o7777, true);
+    } else if (std.mem.eql(u8, case_name, "helper-missing")) {
+        try unlinkPath(target);
+    } else if (std.mem.eql(u8, case_name, "helper-symlink")) {
+        try unlinkPath(target);
+        try symlinkPath("/usr/bin/tar", target);
+    } else if (std.mem.eql(u8, case_name, "interpreter-symlink") or std.mem.eql(u8, case_name, "alias-symlink")) {
+        try unlinkPath(target);
+        try symlinkPath(if (std.mem.eql(u8, case_name, "alias-symlink")) "/usr/sbin" else "bash", target);
+    } else if (std.mem.eql(u8, case_name, "loader-cache")) {
+        try mkdirParents(root, relative);
+        const cache_bytes = try loaderCache(allocator, &.{.{ "libc.so.6", "/unbound/libc.so.6" }});
+        defer allocator.free(cache_bytes);
+        try writeBeneath(anchor, root_relative, cache_bytes, 0o644, false);
+    } else if (std.mem.eql(u8, case_name, "hwcaps-dir")) {
+        try mkdirParents(root, relative);
+        try mkdirPath(target, 0o755);
+    } else {
+        try mkdirParents(root, relative);
+        try writeBeneath(anchor, root_relative, "unbound\n", 0o644, false);
+    }
+}
+
+pub fn proveGuestWithHooks(
+    allocator: std.mem.Allocator,
+    args: ProofArgs,
+    identity: []const u8,
+    hooks: RuntimeProofHooks,
+) !void {
+    const guest_bytes = try reference_paths.readRootFile(allocator, args.runtime, GUEST_MANIFEST, GUEST_MANIFEST_LIMIT);
+    defer allocator.free(guest_bytes);
+    const runtime_bytes = try reference_paths.readRootFile(allocator, args.runtime, "binding.json", 128 * 1024);
+    defer allocator.free(runtime_bytes);
+    const triplet = if (std.mem.eql(u8, args.architecture, "amd64")) "x86_64-linux-gnu" else "aarch64-linux-gnu";
+    const mutations = try guestMutations(allocator, triplet, guest_bytes, runtime_bytes);
+    defer freeGuestMutations(allocator, mutations);
+
+    var cases_json: std.ArrayList(u8) = .empty;
+    defer cases_json.deinit(allocator);
+    var case_count: usize = 0;
+
+    for (mutations) |mutation| {
+        const name = try std.fmt.allocPrint(allocator, "guest-{s}", .{mutation.case_name});
+        defer allocator.free(name);
+        const root = try hooks.fresh_root(allocator, args.root_template, args.workspace, name);
+        defer allocator.free(root);
+        try mutateGuest(allocator, root, mutation.case_name, mutation.relative);
+        const op_res = try hooks.operation(
+            allocator,
+            args.workspace,
+            name,
+            args.launcher,
+            args.dpkg,
+            args.runtime,
+            root,
+            args.architecture,
+            args.archive,
+            args.archive_sha512,
+            args.archive_size,
+            "unpack",
+            .{},
+        );
+        defer allocator.free(op_res.stderr);
+        try requireRefusal(op_res.status, op_res.stderr, mutation.expected);
+        const status_bytes = try reference_paths.readRootFile(allocator, root, "var/lib/dpkg/status", 4 * 1024 * 1024);
+        defer allocator.free(status_bytes);
+        if (status_bytes.len != 0) return error.DpkgStartedDespiteGuestRefusal;
+        const marker = try std.fmt.allocPrint(allocator, "{s}/usr/share/debz-reference-proof/marker", .{root});
+        defer allocator.free(marker);
+        if (lstatPath(marker)) |_| {
+            return error.DpkgStartedDespiteGuestRefusal;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
+        if (case_count > 0) try cases_json.appendSlice(allocator, ",\n");
+        const entry_json = try std.fmt.allocPrint(
+            allocator,
+            "    \"{s}\": {{\"path\": \"/{s}\", \"refusal\": \"{s}\", \"dpkg_started\": false}}",
+            .{ name, mutation.relative, mutation.expected },
+        );
+        defer allocator.free(entry_json);
+        try cases_json.appendSlice(allocator, entry_json);
+        case_count += 1;
+    }
+
+    for ([_][2][]const u8{
+        .{ "tar", "/usr/bin/tar" },
+        .{ "dpkg-deb", "/usr/bin/dpkg-deb" },
+    }) |pair| {
+        const label = pair[0];
+        const member_path = pair[1];
+        const pb_name = try std.fmt.allocPrint(allocator, "guest-{s}-postbinding", .{label});
+        defer allocator.free(pb_name);
+        const pb_root = try hooks.fresh_root(allocator, args.root_template, args.workspace, pb_name);
+        defer allocator.free(pb_root);
+        const pb_cmd = [_][]const u8{
+            args.runtime_tool,
+            "prove-guest-postbinding",
+            args.architecture,
+            args.runtime,
+            pb_root,
+            identity,
+            member_path,
+        };
+        const pb_res = try hooks.runner(allocator, &pb_cmd, null);
+        defer {
+            allocator.free(pb_res.stdout);
+            allocator.free(pb_res.stderr);
+        }
+        if (pb_res.exit_code != 0 or
+            std.mem.indexOf(u8, pb_res.stderr, "GuestSourceChanged; no dpkg or script executed") == null)
+        {
+            return error.GuestPostBindingDriftProofFailed;
+        }
+        const pb_status = try reference_paths.readRootFile(allocator, pb_root, "var/lib/dpkg/status", 4 * 1024 * 1024);
+        defer allocator.free(pb_status);
+        if (pb_status.len != 0) return error.GuestPostBindingMutatedDatabase;
+        _ = try hooks.assert_teardown(allocator, pb_root);
+
+        if (case_count > 0) try cases_json.appendSlice(allocator, ",\n");
+        const pb_json = try std.fmt.allocPrint(
+            allocator,
+            "    \"{s}\": {{\"path\": \"{s}\", \"refusal\": \"GuestSourceChanged\", \"dpkg_started\": false}}",
+            .{ pb_name, member_path },
+        );
+        defer allocator.free(pb_json);
+        try cases_json.appendSlice(allocator, pb_json);
+        case_count += 1;
+    }
+
+    const proof_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"architecture\": \"{s}\",\n  \"guest_bindings\": {s},\n  \"cases\": {{\n{s}\n  }}\n}}\n",
+        .{ args.architecture, std.mem.trim(u8, guest_bytes, " \t\r\n"), cases_json.items },
+    );
+    defer allocator.free(proof_json);
+    try writeBeneath(args.workspace, "guest-preflight-proof.json", proof_json, 0o600, false);
+}
+
 pub fn proveProfiles(
     allocator: std.mem.Allocator,
     args: ProofArgs,
@@ -1462,6 +1853,8 @@ pub fn proveProfiles(
         const script = scripts.get(entry.profile) orelse return error.MissingProfileScript;
         const root = try profileRoot(allocator, args.root_template, args.workspace, name, entry.profile, script, probe, null);
         defer allocator.free(root);
+        const prefix = try guestPrefix(allocator, args, name, probe, .{});
+        defer allocator.free(prefix);
         const selector = try std.fmt.allocPrint(allocator, "{s}:amd64", .{entry.profile});
         defer allocator.free(selector);
         const res = blk: {
@@ -1473,7 +1866,7 @@ pub fn proveProfiles(
                 name,
                 args.launcher,
                 args.dpkg,
-                args.runtime,
+                prefix,
                 root,
                 args.architecture,
                 null,
@@ -1560,13 +1953,15 @@ pub fn proveProfiles(
     for (negatives) |neg| {
         const root = try profileRoot(allocator, args.root_template, args.workspace, neg.name, "systemd", neg.script, probe, neg.version);
         defer allocator.free(root);
+        const prefix = try guestPrefix(allocator, args, neg.name, probe, .{});
+        defer allocator.free(prefix);
         const res = try operation(
             allocator,
             args.workspace,
             neg.name,
             args.launcher,
             args.dpkg,
-            args.runtime,
+            prefix,
             root,
             args.architecture,
             null,
@@ -1788,6 +2183,7 @@ pub fn runMain(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     try verifySha512File(args.escape_archive, args.escape_archive_sha512, args.escape_archive_size);
 
     try proveRuntimeWithHooks(allocator, args, &identity, .{});
+    try proveGuestWithHooks(allocator, args, &identity, .{});
 
     for ([_][2][]const u8{
         .{ "probe", "probe_unpack" },
@@ -2070,6 +2466,7 @@ pub fn runMain(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const summary = try std.fmt.allocPrint(
         allocator,
         "protected pinned-dpkg runtime: ten loader/recursive-library and one preload preflight refusals; " ++
+            "15 guest helper/interpreter/loader/NSS/gconv refusals and two post-binding drifts; " ++
             "probe/unpack, six refusals, unconfined escape control and " ++
             "{d} confined escape checks, read-only archive mount and " ++
             "descendant teardown, denied reachable-host TCP/abstract-UNIX and inherited sockets, " ++
@@ -2112,6 +2509,11 @@ pub fn failureDiagnostic(err: anyerror) []const u8 {
         error.PostBindingDriftProofFailed => "post-binding drift proof failed",
         error.PostBindingMutatedDatabase => "post-binding proof mutated the package database",
         error.DpkgStartedWithUnboundPreload => "dpkg started with an unbound preload",
+        error.InvalidGuestBinding, error.InvalidRuntimeBinding => "guest binding must include required entries",
+        error.EmptyGuestInput => "bound guest input is empty",
+        error.DpkgStartedDespiteGuestRefusal => "dpkg started despite guest refusal",
+        error.GuestPostBindingDriftProofFailed => "guest post-binding drift proof failed",
+        error.GuestPostBindingMutatedDatabase => "guest post-binding proof mutated the package database",
         error.UnreachableHostNetworkControl => "host network controls were not genuinely reachable",
         error.RefusedProfileChangedPackageState => "refused profile changed the package state",
         error.ProbeRanDespiteRefusal => "the probe ran despite the refusal",
@@ -2560,6 +2962,215 @@ test "runtime mutation negatives reach checks using workspace-rooted writes" {
     }) |key| {
         try std.testing.expect(std.mem.indexOf(u8, report_bytes, key) != null);
     }
+}
+
+test "guest mutations reach each input class and probe admission stays private" {
+    const allocator = std.testing.allocator;
+
+    var tdir = try TestTempDir.init(allocator);
+    defer tdir.deinit();
+    reference_paths.setTestRootOverride(tdir.abs_path);
+    defer reference_paths.setTestRootOverride(null);
+
+    const runtime = try std.fmt.allocPrint(allocator, "{s}/runtime", .{tdir.abs_path});
+    defer allocator.free(runtime);
+    try mkdirPath(runtime, 0o700);
+    const runtime_json =
+        "{\"loader\": \"loader.so\", \"objects\": [{\"name\": \"libpcre2-8.so.0\", \"root_path\": \"/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0\"}]}";
+    const guest_json =
+        "{\"entries\": [" ++
+        "{\"path\": \"/usr/bin/sh\", \"role\": \"interpreter\", \"required\": true, \"allowed\": [{\"kind\": \"symlink\"}]}," ++
+        "{\"path\": \"/usr/lib/x86_64-linux-gnu/libpcre2-8.so.0\", \"role\": \"library\", \"required\": true, \"allowed\": [{\"kind\": \"regular\"}]}," ++
+        "{\"path\": \"/usr/lib/x86_64-linux-gnu/libm.so.6\", \"role\": \"library\", \"required\": true, \"allowed\": [{\"kind\": \"regular\"}]}" ++
+        "]}";
+    try writeTestFile(runtime, "binding.json", runtime_json, 0o644);
+    try writeTestFile(runtime, GUEST_MANIFEST, guest_json, 0o644);
+
+    const workspace = try std.fmt.allocPrint(allocator, "{s}/proof", .{tdir.abs_path});
+    defer allocator.free(workspace);
+    try mkdirPath(workspace, 0o700);
+
+    const Hooks = struct {
+        fn fresh(alloc: std.mem.Allocator, _: []const u8, dest: []const u8, name: []const u8) ![]u8 {
+            const root = try std.fmt.allocPrint(alloc, "{s}/{s}-root", .{ dest, name });
+            errdefer alloc.free(root);
+            try mkdirPath(root, 0o700);
+            try writeTestFile(root, "var/lib/dpkg/status", "", 0o644);
+            for ([_][]const u8{
+                "usr/bin/tar",
+                "usr/bin/dpkg-split",
+                "usr/bin/dpkg-deb",
+                "usr/bin/dash",
+                "usr/lib/x86_64-linux-gnu/libm.so.6",
+            }) |rel| {
+                try writeTestFile(root, rel, "original", 0o755);
+            }
+            const bin_link = try std.fmt.allocPrint(alloc, "{s}/bin", .{root});
+            defer alloc.free(bin_link);
+            try symlinkPath("usr/bin", bin_link);
+            const sh_link = try std.fmt.allocPrint(alloc, "{s}/usr/bin/sh", .{root});
+            defer alloc.free(sh_link);
+            try symlinkPath("dash", sh_link);
+            for ([_][]const u8{
+                "usr/sbin",
+                "etc/dpkg/dpkg.cfg.d",
+                "etc/ld.so.conf.d",
+                "usr/lib/x86_64-linux-gnu/gconv",
+            }) |dir_rel| {
+                try mkdirParents(root, dir_rel);
+                const full_dir = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, dir_rel });
+                defer alloc.free(full_dir);
+                mkdirPath(full_dir, 0o755) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+            }
+            return root;
+        }
+
+        fn noopProtected(_: []const u8, _: bool) !void {}
+
+        fn fakeOp(
+            alloc: std.mem.Allocator,
+            _: []const u8,
+            name: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?u64,
+            _: []const u8,
+            _: OperationOptions,
+        ) !OperationResult {
+            const mutations = try guestMutations(alloc, "x86_64-linux-gnu", guest_json, runtime_json);
+            defer freeGuestMutations(alloc, mutations);
+            for (mutations) |m| {
+                const key = try std.fmt.allocPrint(alloc, "guest-{s}", .{m.case_name});
+                defer alloc.free(key);
+                if (std.mem.eql(u8, name, key)) {
+                    return .{ .status = 1, .stderr = try alloc.dupe(u8, m.expected) };
+                }
+            }
+            return error.UnexpectedGuestOperationName;
+        }
+
+        fn fakeTeardown(_: std.mem.Allocator, _: []const u8) !TeardownReport {
+            return .{
+                .polls = 1,
+                .processes_scanned = 1,
+                .mountinfo_entries = 1,
+                .archive_size = 0,
+                .archive_nlink = 1,
+                .archive_mode = 0o600,
+            };
+        }
+
+        fn fakeRunner(alloc: std.mem.Allocator, _: []const []const u8, _: ?i32) !ProcessResult {
+            return .{
+                .exit_code = 0,
+                .stdout = try alloc.dupe(u8, ""),
+                .stderr = try alloc.dupe(u8, "GuestSourceChanged; no dpkg or script executed"),
+            };
+        }
+    };
+
+    const args = ProofArgs{
+        .launcher = "/launcher",
+        .runtime = runtime,
+        .runtime_tool = "/runtime-tool",
+        .dpkg = "/dpkg",
+        .root_template = tdir.abs_path,
+        .workspace = workspace,
+        .archive = "/package.deb",
+        .archive_sha512 = &@as([128]u8, @splat('a')),
+        .archive_size = 42,
+        .architecture = "amd64",
+    };
+
+    try proveGuestWithHooks(allocator, args, &@as([64]u8, @splat('a')), .{
+        .fresh_root = Hooks.fresh,
+        .protected_directory = Hooks.noopProtected,
+        .operation = Hooks.fakeOp,
+        .assert_teardown = Hooks.fakeTeardown,
+        .runner = Hooks.fakeRunner,
+    });
+
+    const report_path = try std.fmt.allocPrint(allocator, "{s}/guest-preflight-proof.json", .{workspace});
+    defer allocator.free(report_path);
+    const report_bytes = try readHostFile(allocator, report_path, 32768);
+    defer allocator.free(report_bytes);
+
+    var report_arena = std.heap.ArenaAllocator.init(allocator);
+    defer report_arena.deinit();
+    const report_parsed = try std.json.parseFromSliceLeaky(std.json.Value, report_arena.allocator(), report_bytes, .{});
+    const cases_obj = report_parsed.object.get("cases").?.object;
+    try std.testing.expectEqual(@as(usize, 17), cases_obj.count());
+    try std.testing.expectEqualStrings(
+        "/usr/lib/x86_64-linux-gnu/libm.so.6",
+        cases_obj.get("guest-library-altered").?.object.get("path").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "GuestSourceChanged",
+        cases_obj.get("guest-tar-postbinding").?.object.get("refusal").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "GuestSourceChanged",
+        cases_obj.get("guest-dpkg-deb-postbinding").?.object.get("refusal").?.string,
+    );
+
+    const tar_path = try std.fmt.allocPrint(allocator, "{s}/guest-helper-altered-root/usr/bin/tar", .{workspace});
+    defer allocator.free(tar_path);
+    const tar_bytes = try readHostFile(allocator, tar_path, 1024);
+    defer allocator.free(tar_bytes);
+    try std.testing.expectEqual(@as(u8, 'o' ^ 1), tar_bytes[0]);
+    try std.testing.expectEqualStrings("riginal", tar_bytes[1..]);
+
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/guest-dpkg-config-root/.dpkg.cfg", .{workspace});
+    defer allocator.free(cfg_path);
+    const cfg_bytes = try readHostFile(allocator, cfg_path, 1024);
+    defer allocator.free(cfg_bytes);
+    try std.testing.expectEqualStrings("unbound\n", cfg_bytes);
+
+    const cache_path = try std.fmt.allocPrint(allocator, "{s}/guest-loader-cache-root/etc/ld.so.cache", .{workspace});
+    defer allocator.free(cache_path);
+    const cache_bytes = try readHostFile(allocator, cache_path, 1024);
+    defer allocator.free(cache_bytes);
+    try std.testing.expect(std.mem.startsWith(u8, cache_bytes, "glibc-ld.so.cache1.1"));
+
+    const hwcaps_path = try std.fmt.allocPrint(allocator, "{s}/guest-hwcaps-dir-root/usr/lib/x86_64-linux-gnu/glibc-hwcaps", .{workspace});
+    defer allocator.free(hwcaps_path);
+    const hwcaps_meta = try lstatPath(hwcaps_path);
+    try std.testing.expectEqual(linux.S.IFDIR, hwcaps_meta.mode & linux.S.IFMT);
+
+    const prefix = try guestPrefix(allocator, args, "profile-systemd", "static-probe", .{
+        .protected_directory = Hooks.noopProtected,
+    });
+    defer allocator.free(prefix);
+
+    const orig_guest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ runtime, GUEST_MANIFEST });
+    defer allocator.free(orig_guest_path);
+    const orig_guest_bytes = try readHostFile(allocator, orig_guest_path, 16384);
+    defer allocator.free(orig_guest_bytes);
+    const orig_guest_parsed = try std.json.parseFromSliceLeaky(std.json.Value, report_arena.allocator(), orig_guest_bytes, .{});
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        orig_guest_parsed.object.get("entries").?.array.items[0].object.get("allowed").?.array.items.len,
+    );
+
+    const priv_guest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, GUEST_MANIFEST });
+    defer allocator.free(priv_guest_path);
+    const priv_guest_bytes = try readHostFile(allocator, priv_guest_path, 16384);
+    defer allocator.free(priv_guest_bytes);
+    const priv_guest_parsed = try std.json.parseFromSliceLeaky(std.json.Value, report_arena.allocator(), priv_guest_bytes, .{});
+    const priv_allowed = priv_guest_parsed.object.get("entries").?.array.items[0].object.get("allowed").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), priv_allowed.len);
+    try std.testing.expectEqualStrings(
+        "debz-reference-escape-probe",
+        priv_allowed[1].object.get("package").?.string,
+    );
 }
 
 test "failure diagnostics emit protected reference CI refusal strings" {

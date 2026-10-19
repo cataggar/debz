@@ -5844,6 +5844,7 @@ pub const PROTECTED_REFERENCE_PATHS = [_][]const u8{
     "tools/real-snapshot-reference-protected.zig",
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/real-snapshot-reference-launcher.zig",
+    "tools/real-snapshot-reference-guest.zig",
     "tools/real-snapshot-reference-order.zig",
     "src/private_network.zig",
     "src/fixtures/script_network_probe.zig",
