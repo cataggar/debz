@@ -680,3 +680,42 @@ test "validates explicit repository context" {
     const component = try parseBorrowed(std.testing.allocator, "", context, .{});
     try std.testing.expectEqual(DiagnosticCode.invalid_context_component, component.diagnostic.code);
 }
+
+test "preserves deep multiline Description lines and spans in Packages records" {
+    const base = try packageParagraph("deep-desc", "1.0-1", "amd64");
+    defer std.testing.allocator.free(base);
+
+    const continuation_count: usize = 128;
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll(base);
+    try input.writer.writeAll("Description: short synopsis\n");
+    for (0..continuation_count) |index| {
+        try input.writer.print(" extended paragraph line {d:0>3}\n", .{index});
+    }
+
+    const parsed = try parseBorrowed(std.testing.allocator, input.written(), testContext("amd64"), .{});
+    var index = switch (parsed) {
+        .index => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer index.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), index.records.len);
+    const unknown = index.records[0].control.unknown_fields;
+    const description = unknown[unknown.len - 1];
+    try std.testing.expectEqualStrings("Description", description.name);
+    try std.testing.expectEqual(continuation_count + 1, description.value_lines.len);
+    try std.testing.expectEqualStrings("short synopsis", description.value_lines[0].text);
+    try std.testing.expectEqual(@as(usize, 8), description.value_lines[0].span.start.line);
+    try std.testing.expectEqual(@as(usize, 14), description.value_lines[0].span.start.column);
+    try std.testing.expectEqualStrings("extended paragraph line 000", description.value_lines[1].text);
+    try std.testing.expectEqual(@as(usize, 9), description.value_lines[1].span.start.line);
+    try std.testing.expectEqual(@as(usize, 2), description.value_lines[1].span.start.column);
+    try std.testing.expectEqualStrings("extended paragraph line 127", description.value_lines[continuation_count].text);
+    try std.testing.expectEqual(@as(usize, 8 + continuation_count), description.value_lines[continuation_count].span.start.line);
+    try std.testing.expectEqual(@as(usize, 2), description.value_lines[continuation_count].span.start.column);
+    try std.testing.expectEqual(@as(usize, 8), description.span.start.line);
+    try std.testing.expectEqual(@as(usize, 8 + continuation_count), description.span.end.line);
+}
+
