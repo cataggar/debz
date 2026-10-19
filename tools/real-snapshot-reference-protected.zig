@@ -1838,9 +1838,34 @@ pub fn proveProfiles(
                 .{ .profile = entry.profile, .selector = selector },
             );
             defer allocator.free(res.stderr);
-            try requireRefusal(res.status, res.stderr, "InvalidProfile");
+            try requireRefusal(res.status, res.stderr, "ReferenceSetupFailed");
+            try requireRefusal(res.status, res.stderr, "failed at stage 10");
+
+            const unbound_name = try std.fmt.allocPrint(allocator, "profile-unbound-{s}-{s}", .{ entry.profile, args.architecture });
+            defer allocator.free(unbound_name);
+            const unbound_res = try operation(
+                allocator,
+                args.workspace,
+                unbound_name,
+                args.launcher,
+                args.dpkg,
+                args.runtime,
+                root,
+                args.architecture,
+                null,
+                null,
+                null,
+                "configure",
+                .{ .profile = "none", .selector = selector },
+            );
+            defer allocator.free(unbound_res.stderr);
+            try requireRefusal(unbound_res.status, unbound_res.stderr, "InvalidProfile");
         }
-        return try std.fmt.allocPrint(allocator, "{s} refusal of the amd64-only signed proc profiles", .{args.architecture});
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s} stage-10 in-root binding and unbound-configure refusals for signed proc profiles",
+            .{args.architecture},
+        );
     }
 
     const host_boot_id_raw = try readHostFile(allocator, "/proc/sys/kernel/random/boot_id", 128);
