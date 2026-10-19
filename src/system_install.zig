@@ -1414,7 +1414,11 @@ const Session = struct {
         if (!requestedBy(archive_lock, evidence, self.invocation.package)) return error.RequestedPackageMissing;
         for (archive_lock.repositories) |locked| {
             const current = authority.repository(locked.id) orelse return error.RepositoryAuthorityChanged;
-            if (current.archive_binding != locked.archive_binding) return error.RepositoryAuthorityChanged;
+            // The derived SHA-512 binding is a native opt-in; a legacy lock
+            // binds only the signed index's published digests.
+            if (self.kind != .native) {
+                if (locked.archive_binding != .published_digests) return error.LegacyArchiveBindingUnsupported;
+            } else if (current.archive_binding != locked.archive_binding) return error.RepositoryAuthorityChanged;
         }
         try self.revalidate();
     }
@@ -2257,6 +2261,35 @@ test "system_install.test native admits only signed or authenticated-derived SHA
     }
 }
 
+test "system_install.test a legacy lock binds only published digests under a native derived opt-in" {
+    const kind = nonNativeKind();
+    var harness = try Harness.init();
+    defer harness.deinit();
+    harness.repositories[0].archive_binding = .signed_sha256_derived_sha512;
+    var result = try harness.run("demo", kind);
+    defer result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.unavailable, result.exitStatus());
+    try std.testing.expectEqual(Outcome.refused_before_mutation, result.value.outcome);
+    const shown = result.value.plan.?;
+    try std.testing.expectEqual(ArchiveClass.signed_sha256_only, shown.archives[0].archive_authentication);
+    try std.testing.expect(shown.archives[0].derived_sha512 == null);
+    try std.testing.expectEqual(lock_v3.ArchiveBinding.published_digests, shown.repositories[0].archive_binding);
+
+    // A legacy lock that claims the derived binding is refused, not executed.
+    var forged = try Harness.init();
+    defer forged.deinit();
+    forged.repositories[0].archive_binding = .signed_sha256_derived_sha512;
+    forged.planner.mode = .derived;
+    var refused = try forged.run("demo", kind);
+    defer refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.planning, refused.exitStatus());
+    try std.testing.expectEqual(Outcome.abandoned_before_mutation, refused.value.outcome);
+    try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.value.diagnostics[0].id);
+    try std.testing.expect(contains(refused.value.summary, "(LegacyArchiveBindingUnsupported)"));
+    try std.testing.expect(refused.value.plan == null);
+    try std.testing.expect(!forged.root.exists(active_path));
+}
+
 test "system_install.test interrupted attempts resume exactly by their owned request" {
     const kind = nonNativeKind();
     for ([_]CrashPoint{
@@ -2363,11 +2396,13 @@ test "system_install.test installed database drift abandons the retained lock be
 }
 
 test "system_install.test authority drift abandons the retained lock before mutation" {
-    const kind = nonNativeKind();
     const Drift = enum { context, binding, removed, uri };
     for (std.enums.values(Drift)) |drift| {
+        // Only a native lock carries its repository's archive binding.
+        const kind: Kind = if (drift == .binding) .native else nonNativeKind();
         var harness = try Harness.init();
         defer harness.deinit();
+        if (drift == .binding) harness.planner.mode = .sha512;
         harness.crash = if (drift == .uri) .after_program else .after_lock_bound;
         var first = try harness.run("demo", kind);
         defer first.deinit();

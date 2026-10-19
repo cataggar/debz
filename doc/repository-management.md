@@ -698,11 +698,38 @@ installed source, refresh of already imported target repositories, and native
 resume. Target import reads the root, derives the policy from those exact
 bytes, then imports again and requires byte-identical sources and keyrings.
 The operation's target manifest therefore becomes the canonical
-`apt-config-snapshot-v2` document. Its file name,
+`apt-config-snapshot-v3` document (a profile that granted only the freshness
+bound would record `apt-config-snapshot-v2`). Its file name,
 `apt-config-snapshot-v1.json`, is unchanged. That document records the source
-and repository freshness policies, and import fails if they differ from the
-policy the descriptor payload earned. The policy also enters the normalized
-repository IDs and the refresh cache evidence.
+and repository freshness policies and archive bindings, and import fails if
+they differ from the policy the descriptor payload earned. The policy also
+enters the normalized repository IDs and the refresh cache evidence.
+
+**Reviewed archive binding.** Microsoft's Noble `Packages` indexes publish
+only a SHA-256 for each archive. On 2026-10-13 the owner approved a derived
+SHA-512 binding for this repository only. An exact match of
+`microsoft-ubuntu-24.04-prod` therefore also grants
+`archive_binding: signed_sha256_derived_sha512`, as described in
+[exact locks and provenance](exact-locks-and-provenance.md). The native
+backend computes the SHA-512 only over archive bytes that already matched the
+signed size and SHA-256. It records the value as `derived_sha512` with
+provenance `derived_from_signed_sha256`.
+
+- Neither results nor documents present it as an upstream or signed SHA-512.
+- The binding enters the repository ID like any other opt-in.
+- It never widens the 14-day Release bound, which stays explicit as
+  `maximum_release_age_seconds: 1209600`.
+- No other shipped profile grants a binding, and nothing grants one by
+  default.
+- If the feed starts publishing SHA-512 archive digests, native planning
+  refuses with `lock_verification_failed` (exit 5) until the profile is
+  reviewed again.
+- An active configuration recorded before the approval keeps its v2 document
+  and `published_digests`, so the native backend still refuses its
+  SHA-256-only archives (exit 5). Running `sudo debz repo add` again records
+  the binding.
+- The legacy backend never derives. It records these archives as
+  `signed_sha256_only`.
 
 Embedders may replace the shipped set through
 `ProductionRepositoryBackend.reviewed_repository_profiles`. Every profile must
@@ -742,17 +769,23 @@ access, passwordless `sudo` and a dpkg-based host. It prepares a disposable
 alternate root under `.zig-cache/` with the descriptor's script interpreter
 and a stub `ca-certificates`. It then runs the legacy backend with the
 reviewed `--sha256` and the host architecture. It requires an installed,
-refreshed result and the 14-day freshness profile on the source and on every
-repository policy. The result and the `apt-config-snapshot-v1.json` copy are
+refreshed result and an `apt-config-snapshot-v3` manifest whose source and
+repository policies all carry the 14-day freshness bound and the
+`signed_sha256_derived_sha512` binding. The result and the
+`apt-config-snapshot-v1.json` copy are
 kept in `.zig-cache/live-repository-add-evidence/` for review. A failure can
 reflect the live feed, such as a Release older than 14 days or a replaced
-descriptor, rather than a debz regression.
+descriptor, rather than a debz regression. The dispatch-only
+[live system install proof](safety-ci.md#live-system-install-proof) repeats
+this on disposable GitHub-hosted Noble runners and then plans real installs
+with the short system profile.
 
 The typed `system_product_context` resolver now retains this profile when it
 loads the active repository configuration described below. The
 [short system-profile install](exact-locks-and-provenance.md#short-system-profile-install-system-install-v1)
 plans with it and records it explicitly in its program and result as
-`bounded_missing_valid_until` with `maximum_release_age_seconds: 1209600`. It is
+`bounded_missing_valid_until` with `maximum_release_age_seconds: 1209600`,
+together with the repository's `archive_binding`. It is
 not yet consumed by the `debz apt` system facade or product API v1 package
 execution, so those still refuse this feed unless a product API `--config`
 explicitly selects the same bounded freshness for its source.

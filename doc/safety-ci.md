@@ -425,3 +425,80 @@ after the recorded review; that review must be refreshed before its expiry.
 Concurrency, fault injection, symlink/path traversal, cleanup and atomic
 publication cases live beside the cache, acquisition, refresh, payload,
 executor and recovery implementations and run in the full test suite.
+
+## Live system install proof
+
+The `system-install-live` job in `.github/workflows/ci.yml` proves the short
+system profile (`sudo debz install <package>`) against the live Microsoft
+Noble feed. It runs only from a `workflow_dispatch` with
+`run_system_install_live: true`; the input defaults to `false`, and pushes,
+pull requests and the schedule never run it. Its two rows use disposable
+GitHub-hosted `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) runners,
+never self-hosted ones. The job has only `contents: read` and
+`attestations: read` permissions, the latter for the verified Zig install,
+and uses no secrets.
+
+The job builds the static ReleaseSafe CLI and runs
+`tools/system-install-live-proof.sh`. The script refuses to run anywhere but
+a GitHub-hosted Ubuntu 24.04 runner of the row's architecture, because it is
+destructive there:
+
+1. It stops the APT timers and waits for package managers to exit.
+2. It purges `packages-microsoft-prod`, then moves the image's APT sources and
+   unowned Microsoft keyring into a root-only quarantine.
+3. It runs `debz repo add` with the reviewed descriptor and the legacy
+   backend.
+4. It runs nine installs, listed below.
+
+`tools/system-install-live-proof.zig` then checks every result and document
+read-only, as root. A build without `system-install-execution-v1` passes only
+when every row matches:
+
+| Run | Required result |
+| --- | --- |
+| `repo add` | Exit 0, installed and refreshed. The `apt-config-snapshot-v3` manifest holds only the Microsoft source, signed by the reviewed key. The source and every repository policy carry the explicit `maximum_release_age_seconds: 1209600` bound and `archive_binding: signed_sha256_derived_sha512`. |
+| Seven root installs of `symcrypt` or `symcrypt-openssl` | Exit 3, `refused_before_mutation`, with the pending-generation diagnostic. The runs cover the native, legacy and default backends, JSON and human output, and a repeat with `-y --noninteractive`. Each publishes an exact v5 lock, request, progress, program, authorization and receipt that agree with its result. |
+| Unprivileged native install | Exit 3, `rejected`, no evidence documents. |
+| Native install of an absent package | Exit 5, `rejected`, `planning_failed`, and no exact lock. |
+
+The checker also requires:
+
+- **Native plans:** programs and locks carry `derived_sha512` with provenance
+  `derived_from_signed_sha256` for every archive. The value must equal the
+  SHA-512 of the cached archive whose size and signed SHA-256 matched.
+- **Legacy plans:** programs and locks stay `signed_sha256_only`, with no
+  derived value.
+- **Installed facts:** they equal `/var/lib/dpkg/status`, with only an
+  installed-database origin.
+- **Output:** no output mentions an upstream digest.
+- **dpkg state:** `/var/lib/dpkg` is unchanged, both content and metadata,
+  after every install run. Any dpkg status change fails the proof.
+
+If the feed's Release is older than the reviewed 14-day bound, debz refuses
+it (`ReleaseExpired`). The proof then fails; it neither retries nor widens the
+bound. Once `system-install-execution-v1` lands, root installs are expected to
+complete (exit 0, `completed`) and change dpkg state, and the proof must be
+updated in the same change.
+
+The job always uploads `.system-install-live/<architecture>/` and keeps it
+for 14 days. It holds:
+
+- every run's output and exit status;
+- the quarantine list, pre-states and dpkg baseline;
+- the verified summary;
+- a readable copy of the root-only evidence and locks;
+- a listing of the package cache.
+
+Dispatch it for a branch with:
+
+```sh
+gh workflow run ci.yml --repo cataggar/debz --ref <branch> \
+  -f run_full_matrix=false -f run_system_install_live=true
+```
+
+`tools/security-audit.zig` and `test/security-policy.zig` pin:
+
+- the job text and its default-off input;
+- the hosted runners and permissions;
+- the script's guards, run table and dpkg comparison;
+- the checker's read-only contract.

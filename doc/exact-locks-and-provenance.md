@@ -355,8 +355,19 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg debz-archive-bindi
 - Because the declaration travels with the source bytes, target-APT
   configuration import (`target-apt-config import`) and repository-add
   descriptors (`.list` or `.sources` payloads) carry it unchanged into the
-  managed sources and repository IDs. The target-APT manifest format does not
-  change.
+  managed sources and repository IDs. A declaration in the source bytes does
+  not change the target-APT manifest format.
+- A [reviewed repository profile](repository-management.md#reviewed-freshness-profiles)
+  can also grant the binding, but only to the one source it matches exactly
+  (URL, suite, component, architectures, keyring path and signing
+  fingerprint). There is no global or default switch. Only
+  `microsoft-ubuntu-24.04-prod` grants it, as approved by the owner on
+  2026-10-13. Target-APT import and repository add record the granted binding
+  per source and per repository in
+  [`apt-config-snapshot-v3`](../schema/apt-config-snapshot-v3.json). A
+  configuration that no profile binds keeps its v1 or v2 bytes. Loading
+  reproduces the recorded binding, so a configuration recorded before the
+  approval stays `published_digests` until `sudo debz repo add` runs again.
 - Native lock production (`plan`/`download --lock-output`, package-family
   `resolve_lock`, and native repository-add operation locks) acquires each
   opted-in repository's locked archives through the package cache. With `--offline`/`--cache-only` it reads only the cache.
@@ -711,14 +722,38 @@ signed index published (`published_digests`) and one class:
 
 Microsoft's Noble `Packages` index lists only a SHA-256 for each archive
 (checked 2026-10-13); its `InRelease` lists SHA-512 only for the index files.
-Its reviewed profile `microsoft-ubuntu-24.04-prod` does not opt in to a derived
-binding, so its archives are `signed_sha256_only` until that opt-in is
-reviewed.
+Its reviewed profile `microsoft-ubuntu-24.04-prod` binds the repository as
+`signed_sha256_derived_sha512` (owner approval, 2026-10-13, for this
+repository only):
+
+- Native plans record these archives as `signed_sha256_derived_sha512`. The
+  only published digest is the signed SHA-256. The SHA-512 is computed over
+  the bytes that matched the signed size and SHA-256 and is recorded as
+  `derived_sha512` with provenance `derived_from_signed_sha256`. Neither JSON
+  nor human output calls it an upstream or signed SHA-512. Human output reads
+  `signed SHA-256; SHA-512 derived locally from the signed SHA-256 match
+  (derived_from_signed_sha256; not independently signed)`.
+- Before any archive is acquired, the native planner checks that the signed
+  index still publishes a SHA-256 and no SHA-512 for every archive of a bound
+  repository. A feed that starts publishing a SHA-512 refuses
+  (`lock_verification_failed`, exit 5, `ArchiveBindingMismatch`) until the
+  profile is reviewed again.
+- A changed or tampered archive refuses before any SHA-512 is derived
+  (`download_failed`, exit 6). The attempt publishes no lock, and the bad
+  bytes never enter the package cache.
+- The legacy backend never derives. Its archives stay `signed_sha256_only`
+  with the repository binding `published_digests`. Human output reads
+  `signed SHA-256 only; no SHA-512 published by the signed index`.
+- Any other repository that publishes only SHA-256 stays unbound. The
+  native backend refuses it (exit 5) unless that repository opts in itself.
+
 Each repository also records its freshness policy. The reviewed
 repository-specific moving-feed bound appears explicitly as
 `bounded_missing_valid_until` with `maximum_release_age_seconds: 1209600`, as
 described in [reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
-No default bound is applied.
+Human output reads `missing Valid-Until accepted for at most 1209600 s
+(explicit repository bound)`. No default bound is applied. The archive
+binding never extends that bound.
 
 **Execution is pending.** No build provides `system-install-execution-v1` yet.
 An authorized attempt therefore settles as `refused_before_mutation` with
@@ -755,7 +790,9 @@ downloads.
   locks;
 - post-mutation recovery and an operator recovery command;
 - refusal of unsettled system-install attempts by other root surfaces;
-- the Microsoft derived-binding review;
 - removal of settled attempts and their retained locks;
 - #68 option overrides;
-- hosted Noble amd64/arm64 acceptance.
+- passing results from the hosted Noble amd64/arm64 acceptance. The
+  dispatch-only
+  [`system-install-live` job](safety-ci.md#live-system-install-proof)
+  provides it, and it has not yet run.

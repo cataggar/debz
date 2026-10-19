@@ -1,4 +1,5 @@
 const std = @import("std");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
@@ -7,6 +8,8 @@ const source = @import("source.zig");
 /// Release omits `Valid-Until`. A profile never matches on hostname alone: the
 /// exact source path and format, every normalized entry, the declared keyring
 /// path, and that keyring's complete primary-fingerprint set must all match.
+/// There is no global or default switch: everything a profile grants applies
+/// only to the one source that matches it exactly.
 pub const Profile = struct {
     name: []const u8,
     source_path: []const u8,
@@ -21,10 +24,35 @@ pub const Profile = struct {
     target_architectures: []const []const u8,
     primary_fingerprints: []const [20]u8,
     maximum_release_age_seconds: u64,
+    /// Reviewed archive identity binding for this repository only. The
+    /// non-default `signed_sha256_derived_sha512` is chosen when the signed
+    /// index publishes SHA-256 but no SHA-512 for archives: the SHA-512 is then
+    /// computed locally over bytes already authenticated by the signed SHA-256
+    /// and size, and is recorded as `derived_from_signed_sha256`. It is never an
+    /// upstream SHA-512 and adds no authority beyond the signed SHA-256.
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 
     pub fn freshness(self: Profile) repository_refresh.ExpiryPolicy {
         return .{ .allow_missing_valid_until_with_max_age_seconds = self.maximum_release_age_seconds };
     }
+
+    pub fn policy(self: Profile) SourcePolicy {
+        return .{
+            .profile = self.name,
+            .freshness = self.freshness(),
+            .archive_binding = self.archive_binding,
+        };
+    }
+};
+
+/// What a source document receives from the reviewed profiles: everything a
+/// profile grants after an exact match, and the fail-closed default (required
+/// `Valid-Until`, archive identities exactly as published) otherwise.
+pub const SourcePolicy = struct {
+    /// Name of the exactly matching reviewed profile, if any.
+    profile: ?[]const u8 = null,
+    freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 };
 
 /// Owner-reviewed maximum signed-Release age for Microsoft's Noble feed.
@@ -36,6 +64,9 @@ pub const microsoft_release_signing_fingerprint = fingerprint("BC528686B50D79E33
 
 /// The source and keyring installed by
 /// `https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb`.
+/// Its signed `Packages` indexes publish only SHA-256 archive digests. The
+/// owner approved (2026-10-13) the derived SHA-512 binding for this profile
+/// only; the 14-day Release bound stays a separate, explicit limit.
 pub const microsoft_ubuntu_noble_prod: Profile = .{
     .name = "microsoft-ubuntu-24.04-prod",
     .source_path = "/etc/apt/sources.list.d/microsoft-prod.list",
@@ -48,6 +79,7 @@ pub const microsoft_ubuntu_noble_prod: Profile = .{
     .target_architectures = &.{ "amd64", "arm64" },
     .primary_fingerprints = &.{microsoft_release_signing_fingerprint},
     .maximum_release_age_seconds = microsoft_maximum_release_age_seconds,
+    .archive_binding = .signed_sha256_derived_sha512,
 };
 
 pub const production_profiles: []const Profile = &.{microsoft_ubuntu_noble_prod};
@@ -95,9 +127,28 @@ pub fn validateProfiles(profiles: []const Profile) ValidationError!void {
     }
 }
 
-/// Returns the reviewed bounded policy only for an exact profile match and the
+/// Returns the reviewed policy only for an exact profile match and the
 /// fail-closed default otherwise. `keyrings` must be the bytes the refresh will
 /// actually authenticate with, already inspected for primary fingerprints.
+pub fn sourcePolicy(
+    allocator: std.mem.Allocator,
+    profiles: []const Profile,
+    candidate: Source,
+    keyrings: []const Keyring,
+    target_architecture: []const u8,
+) std.mem.Allocator.Error!SourcePolicy {
+    for (profiles) |profile| {
+        if (!std.mem.eql(u8, candidate.logical_path, profile.source_path)) continue;
+        if (candidate.format == profile.source_format and
+            containsString(profile.target_architectures, target_architecture) and
+            keyringMatches(profile, keyrings) and
+            try sourceMatches(allocator, profile, candidate, target_architecture))
+            return profile.policy();
+        return .{};
+    }
+    return .{};
+}
+
 pub fn sourceFreshness(
     allocator: std.mem.Allocator,
     profiles: []const Profile,
@@ -105,16 +156,7 @@ pub fn sourceFreshness(
     keyrings: []const Keyring,
     target_architecture: []const u8,
 ) std.mem.Allocator.Error!repository_refresh.ExpiryPolicy {
-    for (profiles) |profile| {
-        if (!std.mem.eql(u8, candidate.logical_path, profile.source_path)) continue;
-        if (candidate.format == profile.source_format and
-            containsString(profile.target_architectures, target_architecture) and
-            keyringMatches(profile, keyrings) and
-            try sourceMatches(allocator, profile, candidate, target_architecture))
-            return profile.freshness();
-        return .require_valid_until;
-    }
-    return .require_valid_until;
+    return (try sourcePolicy(allocator, profiles, candidate, keyrings, target_architecture)).freshness;
 }
 
 fn sourceMatches(
@@ -123,9 +165,15 @@ fn sourceMatches(
     candidate: Source,
     target_architecture: []const u8,
 ) std.mem.Allocator.Error!bool {
+    // A declaration that names a different archive binding contradicts the
+    // reviewed one and is not the reviewed source.
     const normalized = try repository_policy.normalizeBinaryRefresh(
         allocator,
-        &.{.{ .bytes = candidate.bytes, .format = candidate.format }},
+        &.{.{
+            .bytes = candidate.bytes,
+            .format = candidate.format,
+            .policy = .{ .archive_binding = profile.archive_binding },
+        }},
         target_architecture,
         .{},
     );
@@ -143,6 +191,7 @@ fn sourceMatches(
             !std.mem.eql(u8, repository.component, profile.component) or
             !containsString(profile.published_architectures, repository.architecture) or
             repository.immutability.kind != .moving or
+            repository.archive_binding != profile.archive_binding or
             repository.signed_by.len != 1 or
             !std.mem.eql(u8, repository.signed_by[0], profile.keyring_path))
             return false;
@@ -209,17 +258,19 @@ const microsoft_keyring: Keyring = .{
     .primary_fingerprints = &.{microsoft_release_signing_fingerprint},
 };
 
-fn expectDefault(policy: repository_refresh.ExpiryPolicy) !void {
-    try std.testing.expect(repository_refresh.expiryPoliciesEqual(policy, .require_valid_until));
+fn expectDefault(policy: SourcePolicy) !void {
+    try std.testing.expect(policy.profile == null);
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(policy.freshness, .require_valid_until));
+    try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.published_digests, policy.archive_binding);
 }
 
-fn freshnessOf(
+fn policyOf(
     candidate_path: []const u8,
     bytes: []const u8,
     keyrings: []const Keyring,
     architecture: []const u8,
-) !repository_refresh.ExpiryPolicy {
-    return sourceFreshness(std.testing.allocator, production_profiles, .{
+) !SourcePolicy {
+    return sourcePolicy(std.testing.allocator, production_profiles, .{
         .logical_path = candidate_path,
         .bytes = bytes,
         .format = if (std.mem.endsWith(u8, candidate_path, ".sources")) .deb822 else .legacy,
@@ -236,27 +287,36 @@ test "reviewed Microsoft Noble profile is valid and bounded to 14 days" {
 
 test "reviewed profile accepts the exact Microsoft Noble source and pinned key" {
     for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
-        const policy = try freshnessOf(
+        const policy = try policyOf(
             microsoft_ubuntu_noble_prod.source_path,
             live_microsoft_source,
             &.{microsoft_keyring},
             architecture,
         );
+        try std.testing.expectEqualStrings("microsoft-ubuntu-24.04-prod", policy.profile.?);
         try std.testing.expectEqual(
             @as(?u64, microsoft_maximum_release_age_seconds),
-            repository_refresh.expiryPolicyMaxAge(policy),
+            repository_refresh.expiryPolicyMaxAge(policy.freshness),
+        );
+        try std.testing.expectEqual(
+            exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+            policy.archive_binding,
         );
     }
     const target_only =
         "deb [arch=arm64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
         "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
-    const policy = try freshnessOf(
+    const policy = try policyOf(
         microsoft_ubuntu_noble_prod.source_path,
         target_only,
         &.{microsoft_keyring},
         "arm64",
     );
-    try std.testing.expect(repository_refresh.expiryPolicyMaxAge(policy) != null);
+    try std.testing.expect(repository_refresh.expiryPolicyMaxAge(policy.freshness) != null);
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+        policy.archive_binding,
+    );
 }
 
 test "reviewed profile refuses other signers and incomplete keyring evidence" {
@@ -274,7 +334,7 @@ test "reviewed profile refuses other signers and incomplete keyring evidence" {
             .primary_fingerprints = &.{microsoft_release_signing_fingerprint},
         }},
     };
-    for (cases) |keyrings| try expectDefault(try freshnessOf(
+    for (cases) |keyrings| try expectDefault(try policyOf(
         microsoft_ubuntu_noble_prod.source_path,
         live_microsoft_source,
         keyrings,
@@ -310,7 +370,7 @@ test "reviewed profile never applies to other sources or targets" {
         "",
         "not a source\n",
     };
-    for (other_sources) |bytes| try expectDefault(try freshnessOf(
+    for (other_sources) |bytes| try expectDefault(try policyOf(
         microsoft_ubuntu_noble_prod.source_path,
         bytes,
         keyrings,
@@ -321,9 +381,9 @@ test "reviewed profile never applies to other sources or targets" {
         sources_directory ++ "/other.list",
         sources_directory[0 .. sources_directory.len - ".d".len],
         reviewed_source_path ++ ".bak",
-    }) |path| try expectDefault(try freshnessOf(path, live_microsoft_source, keyrings, "amd64"));
+    }) |path| try expectDefault(try policyOf(path, live_microsoft_source, keyrings, "amd64"));
 
-    try expectDefault(try freshnessOf(
+    try expectDefault(try policyOf(
         sources_directory ++ "/microsoft-prod.sources",
         "Types: deb\nURIs: https://packages.microsoft.com/ubuntu/24.04/prod\n" ++
             "Suites: noble\nComponents: main\nArchitectures: amd64\n" ++
@@ -331,20 +391,20 @@ test "reviewed profile never applies to other sources or targets" {
         keyrings,
         "amd64",
     ));
-    try expectDefault(try sourceFreshness(std.testing.allocator, production_profiles, .{
+    try expectDefault(try sourcePolicy(std.testing.allocator, production_profiles, .{
         .logical_path = microsoft_ubuntu_noble_prod.source_path,
         .bytes = live_microsoft_source,
         .format = .deb822,
     }, keyrings, "amd64"));
 
     for ([_][]const u8{ "armhf", "i386", "riscv64" }) |architecture|
-        try expectDefault(try freshnessOf(
+        try expectDefault(try policyOf(
             microsoft_ubuntu_noble_prod.source_path,
             live_microsoft_source,
             keyrings,
             architecture,
         ));
-    try expectDefault(try sourceFreshness(
+    try expectDefault(try sourcePolicy(
         std.testing.allocator,
         &.{},
         .{
@@ -355,6 +415,57 @@ test "reviewed profile never applies to other sources or targets" {
         keyrings,
         "amd64",
     ));
+}
+
+test "reviewed archive binding is a per-profile decision only Microsoft takes" {
+    var derived: usize = 0;
+    for (production_profiles) |profile| {
+        if (profile.archive_binding == .published_digests) continue;
+        derived += 1;
+        try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512, profile.archive_binding);
+        try std.testing.expectEqualStrings("microsoft-ubuntu-24.04-prod", profile.name);
+        try std.testing.expectEqual(@as(u64, 1_209_600), profile.maximum_release_age_seconds);
+    }
+    try std.testing.expectEqual(@as(usize, 1), derived);
+
+    // The same exact match under a profile that keeps published digests grants
+    // the bounded freshness alone.
+    var freshness_only = microsoft_ubuntu_noble_prod;
+    freshness_only.archive_binding = .published_digests;
+    const policy = try sourcePolicy(std.testing.allocator, &.{freshness_only}, .{
+        .logical_path = microsoft_ubuntu_noble_prod.source_path,
+        .bytes = live_microsoft_source,
+        .format = .legacy,
+    }, &.{microsoft_keyring}, "amd64");
+    try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.published_digests, policy.archive_binding);
+    try std.testing.expectEqual(
+        @as(?u64, microsoft_maximum_release_age_seconds),
+        repository_refresh.expiryPolicyMaxAge(policy.freshness),
+    );
+}
+
+test "reviewed profile refuses a declaration that contradicts its archive binding" {
+    const published =
+        "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg " ++
+        "debz-archive-binding=published_digests] " ++
+        "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+    try expectDefault(try policyOf(
+        microsoft_ubuntu_noble_prod.source_path,
+        published,
+        &.{microsoft_keyring},
+        "amd64",
+    ));
+    var freshness_only = microsoft_ubuntu_noble_prod;
+    freshness_only.archive_binding = .published_digests;
+    const derived =
+        "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg " ++
+        "debz-archive-binding=signed_sha256_derived_sha512] " ++
+        "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+    try expectDefault(try sourcePolicy(std.testing.allocator, &.{freshness_only}, .{
+        .logical_path = microsoft_ubuntu_noble_prod.source_path,
+        .bytes = derived,
+        .format = .legacy,
+    }, &.{microsoft_keyring}, "amd64"));
 }
 
 test "reviewed profile validation rejects unbounded or ambiguous profiles" {

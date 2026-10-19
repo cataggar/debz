@@ -163,7 +163,8 @@ identity, immutable-generation drift, and independence from the public
 operation manifest. Use `-Doptimize=ReleaseSafe` to repeat the same cases;
 compile filters alone do not discover Zig's lazy module imports.
 
-Callers may attach an explicit freshness policy to a discovered source path.
+Callers may attach an explicit freshness policy to a discovered source path,
+and with it an archive binding.
 The default requires signed `Valid-Until`; the only alternative allows a
 missing field for a nonzero, bounded maximum Release age. Unknown, duplicate,
 invalid, or missing source-policy paths fail rather than being ignored. This is
@@ -175,8 +176,8 @@ It derives them from the imported source and keyring bytes and repeats the
 import to confirm those bytes are unchanged.
 Target-root configuration has no witness relation, so it refuses
 `frozen_release_with_witnesses` in source policies, manifests and
-`apt-config-snapshot-v2` documents; supporting it would require a new snapshot
-schema.
+`apt-config-snapshot-v2` and `-v3` documents; supporting it would require a new
+snapshot schema.
 
 The canonical `apt-config-snapshot-v2` document records source paths, digests,
 and freshness policies; normalized configuration, repository identities, and
@@ -196,6 +197,23 @@ A source may declare the per-repository signed-SHA256 archive binding
 option). Import validates the token, carries the declaration in the source
 bytes, normalized repositories, and repository identities, and leaves the
 manifest format unchanged ([exact locks](exact-locks-and-provenance.md)).
+
+A source policy can instead grant the binding, as the reviewed
+`microsoft-ubuntu-24.04-prod` profile does. The source bytes then do not carry
+it, so the manifest records it:
+
+- The canonical
+  [`apt-config-snapshot-v3`](../schema/apt-config-snapshot-v3.json) document
+  is v2 plus an `archive_binding` on every source and every repository policy.
+  The repository binding includes bindings a declaration states itself.
+- It is emitted exactly when some source policy grants a non-default binding.
+  A v1 or v2 document with a bound source or repository policy is rejected,
+  and so is a v3 document with no bound source. Each configuration therefore
+  has one canonical form.
+- A declaration in the source may agree with the granted binding but never
+  contradict it.
+- Loading an active configuration reproduces the recorded policies, so a v2
+  configuration never gains a binding by omission.
 
 The module is a foundation for the separately scoped `repo add` workflow. It
 does not install descriptors, mutate repository configuration, alter exact

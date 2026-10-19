@@ -421,8 +421,9 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
   - The schema is unchanged in phase 1. Target-root APT configuration cannot
     express the frozen mode: `parseFreshness` keeps refusing unknown modes, and
     source policies and manifests refuse it explicitly.
-  - Supporting the mode in target-root configuration later requires
-    `apt-config-snapshot-v3`.
+  - Supporting the mode in target-root configuration later requires a new
+    snapshot version. `apt-config-snapshot-v3` now records reviewed archive
+    bindings, so this would be v4.
 - **`tools/real-snapshot-acceptance.sh`, `test/real-snapshot-policy.zig` and
   `.github/workflows/ci.yml`**
   - Write three config documents.
