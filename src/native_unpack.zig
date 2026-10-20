@@ -23811,7 +23811,7 @@ const snapshot_util_linux_arm64_fstrim_created_paths = [_][]const u8{
 
 const snapshot_util_linux_arm64_fstrim_link: SnapshotLessArm64Alias = .{
     .path = "etc/systemd/system/timers.target.wants/fstrim.timer",
-    .target = "/usr/lib/systemd/system/fstrim.timer",
+    .target = "/lib/systemd/system/fstrim.timer",
 };
 
 const snapshot_util_linux_arm64_fstrim_also_bytes = "/etc/systemd/system/timers.target.wants/fstrim.timer\n";
