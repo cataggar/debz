@@ -330,9 +330,9 @@ probe=$workspace/escape-probe
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$probe"
 chmod 0500 "$launcher" "$probe"
-"$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
+ZIG_GLOBAL_CACHE_DIR="$workspace/build/zig-global-cache" \
+  "$zig" build build-reference-runtime -Doptimize=ReleaseSafe \
   --cache-dir "$workspace/build/zig-cache" \
-  --global-cache-dir "$workspace/build/zig-global-cache" \
   --prefix "$workspace/build/runtime-tool"
 runtime=$workspace/reference-runtime
 "$workspace/build/runtime-tool/bin/debz-reference-runtime" record \

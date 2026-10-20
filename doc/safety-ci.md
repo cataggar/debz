@@ -446,8 +446,9 @@ destructive there:
 1. It stops the APT timers and waits for package managers to exit.
 2. It purges `packages-microsoft-prod`, then moves the image's APT sources and
    unowned Microsoft keyring into a root-only quarantine.
-3. It runs `debz repo add` with the reviewed descriptor and the legacy
-   backend.
+3. It runs `debz repo add` with the reviewed descriptor and the native
+   backend against a temporary modeled dpkg baseline before restoring the
+   runner's dpkg state.
 4. It runs nine installs, listed below.
 
 `tools/system-install-live-proof.zig` then checks every result and document
@@ -457,7 +458,8 @@ when every row matches:
 | Run | Required result |
 | --- | --- |
 | `repo add` | Exit 0, installed and refreshed. The `apt-config-snapshot-v3` manifest holds only the Microsoft source, signed by the reviewed key. The source and every repository policy carry the explicit `maximum_release_age_seconds: 1209600` bound and `archive_binding: signed_sha256_derived_sha512`. |
-| Seven root installs of `symcrypt` or `symcrypt-openssl` | Exit 3, `refused_before_mutation`, with the pending-generation diagnostic. The runs cover the native, legacy and default backends, JSON and human output, and a repeat with `-y --noninteractive`. Each publishes an exact v5 lock, request, progress, program, authorization and receipt that agree with its result. |
+| Five native/default root installs of `symcrypt` or `symcrypt-openssl` | Exit 3, `refused_before_mutation`, with the pending-generation diagnostic. The runs cover the native and default backends, JSON and human output, and a repeat with `-y --noninteractive`. Each publishes an exact v5 lock, request, progress, program, authorization and receipt that agree with its result. |
+| Two legacy root installs of `symcrypt` or `symcrypt-openssl` | Exit 8, `rejected`, `legacy_recovery_release_required`, with no attempt or lock created. |
 | Unprivileged native install | Exit 3, `rejected`, no evidence documents. |
 | Native install of an absent package | Exit 5, `rejected`, `planning_failed`, and no exact lock. |
 

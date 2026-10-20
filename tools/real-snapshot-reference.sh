@@ -163,9 +163,9 @@ launcher="$workspace/reference-launcher"
   --global-cache-dir "$workspace/reference-zig-global-cache" \
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
-"$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
+ZIG_GLOBAL_CACHE_DIR="$workspace/reference-zig-global-cache" \
+  "$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
   --cache-dir "$workspace/reference-zig-cache" \
-  --global-cache-dir "$workspace/reference-zig-global-cache" \
   --prefix "$workspace/runtime-tool"
 runtime="$workspace/reference-runtime"
 "$workspace/runtime-tool/bin/debz-reference-runtime" record \

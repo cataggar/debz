@@ -145,8 +145,48 @@ sudo -n find "$quarantine" -mindepth 1 -printf '%P\n' | sort >"$out/quarantined.
 check prestate "$arch" >"$out/prestate-initial.json" ||
   die "the runner's dpkg database is outside the healthy installed-prestate contract; see prestate-initial.json"
 
-capture "$out/repo-add" as_root "$debz" repo add --url "$url" --sha256 "$descriptor" \
-  --transaction-backend legacy_dpkg --json
+capture "$out/repo-add" as_root sh -e -c '
+  quarantine=$1
+  arch=$2
+  shift 2
+  restore() {
+    if [ -d "$quarantine/dpkg" ]; then
+      rm -rf /var/lib/dpkg
+      mv "$quarantine/dpkg" /var/lib/dpkg
+    fi
+    if [ -d "$quarantine/alternatives" ]; then
+      rm -rf /etc/alternatives
+      mv "$quarantine/alternatives" /etc/alternatives
+    fi
+  }
+  trap restore EXIT
+  mv /var/lib/dpkg "$quarantine/dpkg"
+  mv /etc/alternatives "$quarantine/alternatives"
+  install -d -o root -g root -m 0755 \
+    /etc/alternatives \
+    /var/lib/dpkg \
+    /var/lib/dpkg/alternatives \
+    /var/lib/dpkg/info \
+    /var/lib/dpkg/triggers \
+    /var/lib/dpkg/updates
+  printf "Package: dpkg\nStatus: install ok installed\nArchitecture: %s\nVersion: 1\n\nPackage: ca-certificates\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n" "$arch" >/var/lib/dpkg/status
+  printf "1\n" >/var/lib/dpkg/info/format
+  printf "/.\n" >/var/lib/dpkg/info/dpkg.list
+  printf "/.\n" >/var/lib/dpkg/info/ca-certificates.list
+  chmod 0644 \
+    /var/lib/dpkg/status \
+    /var/lib/dpkg/info/format \
+    /var/lib/dpkg/info/dpkg.list \
+    /var/lib/dpkg/info/ca-certificates.list
+  status=0
+  "$@" || status=$?
+  mv /var/lib/dpkg "$quarantine/dpkg-repo-add"
+  mv "$quarantine/dpkg" /var/lib/dpkg
+  rm -rf /etc/alternatives
+  mv "$quarantine/alternatives" /etc/alternatives
+  exit "$status"
+' sh "$quarantine" "$arch" "$debz" repo add --url "$url" --sha256 "$descriptor" \
+  --transaction-backend native --json
 status=$(cat "$out/repo-add.exit")
 if [ "$status" -ne 0 ]; then
   if grep -q ReleaseExpired "$out/repo-add.stdout" "$out/repo-add.stderr"; then

@@ -355,7 +355,12 @@ pub fn writeRegular(
     mode: u32,
 ) !void {
     const parent = std.fs.path.dirname(path) orelse return fail("invalid path: {s}", .{path});
-    try std.Io.Dir.cwd().createDirPath(io, parent);
+    if (std.Io.Dir.openDirAbsolute(io, parent, .{})) |existing| {
+        var dir = existing;
+        dir.close(io);
+    } else |_| {
+        try std.Io.Dir.cwd().createDirPath(io, parent);
+    }
     const path_z = try dupeZ(allocator, path);
     defer allocator.free(path_z);
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{

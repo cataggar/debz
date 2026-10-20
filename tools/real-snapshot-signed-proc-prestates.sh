@@ -270,8 +270,9 @@ launcher=$tools/reference-launcher
   -femit-bin="$launcher"
 chmod 0500 "$launcher"
 require_protected_file "$launcher"
-"$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
-  --cache-dir "$tools/zig-cache" --global-cache-dir "$tools/zig-global-cache" \
+ZIG_GLOBAL_CACHE_DIR="$tools/zig-global-cache" \
+  "$zig" build build-reference-runtime build-reference-order -Doptimize=ReleaseSafe \
+  --cache-dir "$tools/zig-cache" \
   --prefix "$tools/runtime-tool"
 require_protected_file "$tools/runtime-tool/bin/debz-reference-order"
 runtime=$tools/reference-runtime

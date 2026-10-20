@@ -35,6 +35,7 @@ test('native installs bind real receipts across cold, warm, offline, same-root, 
   environment.GITHUB_ACTION_PATH = actionPath;
   environment.RUNNER_ARCH = runnerArchitecture;
   environment.DEBZ_INSTALL_ARCHITECTURE = architecture;
+  environment.DEBZ_INSTALL_DEBZ_VERSION = 'v0.4.0';
   environment.DEBZ_INSTALL_USE_SUDO = process.env.DEBZ_INSTALL_INTEGRATION_SUDO === '1' ? 'true' : 'false';
   environment.DEBZ_INSTALL_CACHE = 'false';
   environment.DEBZ_INSTALL_CLI_CACHE = 'false';
@@ -63,7 +64,7 @@ test('native installs bind real receipts across cold, warm, offline, same-root, 
       timeout: 180_000, maxBuffer: 1024 * 1024,
     },
   );
-  const localCli = path.join(runner, 'debz-tools', '0.3.0', 'bin', 'debz');
+  const localCli = path.join(runner, 'debz-tools', '0.4.0', 'bin', 'debz');
   await mkdir(path.dirname(localCli), { recursive: true });
   await copyFile(sourceCli, localCli);
   await chmod(localCli, 0o755);
@@ -186,7 +187,7 @@ async function execute(
     async setup() {
       return {
         debzPath: localCli,
-        debzVersion: 'v0.3.0',
+        debzVersion: 'v0.4.0',
         target: inputs.target,
         cacheHit: false,
       };
