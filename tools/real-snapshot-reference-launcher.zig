@@ -2365,32 +2365,34 @@ fn runBound(allocator: std.mem.Allocator, options: Options, bound: *const runtim
         target.metadata.mode != 0o100600 or target.metadata.size != 0 or
         target.metadata.nlink != 1 or target.metadata.dev_major != root.metadata.dev_major or
         target.metadata.dev_minor != root.metadata.dev_minor) return error.InvalidArchiveMountpoint;
-    if (scriptBinding(options.profile)) |binding| {
-        const script_path = try std.fmt.allocPrintSentinel(
-            allocator,
-            "{s}/var/lib/dpkg/info/{s}.postinst",
-            .{ options.root, binding.name },
-            0,
-        );
-        const script = openVerified(
-            script_path,
-            std.crypto.hash.sha2.Sha256,
-            binding.digest,
-            binding.size,
-            binding.size,
-        ) catch |err| blk: {
-            if (options.profile == .systemd and (err == error.InvalidSourceFile or err == error.SourceChanged)) {
-                break :blk try openVerified(
-                    script_path,
-                    std.crypto.hash.sha2.Sha256,
-                    debian_systemd_script_binding.digest,
-                    debian_systemd_script_binding.size,
-                    debian_systemd_script_binding.size,
-                );
-            }
-            return err;
-        };
-        _ = linux.close(script.fd);
+    if (std.mem.eql(u8, options.architecture, "amd64")) {
+        if (scriptBinding(options.profile)) |binding| {
+            const script_path = try std.fmt.allocPrintSentinel(
+                allocator,
+                "{s}/var/lib/dpkg/info/{s}.postinst",
+                .{ options.root, binding.name },
+                0,
+            );
+            const script = openVerified(
+                script_path,
+                std.crypto.hash.sha2.Sha256,
+                binding.digest,
+                binding.size,
+                binding.size,
+            ) catch |err| blk: {
+                if (options.profile == .systemd and (err == error.InvalidSourceFile or err == error.SourceChanged)) {
+                    break :blk openVerified(
+                        script_path,
+                        std.crypto.hash.sha2.Sha256,
+                        debian_systemd_script_binding.digest,
+                        debian_systemd_script_binding.size,
+                        debian_systemd_script_binding.size,
+                    ) catch |fallback_err| return if (err == error.SourceChanged and fallback_err == error.InvalidSourceFile) err else fallback_err;
+                }
+                return err;
+            };
+            _ = linux.close(script.fd);
+        }
     }
     const boot_id = if (options.profile == .systemd) try readBootId() else null;
     // Pin guest helpers, interpreters, loader configs and late providers after

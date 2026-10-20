@@ -461,6 +461,7 @@ fn mkdirPath(path: []const u8, mode: usize) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const ptr = try cPath(path, &buf);
     _ = try syscall(linux.mkdirat(linux.AT.FDCWD, ptr, @intCast(mode)));
+    _ = try syscall(linux.fchmodat(linux.AT.FDCWD, ptr, @intCast(mode)));
 }
 
 fn symlinkPath(target: []const u8, link_path: []const u8) !void {
@@ -1211,7 +1212,7 @@ pub const RuntimeProofHooks = struct {
 
 const BindingObject = struct {
     name: []const u8,
-    root_path: []const u8,
+    root_path: ?[]const u8 = null,
 };
 
 const BindingRecord = struct {
@@ -1247,6 +1248,7 @@ pub fn proveRuntimeWithHooks(
     var case_count: usize = 0;
 
     for (selected) |binding| {
+        const root_path = binding.root_path orelse return error.MissingRuntimeBindingObject;
         for ([_][]const u8{ "missing", "altered", "symlink", "private-altered" }) |mutation| {
             const name = try std.fmt.allocPrint(allocator, "runtime-{s}-{s}", .{ binding.name, mutation });
             defer allocator.free(name);
@@ -1256,7 +1258,7 @@ pub fn proveRuntimeWithHooks(
             var prefix = try allocator.dupe(u8, args.runtime);
             defer allocator.free(prefix);
 
-            const trimmed_root_path = std.mem.trimStart(u8, binding.root_path, "/");
+            const trimmed_root_path = std.mem.trimStart(u8, root_path, "/");
             var target = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, trimmed_root_path });
             defer allocator.free(target);
 
@@ -1590,19 +1592,19 @@ pub fn guestMutations(
     const raw_cases = [_][3][]const u8{
         .{ "helper-altered", "usr/bin/tar", "GuestDigestChanged" },
         .{ "helper-missing", "usr/bin/dpkg-split", "MissingGuestBinding" },
-        .{ "helper-symlink", "usr/bin/dpkg-deb", "GuestFileTypeChanged" },
+        .{ "helper-symlink", "usr/bin/dpkg-deb", "GuestAliasChanged" },
         .{ "library-altered", lib_rel, "GuestDigestChanged" },
         .{ "interpreter-altered", "usr/bin/dash", "GuestDigestChanged" },
-        .{ "interpreter-symlink", "usr/bin/sh", "GuestSymlinkChanged" },
-        .{ "alias-symlink", "bin", "GuestSymlinkChanged" },
-        .{ "path-shadow", "usr/sbin/tar", "PresentGuestForbiddenPath" },
-        .{ "dpkg-config", ".dpkg.cfg", "PresentGuestForbiddenPath" },
-        .{ "dpkg-config-dir", "etc/dpkg/dpkg.cfg.d/unbound", "UnboundGuestScopeEntry" },
-        .{ "loader-config", "etc/ld.so.conf.d/zz-unbound.conf", "UnboundGuestScopeEntry" },
+        .{ "interpreter-symlink", "usr/bin/sh", "GuestAliasChanged" },
+        .{ "alias-symlink", "bin", "GuestAliasChanged" },
+        .{ "path-shadow", "usr/sbin/tar", "ForbiddenGuestEntry" },
+        .{ "dpkg-config", ".dpkg.cfg", "ForbiddenGuestEntry" },
+        .{ "dpkg-config-dir", "etc/dpkg/dpkg.cfg.d/unbound", "UnboundGuestEntry" },
+        .{ "loader-config", "etc/ld.so.conf.d/zz-unbound.conf", "UnboundGuestEntry" },
         .{ "loader-cache", "etc/ld.so.cache", "UnboundGuestCacheEntry" },
-        .{ "hwcaps-dir", hwcaps_rel, "PresentGuestForbiddenPath" },
-        .{ "nss-provider", nss_rel, "UnboundGuestScopeEntry" },
-        .{ "gconv-module", gconv_rel, "UnboundGuestScopeEntry" },
+        .{ "hwcaps-dir", hwcaps_rel, "ForbiddenGuestEntry" },
+        .{ "nss-provider", nss_rel, "UnboundGuestEntry" },
+        .{ "gconv-module", gconv_rel, "UnboundGuestEntry" },
     };
 
     var out = try allocator.alloc(GuestMutation, raw_cases.len);
@@ -1660,7 +1662,14 @@ pub fn mutateGuest(
     defer allocator.free(root_relative);
 
     if (std.mem.endsWith(u8, case_name, "-altered")) {
-        const meta = try lstatPath(target);
+        const meta = lstatPath(target) catch |err| switch (err) {
+            error.FileNotFound => {
+                try mkdirParents(root, relative);
+                try writeBeneath(anchor, root_relative, "unbound\n", 0o755, false);
+                return;
+            },
+            else => return err,
+        };
         const data = try readHostFile(allocator, target, 64 * 1024 * 1024);
         defer allocator.free(data);
         if (data.len == 0) return error.EmptyGuestInput;
@@ -1672,7 +1681,10 @@ pub fn mutateGuest(
         try unlinkPath(target);
         try symlinkPath("/usr/bin/tar", target);
     } else if (std.mem.eql(u8, case_name, "interpreter-symlink") or std.mem.eql(u8, case_name, "alias-symlink")) {
-        try unlinkPath(target);
+        unlinkPath(target) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
         try symlinkPath(if (std.mem.eql(u8, case_name, "alias-symlink")) "/usr/sbin" else "bash", target);
     } else if (std.mem.eql(u8, case_name, "loader-cache")) {
         try mkdirParents(root, relative);
@@ -2857,7 +2869,7 @@ test "runtime mutation negatives reach checks using workspace-rooted writes" {
     try writeTestFile(
         runtime,
         "binding.json",
-        "{\"loader\": \"loader.so\", \"objects\": [{\"name\": \"loader.so\", \"root_path\": \"/usr/lib/loader.so\"}, {\"name\": \"libpcre2-8.so.0\", \"root_path\": \"/usr/lib/libpcre2-8.so.0\"}]}",
+        "{\"loader\": \"loader.so\", \"objects\": [{\"name\": \"dpkg\", \"root_path\": null}, {\"name\": \"loader.so\", \"root_path\": \"/usr/lib/loader.so\"}, {\"name\": \"libpcre2-8.so.0\", \"root_path\": \"/usr/lib/libpcre2-8.so.0\"}]}",
         0o644,
     );
 
