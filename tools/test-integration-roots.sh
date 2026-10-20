@@ -618,7 +618,6 @@ EOF
   }
   printf 'CAPABILITY dpkg-root-transactions: %s\n' "$(dpkg --version | head -n 1)"
   mkdir -p "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/info"
-  dpkg --admindir="$root/var/lib/dpkg" --add-architecture "$architecture"
   $privileged dpkg --force-architecture --root="$root" --install \
     "$repo/pool/main/native-helper-target_1.0-1_$architecture.deb" \
     >"$workspace/root-seed.log" 2>&1

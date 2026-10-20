@@ -18,8 +18,9 @@ const SOURCE = "/etc/apt/sources.list.d/microsoft-prod.list";
 const KEYRING = "/usr/share/keyrings/microsoft-prod.gpg";
 const DERIVED = "signed_sha256_derived_sha512";
 const PRIVILEGE = "system install requires root privilege (run with sudo); nothing was changed";
+const LEGACY_RECOVERY = "Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.";
 const ABSENT_PACKAGE = "debz-live-proof-absent";
-const ABSENT = "package has no available candidate; nothing was changed";
+const ABSENT = "no available package or provider matches the requested name; nothing was changed";
 const PENDING = GENERATION ++ " is not available in this build; nothing was changed; the exact lock is retained";
 const MIB = 1024 * 1024;
 const FILE_LIMIT = 64 * MIB;
@@ -1099,9 +1100,12 @@ const Verifier = struct {
         } else {
             try require(stdout.len == 0, "a refused human run wrote stdout");
         }
-        const backend = if (std.mem.eql(u8, raw_backend, "default")) "legacy_dpkg" else raw_backend;
+        const backend = if (std.mem.eql(u8, raw_backend, "default")) "native" else raw_backend;
         if (!std.mem.eql(u8, user, "root")) {
             return self.unprivileged(name, result_opt, status, package);
+        }
+        if (std.mem.eql(u8, backend, "legacy_dpkg")) {
+            return self.legacyRefused(name, result_opt, status, package);
         }
         const attempt = if (result_opt) |rv|
             try getStringField(try getObj(rv), "attempt_id")
@@ -1174,6 +1178,39 @@ const Verifier = struct {
         try rep.put(self.allocator, "name", .{ .string = "unprivileged-native-symcrypt" });
         try rep.put(self.allocator, "exit_status", .{ .integer = status });
         try rep.put(self.allocator, "outcome", .{ .string = "rejected" });
+        try rep.put(self.allocator, "package", .{ .string = package });
+        try self.reports.append(self.allocator, .{ .object = rep });
+    }
+
+    fn legacyRefused(self: *Verifier, name: []const u8, result_opt: ?std.json.Value, status: i64, package: []const u8) !void {
+        try require(status == 8, "legacy_dpkg run exited with unexpected status");
+        var diag: std.json.ObjectMap = .empty;
+        try diag.put(self.allocator, "id", .{ .string = "legacy_recovery_release_required" });
+        try diag.put(self.allocator, "message", .{ .string = LEGACY_RECOVERY });
+        const diags = try self.allocator.alloc(std.json.Value, 1);
+        diags[0] = .{ .object = diag };
+        const docs = try self.allocator.alloc(std.json.Value, 0);
+
+        var expected: std.json.ObjectMap = .empty;
+        try expected.put(self.allocator, "schema", .{ .string = SCHEMA ++ "system-install-result-v1" });
+        try expected.put(self.allocator, "version", .{ .integer = 1 });
+        try expected.put(self.allocator, "operation", .{ .string = "install" });
+        try expected.put(self.allocator, "exit_status", .{ .integer = 8 });
+        try expected.put(self.allocator, "outcome", .{ .string = "rejected" });
+        try expected.put(self.allocator, "changed", .{ .bool = false });
+        try expected.put(self.allocator, "package", .{ .string = package });
+        try expected.put(self.allocator, "summary", .{ .string = LEGACY_RECOVERY });
+        try expected.put(self.allocator, "resumed", .{ .bool = false });
+        try expected.put(self.allocator, "documents", .{ .array = std.json.Array.fromOwnedSlice(self.allocator, docs) });
+        try expected.put(self.allocator, "diagnostics", .{ .array = std.json.Array.fromOwnedSlice(self.allocator, diags) });
+
+        try require(result_opt != null and jsonEqual(result_opt.?, .{ .object = expected }), "unexpected legacy_dpkg result");
+
+        var rep: std.json.ObjectMap = .empty;
+        try rep.put(self.allocator, "name", .{ .string = name });
+        try rep.put(self.allocator, "exit_status", .{ .integer = status });
+        try rep.put(self.allocator, "outcome", .{ .string = "rejected" });
+        try rep.put(self.allocator, "backend", .{ .string = "legacy_dpkg" });
         try rep.put(self.allocator, "package", .{ .string = package });
         try self.reports.append(self.allocator, .{ .object = rep });
     }
@@ -1746,7 +1783,7 @@ const Verifier = struct {
             const package = it.next() orelse return fail("malformed runs/index line", .{});
             try require(it.next() == null, "malformed runs/index line");
             try self.runOne(name, user, output, backend, package);
-            if (std.mem.eql(u8, user, "root")) root_runs += 1;
+            if (std.mem.eql(u8, user, "root") and !std.mem.eql(u8, backend, "legacy_dpkg")) root_runs += 1;
         }
 
         try require(!try self.pathExists(EVIDENCE ++ "/active-v1.json"), "an owned attempt was left unsettled");
