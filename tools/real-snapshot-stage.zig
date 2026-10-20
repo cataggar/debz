@@ -815,6 +815,22 @@ pub fn capturePythonProcess(
         argv_z[idx] = duped.ptr;
     }
 
+    var resolved_exec_buf: [reference_paths.maximum_path_bytes]u8 = undefined;
+    var exec_path_z: [*:0]const u8 = argv_z[0].?;
+    if (std.mem.indexOfScalar(u8, argv[0], '/') == null) {
+        for ([_][]const u8{ "/usr/sbin/", "/usr/bin/", "/sbin/", "/bin/" }) |prefix| {
+            if (prefix.len + argv[0].len + 1 > resolved_exec_buf.len) continue;
+            @memcpy(resolved_exec_buf[0..prefix.len], prefix);
+            @memcpy(resolved_exec_buf[prefix.len .. prefix.len + argv[0].len], argv[0]);
+            resolved_exec_buf[prefix.len + argv[0].len] = 0;
+            const candidate: [*:0]const u8 = @ptrCast(&resolved_exec_buf);
+            if (linux.errno(linux.faccessat(linux.AT.FDCWD, candidate, linux.X_OK, 0)) == .SUCCESS) {
+                exec_path_z = candidate;
+                break;
+            }
+        }
+    }
+
     const pid_rc = try syscall(linux.fork());
     if (pid_rc == 0) {
         _ = linux.close(stdout_pipe[0]);
@@ -823,7 +839,7 @@ pub fn capturePythonProcess(
         _ = linux.dup2(stderr_pipe[1], linux.STDERR_FILENO);
         _ = linux.close(stdout_pipe[1]);
         _ = linux.close(stderr_pipe[1]);
-        const envp: [*:null]const ?[*:0]const u8 = &.{
+        const default_envp: [*:null]const ?[*:0]const u8 = &.{
             "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME=/",
             "LC_ALL=C",
@@ -832,7 +848,11 @@ pub fn capturePythonProcess(
             "DPKG_COLORS=never",
             null,
         };
-        _ = linux.execve(argv_z[0].?, @ptrCast(argv_z.ptr), envp);
+        const envp: [*:null]const ?[*:0]const u8 = if (process_environ.block.isEmpty())
+            default_envp
+        else
+            process_environ.block.slice.ptr;
+        _ = linux.execve(exec_path_z, @ptrCast(argv_z.ptr), envp);
         linux.exit_group(127);
     }
     const child_pid: i32 = @intCast(pid_rc);
@@ -1459,16 +1479,16 @@ pub fn prepareUtilLinux(
             .goal_index = 3,
             .path = "usr/bin/setpriv",
             .mode = 0o755,
-            .expected_size = 51312,
-            .expected_sha256 = "491ef3bd290472fd6ab94de7706ce54fd13e15b4b1ae8d3a588a55ac310ec57f",
+            .expected_size = 68024,
+            .expected_sha256 = "44faaf7cfa4f49215642e592a9f2da9b99ef86ed7bf453d8abc78d8fce5f43c4",
         },
         .{
             .package = "libcap-ng0",
             .goal_index = 3,
             .path = "usr/lib/aarch64-linux-gnu/libcap-ng.so.0.0.0",
             .mode = 0o644,
-            .expected_size = 67648,
-            .expected_sha256 = "12d4b0f0a4bb8b0a341cdbd51c7388a68eb4cf82cb6f5b4a79da0983b1f1db9e",
+            .expected_size = 67856,
+            .expected_sha256 = "c64f9619d98c36eda6fdd02130438620796e30ca388e7c746e1ed43ec3e83956",
         },
         .{
             .package = "init-system-helpers",
@@ -1699,7 +1719,10 @@ pub fn runCli(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
     return 0;
 }
 
+var process_environ: std.process.Environ = .empty;
+
 pub fn main(init: std.process.Init) !void {
+    process_environ = init.minimal.environ;
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
@@ -1903,6 +1926,9 @@ test "python staging, basic negatives, and capture enforce exclusive and bounded
         safe_root,
         "stdout",
         "stderr",
+        "timeout",
+        "--signal=TERM",
+        "10s",
         "/bin/sh",
         "-c",
         "printf 'captured\\n'",
