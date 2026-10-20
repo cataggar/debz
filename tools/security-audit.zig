@@ -6558,7 +6558,6 @@ pub const PROTECTED_REFERENCE_SOURCE_TOKENS = [_]SourceTokenList{
         .path = "tools/real-snapshot-python3-reference.sh",
         .tokens = &.{
             "unset ZIG_LIB_DIR",
-            "--zig-lib-dir \"$(dirname -- \"$zig\")/lib\"",
             "fixture preflight \"$source_root\"",
             "\"$zig\" build test-real-snapshot-python3-source-protected",
             "\"-Dpython3-source-root=$source_root\" \"-Dpython3-source-proof=$source_proof\"",

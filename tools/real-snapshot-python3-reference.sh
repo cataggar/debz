@@ -144,7 +144,6 @@ fixture preflight "$source_root"
 source_proof="$script_root-source-proof.txt"
 env "TMPDIR=$checkout/.zig-cache" "$zig" build test-real-snapshot-python3-source-protected \
   "-Dpython3-source-root=$source_root" "-Dpython3-source-proof=$source_proof" \
-  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   -Doptimize=ReleaseSafe -j2 --summary all
 grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"
 
