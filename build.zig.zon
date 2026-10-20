@@ -1,6 +1,6 @@
 .{
     .name = .debz,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .fingerprint = 0x3c072784b03c6c32,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

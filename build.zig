@@ -1,7 +1,7 @@
 const std = @import("std");
 const liblzma_build = @import("build/liblzma.zig");
 
-const package_version = "0.3.0";
+const package_version = "0.4.0";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
