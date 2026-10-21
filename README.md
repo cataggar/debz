@@ -2,11 +2,6 @@
 
 An embeddable Debian-family package manager library and CLI written in Zig.
 
-Release binaries are fully static Linux x64 or arm64 executables with Zig
-0.17.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd
-included. Gzip and xz binary archives are covered by GitHub provenance
-attestations.
-
 ## Quick start
 
 Install the latest release with [ghr](https://cataggar.github.io/ghr/):
