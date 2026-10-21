@@ -78,6 +78,50 @@ explicit `sudo -n`, conffile/force policy, recovery-state preservation,
 fail-closed offline behavior, legacy canonical transaction-result validation,
 and native receipt versus unchanged-closure evidence before success outputs.
 
+## Workflow examples
+
+Install one exact release with the first-party setup action:
+
+```yaml
+- id: debz
+  uses: cataggar/debz/actions/setup@<reviewed-commit-sha>
+  with:
+    debz-version: v0.4.0
+- run: '"${{ steps.debz.outputs.debz-path }}" version'
+```
+
+Prepare the complete package closure from a reviewed exact lock without
+installing it:
+
+```yaml
+- uses: cataggar/debz/actions/download@<reviewed-commit-sha>
+  id: packages
+  with:
+    lock-input: .github/debz/noble-amd64.lock.json
+    config: .github/debz/noble.json
+    keyring: .github/debz/ubuntu-archive-keyring.gpg
+    architecture: amd64
+```
+
+Install and audit a reviewed lock into an explicit alternate root:
+
+```yaml
+- uses: cataggar/debz/actions/install@<reviewed-commit-sha>
+  id: install
+  with:
+    debz-version: v0.4.0
+    package: scenario-main
+    lock-input: .github/debz/noble-amd64.lock.json
+    config: .github/debz/noble.json
+    keyring: .github/debz/ubuntu-archive-keyring.gpg
+    architecture: amd64
+    install-root: ${{ runner.temp }}/debz-root
+    assume-yes: 'true'
+    noninteractive: 'true'
+    conffile: keep-existing
+    use-sudo: 'true'
+```
+
 ## Native-only cutover (#275 / #283 / #274)
 
 The shipped defaults, checked-in bundles and documentation above are now

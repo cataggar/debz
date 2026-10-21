@@ -1,5 +1,44 @@
 # Documentation
 
+Detailed guides, specifications, and command reference for `debz`. For a
+project overview and quick start, see the [top-level README](../README.md).
+
+## Quick reference
+
+### Add a system repository
+
+Repository descriptors are installed through the repository-management surface:
+
+```sh
+sudo debz repo add \
+  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+```
+
+The target defaults to `/`; `--root PATH` selects an isolated image root.
+Repository add is noninteractive, refreshes by default, and never invokes apt.
+Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
+metadata refresh; see [Repository management API](repository-management.md) and
+[reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
+
+### Profile-bound system facade
+
+The installed CLI exposes the limited profile-bound system facade:
+
+```sh
+sudo debz apt update
+sudo debz apt install -y PACKAGE...
+debz apt list --installed
+sudo debz recover --system-profile /etc/debz/default.json
+```
+
+Its versioned contracts and reusable orchestration engine are documented in
+[Apt-shaped system facade contracts](apt-system-facade.md). The interface is
+**apt-shaped, not apt-compatible**: it accepts only the documented grammar,
+uses an explicit trusted profile, and never inherits host APT configuration,
+proxies, credentials, or keyrings.
+
+## Reference index
+
 - [Stable product API and CLI contract](product-api.md)
 - [Legacy compatibility and native-only cutover policy](legacy-compatibility.md)
   defines exact version/backend identities, active-operation refusal, immutable

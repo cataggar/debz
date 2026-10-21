@@ -2,146 +2,39 @@
 
 An embeddable Debian-family package manager library and CLI written in Zig.
 
-## Install
-
-```sh
-ghr install cataggar/debz@v0.2.0
-```
-
 Release binaries are fully static Linux x64 or arm64 executables with Zig
 0.17.0's reviewed musl snapshot and source-built libsolv, liblzma, and libzstd
 included. Gzip and xz binary archives are covered by GitHub provenance
 attestations.
 
-### GitHub Actions
+## Quick start
 
-Install one exact release with the first-party setup action:
-
-```yaml
-- id: debz
-  uses: cataggar/debz/actions/setup@<reviewed-commit-sha>
-  with:
-    debz-version: v0.3.0
-- run: '"${{ steps.debz.outputs.debz-path }}" version'
-```
-
-The action verifies the GitHub asset digest plus either GitHub/Sigstore release
-provenance or an explicitly supplied trusted SHA-256, extracts without host
-archive tools, and revalidates exact cache hits. See
-[`actions/setup/README.md`](actions/setup/README.md) for pinning, permissions,
-trust, cache, platform, and container details.
-
-Prepare the complete package closure from a reviewed exact lock without
-installing it:
-
-```yaml
-- uses: cataggar/debz/actions/download@<reviewed-commit-sha>
-  id: packages
-  with:
-    lock-input: .github/debz/noble-amd64.lock.json
-    config: .github/debz/noble.json
-    keyring: .github/debz/ubuntu-archive-keyring.gpg
-    architecture: amd64
-```
-
-The download action caches only a path-free opaque serialization of verified
-`packages-v2/objects`. Restores are staged outside the workspace/CAS and
-imported by `debz`; exact and compatible-prefix objects are always revalidated.
-Repository metadata, credentials, keyrings, roots, dpkg state, and transaction
-journals are excluded. A cache hit is not installed state. See
-[`actions/download/README.md`](actions/download/README.md) for the complete
-input/output, offline, repair, and trust contract.
-
-Install and audit a reviewed lock into an explicit alternate root:
-
-```yaml
-- uses: cataggar/debz/actions/install@<reviewed-commit-sha>
-  id: install
-  with:
-    debz-version: v0.3.0
-    package: scenario-main
-    lock-input: .github/debz/noble-amd64.lock.json
-    config: .github/debz/noble.json
-    keyring: .github/debz/ubuntu-archive-keyring.gpg
-    architecture: amd64
-    install-root: ${{ runner.temp }}/debz-root
-    assume-yes: 'true'
-    noninteractive: 'true'
-    conffile: keep-existing
-    use-sudo: 'true'
-```
-
-The install action reuses the exact setup/download implementations and always
-runs `debz install --cache-only`, including on an exact package-cache hit.
-Only the immutable package CAS is cached; roots, dpkg state, metadata,
-journals, and success markers are not. See
-[`actions/install/README.md`](actions/install/README.md).
-
-## Build
+Install the latest release with [ghr](https://cataggar.github.io/ghr/):
 
 ```sh
-zig build
-zig build test
-zig build run -- --help
-zig build -Dversion=0.3.0
-zig build install --prefix "$PWD/install-root"
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
-  release-install --prefix "$PWD/release-root"
+ghr install cataggar/debz
 ```
 
-## Add a system repository
+Without a tag, ghr installs the latest release:
+[https://github.com/cataggar/debz/releases/latest](https://github.com/cataggar/debz/releases/latest).
 
-Repository descriptors are installed through the separate repository-management
-surface:
+Check the version and CLI help:
 
 ```sh
-sudo debz repo add \
-  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+debz version
+debz --help
 ```
 
-The target defaults to `/`; `--root PATH` selects an isolated image root.
-Repository add is noninteractive, refreshes by default, and never invokes apt.
-Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
-metadata refresh. See
-[`doc/repository-management.md`](doc/repository-management.md).
+## Documentation
 
-Refresh requires a signed `Valid-Until` by default. Microsoft's Ubuntu 24.04
-feed omits that field, so `repo add` for the descriptor above applies a
-reviewed 14-day maximum Release age instead. It does so only for its exact
-`microsoft-prod.list` source, `noble main` on `amd64` or `arm64`, and the
-pinned Microsoft signing key. The reviewed upstream descriptor structure is
-also supported; see
-[reviewed freshness profiles](doc/repository-management.md#reviewed-freshness-profiles).
+Browse [`doc/README.md`](doc/README.md) for the complete CLI, library, JSON,
+security, and implementation reference:
 
-Successful repository add retains a root-scoped active configuration and a
-[typed read-only system context](doc/target-apt-config.md#typed-system-product-context).
-The short `sudo debz install PACKAGE` system profile now plans one package
-against that context. It retains an owned exact lock under
-`/var/lib/debz/locks` and versioned per-operation evidence under
-`/var/lib/debz/system-install`. An interrupted attempt resumes only through
-its exact command, before any refresh or replan. **It does not install
-yet:** no build provides its execution generation, so an authorized attempt
-refuses before mutation (exit 3) and keeps its lock. See
-[short system-profile install](doc/exact-locks-and-provenance.md#short-system-profile-install-system-install-v1).
-Until then, use the explicit authenticated plan/review/replay path above where
-its strict installed-baseline and backend requirements can be met. System
-SymCrypt packages do not replace zig-symcrypt's pinned/static build inputs.
+- [GitHub Actions](doc/github-actions.md) — first-party [`actions/setup`](actions/setup/README.md), [`actions/download`](actions/download/README.md), and [`actions/install`](actions/install/README.md) workflows.
+- [Repository management](doc/repository-management.md) — `debz repo add` and reviewed freshness profiles.
+- [Apt-shaped system facade](doc/apt-system-facade.md) — `debz apt` and `debz recover` profile-bound system interface.
+- [Release installation and build](doc/release-installation.md) — building from source, version injection, and static-musl packaging.
 
-The installed CLI exposes the limited profile-bound system facade:
+## License
 
-```sh
-sudo debz apt update
-sudo debz apt install -y PACKAGE...
-debz apt list --installed
-sudo debz recover --system-profile /etc/debz/default.json
-```
-
-Its versioned contracts and reusable orchestration engine are documented in
-[`doc/apt-system-facade.md`](doc/apt-system-facade.md). The interface is
-**apt-shaped, not apt-compatible**. It accepts only the documented grammar,
-uses an explicit trusted profile, and never inherits host APT configuration,
-proxies, credentials, or keyrings.
-
-`-Dversion` must be a SemVer value and defaults to the package version in `build.zig.zon`. An ordinary install places the target-selected CLI in `bin/`, documentation under `share/doc/debz/`, and schemas under `share/debz/`. The dedicated static-musl `release-install` graph additionally installs reviewed release runtime metadata.
-
-See [`doc/README.md`](doc/README.md) for the CLI, library, JSON, security, and implementation reference. Licensed under [Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE)
