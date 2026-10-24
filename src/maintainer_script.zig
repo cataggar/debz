@@ -128,7 +128,8 @@ const snapshot_udev_postinst_size = 2578;
 fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool {
     return std.mem.eql(u8, identity.package, "udev") and
         std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
-        std.mem.eql(u8, identity.architecture, "amd64") and
+        (std.mem.eql(u8, identity.architecture, "amd64") or
+            std.mem.eql(u8, identity.architecture, "arm64")) and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/udev.postinst") and
         std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_udev_sha256) and
@@ -148,7 +149,8 @@ const snapshot_sudo_postinst_size = 1747;
 fn snapshotSudoIdentity(identity: Identity, arguments: []const []const u8) bool {
     return std.mem.eql(u8, identity.package, "sudo") and
         std.mem.eql(u8, identity.version, "1.9.17p2-1ubuntu3.1") and
-        std.mem.eql(u8, identity.architecture, "amd64") and
+        (std.mem.eql(u8, identity.architecture, "amd64") or
+            std.mem.eql(u8, identity.architecture, "arm64")) and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/sudo.postinst") and
         std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_sudo_sha256) and
@@ -354,18 +356,33 @@ const SnapshotUdevInput = struct {
     size: u64,
     mode: u16,
     sha256: []const u8,
+    arm64_size: ?u64 = null,
+    arm64_sha256: ?[]const u8 = null,
+
+    fn maxSize(self: SnapshotUdevInput) usize {
+        return @intCast(@max(self.size, self.arm64_size orelse self.size));
+    }
+
+    fn matchesArch(self: SnapshotUdevInput, size: u64, observed_hash: [32]u8, arm64: bool) bool {
+        const expected_size = if (arm64) (self.arm64_size orelse self.size) else self.size;
+        const expected_hex = if (arm64) (self.arm64_sha256 orelse self.sha256) else self.sha256;
+        if (size != expected_size) return false;
+        var expected: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&expected, expected_hex) catch unreachable;
+        return std.crypto.timing_safe.eql([32]u8, observed_hash, expected);
+    }
 };
 
 const snapshot_udev_inputs = [_]SnapshotUdevInput{
-    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517" },
-    .{ .path = "usr/bin/systemd-hwdb", .size = 14784, .mode = 0o755, .sha256 = "3502e34f903759c07465fc50b1e9406d89325cb6cc6605f4225d3231ba0a7dfc" },
-    .{ .path = "usr/bin/systemd-sysusers", .size = 68224, .mode = 0o755, .sha256 = "09586bca83f4ea590a821c2bd712bef44f7b8b55f0186085cfdcd023b9d0da1f" },
-    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4" },
+    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917", .arm64_size = 133864, .arm64_sha256 = "87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517", .arm64_size = 330816, .arm64_sha256 = "6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f" },
+    .{ .path = "usr/bin/systemd-hwdb", .size = 14784, .mode = 0o755, .sha256 = "3502e34f903759c07465fc50b1e9406d89325cb6cc6605f4225d3231ba0a7dfc", .arm64_size = 68008, .arm64_sha256 = "ceb1f66b47b42f0066fe5ac12786cf57fd4dd07ab40187df95690dfcb17c4bc8" },
+    .{ .path = "usr/bin/systemd-sysusers", .size = 68224, .mode = 0o755, .sha256 = "09586bca83f4ea590a821c2bd712bef44f7b8b55f0186085cfdcd023b9d0da1f", .arm64_size = 68232, .arm64_sha256 = "ce0159601e72dc2e29513e9c2ff5f5236ed85851bb2b6576ce8fb1f1457e8159" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4", .arm64_size = 133832, .arm64_sha256 = "5f9a7a87202f6876f6614f1c91f65c635ee53a7dda64230e488f2bc265fbdd3b" },
     .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
     .{ .path = "usr/bin/deb-systemd-helper", .size = 24358, .mode = 0o755, .sha256 = "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732" },
     .{ .path = "usr/sbin/update-rc.d", .size = 18147, .mode = 0o755, .sha256 = "9a85792c1ee2714d34ad2f0dac9becd987cbaedbfe25519dede7378e6c9ebbf1" },
-    .{ .path = "usr/bin/systemctl", .size = 302112, .mode = 0o755, .sha256 = "6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2" },
+    .{ .path = "usr/bin/systemctl", .size = 302112, .mode = 0o755, .sha256 = "6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2", .arm64_size = 331632, .arm64_sha256 = "29da76cc9d6aeb5e4d4aee4b39dd5edcba76da76809b6abc6b2339d404a8eb2b" },
     .{ .path = "usr/bin/deb-systemd-invoke", .size = 7135, .mode = 0o755, .sha256 = "92eadae89f4df4cd6088f6316f5390b685faf8d0e312a4e5af3a507caaf81bdb" },
     .{ .path = "usr/lib/tmpfiles.d/static-nodes-permissions.conf", .size = 798, .mode = 0o644, .sha256 = "ca4849c27428fd648f6377dd51a3ab0eb79de69fce1bdc910670012c0cf26f85" },
     .{ .path = "usr/lib/sysusers.d/debian-udev.conf", .size = 143, .mode = 0o644, .sha256 = "e9493928a4ed5399c5619cee0559644099f0625075606baca35b40533286b5e0" },
@@ -391,6 +408,13 @@ const snapshot_udev_path_shadows = [_][]const u8{
     "usr/sbin/deb-systemd-invoke",
 };
 
+const snapshot_udev_opensysusers: SnapshotUdevInput = .{
+    .path = "usr/bin/opensysusers-sysusers",
+    .size = 6081,
+    .mode = 0o755,
+    .sha256 = "dbe8ec652820b0f335b4c4bf1bacebe69b82faf356df61d64b3ea067c73a720b",
+};
+
 pub const SnapshotUdevProc = struct {
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -399,7 +423,9 @@ pub const SnapshotUdevProc = struct {
     script: root_fs.PinnedRegularFile,
     bin: root_fs.PinnedSymbolicLink,
     shell: root_fs.PinnedSymbolicLink,
-    inputs: [snapshot_udev_inputs.len]root_fs.PinnedRegularFile,
+    inputs: [snapshot_udev_inputs.len]?root_fs.PinnedRegularFile,
+    opensysusers_link: ?root_fs.PinnedSymbolicLink = null,
+    opensysusers_script: ?root_fs.PinnedRegularFile = null,
     root_stat: std.os.linux.Statx,
     directory_stat: std.os.linux.Statx,
 
@@ -420,11 +446,31 @@ pub const SnapshotUdevProc = struct {
         errdefer bin.close();
         var shell = try root.pinSymbolicLink(try root_fs.Path.init("usr/bin/sh"));
         errdefer shell.close();
-        var inputs: [snapshot_udev_inputs.len]root_fs.PinnedRegularFile = undefined;
+        var inputs: [snapshot_udev_inputs.len]?root_fs.PinnedRegularFile = undefined;
         var count: usize = 0;
-        errdefer for (inputs[0..count]) |*input| input.close();
+        errdefer for (inputs[0..count]) |*input| {
+            if (input.*) |*pinned| pinned.close();
+        };
+        var opensysusers_link: ?root_fs.PinnedSymbolicLink = null;
+        errdefer if (opensysusers_link) |*pinned| pinned.close();
+        var opensysusers_script: ?root_fs.PinnedRegularFile = null;
+        errdefer if (opensysusers_script) |*pinned| pinned.close();
         for (snapshot_udev_inputs, &inputs) |binding, *slot| {
-            slot.* = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+            slot.* = root.pinRegularFile(try root_fs.Path.init(binding.path)) catch |err| switch (err) {
+                error.FileNotFound => if (std.mem.eql(u8, binding.path, "usr/bin/systemd-tmpfiles") or
+                    std.mem.eql(u8, binding.path, "usr/bin/systemctl"))
+                    null
+                else
+                    return err,
+                error.NotRegularFile => if (std.mem.eql(u8, binding.path, "usr/bin/systemd-sysusers")) blk: {
+                    opensysusers_link = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
+                    opensysusers_script = try root.pinRegularFile(
+                        try root_fs.Path.init(snapshot_udev_opensysusers.path),
+                    );
+                    break :blk null;
+                } else return err,
+                else => return err,
+            };
             count += 1;
         }
         var result: SnapshotUdevProc = .{
@@ -436,6 +482,8 @@ pub const SnapshotUdevProc = struct {
             .bin = bin,
             .shell = shell,
             .inputs = inputs,
+            .opensysusers_link = opensysusers_link,
+            .opensysusers_script = opensysusers_script,
             .root_stat = undefined,
             .directory_stat = undefined,
         };
@@ -443,7 +491,7 @@ pub const SnapshotUdevProc = struct {
         if (helperStat(root.dir.handle, &result.root_stat) != .SUCCESS or
             helperStat(directory.dir.handle, &result.directory_stat) != .SUCCESS or
             result.root_stat.uid != 0 or result.root_stat.gid != 0 or
-            result.root_stat.mode != 0o40700)
+            (result.root_stat.mode != 0o40700 and result.root_stat.mode != 0o40755))
             return error.InvalidSnapshotUdevRoot;
         return result;
     }
@@ -488,21 +536,55 @@ pub const SnapshotUdevProc = struct {
             shell.entry.mode != 0o777 or shell.entry.link_count != 1 or
             !std.mem.eql(u8, shell.target, "dash"))
             return error.InvalidSnapshotUdevTool;
-        for (snapshot_udev_inputs, &self.inputs) |binding, *file| {
-            const input = try file.observeStableAlloc(allocator, @intCast(binding.size));
+        var amd64_ok = true;
+        var arm64_ok = true;
+        for (snapshot_udev_inputs, &self.inputs) |binding, *slot| {
+            const file = if (slot.*) |*pinned| pinned else {
+                if (std.mem.eql(u8, binding.path, "usr/bin/systemd-sysusers")) {
+                    const link_pinned = &(self.opensysusers_link orelse return error.InvalidSnapshotUdevTool);
+                    const script_pinned = &(self.opensysusers_script orelse return error.InvalidSnapshotUdevTool);
+                    var link_target: [32]u8 = undefined;
+                    const link = try link_pinned.observe(&link_target);
+                    if (link.entry.uid != 0 or link.entry.gid != 0 or
+                        link.entry.mode != 0o777 or link.entry.link_count != 1 or
+                        !std.mem.eql(u8, link.target, "opensysusers-sysusers"))
+                        return error.InvalidSnapshotUdevTool;
+                    const script_input = try script_pinned.observeStableAlloc(
+                        allocator,
+                        snapshot_udev_opensysusers.maxSize(),
+                    );
+                    defer allocator.free(script_input.bytes);
+                    const observed_script_hash = hashBytes(script_input.bytes);
+                    if (script_input.entry.uid != 0 or script_input.entry.gid != 0 or
+                        script_input.entry.mode != snapshot_udev_opensysusers.mode or
+                        script_input.entry.link_count != 1 or
+                        !snapshot_udev_opensysusers.matchesArch(script_input.entry.size, observed_script_hash, false))
+                        return error.InvalidSnapshotUdevTool;
+                    continue;
+                }
+                if (try self.root.entryIfExists(try root_fs.Path.init(binding.path)) != null)
+                    return error.InvalidSnapshotUdevTool;
+                continue;
+            };
+            const input = try file.observeStableAlloc(allocator, binding.maxSize());
             defer allocator.free(input.bytes);
-            var expected: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&expected, binding.sha256) catch unreachable;
             if (input.entry.uid != 0 or input.entry.gid != 0 or
-                input.entry.mode != binding.mode or input.entry.link_count != 1 or
-                input.entry.size != binding.size or
-                !std.crypto.timing_safe.eql([32]u8, hashBytes(input.bytes), expected))
+                input.entry.mode != binding.mode or input.entry.link_count != 1)
+                return error.InvalidSnapshotUdevTool;
+            const observed_hash = hashBytes(input.bytes);
+            amd64_ok = amd64_ok and binding.matchesArch(input.entry.size, observed_hash, false);
+            arm64_ok = arm64_ok and binding.matchesArch(input.entry.size, observed_hash, true);
+            if (!amd64_ok and !arm64_ok)
                 return error.InvalidSnapshotUdevTool;
         }
     }
 
     pub fn deinit(self: *SnapshotUdevProc) void {
-        for (&self.inputs) |*input| input.close();
+        if (self.opensysusers_script) |*pinned| pinned.close();
+        if (self.opensysusers_link) |*pinned| pinned.close();
+        for (&self.inputs) |*input| {
+            if (input.*) |*pinned| pinned.close();
+        }
         self.shell.close();
         self.bin.close();
         self.script.close();
@@ -513,19 +595,19 @@ pub const SnapshotUdevProc = struct {
 };
 
 const snapshot_sudo_inputs = [_]SnapshotUdevInput{
-    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517" },
-    .{ .path = "usr/bin/dpkg-query", .size = 142160, .mode = 0o755, .sha256 = "82a19acac53907f83faca7d6494289fe2d074514cf1b09933114635415c2e876" },
-    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4" },
+    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917", .arm64_size = 133864, .arm64_sha256 = "87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517", .arm64_size = 330816, .arm64_sha256 = "6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f" },
+    .{ .path = "usr/bin/dpkg-query", .size = 142160, .mode = 0o755, .sha256 = "82a19acac53907f83faca7d6494289fe2d074514cf1b09933114635415c2e876", .arm64_size = 199464, .arm64_sha256 = "39c0ad106972f6d29f7d2c1de709bcadbd7cb916140bbe782127f9e948f5171a" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4", .arm64_size = 133832, .arm64_sha256 = "5f9a7a87202f6876f6614f1c91f65c635ee53a7dda64230e488f2bc265fbdd3b" },
     .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
     .{ .path = "usr/share/dpkg/sh/dpkg-error.sh", .size = 3228, .mode = 0o644, .sha256 = "d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528" },
-    .{ .path = "usr/bin/update-alternatives", .size = 59864, .mode = 0o755, .sha256 = "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45" },
-    .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
-    .{ .path = "usr/bin/gnuchown", .size = 68160, .mode = 0o755, .sha256 = "0e04f6401bfae9a5eafed1da2c738067b007d39a8538ea83ce22271b4cd58fbb" },
-    .{ .path = "usr/bin/gnuchmod", .size = 60000, .mode = 0o755, .sha256 = "787b5abd2db66069fdd2467bf3b6acb089380aa0b4c05771f3c1b2471a24bf94" },
+    .{ .path = "usr/bin/update-alternatives", .size = 59864, .mode = 0o755, .sha256 = "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45", .arm64_size = 68032, .arm64_sha256 = "dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807" },
+    .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6", .arm64_size = 68224, .arm64_sha256 = "d4887172b8395e1eabcefa9320a861489b80496e23bb1f3e62ca8f1d250332d8" },
+    .{ .path = "usr/bin/gnuchown", .size = 68160, .mode = 0o755, .sha256 = "0e04f6401bfae9a5eafed1da2c738067b007d39a8538ea83ce22271b4cd58fbb", .arm64_size = 68224, .arm64_sha256 = "e53a7c3218f1fee9196075683516fa8ce542132b6186f62d88ebab5696f07d41" },
+    .{ .path = "usr/bin/gnuchmod", .size = 60000, .mode = 0o755, .sha256 = "787b5abd2db66069fdd2467bf3b6acb089380aa0b4c05771f3c1b2471a24bf94", .arm64_size = 68232, .arm64_sha256 = "0b9093212bc73a0e3e13e73c3824c764c568bd8ef318f5b6b7fbb2efb3315570" },
     .{ .path = "usr/lib/tmpfiles.d/sudo.conf", .size = 27, .mode = 0o644, .sha256 = "eed7eb9d7ddaccb3ae13d3225de1302a96754938fea4dc305c43b64cbcb5d0bc" },
     .{ .path = "var/lib/dpkg/info/sudo.list", .size = 2376, .mode = 0o644, .sha256 = "39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8" },
-    .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43" },
+    .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43", .arm64_size = 335248, .arm64_sha256 = "8ef9ec82aadaaf8ab5816ddb84116a55e5aa466d523354e4bd90d695ff81c25a" },
     .{ .path = "usr/share/man/man8/sudo.ws.8.gz", .size = 12804, .mode = 0o644, .sha256 = "43b6a4b66f9eb6a430f64e2b25084a100b2e152cfd8896cb83f9ced170793d75" },
 };
 
@@ -562,7 +644,7 @@ pub const SnapshotSudoProc = struct {
     directory: root_fs.PinnedDirectory,
     script: root_fs.PinnedRegularFile,
     aliases: [snapshot_sudo_aliases.len]root_fs.PinnedSymbolicLink,
-    inputs: [snapshot_sudo_inputs.len]root_fs.PinnedRegularFile,
+    inputs: [snapshot_sudo_inputs.len]?root_fs.PinnedRegularFile,
     root_stat: std.os.linux.Statx,
     directory_stat: std.os.linux.Statx,
 
@@ -586,11 +668,19 @@ pub const SnapshotSudoProc = struct {
             slot.* = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
             alias_count += 1;
         }
-        var inputs: [snapshot_sudo_inputs.len]root_fs.PinnedRegularFile = undefined;
+        var inputs: [snapshot_sudo_inputs.len]?root_fs.PinnedRegularFile = undefined;
         var input_count: usize = 0;
-        errdefer for (inputs[0..input_count]) |*input| input.close();
+        errdefer for (inputs[0..input_count]) |*input| {
+            if (input.*) |*pinned| pinned.close();
+        };
         for (snapshot_sudo_inputs, &inputs) |binding, *slot| {
-            slot.* = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+            slot.* = root.pinRegularFile(try root_fs.Path.init(binding.path)) catch |err| switch (err) {
+                error.FileNotFound => if (std.mem.eql(u8, binding.path, "usr/bin/systemd-tmpfiles"))
+                    null
+                else
+                    return err,
+                else => return err,
+            };
             input_count += 1;
         }
         var result: SnapshotSudoProc = .{
@@ -608,7 +698,7 @@ pub const SnapshotSudoProc = struct {
         if (helperStat(root.dir.handle, &result.root_stat) != .SUCCESS or
             helperStat(directory.dir.handle, &result.directory_stat) != .SUCCESS or
             result.root_stat.uid != 0 or result.root_stat.gid != 0 or
-            result.root_stat.mode != 0o40700)
+            (result.root_stat.mode != 0o40700 and result.root_stat.mode != 0o40755))
             return error.InvalidSnapshotSudoRoot;
         return result;
     }
@@ -649,21 +739,31 @@ pub const SnapshotSudoProc = struct {
                 !std.mem.eql(u8, link.target, binding.target))
                 return error.InvalidSnapshotSudoTool;
         }
-        for (snapshot_sudo_inputs, &self.inputs) |binding, *file| {
-            const input = try file.observeStableAlloc(allocator, @intCast(binding.size));
+        var amd64_ok = true;
+        var arm64_ok = true;
+        for (snapshot_sudo_inputs, &self.inputs) |binding, *slot| {
+            const file = if (slot.*) |*pinned| pinned else {
+                if (try self.root.entryIfExists(try root_fs.Path.init(binding.path)) != null)
+                    return error.InvalidSnapshotSudoTool;
+                continue;
+            };
+            const input = try file.observeStableAlloc(allocator, binding.maxSize());
             defer allocator.free(input.bytes);
-            var expected: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&expected, binding.sha256) catch unreachable;
             if (input.entry.uid != 0 or input.entry.gid != 0 or
-                input.entry.mode != binding.mode or input.entry.link_count != 1 or
-                input.entry.size != binding.size or
-                !std.crypto.timing_safe.eql([32]u8, hashBytes(input.bytes), expected))
+                input.entry.mode != binding.mode or input.entry.link_count != 1)
+                return error.InvalidSnapshotSudoTool;
+            const observed_hash = hashBytes(input.bytes);
+            amd64_ok = amd64_ok and binding.matchesArch(input.entry.size, observed_hash, false);
+            arm64_ok = arm64_ok and binding.matchesArch(input.entry.size, observed_hash, true);
+            if (!amd64_ok and !arm64_ok)
                 return error.InvalidSnapshotSudoTool;
         }
     }
 
     pub fn deinit(self: *SnapshotSudoProc) void {
-        for (&self.inputs) |*input| input.close();
+        for (&self.inputs) |*input| {
+            if (input.*) |*pinned| pinned.close();
+        }
         for (&self.aliases) |*alias| alias.close();
         self.script.close();
         self.directory.close();
@@ -5088,6 +5188,8 @@ test "maintainer_script.test.udev PID-only proc rejects unrelated and altered in
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.version = "259.5-0ubuntu3.4";
     request.identity.architecture = "arm64";
+    try testing.expect(validate(request) == null);
+    request.identity.architecture = "riscv64";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.architecture = "amd64";
     request.identity.kind = .preinst;
@@ -5175,7 +5277,7 @@ test "maintainer_script.test.sudo PID-only proc requires exact signed identity" 
     }{
         .{ .package = "sudo-rs" },
         .{ .version = "1.9.17p2-1ubuntu3.2" },
-        .{ .architecture = "arm64" },
+        .{ .architecture = "riscv64" },
         .{ .kind = .preinst },
         .{ .path = "var/lib/debz-lifecycle-scripts/sudo.postinst" },
         .{ .digest = @splat(0) },
