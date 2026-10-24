@@ -23204,7 +23204,17 @@ fn verifySnapshotLessArm64Artifacts(
 ) !void {
     if (!std.mem.eql(u8, architecture, "arm64"))
         return error.InvalidAlternativesScriptAuthority;
-    for (snapshot_less_arm64_artifacts) |binding|
+    for (snapshot_less_arm64_artifacts, 0..) |binding, index| {
+        if (index != 0) {
+            var present = false;
+            for (artifacts) |artifact| {
+                if (std.mem.eql(u8, artifact.package.name, binding.name)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) continue;
+        }
         try verifyAuthenticatedSnapshotArtifact(
             artifacts,
             .{ .name = binding.name, .version = binding.version, .architecture = "arm64" },
@@ -23212,6 +23222,7 @@ fn verifySnapshotLessArm64Artifacts(
             binding.sha512,
             error.InvalidAlternativesScriptAuthority,
         );
+    }
 }
 
 fn verifySnapshotLessArm64AliasBinding(
@@ -23235,7 +23246,12 @@ fn verifySnapshotLessArm64Inputs(
 ) !void {
     try verifySnapshotLessArm64Artifacts(artifacts, architecture);
     const controls = try snapshotLessArm64ControlBindings(kind);
-    try verifySnapshotAlternativesArm64Inputs(allocator, root, controls, &snapshot_less_arm64_aliases, &snapshot_less_arm64_absent);
+    if ((try root.entryIfExists(try root_fs.Path.init("etc/ld.so.cache"))) != null) {
+        try verifySnapshotAlternativesArm64Inputs(allocator, root, controls, &snapshot_less_arm64_aliases, &snapshot_loader_arm64_absent);
+        _ = try verifySnapshotBashArm64CacheInput(allocator, root);
+    } else {
+        try verifySnapshotAlternativesArm64Inputs(allocator, root, controls, &snapshot_less_arm64_aliases, &snapshot_less_arm64_absent);
+    }
 }
 
 fn verifySnapshotAlternativesArm64Inputs(
@@ -23966,6 +23982,15 @@ const snapshot_util_linux_arm64_absent = snapshot_loader_arm64_absent ++ [_][]co
     "var/lib/systemd/deb-systemd-helper-masked/fstrim.timer",
 };
 
+const snapshot_util_linux_arm64_controls_without_less =
+    snapshot_util_linux_arm64_controls[0..3].* ++ snapshot_util_linux_arm64_controls[6..].*;
+
+const snapshot_util_linux_arm64_absent_without_less = snapshot_util_linux_arm64_absent ++ [_][]const u8{
+    "var/lib/dpkg/info/less.list",
+    "usr/bin/less",
+    "usr/share/man/man1/less.1.gz",
+};
+
 const snapshot_util_linux_arm64_fstrim_dirs = [_][]const u8{
     "etc/systemd",
     "etc/systemd/system",
@@ -24025,7 +24050,15 @@ fn verifySnapshotUtilLinuxArm64Inputs(
 ) !native_alternatives.EntryFact {
     if (!std.mem.eql(u8, architecture, "arm64"))
         return error.InvalidAlternativesScriptAuthority;
-    for (snapshot_util_linux_arm64_artifacts) |binding|
+    const has_less = (try root.entryIfExists(try root_fs.Path.init("usr/bin/less"))) != null;
+    for (snapshot_util_linux_arm64_artifacts) |binding| {
+        if (!has_less and std.mem.eql(u8, binding.name, "less")) {
+            for (artifacts) |artifact| {
+                if (std.mem.eql(u8, artifact.package.name, "less"))
+                    return error.InvalidAlternativesScriptAuthority;
+            }
+            continue;
+        }
         try verifyAuthenticatedSnapshotArtifact(
             artifacts,
             .{ .name = binding.name, .version = binding.version, .architecture = binding.architecture },
@@ -24033,12 +24066,13 @@ fn verifySnapshotUtilLinuxArm64Inputs(
             binding.sha512,
             error.InvalidAlternativesScriptAuthority,
         );
+    }
     try verifySnapshotAlternativesArm64Inputs(
         allocator,
         root,
-        &snapshot_util_linux_arm64_controls,
+        if (has_less) &snapshot_util_linux_arm64_controls else &snapshot_util_linux_arm64_controls_without_less,
         &snapshot_util_linux_arm64_aliases,
-        &snapshot_util_linux_arm64_absent,
+        if (has_less) &snapshot_util_linux_arm64_absent else &snapshot_util_linux_arm64_absent_without_less,
     );
     try verifySnapshotUtilLinuxArm64Perl(allocator, root);
     return try verifySnapshotUtilLinuxArm64CacheInput(allocator, root);
@@ -24050,7 +24084,12 @@ fn verifySnapshotUtilLinuxArm64FstrimAbsent(root: root_fs.Root) !void {
             return error.InvalidAlternativesScriptAuthority;
 }
 
-fn verifySnapshotUtilLinuxArm64PagerBefore(before: native_alternatives.Snapshot) !void {
+fn verifySnapshotUtilLinuxArm64PagerBefore(root: root_fs.Root, before: native_alternatives.Snapshot) !void {
+    const has_less = (try root.entryIfExists(try root_fs.Path.init("usr/bin/less"))) != null;
+    if (!has_less) {
+        if (before.group("pager") != null) return error.InvalidAlternativesScriptAuthority;
+        return;
+    }
     const pager = before.group("pager") orelse return error.InvalidAlternativesScriptAuthority;
     if (pager.record.mode != .auto or
         !std.mem.eql(u8, pager.record.master_link, "/usr/bin/pager") or
@@ -24072,19 +24111,25 @@ fn verifySnapshotUtilLinuxArm64PostOutput(
     root: root_fs.Root,
     after: native_alternatives.Snapshot,
 ) !void {
+    const has_less = (try root.entryIfExists(try root_fs.Path.init("usr/bin/less"))) != null;
     const pager = after.group("pager") orelse return error.InvalidAlternativesScriptAuthority;
+    const expected_selected = if (has_less) "/usr/bin/less" else "/bin/more";
     if (pager.record.mode != .auto or
         !std.mem.eql(u8, pager.record.master_link, "/usr/bin/pager") or
-        !std.mem.eql(u8, pager.selected, "/usr/bin/less") or
+        !std.mem.eql(u8, pager.selected, expected_selected) or
         pager.record.slaves.len != 1 or
         !std.mem.eql(u8, pager.record.slaves[0].name, "pager.1.gz") or
         !std.mem.eql(u8, pager.record.slaves[0].link, "/usr/share/man/man1/pager.1.gz"))
         return error.InvalidAlternativesScriptAuthority;
-    const less = pager.record.candidate("/usr/bin/less") orelse
+    if (has_less) {
+        const less = pager.record.candidate("/usr/bin/less") orelse
+            return error.InvalidAlternativesScriptAuthority;
+        if (less.priority != 77 or less.targets.len != 1 or
+            !std.mem.eql(u8, less.targets[0], "/usr/share/man/man1/less.1.gz"))
+            return error.InvalidAlternativesScriptAuthority;
+    } else if (pager.record.candidate("/usr/bin/less") != null) {
         return error.InvalidAlternativesScriptAuthority;
-    if (less.priority != 77 or less.targets.len != 1 or
-        !std.mem.eql(u8, less.targets[0], "/usr/share/man/man1/less.1.gz"))
-        return error.InvalidAlternativesScriptAuthority;
+    }
     const more = pager.record.candidate("/bin/more") orelse
         return error.InvalidAlternativesScriptAuthority;
     if (more.priority != 50 or more.targets.len != 1 or
@@ -24126,12 +24171,13 @@ fn verifySnapshotUtilLinuxArm64PostOutput(
     }
 }
 
-fn bindSnapshotUtilLinuxArm64ImmutableInputs(script: *native_alternatives.ScriptAuthority) !void {
+fn bindSnapshotUtilLinuxArm64ImmutableInputs(root: root_fs.Root, script: *native_alternatives.ScriptAuthority) !void {
+    const has_less = (try root.entryIfExists(try root_fs.Path.init("usr/bin/less"))) != null;
     try bindSnapshotAlternativesArm64ImmutableInputs(
         script,
-        &snapshot_util_linux_arm64_controls,
+        if (has_less) &snapshot_util_linux_arm64_controls else &snapshot_util_linux_arm64_controls_without_less,
         &snapshot_util_linux_arm64_aliases,
-        &snapshot_util_linux_arm64_absent,
+        if (has_less) &snapshot_util_linux_arm64_absent else &snapshot_util_linux_arm64_absent_without_less,
     );
     const allocator = script.arena.allocator();
     const targets = try allocator.alloc([]const u8, script.immutable_targets.len + 2);
@@ -26942,6 +26988,7 @@ test "native_unpack.test.signed arm64 less postinst binds only fresh configure a
 test "native_unpack.test.arm64 less binds authenticated archives and exact runtime metadata" {
     const artifacts = try snapshotLessArm64TestArtifacts();
     try verifySnapshotLessArm64Artifacts(&artifacts, "arm64");
+    try verifySnapshotLessArm64Artifacts(artifacts[0..1], "arm64");
     try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(&artifacts, "amd64"));
     try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Artifacts(artifacts[1..], "arm64"));
     const duplicates = artifacts ++ artifacts[0..1].*;
@@ -27338,6 +27385,8 @@ test "native_unpack.test.signed arm64 util-linux postinst binds only fresh confi
             error.InvalidAlternativesScriptAuthority,
         ));
     }
+    try testing.expectEqual(snapshot_util_linux_arm64_controls.len - 3, snapshot_util_linux_arm64_controls_without_less.len);
+    try testing.expectEqual(snapshot_util_linux_arm64_absent.len + 3, snapshot_util_linux_arm64_absent_without_less.len);
 }
 
 test "native_unpack.test.signed arm64 util-linux artifacts cache and perl guards reject tampered inputs" {
@@ -28129,13 +28178,14 @@ fn prepareAlternativesScriptBoundary(
         return error.InvalidAlternativesScriptAuthority;
     if (procps_trigger_inert)
         try guardSnapshotProcpsTriggerInputs(root, &script);
+    var bash_cache_fact: ?native_alternatives.EntryFact = null;
     if ((less_inert or snapshot_postinst) and std.mem.eql(u8, architecture, "arm64")) {
         if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
             return error.InvalidAlternativesScriptAuthority;
         try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture, kind);
+        bash_cache_fact = try verifySnapshotBashArm64CacheInput(allocator, root);
         try bindSnapshotLessArm64ImmutableInputs(&script, kind);
     }
-    var bash_cache_fact: ?native_alternatives.EntryFact = null;
     if (snapshot_bash_postinst and std.mem.eql(u8, architecture, "arm64")) {
         if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))
             return error.InvalidAlternativesScriptAuthority;
@@ -28156,7 +28206,7 @@ fn prepareAlternativesScriptBoundary(
             return error.InvalidAlternativesScriptAuthority;
         bash_cache_fact = try verifySnapshotUtilLinuxArm64Inputs(allocator, root, program.artifacts, program.target_architecture);
         try verifySnapshotUtilLinuxArm64FstrimAbsent(root);
-        try bindSnapshotUtilLinuxArm64ImmutableInputs(&script);
+        try bindSnapshotUtilLinuxArm64ImmutableInputs(root, &script);
     }
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
@@ -28260,7 +28310,7 @@ fn prepareAlternativesScriptBoundary(
     });
     errdefer before.deinit();
     if (snapshot_util_linux_postinst and std.mem.eql(u8, architecture, "arm64"))
-        try verifySnapshotUtilLinuxArm64PagerBefore(before);
+        try verifySnapshotUtilLinuxArm64PagerBefore(root, before);
     var immutable_before = try native_alternatives.captureScriptInputs(
         allocator,
         root,
