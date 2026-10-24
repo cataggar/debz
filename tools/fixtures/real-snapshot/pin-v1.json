@@ -75,6 +75,62 @@
     {
       "digest": "sha256:95e1e850c9df6ac5534ec74e67f94b3f1e579216d54ce7e83a06860dc6c40439",
       "reason": "gawk 1:5.2.1-2+b1 postinst from the frozen Debian trixie amd64 closure; bound by tools/fixtures/debian-stable-closure-v1/amd64-inventory.json, not the resolute snapshot pin"
+    },
+    {
+      "digest": "sha256:dbe8ec652820b0f335b4c4bf1bacebe69b82faf356df61d64b3ea067c73a720b",
+      "reason": "opensysusers 0.7.3-4.1 usr/bin/opensysusers-sysusers from the minimized Ubuntu 26.04 core closure; outside the ubuntu-minimal series closure"
+    },
+    {
+      "digest": "sha256:ceb1f66b47b42f0066fe5ac12786cf57fd4dd07ab40187df95690dfcb17c4bc8",
+      "reason": "udev 259.5-0ubuntu3.4 arm64 usr/bin/systemd-hwdb for Ubuntu 26.04 arm64 udev lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:ce0159601e72dc2e29513e9c2ff5f5236ed85851bb2b6576ce8fb1f1457e8159",
+      "reason": "systemd 259.5-0ubuntu3.4 arm64 usr/bin/systemd-sysusers for Ubuntu 26.04 arm64 lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:5f9a7a87202f6876f6614f1c91f65c635ee53a7dda64230e488f2bc265fbdd3b",
+      "reason": "systemd 259.5-0ubuntu3.4 arm64 usr/bin/systemd-tmpfiles for Ubuntu 26.04 arm64 lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:29da76cc9d6aeb5e4d4aee4b39dd5edcba76da76809b6abc6b2339d404a8eb2b",
+      "reason": "systemd 259.5-0ubuntu3.4 arm64 usr/bin/systemctl for Ubuntu 26.04 arm64 udev lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:39c0ad106972f6d29f7d2c1de709bcadbd7cb916140bbe782127f9e948f5171a",
+      "reason": "dpkg 1.22.21ubuntu8.1 arm64 usr/bin/dpkg-query for Ubuntu 26.04 arm64 sudo lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:e53a7c3218f1fee9196075683516fa8ce542132b6186f62d88ebab5696f07d41",
+      "reason": "gnu-coreutils arm64 usr/bin/gnuchown for Ubuntu 26.04 arm64 sudo lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:0b9093212bc73a0e3e13e73c3824c764c568bd8ef318f5b6b7fbb2efb3315570",
+      "reason": "gnu-coreutils arm64 usr/bin/gnuchmod for Ubuntu 26.04 arm64 sudo lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:8ef9ec82aadaaf8ab5816ddb84116a55e5aa466d523354e4bd90d695ff81c25a",
+      "reason": "sudo 1.9.17p2-1ubuntu3.1 arm64 usr/bin/sudo.ws for minimized Ubuntu 26.04 core lifecycle binding; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha512:a33eefdc91155a2c9508b2bb0399238764c35380389ddc17a9f2bfa0c9a69929678ac49c6e581ec6109ff2d6be5dd1bd931d18ae9b3f5efaee09a88a76c34b9f",
+      "reason": "sudo 1.9.17p2-1ubuntu3.1 arm64 archive for minimized Ubuntu 26.04 core structural-owner verification; outside the amd64 signed-proc series manifest"
+    },
+    {
+      "digest": "sha256:ef640024dc35f68614c6a90bda4ff8e7ac5334034e1b6a699875d055f3e9db37",
+      "reason": "ca-certificates 20260601~26.04.1 postinst from the minimized Ubuntu 26.04 core closure; outside the ubuntu-minimal series closure"
+    },
+    {
+      "digest": "sha512:d7d7406d19810f3c88471673e40ad6a7dcf00c689fed1634f1d68f7498a4d0bb6418a48d0c7020e2ef56333ed973bbda7787b863702e575ef0e4d2ed0dd044da",
+      "reason": "ca-certificates 20260601~26.04.1 archive from the minimized Ubuntu 26.04 core closure; outside the ubuntu-minimal series closure"
+    },
+    {
+      "digest": "sha256:d1af432be631780e0f48484202cef3cefd0625d711b969b15463b82e578efa46",
+      "reason": "ca-certificates 20260601~26.04.1 debconf config control from the minimized Ubuntu 26.04 core closure; outside the ubuntu-minimal series closure"
+    },
+    {
+      "digest": "sha256:57606252598033175d00c757f01e5c6e82a9835a1f7a16620be8b7d36fcbe079",
+      "reason": "ca-certificates 20260601~26.04.1 debconf templates control from the minimized Ubuntu 26.04 core closure; outside the ubuntu-minimal series closure"
     }
   ],
   "identities": [

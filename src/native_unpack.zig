@@ -23249,8 +23249,7 @@ fn verifySnapshotAlternativesArm64Inputs(
     var stat: linux.Statx = undefined;
     if (linux.errno(linux.statx(root.dir.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat)) != .SUCCESS or
         !stat.mask.TYPE or !stat.mask.MODE or !stat.mask.UID or !stat.mask.GID or
-        stat.uid != 0 or stat.gid != 0 or
-        (stat.mode != 0o40700 and stat.mode != 0o40755))
+        stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)
         return error.InvalidAlternativesScriptAuthority;
     var proc = try root.pinDirectory(try root_fs.Path.init("proc"));
     defer proc.close();
@@ -24484,7 +24483,7 @@ fn verifySnapshotPython3PreinstInputs(
             "reason=root_metadata_mismatch path=. field=gid expected=0 observed={d}",
             .{root_stat.gid},
         );
-    if (root_stat.mode != 0o40700 and root_stat.mode != 0o40755)
+    if (root_stat.mode != 0o40700)
         return invalidPython3Preinst(
             "reason=root_metadata_mismatch path=. field=mode expected=0o40700 observed=0o{o}",
             .{root_stat.mode},
