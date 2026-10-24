@@ -3118,6 +3118,76 @@ fn accountOrderingRecord(
     return repositories[index].packages.records[repository.record_index];
 }
 
+fn accountOrderingVersionMatches(
+    context: *Context,
+    candidate_version: []const u8,
+    constraint: relation.VersionConstraint,
+) bool {
+    const state = internal(context);
+    const comparison = libsolv.pool_evrcmp(
+        state.pool,
+        stringId(state.pool, candidate_version),
+        stringId(state.pool, constraint.version.text),
+        libsolv.EVRCMP_COMPARE,
+    );
+    return switch (constraint.operator) {
+        .less_than => comparison < 0,
+        .less_than_or_equal => comparison <= 0,
+        .equal => comparison == 0,
+        .greater_than_or_equal => comparison >= 0,
+        .greater_than => comparison > 0,
+    };
+}
+
+const AccountDependencyLookup = union(enum) {
+    found: usize,
+    unsupported_dependency,
+    work_limit,
+};
+
+fn resolveAccountOrderingDependency(
+    context: *Context,
+    actions: []const PlanAction,
+    repositories: []const RepositoryInput,
+    repository_order: []const usize,
+    by_name: *const std.StringHashMap(usize),
+    alternative: relation.Alternative,
+    work: *usize,
+) AccountDependencyLookup {
+    if (alternative.package.architecture_qualifier != null) return .unsupported_dependency;
+    if (by_name.get(alternative.package.name.text)) |dependency| {
+        if (dependency == std.math.maxInt(usize) or isRemoval(actions[dependency].kind))
+            return .unsupported_dependency;
+        if (alternative.version) |constraint| {
+            if (!accountOrderingVersionMatches(context, actions[dependency].version, constraint))
+                return .unsupported_dependency;
+        }
+        return .{ .found = dependency };
+    }
+    var matched: ?usize = null;
+    for (actions, 0..) |candidate, candidate_index| {
+        if (isRemoval(candidate.kind)) continue;
+        const record = accountOrderingRecord(repositories, repository_order, candidate) orelse
+            return .unsupported_dependency;
+        const provides = record.control.provides orelse continue;
+        for (provides.value.groups) |group| {
+            work.* += 1;
+            if (work.* > maximum_account_ordering_work) return .work_limit;
+            if (group.alternatives.len != 1) return .unsupported_dependency;
+            const provided = group.alternatives[0];
+            if (!std.mem.eql(u8, provided.package.name.text, alternative.package.name.text)) continue;
+            if (alternative.version) |constraint| {
+                const provided_version = provided.version orelse continue;
+                if (!accountOrderingVersionMatches(context, provided_version.version.text, constraint))
+                    continue;
+            }
+            if (matched != null and matched.? != candidate_index) return .unsupported_dependency;
+            matched = candidate_index;
+        }
+    }
+    return if (matched) |dependency| .{ .found = dependency } else .unsupported_dependency;
+}
+
 fn orderFreshRootAccounts(
     allocator: std.mem.Allocator,
     context: *Context,
@@ -3139,7 +3209,6 @@ fn orderFreshRootAccounts(
     }
     const files = files_index orelse return .ordered;
     const passwd = passwd_index orelse return .ordered;
-    if (passwd < files) return .ordered;
 
     var by_name = std.StringHashMap(usize).init(allocator);
     defer by_name.deinit();
@@ -3153,14 +3222,89 @@ fn orderFreshRootAccounts(
     var promoted = try allocator.alloc(bool, actions.len);
     defer allocator.free(promoted);
     @memset(promoted, false);
+    var in_early_closure = try allocator.alloc(bool, files);
+    defer allocator.free(in_early_closure);
+    @memset(in_early_closure, false);
     var pending: std.ArrayList(usize) = .empty;
     defer pending.deinit(allocator);
-    try pending.append(allocator, passwd);
-    promoted[passwd] = true;
+    var early_pending: std.ArrayList(usize) = .empty;
+    defer early_pending.deinit(allocator);
     var work: usize = 0;
-    var next: usize = 0;
-    while (next < pending.items.len) : (next += 1) {
-        const index = pending.items[next];
+
+    if (passwd > files) {
+        try pending.append(allocator, passwd);
+        promoted[passwd] = true;
+        var next: usize = 0;
+        while (next < pending.items.len) : (next += 1) {
+            const index = pending.items[next];
+            const record = accountOrderingRecord(repositories, repository_order, actions[index]) orelse
+                return .unsupported_dependency;
+            inline for (.{ record.control.pre_depends, record.control.depends }) |value| {
+                if (value) |field| for (field.value.groups) |group| {
+                    work += 1;
+                    if (work > maximum_account_ordering_work) return .work_limit;
+                    if (group.alternatives.len != 1) return .unsupported_dependency;
+                    const dependency = switch (resolveAccountOrderingDependency(
+                        context,
+                        actions,
+                        repositories,
+                        repository_order,
+                        &by_name,
+                        group.alternatives[0],
+                        &work,
+                    )) {
+                        .found => |resolved| resolved,
+                        .unsupported_dependency => return .unsupported_dependency,
+                        .work_limit => return .work_limit,
+                    };
+                    if (dependency == files or dependency >= index) return .dependency_cycle;
+                    if (dependency > files and !promoted[dependency]) {
+                        promoted[dependency] = true;
+                        try pending.append(allocator, dependency);
+                    } else if (dependency < files and !in_early_closure[dependency]) {
+                        in_early_closure[dependency] = true;
+                        try early_pending.append(allocator, dependency);
+                    }
+                };
+            }
+        }
+    } else {
+        in_early_closure[passwd] = true;
+        try early_pending.append(allocator, passwd);
+    }
+
+    const files_record = accountOrderingRecord(repositories, repository_order, actions[files]) orelse
+        return .unsupported_dependency;
+    inline for (.{ files_record.control.pre_depends, files_record.control.depends }) |value| {
+        if (value) |field| for (field.value.groups) |group| {
+            work += 1;
+            if (work > maximum_account_ordering_work) return .work_limit;
+            if (group.alternatives.len != 1) return .unsupported_dependency;
+            const dependency = switch (resolveAccountOrderingDependency(
+                context,
+                actions,
+                repositories,
+                repository_order,
+                &by_name,
+                group.alternatives[0],
+                &work,
+            )) {
+                .found => |resolved| resolved,
+                .unsupported_dependency => return .unsupported_dependency,
+                .work_limit => return .work_limit,
+            };
+            if (dependency == files or (dependency > files and !promoted[dependency]))
+                return .dependency_cycle;
+            if (dependency < files and !in_early_closure[dependency]) {
+                in_early_closure[dependency] = true;
+                try early_pending.append(allocator, dependency);
+            }
+        };
+    }
+
+    var early_next: usize = 0;
+    while (early_next < early_pending.items.len) : (early_next += 1) {
+        const index = early_pending.items[early_next];
         const record = accountOrderingRecord(repositories, repository_order, actions[index]) orelse
             return .unsupported_dependency;
         inline for (.{ record.control.pre_depends, record.control.depends }) |value| {
@@ -3168,42 +3312,45 @@ fn orderFreshRootAccounts(
                 work += 1;
                 if (work > maximum_account_ordering_work) return .work_limit;
                 if (group.alternatives.len != 1) return .unsupported_dependency;
-                const alternative = group.alternatives[0];
-                if (alternative.package.architecture_qualifier != null) return .unsupported_dependency;
-                const dependency = by_name.get(alternative.package.name.text) orelse
-                    return .unsupported_dependency;
-                if (dependency == std.math.maxInt(usize) or isRemoval(actions[dependency].kind))
-                    return .unsupported_dependency;
-                if (dependency == files or dependency >= index) return .dependency_cycle;
-                if (alternative.version) |constraint| {
-                    const state = internal(context);
-                    const comparison = libsolv.pool_evrcmp(
-                        state.pool,
-                        stringId(state.pool, actions[dependency].version),
-                        stringId(state.pool, constraint.version.text),
-                        libsolv.EVRCMP_COMPARE,
-                    );
-                    const matches = switch (constraint.operator) {
-                        .less_than => comparison < 0,
-                        .less_than_or_equal => comparison <= 0,
-                        .equal => comparison == 0,
-                        .greater_than_or_equal => comparison >= 0,
-                        .greater_than => comparison > 0,
-                    };
-                    if (!matches) return .unsupported_dependency;
-                }
-                if (dependency > files and !promoted[dependency]) {
-                    promoted[dependency] = true;
-                    try pending.append(allocator, dependency);
+                const dependency = switch (resolveAccountOrderingDependency(
+                    context,
+                    actions,
+                    repositories,
+                    repository_order,
+                    &by_name,
+                    group.alternatives[0],
+                    &work,
+                )) {
+                    .found => |resolved| resolved,
+                    .unsupported_dependency => return .unsupported_dependency,
+                    .work_limit => return .work_limit,
+                };
+                if (dependency == files or (dependency > files and !promoted[dependency]))
+                    return .dependency_cycle;
+                if (dependency < files and !in_early_closure[dependency]) {
+                    in_early_closure[dependency] = true;
+                    try early_pending.append(allocator, dependency);
                 }
             };
         }
     }
 
+    if (passwd < files) {
+        var all_early = true;
+        for (in_early_closure) |flag| {
+            if (!flag) {
+                all_early = false;
+                break;
+            }
+        }
+        if (all_early) return .ordered;
+    }
+
     const reordered = try allocator.alloc(PlanAction, actions.len);
     defer allocator.free(reordered);
     var count: usize = 0;
-    for (actions[0..files]) |action| {
+    for (actions[0..files], 0..) |action, index| {
+        if (!in_early_closure[index]) continue;
         reordered[count] = action;
         count += 1;
     }
@@ -3214,6 +3361,11 @@ fn orderFreshRootAccounts(
     }
     reordered[count] = actions[files];
     count += 1;
+    for (actions[0..files], 0..) |action, index| {
+        if (in_early_closure[index]) continue;
+        reordered[count] = action;
+        count += 1;
+    }
     for (actions[files + 1 ..], files + 1..) |action, index| {
         if (promoted[index]) continue;
         reordered[count] = action;
@@ -4605,6 +4757,45 @@ test "fresh-root account order refuses an explicit dependency on base-files" {
         try orderFreshRootAccounts(std.testing.allocator, context, &actions, &repositories, &repository_order),
     );
     try std.testing.expectEqualStrings("base-files", actions[0].package);
+}
+
+test "fresh-root account order moves non-closure packages after base-files" {
+    const hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    const text =
+        "Package: wireless-regdb\nVersion: 2026.02.04-0ubuntu1\nArchitecture: all\nFilename: pool/wireless-regdb.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: linux-modules-7.0.0-2015-nvidia-bos-64k\nVersion: 7.0.0-2015.15\nArchitecture: arm64\nDepends: wireless-regdb\nFilename: pool/linux-modules.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libc6\nVersion: 2.43-2ubuntu2\nArchitecture: arm64\nFilename: pool/libc6.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: mawk\nVersion: 1.3.4.20260129-1\nArchitecture: arm64\nProvides: awk\nDepends: libc6 (>= 2.38)\nFilename: pool/mawk.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: base-files\nVersion: 14ubuntu2\nArchitecture: arm64\nEssential: yes\nPre-Depends: awk\nDepends: libc6 (>= 2.34)\nProvides: base, usr-is-merged\nFilename: pool/base-files.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libdebconfclient0\nVersion: 0.282ubuntu2\nArchitecture: arm64\nDepends: libc6 (>= 2.38)\nFilename: pool/libdebconf.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libpcre2-8-0\nVersion: 10.46-1ubuntu1\nArchitecture: arm64\nDepends: libc6 (>= 2.34)\nFilename: pool/libpcre2.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libselinux1\nVersion: 3.9-4ubuntu1\nArchitecture: arm64\nDepends: libc6 (>= 2.38), libpcre2-8-0 (>= 10.22)\nFilename: pool/libselinux.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: base-passwd\nVersion: 3.6.11\nArchitecture: arm64\nEssential: yes\nDepends: libc6 (>= 2.34), libdebconfclient0 (>= 0.145), libselinux1 (>= 3.1~)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: " ++ hash ++ "\n";
+    const id = testRepositoryId('c');
+    var index = try availableIndexForArchitecture(id, "arm64", text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const context = try Context.createForArchitecture(std.testing.allocator, "arm64");
+    defer context.destroy();
+    try context.importAvailable(repositories[0], .{});
+    const repository_order = [_]usize{0};
+    var actions: [9]PlanAction = undefined;
+    for (&actions, 0..) |*action, record_index|
+        action.* = accountOrderingTestAction(&index, id, record_index);
+
+    try std.testing.expectEqual(
+        AccountOrderResult.ordered,
+        try orderFreshRootAccounts(std.testing.allocator, context, &actions, &repositories, &repository_order),
+    );
+    try std.testing.expectEqualStrings("libc6", actions[0].package);
+    try std.testing.expectEqualStrings("mawk", actions[1].package);
+    try std.testing.expectEqualStrings("libdebconfclient0", actions[2].package);
+    try std.testing.expectEqualStrings("libpcre2-8-0", actions[3].package);
+    try std.testing.expectEqualStrings("libselinux1", actions[4].package);
+    try std.testing.expectEqualStrings("base-passwd", actions[5].package);
+    try std.testing.expectEqualStrings("base-files", actions[6].package);
+    try std.testing.expectEqualStrings("wireless-regdb", actions[7].package);
+    try std.testing.expectEqualStrings("linux-modules-7.0.0-2015-nvidia-bos-64k", actions[8].package);
 }
 
 test "available import requires explicit trust and owns identities" {
