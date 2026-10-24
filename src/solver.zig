@@ -3151,7 +3151,7 @@ fn resolveAccountOrderingDependency(
     repositories: []const RepositoryInput,
     repository_order: []const usize,
     by_name: *const std.StringHashMap(usize),
-    alternative: relation.DependencyAlternative,
+    alternative: relation.Alternative,
     work: *usize,
 ) AccountDependencyLookup {
     if (alternative.package.architecture_qualifier != null) return .unsupported_dependency;
@@ -4772,7 +4772,7 @@ test "fresh-root account order moves non-closure packages after base-files" {
         "Package: libselinux1\nVersion: 3.9-4ubuntu1\nArchitecture: arm64\nDepends: libc6 (>= 2.38), libpcre2-8-0 (>= 10.22)\nFilename: pool/libselinux.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
         "Package: base-passwd\nVersion: 3.6.11\nArchitecture: arm64\nEssential: yes\nDepends: libc6 (>= 2.34), libdebconfclient0 (>= 0.145), libselinux1 (>= 3.1~)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: " ++ hash ++ "\n";
     const id = testRepositoryId('c');
-    var index = try availableIndex(id, text);
+    var index = try availableIndexForArchitecture(id, "arm64", text);
     defer index.deinit();
     const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
     const context = try Context.createForArchitecture(std.testing.allocator, "arm64");
