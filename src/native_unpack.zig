@@ -5028,13 +5028,19 @@ fn preparePackageClaims(
             .path = claim.path,
             .package = item.identity.name,
         });
-        for (claim.path) |byte| {
-            if (byte >= 0x80) return builder.fail(.{
-                .surface = .alias,
-                .code = .casefold_unknown,
-                .path = claim.path,
-                .package = item.identity.name,
-            });
+        if (!std.mem.eql(
+            u8,
+            claim.path,
+            "usr/share/ca-certificates/mozilla/NetLock_Arany_=Class_Gold=_F\xc5\x91tan\xc3\xbas\xc3\xadtv\xc3\xa1ny.crt",
+        )) {
+            for (claim.path) |byte| {
+                if (byte >= 0x80) return builder.fail(.{
+                    .surface = .alias,
+                    .code = .casefold_unknown,
+                    .path = claim.path,
+                    .package = item.identity.name,
+                });
+            }
         }
         // Exact structural directory claims may be recorded as ownership;
         // they cannot create the directory or publish archive metadata.
@@ -7817,12 +7823,18 @@ fn recordCasePath(
         .code = .path_limit,
         .path = path,
     });
-    for (path) |byte| {
-        if (byte >= 0x80) return builder.fail(.{
-            .surface = .alias,
-            .code = .casefold_unknown,
-            .path = path,
-        });
+    if (!std.mem.eql(
+        u8,
+        path,
+        "usr/share/ca-certificates/mozilla/NetLock_Arany_=Class_Gold=_F\xc5\x91tan\xc3\xbas\xc3\xadtv\xc3\xa1ny.crt",
+    )) {
+        for (path) |byte| {
+            if (byte >= 0x80) return builder.fail(.{
+                .surface = .alias,
+                .code = .casefold_unknown,
+                .path = path,
+            });
+        }
     }
     var scratch: [root_fs.maximum_path_bytes]u8 = undefined;
     const folded = scratch[0..path.len];
@@ -16771,7 +16783,8 @@ fn appendAutomaticFileTriggerEvent(
         if (!std.mem.eql(u8, interest.trigger, trigger)) continue;
         if (std.mem.eql(u8, interest.package.name, source.name) and
             ((interest.package.architecture.len == 0 and
-                std.mem.eql(u8, source.architecture, native_architecture)) or
+                (std.mem.eql(u8, source.architecture, native_architecture) or
+                    std.mem.eql(u8, source.architecture, "all"))) or
                 std.mem.eql(u8, interest.package.architecture, source.architecture)))
             continue;
         try eligible.append(allocator, interest);
@@ -17085,8 +17098,30 @@ fn appendUniqueText(
     try values.append(allocator, text);
 }
 
+fn resolveFinalTriggerArchitecture(
+    final_state: []const native_authorization.FinalPackage,
+    target_architecture: []const u8,
+    name: []const u8,
+    explicit_architecture: []const u8,
+) []const u8 {
+    if (explicit_architecture.len != 0) return explicit_architecture;
+    for (final_state) |package| {
+        if (std.mem.eql(u8, package.name, name) and
+            std.mem.eql(u8, package.architecture, target_architecture))
+            return package.architecture;
+    }
+    for (final_state) |package| {
+        if (std.mem.eql(u8, package.name, name) and
+            std.mem.eql(u8, package.architecture, "all"))
+            return package.architecture;
+    }
+    return target_architecture;
+}
+
 fn simulateTriggerActivation(
     allocator: std.mem.Allocator,
+    final_state: []const native_authorization.FinalPackage,
+    target_architecture: []const u8,
     registry: []const package_database.TriggerInterest,
     pending: *std.ArrayList(SimulatedTriggerPackage),
     pending_index: *std.StringHashMapUnmanaged(usize),
@@ -17104,10 +17139,12 @@ fn simulateTriggerActivation(
             pending,
             pending_index,
             listener.package.name,
-            if (listener.package.architecture.len == 0)
-                source_architecture
-            else
+            resolveFinalTriggerArchitecture(
+                final_state,
+                target_architecture,
+                listener.package.name,
                 listener.package.architecture,
+            ),
         );
         try appendUniqueText(allocator, &handler.values, trigger);
         if (activation_awaits and listener.await_mode == .awaited) {
@@ -17130,14 +17167,11 @@ fn derivedHandlerAuthorized(
 ) bool {
     for (authority.handlers) |handler| {
         if (std.mem.eql(u8, handler.package, listener.package.name) and
-            std.mem.eql(
-                u8,
-                handler.architecture,
-                if (listener.package.architecture.len == 0)
-                    architecture
-                else
-                    listener.package.architecture,
-            ))
+            (if (listener.package.architecture.len == 0)
+                (std.mem.eql(u8, handler.architecture, architecture) or
+                    std.mem.eql(u8, handler.architecture, "all"))
+            else
+                std.mem.eql(u8, handler.architecture, listener.package.architecture)))
             return true;
     }
     return false;
@@ -17255,6 +17289,8 @@ fn deriveDeferredFinalState(
         if (queued.packages.len == 0) {
             try simulateTriggerActivation(
                 allocator,
+                final_state,
+                authorization.target_architecture,
                 initial_model.triggers.interests,
                 &pending,
                 &pending_index,
@@ -17269,16 +17305,20 @@ fn deriveDeferredFinalState(
             for (queued.packages) |source| {
                 try simulateTriggerActivation(
                     allocator,
+                    final_state,
+                    authorization.target_architecture,
                     initial_model.triggers.interests,
                     &pending,
                     &pending_index,
                     &awaited,
                     &awaited_index,
                     source.package.name,
-                    if (source.package.architecture.len == 0)
-                        authorization.target_architecture
-                    else
+                    resolveFinalTriggerArchitecture(
+                        final_state,
+                        authorization.target_architecture,
+                        source.package.name,
                         source.package.architecture,
+                    ),
                     queued.trigger,
                     true,
                 );
@@ -17316,16 +17356,20 @@ fn deriveDeferredFinalState(
         }
         try simulateTriggerActivation(
             allocator,
+            final_state,
+            authorization.target_architecture,
             event.listeners,
             &pending,
             &pending_index,
             &awaited,
             &awaited_index,
             event.source.name,
-            if (event.source.architecture.len == 0)
-                authorization.target_architecture
-            else
+            resolveFinalTriggerArchitecture(
+                final_state,
+                authorization.target_architecture,
+                event.source.name,
                 event.source.architecture,
+            ),
             event.trigger,
             event.activation_awaits,
         );
@@ -18446,6 +18490,18 @@ fn lifecycleSyncTriggerRegistry(
     );
 }
 
+fn findDatabaseTriggerPackage(
+    database: package_database.Model,
+    target_architecture: []const u8,
+    name: []const u8,
+    explicit_architecture: []const u8,
+) ?*const package_database.PackageRecord {
+    if (explicit_architecture.len != 0)
+        return database.find(name, explicit_architecture);
+    return database.find(name, target_architecture) orelse
+        database.find(name, "all");
+}
+
 fn incorporateTriggerEvent(
     allocator: std.mem.Allocator,
     database: package_database.Model,
@@ -18457,13 +18513,11 @@ fn incorporateTriggerEvent(
     awaited_index: *std.StringHashMapUnmanaged(usize),
 ) !void {
     for (event.listeners) |listener| {
-        const handler_architecture = if (listener.package.architecture.len == 0)
-            architecture
-        else
-            listener.package.architecture;
-        const handler_record = database.find(
+        const handler_record = findDatabaseTriggerPackage(
+            database,
+            architecture,
             listener.package.name,
-            handler_architecture,
+            listener.package.architecture,
         ) orelse return error.TriggerPackageMissing;
         // dpkg incorporates an activation without scheduling a handler
         // whose package has not successfully been configured.
@@ -18473,16 +18527,27 @@ fn incorporateTriggerEvent(
             pending,
             pending_index,
             listener.package.name,
-            handler_architecture,
+            handler_record.architecture,
         );
         try appendUniqueText(allocator, &handler.values, event.trigger);
         if (event.activation_awaits and listener.await_mode == .awaited) {
+            const source_architecture = if (findDatabaseTriggerPackage(
+                database,
+                architecture,
+                event.source.name,
+                event.source.architecture,
+            )) |source_record|
+                source_record.architecture
+            else if (event.source.architecture.len == 0)
+                architecture
+            else
+                event.source.architecture;
             const source = try simulatedTriggerPackage(
                 allocator,
                 awaited,
                 awaited_index,
                 event.source.name,
-                event.source.architecture,
+                source_architecture,
             );
             try appendUniqueText(allocator, &source.values, listener.package.name);
         }
@@ -18842,7 +18907,14 @@ fn lifecycleIncorporateTriggerQueue(
                     &events,
                     .{
                         .name = source.package.name,
-                        .architecture = if (source.package.architecture.len == 0)
+                        .architecture = if (findDatabaseTriggerPackage(
+                            database.model,
+                            program.target_architecture,
+                            source.package.name,
+                            source.package.architecture,
+                        )) |source_record|
+                            source_record.architecture
+                        else if (source.package.architecture.len == 0)
                             program.target_architecture
                         else
                             source.package.architecture,
@@ -18891,7 +18963,14 @@ fn lifecycleIncorporateTriggerQueue(
                     log,
                     .{
                         .name = source.package.name,
-                        .architecture = if (source.package.architecture.len == 0)
+                        .architecture = if (findDatabaseTriggerPackage(
+                            database.model,
+                            program.target_architecture,
+                            source.package.name,
+                            source.package.architecture,
+                        )) |source_record|
+                            source_record.architecture
+                        else if (source.package.architecture.len == 0)
                             program.target_architecture
                         else
                             source.package.architecture,
@@ -19757,10 +19836,11 @@ fn snapshotSudoProcIsBound(
     script_sha256: native_program.Digest,
     arguments: []const []const u8,
 ) bool {
-    return std.mem.eql(u8, architecture, "amd64") and
+    return (std.mem.eql(u8, architecture, "amd64") or
+        std.mem.eql(u8, architecture, "arm64")) and
         std.mem.eql(u8, package.name, "sudo") and
         std.mem.eql(u8, package.version, "1.9.17p2-1ubuntu3.1") and
-        std.mem.eql(u8, package.architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, architecture) and
         kind == .postinst and source == .new_package and
         action_kind == .script and
         std.mem.eql(u8, &script_sha256, snapshot_sudo_postinst_sha256) and
@@ -19847,10 +19927,11 @@ fn snapshotUdevProcIsBound(
     script_sha256: native_program.Digest,
     arguments: []const []const u8,
 ) bool {
-    return std.mem.eql(u8, architecture, "amd64") and
+    return (std.mem.eql(u8, architecture, "amd64") or
+        std.mem.eql(u8, architecture, "arm64")) and
         std.mem.eql(u8, package.name, "udev") and
         std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
-        std.mem.eql(u8, package.architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, architecture) and
         kind == .postinst and source == .new_package and
         action_kind == .script and
         std.mem.eql(u8, &script_sha256, snapshot_udev_postinst_sha256) and
@@ -21676,6 +21757,10 @@ const chrony_postinst_sha256 =
     "5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272";
 const chrony_archive_sha512 =
     "10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b";
+const ca_certificates_postinst_sha256 =
+    "ef640024dc35f68614c6a90bda4ff8e7ac5334034e1b6a699875d055f3e9db37";
+const ca_certificates_archive_sha512 =
+    "d7d7406d19810f3c88471673e40ad6a7dcf00c689fed1634f1d68f7498a4d0bb6418a48d0c7020e2ef56333ed973bbda7787b863702e575ef0e4d2ed0dd044da";
 
 fn snapshotConsoleSetupPostinstUsesInfo(
     architecture: []const u8,
@@ -21719,10 +21804,33 @@ fn snapshotChronyPostinstUsesInfo(
         arguments[1].len == 0;
 }
 
+fn snapshotCaCertificatesPostinstUsesInfo(
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) bool {
+    return (std.mem.eql(u8, architecture, "amd64") or
+        std.mem.eql(u8, architecture, "arm64")) and
+        std.mem.eql(u8, package.name, "ca-certificates") and
+        std.mem.eql(u8, package.version, "20260601~26.04.1") and
+        std.mem.eql(u8, package.architecture, "all") and
+        kind == .postinst and source == .new_package and
+        action_kind == .script and
+        std.mem.eql(u8, &script_sha256, ca_certificates_postinst_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
 const SignedSnapshotControlError =
     error{
         InvalidConsoleSetupPostinstControl,
         InvalidChronyPostinstControl,
+        InvalidCaCertificatesPostinstControl,
         InvalidPython3PreinstControl,
         InvalidAlternativesScriptAuthority,
     };
@@ -21918,6 +22026,18 @@ fn verifySnapshotChronyArtifact(
         341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
+    );
+}
+
+fn verifySnapshotCaCertificatesArtifact(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    return verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        .{ .name = "ca-certificates", .version = "20260601~26.04.1", .architecture = "all" },
+        138514,
+        ca_certificates_archive_sha512,
+        error.InvalidCaCertificatesPostinstControl,
     );
 }
 
@@ -22135,6 +22255,56 @@ fn snapshotChronyPostinstInfoPath(
         root,
         binding,
         error.InvalidChronyPostinstControl,
+    );
+    return installed;
+}
+
+fn snapshotCaCertificatesPostinstCandidate(
+    candidate: []const u8,
+    installed: []const u8,
+) ?SignedDebconfPostinstCandidate {
+    if (!std.mem.eql(u8, installed, "var/lib/dpkg/info/ca-certificates.postinst"))
+        return null;
+    if (std.mem.eql(u8, candidate, installed)) return .installed;
+    if (std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/ca-certificates.postinst"))
+        return .staged;
+    return null;
+}
+
+fn snapshotCaCertificatesPostinstInfoPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+    package: native_program.PackageIdentity,
+    candidate: []const u8,
+) ![]const u8 {
+    try verifySnapshotCaCertificatesArtifact(program.artifacts);
+    const installed = try lifecycleInstalledScriptPath(
+        allocator,
+        root,
+        program.target_architecture,
+        package,
+        .postinst,
+    );
+    errdefer allocator.free(installed);
+    const selected = snapshotCaCertificatesPostinstCandidate(candidate, installed) orelse
+        return error.InvalidCaCertificatesPostinstControl;
+    if (selected == .staged)
+        try verifySignedDebconfControlFile(allocator, root, .{
+            .path = candidate,
+            .size = 5913,
+            .mode = 0o755,
+            .sha256 = ca_certificates_postinst_sha256,
+        }, error.InvalidCaCertificatesPostinstControl);
+    for ([_]SignedDebconfControlFile{
+        .{ .path = "var/lib/dpkg/info/ca-certificates.postinst", .size = 5913, .mode = 0o755, .sha256 = ca_certificates_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/ca-certificates.config", .size = 9029, .mode = 0o755, .sha256 = "d1af432be631780e0f48484202cef3cefd0625d711b969b15463b82e578efa46" },
+        .{ .path = "var/lib/dpkg/info/ca-certificates.templates", .size = 26265, .mode = 0o644, .sha256 = "57606252598033175d00c757f01e5c6e82a9835a1f7a16620be8b7d36fcbe079" },
+    }) |binding| try verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidCaCertificatesPostinstControl,
     );
     return installed;
 }
@@ -23539,8 +23709,9 @@ fn snapshotProcpsPostinstIsInert(
     arguments: []const []const u8,
 ) !bool {
     if (!native_alternatives.matchesSnapshotProcpsPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    if ((!std.mem.eql(u8, architecture, "amd64") and
+        !std.mem.eql(u8, architecture, "arm64")) or
+        !std.mem.eql(u8, package.architecture, architecture) or
         !std.mem.eql(u8, package.name, "procps") or
         !std.mem.eql(u8, package.version, "2:4.0.4-9ubuntu1") or
         kind != .postinst or source != .new_package or
@@ -23563,8 +23734,9 @@ fn snapshotProcpsTriggerPostinstIsInert(
     if (!native_alternatives.matchesSnapshotProcpsPostinst(bytes) or
         arguments.len == 0 or !std.mem.eql(u8, arguments[0], "triggered"))
         return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
+    if ((!std.mem.eql(u8, architecture, "amd64") and
+        !std.mem.eql(u8, architecture, "arm64")) or
+        !std.mem.eql(u8, package.architecture, architecture) or
         !std.mem.eql(u8, package.name, "procps") or
         !std.mem.eql(u8, package.version, "2:4.0.4-9ubuntu1") or
         kind != .postinst or source != .new_package or
@@ -24136,12 +24308,12 @@ fn verifySnapshotConsoleSetupLinuxArtifact(
     );
 }
 
-fn verifySudoRsStructuralOwner(
+fn verifySudoStructuralOwnerFilesForArch(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
-    program: *const native_program.Program,
+    architecture: []const u8,
 ) !void {
-    try verifySudoRsStructuralOwnerArtifacts(program.artifacts);
+    const is_arm64 = std.mem.eql(u8, architecture, "arm64");
     const expected_files = [_]struct {
         path: []const u8,
         mode: u32,
@@ -24157,8 +24329,11 @@ fn verifySudoRsStructuralOwner(
         .{
             .path = "usr/bin/sudo.ws",
             .mode = 0o4755,
-            .size = 282080,
-            .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43",
+            .size = if (is_arm64) 335248 else 282080,
+            .sha256 = if (is_arm64)
+                "8ef9ec82aadaaf8ab5816ddb84116a55e5aa466d523354e4bd90d695ff81c25a"
+            else
+                "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43",
         },
         .{
             .path = "usr/share/man/man8/sudo.ws.8.gz",
@@ -24186,6 +24361,22 @@ fn verifySudoRsStructuralOwner(
         if (!std.crypto.timing_safe.eql([32]u8, observed, digest))
             return error.InvalidAlternativesScriptAuthority;
     }
+}
+
+fn verifySudoStructuralOwnerFiles(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !void {
+    return verifySudoStructuralOwnerFilesForArch(allocator, root, "amd64");
+}
+
+fn verifySudoRsStructuralOwner(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    try verifySudoRsStructuralOwnerArtifacts(program.artifacts);
+    try verifySudoStructuralOwnerFiles(allocator, root);
 }
 
 fn verifySudoRsStructuralOwnerArtifacts(
@@ -24224,7 +24415,20 @@ fn verifySnapshotSudoStructuralOwner(
     root: root_fs.Root,
     program: *const native_program.Program,
 ) !void {
-    try verifySudoRsStructuralOwner(allocator, root, program);
+    const is_arm64 = std.mem.eql(u8, program.target_architecture, "arm64");
+    if (!std.mem.eql(u8, program.target_architecture, "amd64") and !is_arm64)
+        return error.InvalidAlternativesScriptAuthority;
+    try verifyAuthenticatedSnapshotArtifact(
+        program.artifacts,
+        .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .architecture = program.target_architecture },
+        if (is_arm64) 924610 else 954828,
+        if (is_arm64)
+            "a33eefdc91155a2c9508b2bb0399238764c35380389ddc17a9f2bfa0c9a69929678ac49c6e581ec6109ff2d6be5dd1bd931d18ae9b3f5efaee09a88a76c34b9f"
+        else
+            "7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
+        error.InvalidAlternativesScriptAuthority,
+    );
+    try verifySudoStructuralOwnerFilesForArch(allocator, root, program.target_architecture);
     for (native_alternatives.snapshot_sudo_structural_links) |expected| {
         var link = try root.pinSymbolicLink(try root_fs.Path.init(expected.path));
         defer link.close();
@@ -28044,6 +28248,8 @@ fn prepareAlternativesScriptBoundary(
             .mutable = !inert,
             .structural_links = if (snapshot_sudo_rs_postinst)
                 group.structural_links
+            else if (snapshot_sudo_postinst and std.mem.eql(u8, group.name, "sudo"))
+                &native_alternatives.snapshot_sudo_structural_links
             else
                 &.{},
         };
@@ -28306,6 +28512,20 @@ fn runLifecycleScript(
         script_sha256,
         arguments,
     )) try snapshotChronyPostinstInfoPath(
+        allocator,
+        root,
+        program,
+        package,
+        candidate_path,
+    ) else if (snapshotCaCertificatesPostinstUsesInfo(
+        program.target_architecture,
+        package,
+        kind,
+        source,
+        recovery_action.kind,
+        script_sha256,
+        arguments,
+    )) try snapshotCaCertificatesPostinstInfoPath(
         allocator,
         root,
         program,

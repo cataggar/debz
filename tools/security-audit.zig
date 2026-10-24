@@ -4039,14 +4039,14 @@ pub fn auditDependencies(ctx: *AuditContext) !void {
         },
         .{
             .manifest_name = "xz",
-            .url = "https://github.com/tukaani-project/xz/archive/4b73f2ec19a99ef465282fbce633e8deb33691b3.tar.gz",
+            .url = "https://codeload.github.com/tukaani-project/xz/tar.gz/4b73f2ec19a99ef465282fbce633e8deb33691b3",
             .digest = "N-V-__8AAPy-ZQDvb3F10PKDTFyFXk7kwDjstLisczD0n9Fs",
             .policy_name = "liblzma",
             .commit = "4b73f2ec19a99ef465282fbce633e8deb33691b3",
         },
         .{
             .manifest_name = "zstd",
-            .url = "https://github.com/cataggar/zstd/archive/71502da18ccdacac0c2049c033dedbbf25a40b93.tar.gz",
+            .url = "https://codeload.github.com/cataggar/zstd/tar.gz/71502da18ccdacac0c2049c033dedbbf25a40b93",
             .digest = "zstd-1.6.0-Nyx42nbYOwBGNLCV3_VPmuHUh7voiJK2Dqm6OBEBfiod",
             .policy_name = "libzstd",
             .commit = "71502da18ccdacac0c2049c033dedbbf25a40b93",
