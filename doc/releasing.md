@@ -30,7 +30,7 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
    retain stable recovery guidance (`>=0.3.0,<0.4.0`).
 6. Create one annotated tag without changing the commit: `git tag -a v0.3.0 -m "debz 0.3.0"`.
 7. Push only that tag: `git push origin refs/tags/v0.3.0`.
-8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus verified standalone `ghr` v0.8.1 smoke jobs.
+8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus verified standalone `ghr` v0.9.1 smoke jobs.
 9. Confirm the release is named `debz 0.3.0`, its prerelease flag matches parsed SemVer, only the four Linux x64/arm64 gzip/xz binary archives are present, the generated notes summarize changes since the previous release, and `cataggar/debz/actions/setup@v0.3.0`, `cataggar/debz/actions/download@v0.3.0`, `cataggar/debz/actions/install@v0.3.0`, and `ghr install cataggar/debz@v0.3.0` succeed on native x64 and arm64. The install smoke must show a cold alternate-root transaction followed by an exact package-cache hit into a different fresh root with zero package downloads and a separately verified transaction result.
 10. Verify both archive formats with `gh attestation verify debz-0.3.0-linux-x64.tar.gz --repo cataggar/debz` and `gh attestation verify debz-0.3.0-linux-x64.tar.xz --repo cataggar/debz` after downloading the assets.
 
@@ -45,7 +45,7 @@ If publication succeeds but a smoke job or later investigation finds a defect, d
 The workflow uses no repository secrets and cannot run on pull requests. A rerun is safe only when no GitHub Release exists for the tag; after publication, diagnose the existing immutable release instead of rerunning publication.
 
 The ghr smoke bootstrap uses the same fully pinned native setup action and exact
-v0.8.1 CLI as the verified Zig installer, with GitHub release provenance
+v0.9.1 CLI as the verified Zig installer, with GitHub release provenance
 verification and exact-cache rehashing. It no longer installs `ghr-bin` through
 pip or creates a Python virtual environment. Both required release dry-run
 architectures exercise the standalone bootstrap against the existing immutable

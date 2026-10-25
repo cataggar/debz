@@ -4607,8 +4607,8 @@ pub const WORKLOAD_SETUP_STEPS = [_][]const u8{
 
 pub const WORKLOAD_SETUP_LINES = [_][]const u8{
     "          persist-credentials: false",
-    "        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1",
-    "          ghr-version: v0.8.1",
+    "        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1",
+    "          ghr-version: v0.9.1",
     "            cataggar/zig@v0.17.0",
     "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "        run: test \"$(zig version)\" = 0.17.0",
@@ -6931,11 +6931,11 @@ const SYSTEM_INSTALL_LIVE_JOB =
     \\        with:
     \\          persist-credentials: false
     \\      - name: Install Zig via ghr
-    \\        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+    \\        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
     \\        env:
     \\          GH_TOKEN: ${{ github.token }}
     \\        with:
-    \\          ghr-version: v0.8.1
+    \\          ghr-version: v0.9.1
     \\          tools: >-
     \\            cataggar/zig@v0.17.0
     \\            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -9959,11 +9959,11 @@ pub fn nativeProvenanceBindingWiringFailures(
 
 pub const GHR_ZIG_INSTALL =
     "      - name: Install Zig via ghr\n" ++
-    "        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1\n" ++
+    "        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1\n" ++
     "        env:\n" ++
     "          GH_TOKEN: ${{ github.token }}\n" ++
     "        with:\n" ++
-    "          ghr-version: v0.8.1\n" ++
+    "          ghr-version: v0.9.1\n" ++
     "          tools: >-\n" ++
     "            cataggar/zig@v0.17.0\n" ++
     "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U\n" ++

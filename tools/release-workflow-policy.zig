@@ -7,11 +7,11 @@ const maximum_file_bytes = 16 * 1024 * 1024;
 
 pub const ghr_zig_install =
     \\      - name: Install Zig via ghr
-    \\        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+    \\        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
     \\        env:
     \\          GH_TOKEN: ${{ github.token }}
     \\        with:
-    \\          ghr-version: v0.8.1
+    \\          ghr-version: v0.9.1
     \\          tools: >-
     \\            cataggar/zig@v0.17.0
     \\            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -23,9 +23,9 @@ pub const ghr_zig_install =
 pub const ghr_standalone_setup =
     \\      - name: Install verified standalone ghr
     \\        id: ghr
-    \\        uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+    \\        uses: cataggar/ghr/actions/setup@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
     \\        with:
-    \\          ghr-version: v0.8.1
+    \\          ghr-version: v0.9.1
     \\
 ;
 
@@ -473,8 +473,8 @@ pub fn auditGhrSmoke(failures: *Failures, ci: []const u8, release: []const u8) !
         "GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin",
         "GHR_CACHE_DIR: ${{ runner.temp }}/debz-release-ghr-cache",
         "test -x \"$GHR_PATH\"",
-        "test \"$GHR_VERSION\" = v0.8.1",
-        "test \"$(PATH=/no-host-interpreters \"$GHR_PATH\" version)\" = 0.8.1",
+        "test \"$GHR_VERSION\" = v0.9.1",
+        "test \"$(PATH=/no-host-interpreters \"$GHR_PATH\" version)\" = 0.9.1",
         "PATH=/no-host-interpreters \"$GHR_PATH\" install \"cataggar/debz@v$VERSION\"",
         "bin_dir=$(PATH=/no-host-interpreters \"$GHR_PATH\" path bin)",
         "test \"$bin_dir\" = \"$GHR_BIN_DIR\"",
@@ -1384,7 +1384,7 @@ test "balanced move out of native oracle evidence job still fails" {
 test "unverified or duplicate install refuses" {
     var fx = try TestFixture.init();
     defer fx.deinit();
-    const changed = try fx.replaceFirst(fx.ci, "ghr-version: v0.8.1", "ghr-version: v0.8.0");
+    const changed = try fx.replaceFirst(fx.ci, "ghr-version: v0.9.1", "ghr-version: v0.8.0");
     var failures = Failures.init(fx.arena.allocator());
     try auditZigInstallation(&failures, changed, fx.release);
     try testing.expect(TestFixture.hasFailureContaining(&failures, "exact verified ghr Zig install blocks"));
@@ -1478,7 +1478,7 @@ test "both native smoke consumers use the verified standalone bootstrap and refu
     try auditGhrSmoke(&failures, fx.ci, fx.release);
     try testing.expectEqual(@as(usize, 0), failures.items().len);
 
-    const ghr_v_latest = try fx.replaceFirst(ghr_standalone_setup, "v0.8.1", "latest");
+    const ghr_v_latest = try fx.replaceFirst(ghr_standalone_setup, "v0.9.1", "latest");
     const ghr_extra_sha = try std.mem.concat(fx.arena.allocator(), u8, &.{ ghr_standalone_setup, "          sha256: unreviewed\n" });
 
     for ([_]usize{ 0, 1 }) |workflow_index| {
@@ -1488,7 +1488,7 @@ test "both native smoke consumers use the verified standalone bootstrap and refu
             try fx.replaceFirst(original, ghr_standalone_setup, ghr_v_latest),
             try fx.replaceFirst(original, ghr_standalone_setup, ghr_extra_sha),
             try fx.replaceFirst(original, "          PATH=/no-host-interpreters \"$GHR_PATH\" install \"cataggar/debz@v$VERSION\"\n", ""),
-            try fx.replaceFirst(original, "          test \"$(PATH=/no-host-interpreters \"$GHR_PATH\" version)\" = 0.8.1\n", ""),
+            try fx.replaceFirst(original, "          test \"$(PATH=/no-host-interpreters \"$GHR_PATH\" version)\" = 0.9.1\n", ""),
             try fx.replaceFirst(original, "          GHR_BIN_DIR: ${{ runner.temp }}/debz-release-ghr-bin\n", ""),
             try fx.replaceFirst(original, "          test \"$bin_dir\" = \"$GHR_BIN_DIR\"\n", ""),
             try std.mem.concat(fx.arena.allocator(), u8, &.{

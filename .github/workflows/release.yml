@@ -38,11 +38,11 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          ghr-version: v0.8.1
+          ghr-version: v0.9.1
           tools: >-
             cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -111,11 +111,11 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          ghr-version: v0.8.1
+          ghr-version: v0.9.1
           tools: >-
             cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -205,11 +205,11 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          ghr-version: v0.8.1
+          ghr-version: v0.9.1
           tools: >-
             cataggar/zig@v0.17.0
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -246,9 +246,9 @@ jobs:
           "$DEBZ_PATH" --help >/dev/null
       - name: Install verified standalone ghr
         id: ghr
-        uses: cataggar/ghr/actions/setup@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        uses: cataggar/ghr/actions/setup@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
         with:
-          ghr-version: v0.8.1
+          ghr-version: v0.9.1
       - name: Create signed release download fixture
         id: download-fixture
         env:
@@ -376,8 +376,8 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           test -x "$GHR_PATH"
-          test "$GHR_VERSION" = v0.8.1
-          test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.8.1
+          test "$GHR_VERSION" = v0.9.1
+          test "$(PATH=/no-host-interpreters "$GHR_PATH" version)" = 0.9.1
           mkdir -p .zig-cache/released
           gh release download "$GITHUB_REF_NAME" --dir .zig-cache/released \
             --pattern "debz-$VERSION-$PLATFORM.tar.gz"

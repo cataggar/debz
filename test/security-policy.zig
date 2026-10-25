@@ -420,7 +420,7 @@ test "security: Zig installer must remain exact and setup-zig or cache substitut
         const valid = try f.check(workflow.kind, source);
         defer valid.deinit();
         try valid.ok();
-        const old = try f.replace(source, "ghr-version: v0.8.1", "ghr-version: v0.8.0");
+        const old = try f.replace(source, "ghr-version: v0.9.1", "ghr-version: v0.8.0");
         const invalid = try f.check(workflow.kind, old);
         defer invalid.deinit();
         try invalid.failsWith("exact verified ghr Zig install blocks");
