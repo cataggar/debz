@@ -88,7 +88,7 @@ this prepared three-job graph requires exactly 13 in both security and
 release workflow policy audits.
 
 Ordinary CI and release builds obtain Zig 0.17.0 from `cataggar/zig` through the
-commit-pinned `ghr` v0.8.1 install action, verify the release with its pinned
+commit-pinned `ghr` v0.9.1 install action, verify the release with its pinned
 minisign key and GitHub attestations, and check `zig version` before use. The
 action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
