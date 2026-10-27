@@ -96,12 +96,14 @@ no-build-cache policy.
 
 ## Runner placement and the rootless root container
 
-Jobs that need no `sudo` run directly on the trusted self-hosted pool
+When the repository `USE_SELF_HOSTED` variable is set to `'true'`, jobs that
+need no `sudo` run directly on the trusted self-hosted pool
 (`[self-hosted, Linux, X64|ARM64, ubuntu2604]`) as its unprivileged runner
 account. These include the action unit checks, the `build-and-test-workload`
-core, the release dry-runs and `fuzz`. Pull requests from forks never reach
-the pool: their rows fall back to a GitHub-hosted runner, and
-`download-action-cache`, which has no hosted form, is skipped.
+core, `download-action-cache`, the release dry-runs and `fuzz`. When
+`USE_SELF_HOSTED` is unset or on pull requests from forks, their rows fall back
+to a GitHub-hosted runner, and `download-action-cache` is skipped on fork pull
+requests.
 
 Thirteen jobs need `sudo` but only root inside a user namespace. They run in a
 privileged rootless root container instead: `install-action-native`, the four

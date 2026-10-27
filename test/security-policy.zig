@@ -937,11 +937,11 @@ test "security: only the fork-gated core workload may use self-hosted runners di
     const workflow = try f.source(".github/workflows/ci.yml");
     const core = workload_jobs[0];
     const core_body = try job(workflow, core.name, core.next);
-    const core_runs_on = "    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}";
+    const core_runs_on = "    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, core_body, core_runs_on));
     const core_limit = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must require both architectures and optimization modes within 45 minutes", .{core.name});
     for ([_]struct { before: []const u8, after: []const u8 }{
-        .{ .before = "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ", .after = "" },
+        .{ .before = "vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ", .after = "" },
         .{ .before = core_runs_on, .after = core_runs_on ++ "\n" ++ core_runs_on },
         .{ .before = core_runs_on, .after = "    runs-on: [self-hosted, Linux, X64, ubuntu2604]" },
     }) |mutation| {
@@ -965,7 +965,7 @@ test "security: only the fork-gated core workload may use self-hosted runners di
     }
 }
 
-const rootless_gate = "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
+const rootless_gate = "vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)";
 
 fn rootlessRunsOn(f: *Fixture, key: ?[]const u8) ![]const u8 {
     const matrix_key = key orelse return "    runs-on: ${{ " ++ rootless_gate ++ " && fromJSON('[\"self-hosted\",\"Linux\",\"X64\",\"ubuntu2604\",\"podman\"]') || 'ubuntu-24.04' }}";
