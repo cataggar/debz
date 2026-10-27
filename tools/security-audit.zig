@@ -4617,7 +4617,7 @@ pub const WORKLOAD_SETUP_LINES = [_][]const u8{
 
 pub const WORKLOAD_RUNS_ON = "    runs-on: ${{ matrix.os }}";
 pub const WORKLOAD_CORE_RUNS_ON =
-    "    runs-on: ${{ (github.event_name != 'pull_request' || " ++
+    "    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || " ++
     "github.event.pull_request.head.repo.full_name == github.repository) && " ++
     "fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', " ++
     "matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}";
@@ -4640,7 +4640,7 @@ pub const ROOTLESS_ROOT_JOBS = [_]RootlessJobSpec{
 };
 
 pub const ROOTLESS_ROOT_GATE =
-    "(github.event_name != 'pull_request' || " ++
+    "vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || " ++
     "github.event.pull_request.head.repo.full_name == github.repository)";
 
 pub const ROOTLESS_ROOT_CONTAINER =

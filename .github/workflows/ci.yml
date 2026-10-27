@@ -126,7 +126,7 @@ permissions:
 jobs:
   setup-action-unit:
     name: Setup action unit and bundle checks
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -146,7 +146,7 @@ jobs:
 
   setup-action-native:
     name: Setup action native (${{ matrix.target }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -203,7 +203,7 @@ jobs:
 
   setup-action-container:
     name: Setup action in bare Ubuntu container
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container: ubuntu:24.04
     timeout-minutes: 10
     steps:
@@ -237,7 +237,7 @@ jobs:
 
   download-action-unit:
     name: Download action unit and bundle checks
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -257,7 +257,7 @@ jobs:
 
   install-action-unit:
     name: Install action unit and bundle checks
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -277,7 +277,7 @@ jobs:
 
   install-action-native:
     name: Install action native transaction (${{ matrix.architecture }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -408,7 +408,7 @@ jobs:
   download-action-cache:
     name: Download action cache semantics
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, ubuntu2604]
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -731,7 +731,7 @@ jobs:
 
   download-action-container-fixture:
     name: Build download action container fixture
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -768,7 +768,7 @@ jobs:
   download-action-container:
     name: Download action in bare Ubuntu container
     needs: download-action-container-fixture
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container: ubuntu:24.04
     timeout-minutes: 15
     steps:
@@ -859,7 +859,7 @@ jobs:
   build-and-test-workload:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload core (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -967,7 +967,7 @@ jobs:
   build-and-test-workload-production:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload production (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1074,7 +1074,7 @@ jobs:
   build-and-test-workload-apt-system:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload apt system (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1205,7 +1205,7 @@ jobs:
   build-and-test-workload-native:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Build and test workload native (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1317,7 +1317,7 @@ jobs:
   build-and-test-workload-release:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload release (${{ matrix.name }}, ${{ matrix.optimize }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1452,7 +1452,7 @@ jobs:
   native-recovery-zig-workflows:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig core (${{ matrix.name }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1561,7 +1561,7 @@ jobs:
   native-recovery-zig-repository:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig repository (${{ matrix.name }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1658,7 +1658,7 @@ jobs:
   native-recovery-zig-helper:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig helper, bootstrap, parity and rollback (${{ matrix.name }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1761,7 +1761,7 @@ jobs:
   native-recovery-zig-family:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig signed FAMILY (${{ matrix.name }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1858,7 +1858,7 @@ jobs:
   native-recovery-zig-scenarios:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig scenario matrices (${{ matrix.name }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -1968,7 +1968,7 @@ jobs:
   native-recovery-zig-diversions:
     if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix || inputs.run_native_recovery_cohort
     name: Native crash recovery Zig diversion shard (${{ matrix.name }} / ${{ matrix.shard }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -2590,7 +2590,7 @@ jobs:
     name: Build and test (${{ matrix.name }})
     needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]
     if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_full_matrix) }}
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -2625,7 +2625,7 @@ jobs:
 
   security-audit:
     name: Security and dependency policy
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604","podman"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604","podman"]') || 'ubuntu-24.04' }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
@@ -2717,7 +2717,7 @@ jobs:
 
   release-dry-run:
     name: Required release dry-run (${{ matrix.platform }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -2814,7 +2814,7 @@ jobs:
   release-dry-run-verify:
     name: Required release dry-run exact verification
     needs: release-dry-run
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -2845,7 +2845,7 @@ jobs:
 
   release-policy:
     name: Required release workflow policy
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -2870,7 +2870,7 @@ jobs:
 
   fuzz:
     name: Bounded mutation fuzzing (linux-x64)
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -2904,7 +2904,7 @@ jobs:
 
   integration-required:
     name: Required disposable root (${{ matrix.suite }}/${{ matrix.architecture }})
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('["self-hosted","Linux","{0}","ubuntu2604","podman"]', matrix.runner == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.runner }}
     container:
       image: ubuntu:24.04
       options: --privileged --init
